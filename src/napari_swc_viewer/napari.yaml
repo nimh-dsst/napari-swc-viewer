@@ -1,0 +1,6 @@
+name: napari-swc-viewer
+display_name: SWC Viewer
+contributions:
+  commands: []
+  readers: []
+  widgets: []
