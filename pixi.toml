@@ -8,6 +8,8 @@ platforms = ["win-64", "osx-arm64", "linux-64"]
 [tasks]
 test = "pytest -v"
 test-cov = "pytest -v --cov=napari_swc_viewer --cov-report=xml"
+build = "pip install -e ."
+napari = { cmd = "napari", depends-on = ["build"] }
 
 [dependencies]
 python = ">=3.10,<3.13"
