@@ -10,6 +10,7 @@ test = "pytest -v"
 test-cov = "pytest -v --cov=napari_swc_viewer --cov-report=xml"
 build = "pip install -e ."
 napari = { cmd = "napari", depends-on = ["build"] }
+download-test-data = "python scripts/download_test_data.py"
 
 [dependencies]
 python = ">=3.10,<3.13"
