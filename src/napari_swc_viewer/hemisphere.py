@@ -30,28 +30,77 @@ class Hemisphere(Enum):
     MIDLINE = "midline"
 
 
-def get_atlas_midline(atlas: BrainGlobeAtlas) -> float:
-    """Get the midline coordinate (in microns) for an atlas.
+# Mapping from BrainGlobeAtlas hemisphere_from_coords return values to Hemisphere enum
+# hemisphere_from_coords returns: 0=outside brain, 1=left, 2=right
+_ATLAS_HEMISPHERE_MAP = {
+    1: Hemisphere.LEFT,
+    2: Hemisphere.RIGHT,
+}
 
-    The midline is at the center of the atlas along the
-    left-right axis (typically the first axis in BrainGlobe atlases).
+
+def _validate_hemisphere_with_atlas(
+    coords: tuple[float, float, float],
+    atlas: BrainGlobeAtlas,
+    midline_result: Hemisphere,
+) -> None:
+    """Validate midline-based hemisphere detection against atlas.
+
+    Parameters
+    ----------
+    coords : tuple[float, float, float]
+        Coordinates in microns (x, y, z).
+    atlas : BrainGlobeAtlas
+        The atlas instance to validate against.
+    midline_result : Hemisphere
+        The hemisphere determined by midline calculation.
+
+    Raises
+    ------
+    ValueError
+        If the midline-based result differs from the atlas's hemisphere_from_coords.
+    """
+    # Get hemisphere from atlas using its built-in method
+    atlas_hemisphere_code = atlas.hemisphere_from_coords(coords, microns=True)
+
+    # 0 means outside the brain - skip validation in this case
+    if atlas_hemisphere_code == 0:
+        return
+
+    atlas_hemisphere = _ATLAS_HEMISPHERE_MAP.get(atlas_hemisphere_code)
+
+    # If midline result is MIDLINE, it could match either hemisphere at boundary
+    if midline_result == Hemisphere.MIDLINE:
+        return
+
+    # Check if results match
+    if atlas_hemisphere is not None and atlas_hemisphere != midline_result:
+        raise ValueError(
+            f"Hemisphere mismatch: midline calculation returned {midline_result.value}, "
+            f"but atlas.hemisphere_from_coords returned {atlas_hemisphere.value} "
+            f"(code={atlas_hemisphere_code}) for coordinates {coords}"
+        )
+
+
+def get_atlas_midline(atlas: BrainGlobeAtlas, coord_axis: int = 2) -> float:
+    """Get the midline coordinate (in microns) for an atlas along a given axis.
+
+    The midline is at the center of the atlas along the specified axis.
 
     Parameters
     ----------
     atlas : BrainGlobeAtlas
         A BrainGlobe atlas instance.
+    coord_axis : int, default=0
+        Which coordinate axis (0=x, 1=y, 2=z) to get the midline for.
 
     Returns
     -------
     float
         The midline coordinate in microns.
     """
-    # BrainGlobe atlases have shape (AP, DV, LR) or similar
-    # The midline is at the center of the left-right axis
     # Shape is in voxels, resolution converts to microns
-    lr_axis = 2  # Left-right is typically the third axis (index 2)
-    shape_voxels = atlas.shape[lr_axis]
-    resolution_um = atlas.resolution[lr_axis]
+    shape_voxels = atlas.shape[coord_axis]
+    resolution_um = atlas.resolution[coord_axis]
     midline_um = (shape_voxels * resolution_um) / 2.0
     return midline_um
 
@@ -59,9 +108,10 @@ def get_atlas_midline(atlas: BrainGlobeAtlas) -> float:
 def detect_hemisphere(
     coords: NDArray[np.float64],
     atlas: BrainGlobeAtlas | None = None,
-    atlas_name: str = "allen_mouse_25um",
+    atlas_name: str = "allen_mouse_10um",
     midline: float | None = None,
-    coord_axis: int = 0,
+    coord_axis: int = 2,
+    validate: bool = True,
 ) -> Hemisphere:
     """Detect which hemisphere a coordinate or set of coordinates is in.
 
@@ -71,17 +121,27 @@ def detect_hemisphere(
         Coordinates to check. Can be a single point (3,) or multiple points (N, 3).
     atlas : BrainGlobeAtlas, optional
         Pre-loaded atlas instance. If None, will load using atlas_name.
-    atlas_name : str, default="allen_mouse_25um"
+    atlas_name : str, default="allen_mouse_10um"
         Name of the BrainGlobe atlas to use if atlas is not provided.
     midline : float, optional
         Override the atlas midline with a custom value in microns.
-    coord_axis : int, default=0
+        When provided, validation against atlas is skipped.
+    coord_axis : int, default=2
         Which coordinate axis (0=x, 1=y, 2=z) corresponds to the left-right axis.
+    validate : bool, default=True
+        If True, validate the result against atlas.hemisphere_from_coords.
+        Validation is skipped when a custom midline is provided.
 
     Returns
     -------
     Hemisphere
         The hemisphere the coordinates are in (LEFT, RIGHT, or MIDLINE).
+
+    Raises
+    ------
+    ValueError
+        If validation is enabled and the midline-based result differs from
+        the atlas's hemisphere_from_coords method.
 
     Notes
     -----
@@ -89,32 +149,45 @@ def detect_hemisphere(
     Coordinates exactly at the midline return MIDLINE.
     """
     coords = np.atleast_2d(coords)
+    custom_midline_provided = midline is not None
 
     # Get midline value
     if midline is None:
         if atlas is None:
             atlas = BrainGlobeAtlas(atlas_name)
-        midline = get_atlas_midline(atlas)
+        midline = get_atlas_midline(atlas, coord_axis)
 
     # Calculate mean position along left-right axis
-    mean_lr = np.mean(coords[:, coord_axis])
+    mean_coords = np.mean(coords, axis=0)
+    mean_lr = mean_coords[coord_axis]
 
     # Determine hemisphere with small tolerance for midline
     tolerance = 1.0  # 1 micron tolerance
     if abs(mean_lr - midline) < tolerance:
-        return Hemisphere.MIDLINE
+        result = Hemisphere.MIDLINE
     elif mean_lr < midline:
-        return Hemisphere.LEFT
+        result = Hemisphere.LEFT
     else:
-        return Hemisphere.RIGHT
+        result = Hemisphere.RIGHT
+
+    # Validate against atlas if enabled and no custom midline was provided
+    if validate and not custom_midline_provided and atlas is not None:
+        _validate_hemisphere_with_atlas(
+            tuple(mean_coords),
+            atlas,
+            result,
+        )
+
+    return result
 
 
 def detect_soma_hemisphere(
     swc_data: SWCData,
     atlas: BrainGlobeAtlas | None = None,
-    atlas_name: str = "allen_mouse_25um",
+    atlas_name: str = "allen_mouse_10um",
     midline: float | None = None,
-    coord_axis: int = 0,
+    coord_axis: int = 2,
+    validate: bool = True,
 ) -> Hemisphere:
     """Detect which hemisphere the soma of an SWC morphology is in.
 
@@ -124,12 +197,15 @@ def detect_soma_hemisphere(
         Parsed SWC morphology data.
     atlas : BrainGlobeAtlas, optional
         Pre-loaded atlas instance.
-    atlas_name : str, default="allen_mouse_25um"
+    atlas_name : str, default="allen_mouse_10um"
         Name of the BrainGlobe atlas to use.
     midline : float, optional
         Override the atlas midline with a custom value.
-    coord_axis : int, default=0
+        When provided, validation against atlas is skipped.
+    coord_axis : int, default=2
         Which coordinate axis corresponds to left-right.
+    validate : bool, default=True
+        If True, validate the result against atlas.hemisphere_from_coords.
 
     Returns
     -------
@@ -139,7 +215,7 @@ def detect_soma_hemisphere(
     Raises
     ------
     ValueError
-        If no soma nodes are found in the SWC data.
+        If no soma nodes are found in the SWC data, or if validation fails.
     """
     soma_coords = swc_data.soma_coords
     if len(soma_coords) == 0:
@@ -151,15 +227,16 @@ def detect_soma_hemisphere(
         atlas_name=atlas_name,
         midline=midline,
         coord_axis=coord_axis,
+        validate=validate,
     )
 
 
 def flip_coordinates(
     coords: NDArray[np.float64],
     atlas: BrainGlobeAtlas | None = None,
-    atlas_name: str = "allen_mouse_25um",
+    atlas_name: str = "allen_mouse_10um",
     midline: float | None = None,
-    coord_axis: int = 0,
+    coord_axis: int = 2,
 ) -> NDArray[np.float64]:
     """Flip coordinates from one hemisphere to the other.
 
@@ -201,7 +278,7 @@ def flip_coordinates(
     if midline is None:
         if atlas is None:
             atlas = BrainGlobeAtlas(atlas_name)
-        midline = get_atlas_midline(atlas)
+        midline = get_atlas_midline(atlas, coord_axis)
 
     # Vectorized flip: reflect across midline
     # new_x = midline - (old_x - midline) = 2 * midline - old_x
@@ -217,9 +294,9 @@ def flip_coordinates(
 def flip_swc(
     swc_data: SWCData,
     atlas: BrainGlobeAtlas | None = None,
-    atlas_name: str = "allen_mouse_25um",
+    atlas_name: str = "allen_mouse_10um",
     midline: float | None = None,
-    coord_axis: int = 0,
+    coord_axis: int = 2,
     in_place: bool = False,
 ) -> SWCData:
     """Flip all coordinates in an SWC morphology to the opposite hemisphere.
@@ -269,9 +346,9 @@ def flip_swc(
 def flip_swc_batch(
     swc_data_list: list[SWCData],
     atlas: BrainGlobeAtlas | None = None,
-    atlas_name: str = "allen_mouse_25um",
+    atlas_name: str = "allen_mouse_10um",
     midline: float | None = None,
-    coord_axis: int = 0,
+    coord_axis: int = 2,
 ) -> list[SWCData]:
     """Flip multiple SWC morphologies to the opposite hemisphere.
 
@@ -299,7 +376,7 @@ def flip_swc_batch(
     # Load atlas once for all operations
     if atlas is None and midline is None:
         atlas = BrainGlobeAtlas(atlas_name)
-        midline = get_atlas_midline(atlas)
+        midline = get_atlas_midline(atlas, coord_axis)
 
     return [
         flip_swc(
