@@ -84,13 +84,14 @@ def _validate_hemisphere_with_atlas(
 def get_atlas_midline(atlas: BrainGlobeAtlas, coord_axis: int = 2) -> float:
     """Get the midline coordinate (in microns) for an atlas along a given axis.
 
-    The midline is at the center of the atlas along the specified axis.
+    The midline is at the center of the atlas along the specified axis,
+    calculated as the midpoint between the first and last voxel positions.
 
     Parameters
     ----------
     atlas : BrainGlobeAtlas
         A BrainGlobe atlas instance.
-    coord_axis : int, default=0
+    coord_axis : int, default=2
         Which coordinate axis (0=x, 1=y, 2=z) to get the midline for.
 
     Returns
@@ -98,10 +99,12 @@ def get_atlas_midline(atlas: BrainGlobeAtlas, coord_axis: int = 2) -> float:
     float
         The midline coordinate in microns.
     """
-    # Shape is in voxels, resolution converts to microns
+    # Voxel indices go from 0 to (shape - 1)
+    # The center is at (shape - 1) / 2 in voxel coordinates
+    # Convert to microns by multiplying by resolution
     shape_voxels = atlas.shape[coord_axis]
     resolution_um = atlas.resolution[coord_axis]
-    midline_um = (shape_voxels * resolution_um) / 2.0
+    midline_um = ((shape_voxels - 1) * resolution_um) / 2.0
     return midline_um
 
 

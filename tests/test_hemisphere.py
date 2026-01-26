@@ -21,13 +21,13 @@ from napari_swc_viewer.swc import SWCData
 def mock_atlas():
     """Create a mock BrainGlobeAtlas."""
     atlas = MagicMock()
-    # Mock a 10mm x 10mm x 10mm atlas at 25um resolution
-    # Shape in voxels: 400 x 400 x 400
-    atlas.shape = (400, 400, 400)
+    # Mock atlas with shape 401 so midline is exactly 5000um
+    # Midline = ((401 - 1) * 25) / 2 = 5000um
+    atlas.shape = (401, 401, 401)
     atlas.resolution = (25.0, 25.0, 25.0)  # microns
 
     # Mock hemisphere_from_coords to return consistent results with midline
-    # Midline is at 5000um (400 * 25 / 2)
+    # Midline is at 5000um
     # Returns: 0=outside, 1=left, 2=right
     def mock_hemisphere_from_coords(coords, microns=False):
         if microns:
@@ -80,12 +80,13 @@ class TestGetAtlasMidline:
         atlas.shape = (500, 600, 1000)  # Different shape per axis
         atlas.resolution = (10.0, 20.0, 25.0)  # Different resolution per axis
 
-        # Axis 0: 500 voxels * 10um = 5000um, midline at 2500
-        assert get_atlas_midline(atlas, coord_axis=0) == 2500.0
-        # Axis 1: 600 voxels * 20um = 12000um, midline at 6000
-        assert get_atlas_midline(atlas, coord_axis=1) == 6000.0
-        # Axis 2: 1000 voxels * 25um = 25000um, midline at 12500
-        assert get_atlas_midline(atlas, coord_axis=2) == 12500.0
+        # Midline = ((shape - 1) * resolution) / 2
+        # Axis 0: ((500-1) * 10) / 2 = 2495
+        assert get_atlas_midline(atlas, coord_axis=0) == 2495.0
+        # Axis 1: ((600-1) * 20) / 2 = 5990
+        assert get_atlas_midline(atlas, coord_axis=1) == 5990.0
+        # Axis 2: ((1000-1) * 25) / 2 = 12487.5
+        assert get_atlas_midline(atlas, coord_axis=2) == 12487.5
 
     def test_midline_uses_coord_axis(self, mock_atlas):
         """Test that coord_axis is used correctly."""
@@ -350,7 +351,7 @@ class TestHemisphereValidation:
     def test_validation_raises_on_mismatch(self):
         """Test that validation raises ValueError on mismatch."""
         atlas = MagicMock()
-        atlas.shape = (400, 400, 400)
+        atlas.shape = (401, 401, 401)
         atlas.resolution = (25.0, 25.0, 25.0)
         # Force atlas to return opposite hemisphere
         atlas.hemisphere_from_coords = MagicMock(return_value=2)  # right
@@ -363,7 +364,7 @@ class TestHemisphereValidation:
     def test_validation_skipped_with_custom_midline(self):
         """Test that validation is skipped when custom midline is provided."""
         atlas = MagicMock()
-        atlas.shape = (400, 400, 400)
+        atlas.shape = (401, 401, 401)
         atlas.resolution = (25.0, 25.0, 25.0)
         # Force atlas to return opposite hemisphere
         atlas.hemisphere_from_coords = MagicMock(return_value=2)  # right
@@ -379,7 +380,7 @@ class TestHemisphereValidation:
     def test_validation_skipped_when_disabled(self):
         """Test that validation can be disabled."""
         atlas = MagicMock()
-        atlas.shape = (400, 400, 400)
+        atlas.shape = (401, 401, 401)
         atlas.resolution = (25.0, 25.0, 25.0)
         # Force atlas to return opposite hemisphere
         atlas.hemisphere_from_coords = MagicMock(return_value=2)  # right
@@ -393,7 +394,7 @@ class TestHemisphereValidation:
     def test_validation_skipped_for_outside_brain(self):
         """Test that validation is skipped when atlas returns 0 (outside)."""
         atlas = MagicMock()
-        atlas.shape = (400, 400, 400)
+        atlas.shape = (401, 401, 401)
         atlas.resolution = (25.0, 25.0, 25.0)
         # Atlas returns 0 (outside brain)
         atlas.hemisphere_from_coords = MagicMock(return_value=0)
