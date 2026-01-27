@@ -145,25 +145,29 @@ def add_region_mesh(
         return None
 
     structure = atlas.structures[acronym]
-    struct_id = structure["id"]
 
-    # Get mesh
+    # Get mesh using BrainGlobe API
     try:
-        mesh = atlas.meshes[struct_id]
-    except (KeyError, FileNotFoundError):
+        mesh = atlas.mesh_from_structure(acronym)
+    except (KeyError, FileNotFoundError, Exception):
         return None
 
     # Get vertices and faces
     vertices = mesh.points
-    faces = mesh.faces.reshape(-1, 4)[:, 1:4]  # Convert from VTK format
+    # meshio returns faces as cells - extract triangles
+    faces = None
+    for cell_block in mesh.cells:
+        if cell_block.type == "triangle":
+            faces = cell_block.data
+            break
 
-    # Convert to microns (BrainGlobe meshes are in atlas space)
-    # Meshes are already in microns for BrainGlobe atlases
+    if faces is None:
+        return None
 
     # Determine color
     if color is None:
-        color_hex = structure.get("color_hex_triplet", "808080")
-        color = tuple(int(color_hex[i : i + 2], 16) / 255 for i in (0, 2, 4))
+        rgb = structure.get("rgb_triplet", [128, 128, 128])
+        color = tuple(c / 255 for c in rgb)
 
     # Create layer name
     if name is None:
@@ -179,9 +183,6 @@ def add_region_mesh(
         colormap="gray",
         visible=visible,
     )
-
-    # Set single color
-    layer.colormap = "gray"
 
     return layer
 
@@ -259,29 +260,24 @@ def add_brain_outline(
     napari.layers.Surface or None
         The created surface layer, or None if not available.
     """
-    # The root structure is usually ID 997 in Allen CCF
+    # Get the root mesh using BrainGlobe API
     try:
-        mesh = atlas.meshes[997]
-    except (KeyError, FileNotFoundError):
-        # Try to find root by looking for "root" or "brain" structure
-        root_id = None
-        for struct_id, struct in atlas.structures.items():
-            if isinstance(struct_id, int):
-                name_lower = struct.get("name", "").lower()
-                if "root" in name_lower or name_lower == "brain":
-                    root_id = struct_id
-                    break
-
-        if root_id is None:
-            return None
-
-        try:
-            mesh = atlas.meshes[root_id]
-        except (KeyError, FileNotFoundError):
-            return None
+        mesh = atlas.mesh_from_structure("root")
+    except (KeyError, FileNotFoundError, Exception):
+        return None
 
     vertices = mesh.points
-    faces = mesh.faces.reshape(-1, 4)[:, 1:4]
+
+    # meshio returns faces as cells - extract triangles
+    faces = None
+    for cell_block in mesh.cells:
+        if cell_block.type == "triangle":
+            faces = cell_block.data
+            break
+
+    if faces is None:
+        return None
+
     values = np.ones(len(vertices))
 
     layer = viewer.add_surface(

@@ -147,6 +147,10 @@ class NeuronViewerWidget(QWidget):
 
         layout.addWidget(atlas_group)
 
+        # Atlas status label
+        self._atlas_status_label = QLabel("Atlas: Not loaded")
+        layout.addWidget(self._atlas_status_label)
+
         # Selected neurons list
         neurons_group = QGroupBox("Selected Neurons")
         neurons_layout = QVBoxLayout(neurons_group)
@@ -344,13 +348,21 @@ class NeuronViewerWidget(QWidget):
         """Load the selected BrainGlobe atlas."""
         atlas_name = self._atlas_combo.currentText()
 
+        self._atlas_status_label.setText(f"Atlas: Loading {atlas_name}...")
+        # Force UI update
+        self._atlas_status_label.repaint()
+
         try:
             self._atlas = BrainGlobeAtlas(atlas_name)
             self._region_selector.set_atlas(self._atlas)
+            self._atlas_status_label.setText(
+                f"Atlas: {atlas_name} ({len(self._atlas.structures)} structures)"
+            )
             logger.info(f"Loaded atlas: {atlas_name}")
 
         except Exception as e:
             logger.error(f"Failed to load atlas: {e}")
+            self._atlas_status_label.setText(f"Atlas: Error - {e}")
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
