@@ -5,6 +5,7 @@ try:
 except ImportError:
     __version__ = "unknown"
 
+from .db import NeuronDatabase
 from .hemisphere import (
     Hemisphere,
     detect_hemisphere,
@@ -13,6 +14,18 @@ from .hemisphere import (
     flip_swc,
     flip_swc_batch,
     get_atlas_midline,
+)
+from .parquet import (
+    NEURON_SCHEMA,
+    get_parquet_summary,
+    swc_files_to_parquet,
+)
+from .region import (
+    build_region_lookup,
+    get_region_at_coords,
+    get_region_ids_vectorized,
+    get_regions_for_coords,
+    setup_allen_sdk,
 )
 from .swc import NodeType, SWCData, parse_swc, write_swc
 
@@ -31,4 +44,16 @@ __all__ = [
     "flip_swc",
     "flip_swc_batch",
     "get_atlas_midline",
+    # Region mapping
+    "setup_allen_sdk",
+    "get_region_at_coords",
+    "get_regions_for_coords",
+    "get_region_ids_vectorized",
+    "build_region_lookup",
+    # Parquet conversion
+    "NEURON_SCHEMA",
+    "swc_files_to_parquet",
+    "get_parquet_summary",
+    # Database
+    "NeuronDatabase",
 ]

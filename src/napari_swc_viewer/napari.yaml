@@ -1,6 +1,21 @@
 name: napari-swc-viewer
 display_name: SWC Viewer
 contributions:
-  commands: []
-  readers: []
-  widgets: []
+  commands:
+    - id: napari-swc-viewer.get_reader
+      python_name: napari_swc_viewer._reader:napari_get_reader
+      title: Open SWC or Parquet file
+    - id: napari-swc-viewer.neuron_viewer
+      python_name: napari_swc_viewer.widgets:NeuronViewerWidget
+      title: Neuron Viewer
+
+  readers:
+    - command: napari-swc-viewer.get_reader
+      accepts_directories: false
+      filename_patterns:
+        - "*.swc"
+        - "*.parquet"
+
+  widgets:
+    - command: napari-swc-viewer.neuron_viewer
+      display_name: Neuron Viewer
