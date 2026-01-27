@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
+from napari.utils.notifications import show_info
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -525,6 +526,10 @@ class NeuronViewerWidget(QWidget):
         if state == Qt.Checked:
             existing = [l for l in self.viewer.layers if l.name == layer_name]
             if not existing:
+                # Switch to 3D mode for mesh viewing
+                if self.viewer.dims.ndisplay == 2:
+                    self.viewer.dims.ndisplay = 3
+                    show_info("Switched to 3D view for mesh display")
                 add_brain_outline(self.viewer, self._atlas)
         else:
             for layer in self.viewer.layers:
@@ -552,6 +557,14 @@ class NeuronViewerWidget(QWidget):
 
         if not self._show_region_meshes_cb.isChecked():
             return
+
+        if not acronyms:
+            return
+
+        # Switch to 3D mode for mesh viewing
+        if self.viewer.dims.ndisplay == 2:
+            self.viewer.dims.ndisplay = 3
+            show_info("Switched to 3D view for mesh display")
 
         # Add new meshes
         opacity = self._mesh_opacity_slider.value() / 100.0
