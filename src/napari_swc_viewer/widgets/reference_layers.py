@@ -159,8 +159,9 @@ def add_region_mesh(
         return None
 
     # Get vertices and faces (meshio format)
-    vertices = mesh.points
-    faces = mesh.cells[0].data
+    # Convert to float32/int32 for better vispy/OpenGL compatibility
+    vertices = mesh.points.astype(np.float32)
+    faces = mesh.cells[0].data.astype(np.int32)
 
     # Scale mesh from microns to pixel/voxel space to match the reference image
     scale = [1.0 / res for res in atlas.resolution]
@@ -175,10 +176,10 @@ def add_region_mesh(
     else:
         rgb = [int(c * 255) if isinstance(c, float) and c <= 1 else c for c in color]
 
-    # Create vertex colors array (RGB 0-1 for each vertex)
+    # Create vertex colors array (RGB 0-1 for each vertex, float32 for vispy)
     vertex_colors = np.repeat(
         [[float(c) / 255 for c in rgb]], len(vertices), axis=0
-    )
+    ).astype(np.float32)
 
     logger.info(f"Creating surface layer '{name}': {len(vertices)} vertices, {len(faces)} faces")
     layer = viewer.add_surface(
@@ -280,14 +281,15 @@ def add_brain_outline(
         return None
 
     # Get vertices and faces (meshio format)
-    vertices = mesh.points
-    faces = mesh.cells[0].data
+    # Convert to float32/int32 for better vispy/OpenGL compatibility
+    vertices = mesh.points.astype(np.float32)
+    faces = mesh.cells[0].data.astype(np.int32)
 
     # Scale mesh from microns to pixel/voxel space to match the reference image
     scale = [1.0 / res for res in atlas.resolution]
 
-    # Gray color for outline
-    vertex_colors = np.repeat([[0.5, 0.5, 0.5]], len(vertices), axis=0)
+    # Gray color for outline (float32 for vispy)
+    vertex_colors = np.repeat([[0.5, 0.5, 0.5]], len(vertices), axis=0).astype(np.float32)
 
     logger.info(f"Creating brain outline surface: {len(vertices)} vertices, {len(faces)} faces")
 
