@@ -6,6 +6,7 @@ brain region meshes to a napari viewer.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,6 +14,8 @@ import numpy as np
 if TYPE_CHECKING:
     import napari
     from brainglobe_atlasapi import BrainGlobeAtlas
+
+logger = logging.getLogger(__name__)
 
 
 def add_allen_template(
@@ -140,16 +143,26 @@ def add_region_mesh(
     napari.layers.Surface or None
         The created surface layer, or None if the region mesh is not available.
     """
-    # Get structure info
-    if acronym not in atlas.structures:
+    # Get structure info - atlas.structures is keyed by ID, so we need to look up by acronym
+    structure = None
+    for struct_id, struct in atlas.structures.items():
+        if isinstance(struct_id, int) and struct.get("acronym") == acronym:
+            structure = struct
+            break
+
+    if structure is None:
+        logger.warning(f"Region '{acronym}' not found in atlas structures")
         return None
 
-    structure = atlas.structures[acronym]
-
-    # Get mesh using BrainGlobe API
+    # Get mesh using BrainGlobe API (accepts acronym directly)
     try:
         mesh = atlas.mesh_from_structure(acronym)
-    except (KeyError, FileNotFoundError, Exception):
+        logger.info(f"Loaded mesh for '{acronym}' with {len(mesh.points)} vertices")
+    except (KeyError, FileNotFoundError) as e:
+        logger.warning(f"Could not load mesh for '{acronym}': {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error loading mesh for '{acronym}': {e}")
         return None
 
     # Get vertices and faces
@@ -162,6 +175,7 @@ def add_region_mesh(
             break
 
     if faces is None:
+        logger.warning(f"No triangle faces found in mesh for '{acronym}'")
         return None
 
     # Determine color
@@ -176,6 +190,7 @@ def add_region_mesh(
     # Create values array for coloring
     values = np.ones(len(vertices))
 
+    logger.info(f"Creating surface layer '{name}': {len(vertices)} vertices, {len(faces)} faces")
     layer = viewer.add_surface(
         (vertices, faces, values),
         name=name,
@@ -184,6 +199,7 @@ def add_region_mesh(
         visible=visible,
     )
 
+    logger.info(f"Added region mesh layer: {layer}")
     return layer
 
 
@@ -263,7 +279,12 @@ def add_brain_outline(
     # Get the root mesh using BrainGlobe API
     try:
         mesh = atlas.mesh_from_structure("root")
-    except (KeyError, FileNotFoundError, Exception):
+        logger.info(f"Loaded root mesh with {len(mesh.points)} vertices")
+    except (KeyError, FileNotFoundError) as e:
+        logger.warning(f"Could not load root mesh: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error loading root mesh: {e}")
         return None
 
     vertices = mesh.points
@@ -276,8 +297,10 @@ def add_brain_outline(
             break
 
     if faces is None:
+        logger.warning("No triangle faces found in root mesh")
         return None
 
+    logger.info(f"Creating brain outline surface: {len(vertices)} vertices, {len(faces)} faces")
     values = np.ones(len(vertices))
 
     layer = viewer.add_surface(
@@ -288,6 +311,7 @@ def add_brain_outline(
         visible=visible,
     )
 
+    logger.info(f"Added brain outline layer: {layer}")
     return layer
 
 
