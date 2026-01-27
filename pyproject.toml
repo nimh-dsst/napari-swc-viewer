@@ -37,9 +37,6 @@ testing = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
-allensdk = [
-    "allensdk>=2.16",
-]
 
 [project.entry-points."napari.manifest"]
 napari-swc-viewer = "napari_swc_viewer:napari.yaml"

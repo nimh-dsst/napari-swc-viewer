@@ -1,14 +1,9 @@
-"""Allen SDK setup and coordinate-to-region mapping.
+"""Brain region mapping using BrainGlobe Atlas API.
 
 This module provides functionality to:
-1. Set up Allen SDK ReferenceSpaceCache for accessing annotation volumes
+1. Load annotation volumes from BrainGlobe atlases
 2. Map coordinates to brain regions using the Allen CCF
 3. Get hierarchical region information from the structure tree
-
-Note: This module requires the allensdk package, which can be installed with:
-    pip install allensdk
-
-Due to dependency conflicts with scipy, allensdk is an optional dependency.
 """
 
 from __future__ import annotations
@@ -19,103 +14,126 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+from brainglobe_atlasapi import BrainGlobeAtlas
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-# Check if allensdk is available
-try:
-    from allensdk.core.reference_space_cache import ReferenceSpaceCache
-
-    ALLENSDK_AVAILABLE = True
-except ImportError:
-    ALLENSDK_AVAILABLE = False
-    ReferenceSpaceCache = None
-
-# Default cache directory for Allen SDK data
-DEFAULT_CACHE_DIR = Path.home() / ".allen_sdk_cache"
-
 # Allen CCF resolution options in microns
 RESOLUTIONS = [10, 25, 50, 100]
+
+# Mapping from resolution to atlas name
+ATLAS_NAMES = {
+    10: "allen_mouse_10um",
+    25: "allen_mouse_25um",
+    50: "allen_mouse_50um",
+    100: "allen_mouse_100um",
+}
 
 
 def setup_allen_sdk(
     resolution: int = 25,
     cache_dir: Path | str | None = None,
 ) -> tuple:
-    """Set up Allen SDK ReferenceSpaceCache and load annotation volume.
+    """Load annotation volume and structure data using BrainGlobe Atlas API.
+
+    This function provides a compatible interface with the original Allen SDK
+    setup, but uses BrainGlobe Atlas API which has better dependency compatibility.
 
     Parameters
     ----------
     resolution : int, default=25
         Resolution in microns. Must be one of [10, 25, 50, 100].
     cache_dir : Path or str, optional
-        Directory to cache downloaded data. Defaults to ~/.allen_sdk_cache.
+        Not used (BrainGlobe manages its own cache). Kept for API compatibility.
 
     Returns
     -------
     tuple
-        (rsp, annotation_volume, structure_tree) where:
-        - rsp: ReferenceSpaceCache instance
+        (atlas, annotation_volume, structure_tree) where:
+        - atlas: BrainGlobeAtlas instance
         - annotation_volume: 3D array of region IDs
-        - structure_tree: StructureTree for region metadata
-
-    Raises
-    ------
-    ImportError
-        If allensdk is not installed.
+        - structure_tree: BrainGlobeStructureTree wrapper for region metadata
     """
-    if not ALLENSDK_AVAILABLE:
-        raise ImportError(
-            "allensdk is required for region mapping. "
-            "Install it with: pip install allensdk"
-        )
-
     if resolution not in RESOLUTIONS:
         raise ValueError(f"Resolution must be one of {RESOLUTIONS}, got {resolution}")
 
-    if cache_dir is None:
-        cache_dir = DEFAULT_CACHE_DIR
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    atlas_name = ATLAS_NAMES[resolution]
+    logger.info(f"Loading BrainGlobe atlas: {atlas_name}")
 
-    # Create the reference space cache
-    rsp = ReferenceSpaceCache(
-        resolution,
-        reference_space_key="annotation/ccf_2017",
-        manifest=str(cache_dir / "manifest.json"),
-    )
+    atlas = BrainGlobeAtlas(atlas_name)
+    annotation_volume = atlas.annotation
 
-    # Download and load annotation volume
-    logger.info(f"Loading annotation volume at {resolution}um resolution...")
-    annotation_volume, meta = rsp.get_annotation_volume()
-
-    # Get structure tree for region names
-    structure_tree = rsp.get_structure_tree()
+    # Create a structure tree wrapper that provides compatible interface
+    structure_tree = BrainGlobeStructureTree(atlas)
 
     logger.info(
         f"Annotation volume shape: {annotation_volume.shape}, "
-        f"Structure tree loaded with {len(structure_tree.get_structures_by_set_id([]))} structures"
+        f"Structure tree loaded with {len(atlas.structures)} structures"
     )
 
-    return rsp, annotation_volume, structure_tree
+    return atlas, annotation_volume, structure_tree
 
 
-@lru_cache(maxsize=1)
-def _get_cached_allen_data(
-    resolution: int = 25,
-    cache_dir: str | None = None,
-) -> tuple:
-    """Get cached Allen SDK data. Returns same tuple as setup_allen_sdk."""
-    return setup_allen_sdk(resolution, cache_dir)
+class BrainGlobeStructureTree:
+    """Wrapper around BrainGlobe atlas structures to provide Allen SDK-like interface."""
+
+    def __init__(self, atlas: BrainGlobeAtlas):
+        self.atlas = atlas
+        self._structures_by_id: dict[int, dict] = {}
+        self._children: dict[int, list[int]] = {}
+
+        # Build lookup tables - extract only the fields we need without triggering mesh loading
+        for key, struct in atlas.structures.items():
+            if isinstance(key, int):
+                # Manually extract fields to avoid triggering mesh loading via dict()
+                struct_dict = {
+                    "id": key,
+                    "name": struct["name"],
+                    "acronym": struct["acronym"],
+                    "structure_id_path": struct["structure_id_path"],
+                    "rgb_triplet": struct["rgb_triplet"],
+                }
+                # Safely get optional fields
+                if "parent_structure_id" in struct.data:
+                    struct_dict["parent_structure_id"] = struct["parent_structure_id"]
+                if "color_hex_triplet" in struct.data:
+                    struct_dict["color_hex_triplet"] = struct["color_hex_triplet"]
+
+                self._structures_by_id[key] = struct_dict
+
+                # Build children mapping
+                parent_id = struct_dict.get("parent_structure_id")
+                if parent_id is not None:
+                    if parent_id not in self._children:
+                        self._children[parent_id] = []
+                    self._children[parent_id].append(key)
+
+    def get_structures_by_id(self, ids: list[int]) -> list[dict]:
+        """Get structures by their IDs."""
+        return [self._structures_by_id[i] for i in ids if i in self._structures_by_id]
+
+    def get_structures_by_set_id(self, set_ids: list) -> list[dict]:
+        """Get all structures (set_ids is ignored, returns all)."""
+        return list(self._structures_by_id.values())
+
+    def child_ids(self, parent_ids: list[int]) -> list[list[int]]:
+        """Get child IDs for each parent ID."""
+        return [self._children.get(pid, []) for pid in parent_ids]
+
+
+@lru_cache(maxsize=4)
+def _get_cached_atlas(resolution: int = 25) -> tuple:
+    """Get cached atlas data. Returns same tuple as setup_allen_sdk."""
+    return setup_allen_sdk(resolution)
 
 
 def get_region_at_coords(
     coords: NDArray[np.float64] | tuple[float, float, float],
     annotation_volume: NDArray[np.int32],
-    structure_tree,
+    structure_tree: BrainGlobeStructureTree,
     resolution: int = 25,
 ) -> dict | None:
     """Get brain region information for a single coordinate.
@@ -125,9 +143,9 @@ def get_region_at_coords(
     coords : array-like
         Coordinate in microns (x, y, z) or PIR format matching the atlas.
     annotation_volume : NDArray[np.int32]
-        3D annotation volume from Allen SDK.
-    structure_tree : StructureTree
-        Allen SDK structure tree for region metadata.
+        3D annotation volume.
+    structure_tree : BrainGlobeStructureTree
+        Structure tree for region metadata.
     resolution : int, default=25
         Resolution of the annotation volume in microns.
 
@@ -152,16 +170,16 @@ def get_region_at_coords(
         return None  # Outside brain
 
     # Get region info from structure tree
-    structure = structure_tree.get_structures_by_id([region_id])
-    if not structure:
+    structures = structure_tree.get_structures_by_id([int(region_id)])
+    if not structures:
         return None
 
-    structure = structure[0]
+    structure = structures[0]
     return {
-        "id": region_id,
-        "name": structure["name"],
-        "acronym": structure["acronym"],
-        "structure_id_path": structure["structure_id_path"],
+        "id": int(region_id),
+        "name": structure.get("name", ""),
+        "acronym": structure.get("acronym", ""),
+        "structure_id_path": structure.get("structure_id_path", []),
         "color_hex_triplet": structure.get("color_hex_triplet", ""),
     }
 
@@ -169,7 +187,7 @@ def get_region_at_coords(
 def get_regions_for_coords(
     coords: NDArray[np.float64],
     annotation_volume: NDArray[np.int32],
-    structure_tree,
+    structure_tree: BrainGlobeStructureTree,
     resolution: int = 25,
 ) -> list[dict | None]:
     """Get brain region information for multiple coordinates.
@@ -179,9 +197,9 @@ def get_regions_for_coords(
     coords : NDArray[np.float64]
         Array of coordinates in microns, shape (N, 3).
     annotation_volume : NDArray[np.int32]
-        3D annotation volume from Allen SDK.
-    structure_tree : StructureTree
-        Allen SDK structure tree for region metadata.
+        3D annotation volume.
+    structure_tree : BrainGlobeStructureTree
+        Structure tree for region metadata.
     resolution : int, default=25
         Resolution of the annotation volume in microns.
 
@@ -209,7 +227,7 @@ def get_region_ids_vectorized(
     coords : NDArray[np.float64]
         Array of coordinates in microns, shape (N, 3).
     annotation_volume : NDArray[np.int32]
-        3D annotation volume from Allen SDK.
+        3D annotation volume.
     resolution : int, default=25
         Resolution of the annotation volume in microns.
 
@@ -243,13 +261,13 @@ def get_region_ids_vectorized(
     return region_ids
 
 
-def build_region_lookup(structure_tree) -> dict[int, dict]:
+def build_region_lookup(structure_tree: BrainGlobeStructureTree) -> dict[int, dict]:
     """Build a lookup table from region ID to region info.
 
     Parameters
     ----------
-    structure_tree : StructureTree
-        Allen SDK structure tree.
+    structure_tree : BrainGlobeStructureTree
+        Structure tree wrapper.
 
     Returns
     -------
@@ -260,9 +278,9 @@ def build_region_lookup(structure_tree) -> dict[int, dict]:
     return {
         s["id"]: {
             "id": s["id"],
-            "name": s["name"],
-            "acronym": s["acronym"],
-            "structure_id_path": s["structure_id_path"],
+            "name": s.get("name", ""),
+            "acronym": s.get("acronym", ""),
+            "structure_id_path": s.get("structure_id_path", []),
             "color_hex_triplet": s.get("color_hex_triplet", ""),
             "parent_structure_id": s.get("parent_structure_id"),
         }
@@ -270,42 +288,32 @@ def build_region_lookup(structure_tree) -> dict[int, dict]:
     }
 
 
-def get_region_hierarchy(structure_tree) -> dict[int, list[int]]:
+def get_region_hierarchy(structure_tree: BrainGlobeStructureTree) -> dict[int, list[int]]:
     """Get the full hierarchy of regions.
 
     Parameters
     ----------
-    structure_tree : StructureTree
-        Allen SDK structure tree.
+    structure_tree : BrainGlobeStructureTree
+        Structure tree wrapper.
 
     Returns
     -------
     dict[int, list[int]]
         Mapping from region ID to list of child region IDs.
     """
-    all_structures = structure_tree.get_structures_by_set_id([])
-    children: dict[int, list[int]] = {}
-
-    for s in all_structures:
-        parent_id = s.get("parent_structure_id")
-        if parent_id is not None:
-            if parent_id not in children:
-                children[parent_id] = []
-            children[parent_id].append(s["id"])
-
-    return children
+    return structure_tree._children.copy()
 
 
 def get_all_descendant_ids(
-    structure_tree,
+    structure_tree: BrainGlobeStructureTree,
     region_id: int,
 ) -> set[int]:
     """Get all descendant region IDs for a given region.
 
     Parameters
     ----------
-    structure_tree : StructureTree
-        Allen SDK structure tree.
+    structure_tree : BrainGlobeStructureTree
+        Structure tree wrapper.
     region_id : int
         The region ID to get descendants for.
 
@@ -324,15 +332,15 @@ def get_all_descendant_ids(
 
 
 def get_structures_with_ancestors(
-    structure_tree,
+    structure_tree: BrainGlobeStructureTree,
     region_ids: list[int] | set[int],
 ) -> dict[int, list[dict]]:
     """Get structure info with full ancestor path for multiple regions.
 
     Parameters
     ----------
-    structure_tree : StructureTree
-        Allen SDK structure tree.
+    structure_tree : BrainGlobeStructureTree
+        Structure tree wrapper.
     region_ids : list or set of int
         Region IDs to get ancestry for.
 
@@ -352,6 +360,8 @@ def get_structures_with_ancestors(
         structure = lookup[region_id]
         path_ids = structure.get("structure_id_path", [])
         ancestors = structure_tree.get_structures_by_id(path_ids)
-        result[region_id] = sorted(ancestors, key=lambda x: len(x["structure_id_path"]))
+        result[region_id] = sorted(
+            ancestors, key=lambda x: len(x.get("structure_id_path", []))
+        )
 
     return result
