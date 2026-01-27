@@ -28,6 +28,8 @@ def add_allen_template(
 ) -> napari.layers.Image:
     """Add the Allen CCF template image to the viewer.
 
+    All layers are in voxel/pixel space (not microns) to match brainrender-napari.
+
     Parameters
     ----------
     viewer : napari.Viewer
@@ -48,16 +50,12 @@ def add_allen_template(
     napari.layers.Image
         The created image layer.
     """
-    # Get reference image
+    # Get reference image (in voxel space)
     reference = atlas.reference
-
-    # Create scale to convert voxels to microns
-    scale = atlas.resolution
 
     layer = viewer.add_image(
         reference,
         name=name,
-        scale=scale,
         opacity=opacity,
         colormap=colormap,
         visible=visible,
@@ -75,6 +73,8 @@ def add_annotation_volume(
     visible: bool = False,
 ) -> napari.layers.Labels:
     """Add the Allen CCF annotation volume as a labels layer.
+
+    All layers are in voxel/pixel space (not microns) to match brainrender-napari.
 
     Parameters
     ----------
@@ -94,15 +94,12 @@ def add_annotation_volume(
     napari.layers.Labels
         The created labels layer.
     """
+    # Annotation volume (in voxel space)
     annotation = atlas.annotation
-
-    # Create scale to convert voxels to microns
-    scale = atlas.resolution
 
     layer = viewer.add_labels(
         annotation,
         name=name,
-        scale=scale,
         opacity=opacity,
         visible=visible,
     )
@@ -114,7 +111,7 @@ def add_region_mesh(
     viewer: napari.Viewer,
     atlas: BrainGlobeAtlas,
     acronym: str,
-    opacity: float = 0.3,
+    opacity: float = 0.4,
     color: str | tuple | None = None,
     name: str | None = None,
     visible: bool = True,
@@ -129,7 +126,7 @@ def add_region_mesh(
         The atlas to use for the mesh.
     acronym : str
         The region acronym (e.g., "VISp").
-    opacity : float, default=0.3
+    opacity : float, default=0.4
         Mesh opacity.
     color : str or tuple, optional
         Mesh color. If None, uses the atlas's color for the region.
@@ -143,18 +140,14 @@ def add_region_mesh(
     napari.layers.Surface or None
         The created surface layer, or None if the region mesh is not available.
     """
-    # Get structure info - atlas.structures is keyed by ID, so we need to look up by acronym
-    structure = None
-    for struct_id, struct in atlas.structures.items():
-        if isinstance(struct_id, int) and struct.get("acronym") == acronym:
-            structure = struct
-            break
-
-    if structure is None:
+    # Get structure info - StructuresDict supports direct acronym access via []
+    try:
+        structure = atlas.structures[acronym]
+    except KeyError:
         logger.warning(f"Region '{acronym}' not found in atlas structures")
         return None
 
-    # Get mesh using BrainGlobe API (accepts acronym directly)
+    # Get mesh using BrainGlobe API
     try:
         mesh = atlas.mesh_from_structure(acronym)
         logger.info(f"Loaded mesh for '{acronym}' with {len(mesh.points)} vertices")
@@ -165,37 +158,36 @@ def add_region_mesh(
         logger.error(f"Unexpected error loading mesh for '{acronym}': {e}")
         return None
 
-    # Get vertices and faces
+    # Get vertices and faces (meshio format)
     vertices = mesh.points
-    # meshio returns faces as cells - extract triangles
-    faces = None
-    for cell_block in mesh.cells:
-        if cell_block.type == "triangle":
-            faces = cell_block.data
-            break
+    faces = mesh.cells[0].data
 
-    if faces is None:
-        logger.warning(f"No triangle faces found in mesh for '{acronym}'")
-        return None
-
-    # Determine color
-    if color is None:
-        rgb = structure.get("rgb_triplet", [128, 128, 128])
-        color = tuple(c / 255 for c in rgb)
+    # Scale mesh from microns to pixel/voxel space to match the reference image
+    scale = [1.0 / res for res in atlas.resolution]
 
     # Create layer name
     if name is None:
         name = f"Region: {acronym}"
 
-    # Create values array for coloring
-    values = np.ones(len(vertices))
+    # Determine vertex colors
+    if color is None:
+        rgb = structure.get("rgb_triplet", [128, 128, 128])
+    else:
+        rgb = [int(c * 255) if isinstance(c, float) and c <= 1 else c for c in color]
+
+    # Create vertex colors array (RGB 0-1 for each vertex)
+    vertex_colors = np.repeat(
+        [[float(c) / 255 for c in rgb]], len(vertices), axis=0
+    )
 
     logger.info(f"Creating surface layer '{name}': {len(vertices)} vertices, {len(faces)} faces")
     layer = viewer.add_surface(
-        (vertices, faces, values),
+        (vertices, faces),
+        scale=scale,
         name=name,
         opacity=opacity,
-        colormap="gray",
+        blending="translucent_no_depth",
+        vertex_colors=vertex_colors,
         visible=visible,
     )
 
@@ -252,7 +244,7 @@ def add_region_meshes(
 def add_brain_outline(
     viewer: napari.Viewer,
     atlas: BrainGlobeAtlas,
-    opacity: float = 0.1,
+    opacity: float = 0.2,
     name: str = "Brain Outline",
     visible: bool = True,
 ) -> napari.layers.Surface | None:
@@ -264,7 +256,7 @@ def add_brain_outline(
         The napari viewer instance.
     atlas : BrainGlobeAtlas
         The atlas to use.
-    opacity : float, default=0.1
+    opacity : float, default=0.2
         Mesh opacity.
     name : str, default="Brain Outline"
         Name for the layer.
@@ -287,27 +279,25 @@ def add_brain_outline(
         logger.error(f"Unexpected error loading root mesh: {e}")
         return None
 
+    # Get vertices and faces (meshio format)
     vertices = mesh.points
+    faces = mesh.cells[0].data
 
-    # meshio returns faces as cells - extract triangles
-    faces = None
-    for cell_block in mesh.cells:
-        if cell_block.type == "triangle":
-            faces = cell_block.data
-            break
+    # Scale mesh from microns to pixel/voxel space to match the reference image
+    scale = [1.0 / res for res in atlas.resolution]
 
-    if faces is None:
-        logger.warning("No triangle faces found in root mesh")
-        return None
+    # Gray color for outline
+    vertex_colors = np.repeat([[0.5, 0.5, 0.5]], len(vertices), axis=0)
 
     logger.info(f"Creating brain outline surface: {len(vertices)} vertices, {len(faces)} faces")
-    values = np.ones(len(vertices))
 
     layer = viewer.add_surface(
-        (vertices, faces, values),
+        (vertices, faces),
+        scale=scale,
         name=name,
         opacity=opacity,
-        colormap="gray",
+        blending="translucent_no_depth",
+        vertex_colors=vertex_colors,
         visible=visible,
     )
 
