@@ -42,6 +42,7 @@ from .reference_layers import (
     remove_region_layers,
 )
 from .region_selector import RegionSelectorWidget
+from .slice_projection import NeuronSliceProjector
 
 if TYPE_CHECKING:
     import napari
@@ -71,6 +72,9 @@ class NeuronViewerWidget(QWidget):
         self._atlas: BrainGlobeAtlas | None = None
         self._current_neuron_layers: list = []
         self._current_region_layers: list = []
+
+        # Slice projection for 2D viewing
+        self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=50.0)
 
         self._setup_ui()
 
@@ -237,6 +241,26 @@ class NeuronViewerWidget(QWidget):
         line_layout.addLayout(width_row)
 
         layout.addWidget(line_group)
+
+        # 2D Slice Projection settings
+        slice_group = QGroupBox("2D Slice Projection")
+        slice_layout = QVBoxLayout(slice_group)
+
+        self._show_slice_projection_cb = QCheckBox("Show in 2D slices")
+        self._show_slice_projection_cb.setChecked(True)
+        self._show_slice_projection_cb.stateChanged.connect(self._toggle_slice_projection)
+        slice_layout.addWidget(self._show_slice_projection_cb)
+
+        thickness_row = QHBoxLayout()
+        thickness_row.addWidget(QLabel("Slice thickness (μm):"))
+        self._slice_thickness_spin = QSpinBox()
+        self._slice_thickness_spin.setRange(10, 200)
+        self._slice_thickness_spin.setValue(50)
+        self._slice_thickness_spin.valueChanged.connect(self._update_slice_thickness)
+        thickness_row.addWidget(self._slice_thickness_spin)
+        slice_layout.addLayout(thickness_row)
+
+        layout.addWidget(slice_group)
 
         # Opacity
         opacity_group = QGroupBox("Opacity")
@@ -444,6 +468,10 @@ class NeuronViewerWidget(QWidget):
 
         self._current_neuron_layers.append(layer)
 
+        # Add to slice projector for 2D viewing
+        self._slice_projector.set_scale(scale)
+        self._slice_projector.add_neuron_data(file_id, coords, edges)
+
     def _add_neuron_points(self, file_id: str, opacity: float) -> None:
         """Add a neuron as a points layer."""
         df = self._db.get_neurons_for_rendering([file_id])
@@ -493,6 +521,9 @@ class NeuronViewerWidget(QWidget):
                 pass  # Layer already removed
 
         self._current_neuron_layers.clear()
+
+        # Clear slice projector data
+        self._slice_projector.clear()
 
     def _toggle_template(self, state: int) -> None:
         """Toggle the template layer visibility."""
@@ -582,3 +613,11 @@ class NeuronViewerWidget(QWidget):
         opacity = self._mesh_opacity_slider.value() / 100.0
         for acronym in acronyms:
             add_region_mesh(self.viewer, self._atlas, acronym, opacity=opacity)
+
+    def _toggle_slice_projection(self, state: int) -> None:
+        """Toggle the 2D slice projection visibility."""
+        self._slice_projector.enabled = state == Qt.Checked
+
+    def _update_slice_thickness(self, value: int) -> None:
+        """Update the slice projection thickness/tolerance."""
+        self._slice_projector.tolerance = float(value)
