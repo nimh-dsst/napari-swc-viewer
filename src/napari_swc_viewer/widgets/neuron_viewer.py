@@ -427,6 +427,11 @@ class NeuronViewerWidget(QWidget):
         for edge in edges:
             lines.append([coords[edge[0]], coords[edge[1]]])
 
+        # Scale to match atlas mesh (coordinates are in microns)
+        scale = None
+        if self._atlas is not None:
+            scale = [1.0 / res for res in self._atlas.resolution]
+
         layer = self.viewer.add_shapes(
             lines,
             shape_type="line",
@@ -434,6 +439,7 @@ class NeuronViewerWidget(QWidget):
             edge_color="cyan",
             name=f"Lines: {file_id}",
             opacity=opacity,
+            scale=scale,
         )
 
         self._current_neuron_layers.append(layer)
@@ -462,12 +468,18 @@ class NeuronViewerWidget(QWidget):
         else:
             colors = "magenta"
 
+        # Scale to match atlas mesh (coordinates are in microns)
+        scale = None
+        if self._atlas is not None:
+            scale = [1.0 / res for res in self._atlas.resolution]
+
         layer = self.viewer.add_points(
             coords,
             size=self._point_size_spin.value(),
             face_color=colors,
             name=f"Points: {file_id}",
             opacity=opacity,
+            scale=scale,
         )
 
         self._current_neuron_layers.append(layer)
