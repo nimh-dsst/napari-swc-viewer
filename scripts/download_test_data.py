@@ -4,6 +4,8 @@
 This script retrieves a random subset of SWC files from the BIL dataset
 DOI 10.35077/g.73 "Morphological diversity of single neurons in molecularly
 defined cell types" for testing the napari-swc-viewer plugin.
+
+Downloads _reg.swc files which are registered to the Allen CCF coordinate system.
 """
 
 import json
@@ -85,10 +87,10 @@ def get_swc_files_for_bildid(bildid: str) -> list[str]:
             with urllib.request.urlopen(req, context=get_ssl_context()) as response:
                 html = response.read().decode()
 
-            # Parse SWC files from directory listing (exclude _reg.swc for simplicity)
+            # Parse SWC files from directory listing (use _reg.swc - Allen CCF registered)
             for swc_match in re.finditer(r'href="([^"]+\.swc)"', html):
                 filename = swc_match.group(1)
-                if not filename.endswith("_reg.swc"):
+                if filename.endswith("_reg.swc"):
                     swc_urls.append(f"{DOWNLOAD_BASE}/{download_path}/{filename}")
         except Exception as e:
             print(f"  Warning: Could not list directory {dir_url}: {e}")

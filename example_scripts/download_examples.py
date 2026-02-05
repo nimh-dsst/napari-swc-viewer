@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""download_examples.py - Download 5 example SWC files from BIL."""
+"""download_examples.py - Download 5 example SWC files from BIL.
+
+Downloads _reg.swc files which are registered to the Allen CCF coordinate system.
+"""
 
 import json
 import re
@@ -75,7 +78,7 @@ def main():
 
                 for swc_match in re.finditer(r'href="([^"]+\.swc)"', html):
                     filename = swc_match.group(1)
-                    if not filename.endswith("_reg.swc"):
+                    if filename.endswith("_reg.swc"):
                         swc_urls.append(f"{DOWNLOAD_BASE}/{download_path}/{filename}")
             except Exception:
                 pass
