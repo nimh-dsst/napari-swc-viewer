@@ -62,7 +62,10 @@ Download 5 example neurons from the Brain Image Library (BIL) dataset "Morpholog
 
 ```python
 #!/usr/bin/env python
-"""download_examples.py - Download 5 example SWC files from BIL."""
+"""download_examples.py - Download 5 example SWC files from BIL.
+
+Downloads _reg.swc files which are registered to the Allen CCF coordinate system.
+"""
 
 import json
 import re
@@ -138,7 +141,7 @@ def main():
 
                 for swc_match in re.finditer(r'href="([^"]+\.swc)"', html):
                     filename = swc_match.group(1)
-                    if not filename.endswith("_reg.swc"):
+                    if filename.endswith("_reg.swc"):
                         swc_urls.append(f"{DOWNLOAD_BASE}/{download_path}/{filename}")
             except Exception:
                 pass
@@ -503,6 +506,15 @@ For the full interactive experience with region filtering:
      - Choose **Lines**, **Points**, or **Both** render modes
      - Adjust point size and line width
      - Change opacity
+     - Enable **Color by type** to color nodes by SWC node type:
+
+       | Color | Node Type | SWC Type ID |
+       |-------|-----------|-------------|
+       | Red | Soma | 1 |
+       | Blue | Axon | 2 |
+       | Green | Basal dendrite | 3 |
+       | Yellow | Apical dendrite | 4 |
+       | Gray | Other/undefined | 5+ |
 
 7. Add reference layers:
    - In the **Reference** tab:
