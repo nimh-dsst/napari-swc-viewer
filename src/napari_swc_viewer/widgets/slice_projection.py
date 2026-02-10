@@ -1,0 +1,373 @@
+"""Dynamic 2D slice projection for neuron line segments.
+
+This module provides functionality to display neuron line segments in napari's
+2D slice view. Since thin line segments rarely intersect the exact slice plane,
+this projector shows all line segments within a configurable Z tolerance.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+import numpy as np
+from qtpy.QtCore import QTimer
+
+if TYPE_CHECKING:
+    import napari
+
+logger = logging.getLogger(__name__)
+
+
+class NeuronSliceProjector:
+    """Projects neuron line segments onto the current 2D slice.
+
+    This class maintains a cache of neuron line data and dynamically updates
+    a 2D Shapes layer to show line segments within a configurable Z tolerance
+    of the current slice position.
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+        The napari viewer instance.
+    tolerance : float
+        Z tolerance in microns. Lines within this distance of the slice are shown.
+    """
+
+    def __init__(self, viewer: napari.Viewer, tolerance: float = 50.0, edge_width: int = 4):
+        self._viewer = viewer
+        self._tolerance = tolerance
+        self._edge_width = edge_width
+        self._source_data: dict[str, tuple[np.ndarray, np.ndarray, tuple]] = {}
+        self._projection_layer = None
+        self._scale: list[float] | None = None
+        self._enabled = True
+        self._connected = False
+
+        # Precomputed arrays for vectorized projection (rebuilt on data change)
+        self._all_p1: np.ndarray | None = None  # (M, 3) start points
+        self._all_p2: np.ndarray | None = None  # (M, 3) end points
+        self._all_colors: np.ndarray | None = None  # (M, 4) RGBA per segment
+
+        # Debounce timer for slice updates
+        self._update_timer = QTimer()
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(50)  # 50ms debounce
+        self._update_timer.timeout.connect(self._do_update_projection)
+
+        # Connect to viewer events immediately since we start enabled
+        self._connect_events()
+
+    @property
+    def tolerance(self) -> float:
+        """Get the current Z tolerance in microns."""
+        return self._tolerance
+
+    @tolerance.setter
+    def tolerance(self, value: float) -> None:
+        """Set the Z tolerance and trigger an update."""
+        self._tolerance = value
+        if self._enabled:
+            self._schedule_update()
+
+    @property
+    def edge_width(self) -> int:
+        """Get the current edge width."""
+        return self._edge_width
+
+    @edge_width.setter
+    def edge_width(self, value: int) -> None:
+        """Set the edge width and update the projection layer."""
+        self._edge_width = value
+        if self._projection_layer is not None:
+            self._projection_layer.edge_width = value
+
+    @property
+    def enabled(self) -> bool:
+        """Check if the projector is enabled."""
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        """Enable or disable the projector."""
+        self._enabled = value
+        if value:
+            self._connect_events()
+            self._schedule_update()
+        else:
+            self._disconnect_events()
+            self._remove_projection_layer()
+
+    def set_scale(self, scale: list[float] | None) -> None:
+        """Set the coordinate scale for the projection layer.
+
+        Parameters
+        ----------
+        scale : list[float] | None
+            Scale factors for each dimension, or None for no scaling.
+        """
+        self._scale = scale
+
+    def add_neuron_data(
+        self,
+        file_id: str,
+        coords: np.ndarray,
+        edges: np.ndarray,
+        color: tuple = (1, 1, 0, 1),
+    ) -> None:
+        """Add or update neuron line data for projection.
+
+        Parameters
+        ----------
+        file_id : str
+            Unique identifier for the neuron.
+        coords : np.ndarray
+            Node coordinates array with shape (N, 3) in ZYX order.
+        edges : np.ndarray
+            Edge array with shape (M, 2) containing node index pairs.
+        color : tuple
+            RGBA color tuple for this neuron's lines.
+        """
+        self._source_data[file_id] = (coords.copy(), edges.copy(), color)
+        self._rebuild_arrays()
+        if self._enabled:
+            self._schedule_update()
+
+    def remove_neuron_data(self, file_id: str) -> None:
+        """Remove neuron data from projection.
+
+        Parameters
+        ----------
+        file_id : str
+            Unique identifier for the neuron to remove.
+        """
+        if file_id in self._source_data:
+            del self._source_data[file_id]
+            self._rebuild_arrays()
+            if self._enabled:
+                self._schedule_update()
+
+    def clear(self) -> None:
+        """Clear all neuron data and remove the projection layer."""
+        self._source_data.clear()
+        self._all_p1 = None
+        self._all_p2 = None
+        self._all_colors = None
+        self._remove_projection_layer()
+
+    def _rebuild_arrays(self) -> None:
+        """Precompute flat arrays of all line segment endpoints and colors.
+
+        Called when neuron data is added or removed. Converts the per-neuron
+        data into contiguous arrays for fast vectorized slicing.
+        """
+        if not self._source_data:
+            self._all_p1 = None
+            self._all_p2 = None
+            self._all_colors = None
+            return
+
+        p1_list = []
+        p2_list = []
+        color_list = []
+        for coords, edges, color in self._source_data.values():
+            if len(edges) == 0:
+                continue
+            p1_list.append(coords[edges[:, 0]])
+            p2_list.append(coords[edges[:, 1]])
+            color_arr = np.empty((len(edges), len(color)))
+            color_arr[:] = color
+            color_list.append(color_arr)
+
+        if p1_list:
+            self._all_p1 = np.concatenate(p1_list)
+            self._all_p2 = np.concatenate(p2_list)
+            self._all_colors = np.concatenate(color_list)
+        else:
+            self._all_p1 = None
+            self._all_p2 = None
+            self._all_colors = None
+
+    def _connect_events(self) -> None:
+        """Connect to viewer dimension events."""
+        if not self._connected:
+            self._viewer.dims.events.current_step.connect(self._on_dims_changed)
+            self._viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+            self._viewer.dims.events.order.connect(self._on_dims_changed)
+            self._connected = True
+
+    def _disconnect_events(self) -> None:
+        """Disconnect from viewer dimension events."""
+        if self._connected:
+            try:
+                self._viewer.dims.events.current_step.disconnect(self._on_dims_changed)
+                self._viewer.dims.events.ndisplay.disconnect(self._on_ndisplay_changed)
+                self._viewer.dims.events.order.disconnect(self._on_dims_changed)
+            except (TypeError, RuntimeError):
+                pass  # Event not connected
+            self._connected = False
+
+    def _on_dims_changed(self, event) -> None:
+        """Handle dimension/slice changes."""
+        if self._enabled and self._viewer.dims.ndisplay == 2:
+            self._schedule_update()
+
+    def _on_ndisplay_changed(self, event) -> None:
+        """Handle display mode changes (2D/3D toggle)."""
+        if not self._enabled:
+            return
+
+        if self._viewer.dims.ndisplay == 2:
+            self._schedule_update()
+        else:
+            # In 3D mode, hide the projection layer
+            if self._projection_layer is not None:
+                self._projection_layer.visible = False
+
+    def _schedule_update(self) -> None:
+        """Schedule a debounced projection update."""
+        self._update_timer.start()
+
+    def _do_update_projection(self) -> None:
+        """Actually perform the projection update."""
+        if not self._enabled:
+            return
+
+        # Only show projection in 2D mode
+        if self._viewer.dims.ndisplay != 2:
+            if self._projection_layer is not None:
+                self._projection_layer.visible = False
+            return
+
+        # Determine which axis is being sliced (the non-displayed dimension)
+        not_displayed = self._viewer.dims.not_displayed
+        if not not_displayed:
+            return
+        slice_axis = not_displayed[0]
+
+        # Get current position in world coordinates, then convert to data
+        # coordinates (microns). dims.point gives the world coordinate;
+        # dividing by the layer scale converts back to data space.
+        slice_world = self._viewer.dims.point[slice_axis]
+        if self._scale is not None:
+            slice_position_microns = slice_world / self._scale[slice_axis]
+        else:
+            slice_position_microns = slice_world
+
+        # Compute lines within the slab
+        lines, colors = self._compute_slice_projection(
+            slice_position_microns, slice_axis
+        )
+
+        if lines is None:
+            self._remove_projection_layer()
+            return
+
+        # Create or update the projection layer
+        self._update_projection_layer(lines, colors)
+
+    def _compute_slice_projection(
+        self, slice_position: float, slice_axis: int
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Compute line segments within the slab, flattened onto the slice.
+
+        Uses precomputed arrays for vectorized filtering — no Python loops
+        over individual edges.
+
+        Parameters
+        ----------
+        slice_position : float
+            Current position along the slicing axis in microns.
+        slice_axis : int
+            The data dimension index being sliced (0, 1, or 2).
+
+        Returns
+        -------
+        lines : ndarray or None
+            Array of shape (N, 2, 3) with flattened line segments, or None.
+        colors : ndarray or None
+            Array of shape (N, 4) with RGBA colors, or None.
+        """
+        if self._all_p1 is None:
+            return None, None
+
+        slab_min = slice_position - self._tolerance
+        slab_max = slice_position + self._tolerance
+
+        # Vectorized slab test: include segment if any part is within the slab
+        v1 = self._all_p1[:, slice_axis]
+        v2 = self._all_p2[:, slice_axis]
+        mask = (np.maximum(v1, v2) >= slab_min) & (np.minimum(v1, v2) <= slab_max)
+
+        if not mask.any():
+            return None, None
+
+        # Extract matching segments and flatten onto slice plane
+        p1 = self._all_p1[mask].copy()
+        p2 = self._all_p2[mask].copy()
+        p1[:, slice_axis] = slice_position
+        p2[:, slice_axis] = slice_position
+
+        # Stack into (N, 2, 3) for napari shapes
+        lines = np.stack([p1, p2], axis=1)
+        colors = self._all_colors[mask]
+
+        return lines, colors
+
+    def _update_projection_layer(
+        self, lines: np.ndarray, colors: np.ndarray
+    ) -> None:
+        """Update or create the projection shapes layer.
+
+        Parameters
+        ----------
+        lines : np.ndarray
+            Array of shape (N, 2, 3) with line segments.
+        colors : np.ndarray
+            Array of shape (N, 4) with RGBA colors per segment.
+        """
+        layer_name = "Neuron Slice Projection"
+        edge_colors = colors
+
+        if self._projection_layer is None:
+            # Check if layer exists in viewer (may have been created before)
+            for layer in self._viewer.layers:
+                if layer.name == layer_name:
+                    self._projection_layer = layer
+                    break
+
+        if self._projection_layer is None:
+            # Create new layer
+            self._projection_layer = self._viewer.add_shapes(
+                lines,
+                shape_type="line",
+                edge_width=self._edge_width,
+                edge_color=edge_colors,
+                name=layer_name,
+                opacity=1.0,
+                scale=self._scale,
+            )
+        else:
+            # Update existing layer
+            self._projection_layer.data = lines
+            self._projection_layer.edge_color = edge_colors
+            self._projection_layer.visible = True
+            # Update scale if changed
+            if self._scale is not None:
+                self._projection_layer.scale = self._scale
+
+    def _remove_projection_layer(self) -> None:
+        """Remove the projection layer from the viewer."""
+        if self._projection_layer is not None:
+            try:
+                self._viewer.layers.remove(self._projection_layer)
+            except ValueError:
+                pass  # Layer already removed
+            self._projection_layer = None
+
+    def cleanup(self) -> None:
+        """Clean up resources when the widget is destroyed."""
+        self._update_timer.stop()
+        self._disconnect_events()
+        self._remove_projection_layer()
+        self._source_data.clear()
