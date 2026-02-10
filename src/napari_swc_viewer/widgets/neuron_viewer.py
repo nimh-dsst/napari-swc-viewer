@@ -42,6 +42,7 @@ from .reference_layers import (
     add_region_mesh,
     remove_region_layers,
 )
+from .analysis_tab import AnalysisTabWidget
 from .region_selector import RegionSelectorWidget
 from .slice_projection import NeuronSliceProjector
 
@@ -106,6 +107,10 @@ class NeuronViewerWidget(QWidget):
         ref_tab = QWidget()
         tabs.addTab(ref_tab, "Reference")
         self._setup_reference_tab(ref_tab)
+
+        # Analysis tab
+        self._analysis_tab = AnalysisTabWidget(self.viewer)
+        tabs.addTab(self._analysis_tab, "Analysis")
 
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
@@ -365,6 +370,7 @@ class NeuronViewerWidget(QWidget):
             )
 
             self._query_btn.setEnabled(True)
+            self._analysis_tab.set_database(self._db)
             logger.info(f"Loaded Parquet file: {filepath}")
 
         except Exception as e:
@@ -385,6 +391,7 @@ class NeuronViewerWidget(QWidget):
             self._atlas_status_label.setText(
                 f"Atlas: {atlas_name} ({len(self._atlas.structures)} structures)"
             )
+            self._analysis_tab.set_atlas(self._atlas)
             logger.info(f"Loaded atlas: {atlas_name}")
 
         except Exception as e:
