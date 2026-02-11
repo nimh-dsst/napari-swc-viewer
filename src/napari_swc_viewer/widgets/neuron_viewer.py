@@ -121,26 +121,6 @@ class NeuronViewerWidget(QWidget):
         """Set up the data loading tab."""
         layout = QVBoxLayout(parent)
 
-        # File selection
-        file_group = QGroupBox("Parquet Data")
-        file_layout = QVBoxLayout(file_group)
-
-        file_row = QHBoxLayout()
-        self._file_label = QLabel("No file loaded")
-        self._file_label.setWordWrap(True)
-        file_row.addWidget(self._file_label)
-
-        load_btn = QPushButton("Load...")
-        load_btn.clicked.connect(self._load_parquet)
-        file_row.addWidget(load_btn)
-        file_layout.addLayout(file_row)
-
-        # Stats
-        self._stats_label = QLabel("")
-        file_layout.addWidget(self._stats_label)
-
-        layout.addWidget(file_group)
-
         # SWC to Parquet conversion
         convert_group = QGroupBox("Convert SWC to Parquet")
         convert_layout = QVBoxLayout(convert_group)
@@ -171,6 +151,26 @@ class NeuronViewerWidget(QWidget):
         convert_layout.addWidget(self._convert_status_label)
 
         layout.addWidget(convert_group)
+
+        # File selection
+        file_group = QGroupBox("Parquet Data")
+        file_layout = QVBoxLayout(file_group)
+
+        file_row = QHBoxLayout()
+        self._file_label = QLabel("No file loaded")
+        self._file_label.setWordWrap(True)
+        file_row.addWidget(self._file_label)
+
+        load_btn = QPushButton("Load...")
+        load_btn.clicked.connect(self._load_parquet)
+        file_row.addWidget(load_btn)
+        file_layout.addLayout(file_row)
+
+        # Stats
+        self._stats_label = QLabel("")
+        file_layout.addWidget(self._stats_label)
+
+        layout.addWidget(file_group)
 
         # Atlas selection
         atlas_group = QGroupBox("Atlas")
