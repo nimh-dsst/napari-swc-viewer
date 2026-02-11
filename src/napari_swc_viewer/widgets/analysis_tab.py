@@ -61,6 +61,7 @@ class AnalysisTabWidget(QWidget):
         self._worker_thread: QThread | None = None
         self._last_cluster_result: ClusterResult | None = None
         self._heatmap_layer = None
+        self._slice_projector = None
         self._setup_ui()
 
     def set_database(self, db: NeuronDatabase) -> None:
@@ -73,6 +74,10 @@ class AnalysisTabWidget(QWidget):
         """Set the atlas instance."""
         self._atlas = atlas
         self._update_button_states()
+
+    def set_slice_projector(self, projector) -> None:
+        """Set the slice projector for updating 2D projection colors."""
+        self._slice_projector = projector
 
     def _update_button_states(self) -> None:
         """Enable/disable buttons based on loaded data."""
@@ -351,7 +356,14 @@ class AnalysisTabWidget(QWidget):
             self._canvas.draw()
 
     def _color_neurons_by_cluster(self) -> None:
-        """Color existing neuron layers by their cluster assignment."""
+        """Color existing neuron layers by their cluster assignment.
+
+        Works with the batched single-layer rendering where all neurons
+        are merged into one ``Neuron Lines`` and/or ``Neuron Points``
+        layer.  Layer metadata (``file_ids``, ``segments_per_neuron``,
+        ``file_ids_per_point``) is used to map cluster labels back to
+        individual segments/points.
+        """
         if self._last_cluster_result is None:
             return
 
@@ -359,25 +371,43 @@ class AnalysisTabWidget(QWidget):
         n_clusters = int(result.labels.max())
         cmap = plt.get_cmap("tab10" if n_clusters <= 10 else "tab20")
 
-        # Build neuron_id -> color mapping
-        color_map = {}
+        # Build neuron_id -> RGBA color mapping
+        color_map: dict[str, list[float]] = {}
         for neuron_id, label in zip(result.neuron_ids, result.labels):
             color_map[neuron_id] = list(cmap((label - 1) / max(n_clusters - 1, 1)))
 
-        # Update existing line layers
+        default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
+
         for layer in self._viewer.layers:
-            if layer.name.startswith("Lines: "):
-                file_id = layer.name.removeprefix("Lines: ")
-                if file_id in color_map:
-                    layer.edge_color = color_map[file_id]
-                    updated += 1
-            elif layer.name.startswith("Points: "):
-                file_id = layer.name.removeprefix("Points: ")
-                if file_id in color_map:
-                    layer.face_color = color_map[file_id]
+            if layer.name == "Neuron Lines":
+                meta = layer.metadata or {}
+                file_ids = meta.get("file_ids", [])
+                seg_counts = meta.get("segments_per_neuron", [])
+                if file_ids and seg_counts:
+                    parts = []
+                    for fid, count in zip(file_ids, seg_counts):
+                        c = color_map.get(fid, default_color)
+                        arr = np.empty((count, 4))
+                        arr[:] = c[:4]
+                        parts.append(arr)
+                    layer.edge_color = np.concatenate(parts)
                     updated += 1
 
+            elif layer.name == "Neuron Points":
+                meta = layer.metadata or {}
+                fids = meta.get("file_ids_per_point", [])
+                if fids:
+                    colors = np.array(
+                        [color_map.get(fid, default_color)[:4] for fid in fids]
+                    )
+                    layer.face_color = colors
+                    updated += 1
+
+        # Also update the 2D slice projector colors
+        if self._slice_projector is not None:
+            self._slice_projector.update_neuron_colors(color_map)
+
         self._progress_label.setText(
-            f"Colored {updated} layers by cluster ({n_clusters} clusters)"
+            f"Colored {updated} layer(s) by cluster ({n_clusters} clusters)"
         )

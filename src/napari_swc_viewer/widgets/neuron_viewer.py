@@ -115,6 +115,7 @@ class NeuronViewerWidget(QWidget):
 
         # Analysis tab
         self._analysis_tab = AnalysisTabWidget(self.viewer)
+        self._analysis_tab.set_slice_projector(self._slice_projector)
         tabs.addTab(self._analysis_tab, "Analysis")
 
     def _setup_data_tab(self, parent: QWidget) -> None:
@@ -501,6 +502,8 @@ class NeuronViewerWidget(QWidget):
             all_lines = []
             all_edge_colors = []
             projector_batch = {}
+            rendered_file_ids = []
+            segments_per_neuron = []
 
             for file_id, color in zip(file_ids, neuron_colors):
                 if file_id not in all_data:
@@ -520,6 +523,8 @@ class NeuronViewerWidget(QWidget):
                 all_edge_colors.append(color_arr)
 
                 projector_batch[file_id] = (coords, edges, tuple(color))
+                rendered_file_ids.append(file_id)
+                segments_per_neuron.append(len(edges))
 
             if all_lines:
                 merged_lines = np.concatenate(all_lines)
@@ -533,6 +538,10 @@ class NeuronViewerWidget(QWidget):
                     name="Neuron Lines",
                     opacity=opacity,
                     scale=scale,
+                    metadata={
+                        "file_ids": rendered_file_ids,
+                        "segments_per_neuron": segments_per_neuron,
+                    },
                 )
                 self._current_neuron_layers.append(layer)
 
@@ -575,6 +584,9 @@ class NeuronViewerWidget(QWidget):
                     name="Neuron Points",
                     opacity=opacity,
                     scale=scale,
+                    metadata={
+                        "file_ids_per_point": df["file_id"].values.tolist(),
+                    },
                 )
                 self._current_neuron_layers.append(layer)
 
