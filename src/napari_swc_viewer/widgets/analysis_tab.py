@@ -215,6 +215,7 @@ class AnalysisTabWidget(QWidget):
         worker.finished.connect(thread.quit)
         worker.error.connect(self._on_error)
         worker.error.connect(thread.quit)
+        thread.finished.connect(self._update_button_states)
         thread.finished.connect(thread.deleteLater)
 
         # Keep references to prevent garbage collection
@@ -255,6 +256,7 @@ class AnalysisTabWidget(QWidget):
         worker.finished.connect(thread.quit)
         worker.error.connect(self._on_error)
         worker.error.connect(thread.quit)
+        thread.finished.connect(self._update_button_states)
         thread.finished.connect(thread.deleteLater)
 
         self._worker_thread = thread
