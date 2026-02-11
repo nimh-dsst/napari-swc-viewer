@@ -299,7 +299,7 @@ class NeuronViewerWidget(QWidget):
         thickness_row.addWidget(QLabel("Slice thickness (μm):"))
         self._slice_thickness_spin = QSpinBox()
         self._slice_thickness_spin.setRange(10, 2500)
-        self._slice_thickness_spin.setValue(2500)
+        self._slice_thickness_spin.setValue(100)
         self._slice_thickness_spin.valueChanged.connect(self._update_slice_thickness)
         thickness_row.addWidget(self._slice_thickness_spin)
         slice_layout.addLayout(thickness_row)
