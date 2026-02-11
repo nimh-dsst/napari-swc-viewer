@@ -330,8 +330,8 @@ class AnalysisTabWidget(QWidget):
                 cmap="coolwarm",
                 center=0,
                 figsize=(6, 6),
-                xticklabels=result.neuron_ids,
-                yticklabels=result.neuron_ids,
+                xticklabels=False,
+                yticklabels=False,
             )
 
             # Copy the clustermap figure content to our embedded canvas figure
