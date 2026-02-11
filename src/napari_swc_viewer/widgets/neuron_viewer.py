@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QThread
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,6 +27,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -77,6 +78,10 @@ class NeuronViewerWidget(QWidget):
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=2500.0)
+
+        # Conversion worker state
+        self._convert_thread: QThread | None = None
+        self._convert_worker = None
 
         self._setup_ui()
 
@@ -135,6 +140,37 @@ class NeuronViewerWidget(QWidget):
         file_layout.addWidget(self._stats_label)
 
         layout.addWidget(file_group)
+
+        # SWC to Parquet conversion
+        convert_group = QGroupBox("Convert SWC to Parquet")
+        convert_layout = QVBoxLayout(convert_group)
+
+        convert_btn_row = QHBoxLayout()
+        convert_dir_btn = QPushButton("From Directory...")
+        convert_dir_btn.clicked.connect(self._convert_from_directory)
+        convert_btn_row.addWidget(convert_dir_btn)
+
+        convert_files_btn = QPushButton("From Files...")
+        convert_files_btn.clicked.connect(self._convert_from_files)
+        convert_btn_row.addWidget(convert_files_btn)
+        convert_layout.addLayout(convert_btn_row)
+
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Resolution (μm):"))
+        self._convert_resolution_spin = QSpinBox()
+        self._convert_resolution_spin.setRange(10, 100)
+        self._convert_resolution_spin.setValue(25)
+        res_row.addWidget(self._convert_resolution_spin)
+        convert_layout.addLayout(res_row)
+
+        self._convert_progress = QProgressBar()
+        self._convert_progress.setVisible(False)
+        convert_layout.addWidget(self._convert_progress)
+
+        self._convert_status_label = QLabel("")
+        convert_layout.addWidget(self._convert_status_label)
+
+        layout.addWidget(convert_group)
 
         # Atlas selection
         atlas_group = QGroupBox("Atlas")
@@ -646,3 +682,91 @@ class NeuronViewerWidget(QWidget):
             if hasattr(layer, "edge_width"):
                 layer.edge_width = value
         self._slice_projector.edge_width = value
+
+    # --- SWC-to-Parquet conversion ---
+
+    def _convert_from_directory(self) -> None:
+        """Pick a directory of SWC files and convert to Parquet."""
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Directory of SWC Files"
+        )
+        if not directory:
+            return
+
+        swc_files = sorted(Path(directory).rglob("*.swc"))
+        if not swc_files:
+            self._convert_status_label.setText("No SWC files found in directory.")
+            return
+
+        self._prompt_output_and_convert([str(f) for f in swc_files])
+
+    def _convert_from_files(self) -> None:
+        """Pick individual SWC files and convert to Parquet."""
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select SWC Files",
+            "",
+            "SWC Files (*.swc);;All Files (*)",
+        )
+        if not filepaths:
+            return
+
+        self._prompt_output_and_convert(filepaths)
+
+    def _prompt_output_and_convert(self, swc_paths: list[str]) -> None:
+        """Ask for output path and start conversion."""
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Parquet File",
+            "neurons.parquet",
+            "Parquet Files (*.parquet)",
+        )
+        if not output_path:
+            return
+
+        self._start_conversion(swc_paths, output_path)
+
+    def _start_conversion(self, swc_paths: list[str], output_path: str) -> None:
+        """Launch the background conversion worker."""
+        from ..workers import ConvertWorker
+
+        resolution = self._convert_resolution_spin.value()
+
+        self._convert_progress.setVisible(True)
+        self._convert_progress.setRange(0, len(swc_paths))
+        self._convert_progress.setValue(0)
+        self._convert_status_label.setText(
+            f"Converting {len(swc_paths)} SWC files..."
+        )
+
+        self._convert_thread = QThread()
+        self._convert_worker = ConvertWorker(swc_paths, output_path, resolution)
+        self._convert_worker.moveToThread(self._convert_thread)
+
+        self._convert_thread.started.connect(self._convert_worker.run)
+        self._convert_worker.progress.connect(self._on_convert_progress)
+        self._convert_worker.finished.connect(self._on_convert_finished)
+        self._convert_worker.error.connect(self._on_convert_error)
+        self._convert_worker.finished.connect(self._convert_thread.quit)
+        self._convert_worker.error.connect(self._convert_thread.quit)
+
+        self._convert_thread.start()
+
+    def _on_convert_progress(self, message: str, current: int, total: int) -> None:
+        """Handle conversion progress updates."""
+        self._convert_progress.setValue(current)
+        self._convert_status_label.setText(message)
+
+    def _on_convert_finished(self, output_path: str, n_files: int) -> None:
+        """Handle conversion completion."""
+        self._convert_progress.setVisible(False)
+        self._convert_status_label.setText(
+            f"Done! Converted {n_files} files → {Path(output_path).name}"
+        )
+        logger.info(f"SWC-to-Parquet conversion complete: {output_path}")
+
+    def _on_convert_error(self, error_msg: str) -> None:
+        """Handle conversion error."""
+        self._convert_progress.setVisible(False)
+        self._convert_status_label.setText(f"Error: {error_msg}")
+        logger.error(f"SWC-to-Parquet conversion failed: {error_msg}")

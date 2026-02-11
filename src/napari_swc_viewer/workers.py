@@ -8,6 +8,7 @@ connections since DuckDB connections are not thread-safe.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -19,6 +20,82 @@ if TYPE_CHECKING:
     from .analysis.clustering import ClusterResult
 
 logger = logging.getLogger(__name__)
+
+
+class ConvertWorker(QObject):
+    """Convert SWC files to annotated Parquet in the background.
+
+    Signals
+    -------
+    progress(str, int, int)
+        (message, files_processed, total_files)
+    finished(str, int)
+        (output_path, n_files_processed)
+    error(str)
+        Emitted with error message on failure.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(str, int)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        swc_paths: list[str],
+        output_path: str,
+        resolution: int = 25,
+    ):
+        super().__init__()
+        self._swc_paths = [Path(p) for p in swc_paths]
+        self._output_path = Path(output_path)
+        self._resolution = resolution
+
+    def run(self) -> None:
+        """Execute the conversion pipeline."""
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            from .parquet import NEURON_SCHEMA, swc_to_annotated_rows
+            from .region import build_region_lookup, setup_allen_sdk
+
+            total = len(self._swc_paths)
+            self.progress.emit("Setting up Allen SDK...", 0, total)
+
+            _, annotation_volume, structure_tree = setup_allen_sdk(
+                self._resolution
+            )
+            region_lookup = build_region_lookup(structure_tree)
+
+            all_rows: list[dict] = []
+            processed = 0
+
+            for swc_path in self._swc_paths:
+                try:
+                    self.progress.emit(
+                        f"Processing {swc_path.name}...", processed, total
+                    )
+                    rows = swc_to_annotated_rows(
+                        swc_path,
+                        annotation_volume,
+                        structure_tree,
+                        region_lookup,
+                        self._resolution,
+                    )
+                    all_rows.extend(rows)
+                    processed += 1
+                except Exception as e:
+                    logger.error(f"Error processing {swc_path}: {e}")
+
+            if all_rows:
+                table = pa.Table.from_pylist(all_rows, schema=NEURON_SCHEMA)
+                pq.write_table(table, self._output_path, compression="snappy")
+
+            self.finished.emit(str(self._output_path), processed)
+
+        except Exception as e:
+            logger.exception("SWC-to-Parquet conversion failed")
+            self.error.emit(str(e))
 
 
 class CorrelationWorker(QObject):
