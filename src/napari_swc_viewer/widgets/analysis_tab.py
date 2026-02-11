@@ -87,6 +87,11 @@ class AnalysisTabWidget(QWidget):
         self._run_heat_btn.setEnabled(ready and not busy)
         self._color_by_cluster_btn.setEnabled(self._last_cluster_result is not None)
 
+    def _on_thread_finished(self) -> None:
+        """Clear worker references after the thread has stopped."""
+        self._worker_thread = None
+        self._current_worker = None
+
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
@@ -215,6 +220,7 @@ class AnalysisTabWidget(QWidget):
         worker.finished.connect(thread.quit)
         worker.error.connect(self._on_error)
         worker.error.connect(thread.quit)
+        thread.finished.connect(self._on_thread_finished)
         thread.finished.connect(self._update_button_states)
         thread.finished.connect(thread.deleteLater)
 
@@ -256,6 +262,7 @@ class AnalysisTabWidget(QWidget):
         worker.finished.connect(thread.quit)
         worker.error.connect(self._on_error)
         worker.error.connect(thread.quit)
+        thread.finished.connect(self._on_thread_finished)
         thread.finished.connect(self._update_button_states)
         thread.finished.connect(thread.deleteLater)
 
