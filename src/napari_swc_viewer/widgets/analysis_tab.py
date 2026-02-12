@@ -383,7 +383,7 @@ class AnalysisTabWidget(QWidget):
         # Build neuron_id -> RGBA color mapping
         color_map: dict[str, list[float]] = {}
         for neuron_id, label in zip(result.neuron_ids, result.labels):
-            color_map[neuron_id] = list(cmap((label - 1) / max(n_clusters - 1, 1)))
+            color_map[neuron_id] = list(cmap((label - 1) / n_clusters))
 
         default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
