@@ -133,6 +133,46 @@ class NeuronSliceProjector:
         if self._enabled:
             self._schedule_update()
 
+    def add_neuron_data_batch(
+        self,
+        data: dict[str, tuple[np.ndarray, np.ndarray, tuple]],
+    ) -> None:
+        """Add multiple neurons at once, rebuilding arrays only once.
+
+        Parameters
+        ----------
+        data : dict[str, tuple[ndarray, ndarray, tuple]]
+            Mapping of file_id to (coords, edges, color).
+        """
+        for file_id, (coords, edges, color) in data.items():
+            self._source_data[file_id] = (coords.copy(), edges.copy(), color)
+        self._rebuild_arrays()
+        if self._enabled:
+            self._schedule_update()
+
+    def update_neuron_colors(
+        self,
+        color_map: dict[str, list[float]],
+    ) -> None:
+        """Update the color for each neuron without changing geometry.
+
+        Parameters
+        ----------
+        color_map : dict[str, list[float]]
+            Mapping of file_id to RGBA color list.
+        """
+        changed = False
+        for file_id, (coords, edges, old_color) in list(self._source_data.items()):
+            if file_id in color_map:
+                new_color = tuple(color_map[file_id][:4])
+                if new_color != old_color:
+                    self._source_data[file_id] = (coords, edges, new_color)
+                    changed = True
+        if changed:
+            self._rebuild_arrays()
+            if self._enabled:
+                self._schedule_update()
+
     def remove_neuron_data(self, file_id: str) -> None:
         """Remove neuron data from projection.
 

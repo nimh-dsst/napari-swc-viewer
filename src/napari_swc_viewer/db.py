@@ -255,6 +255,56 @@ class NeuronDatabase:
 
         return coords, edges
 
+    def get_neuron_lines_batch(
+        self,
+        file_ids: list[str],
+    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.int32]]]:
+        """Get line segments for multiple neurons in a single query.
+
+        Parameters
+        ----------
+        file_ids : list[str]
+            The file IDs of the neurons.
+
+        Returns
+        -------
+        dict[str, tuple[NDArray, NDArray]]
+            Mapping of file_id to (vertices, edges) where vertices is (N, 3)
+            coordinates and edges is (M, 2) indices into vertices.
+        """
+        if not file_ids:
+            return {}
+
+        placeholders = ", ".join(["?"] * len(file_ids))
+        query = f"""
+            SELECT file_id, node_id, x, y, z, parent_id
+            FROM neurons
+            WHERE file_id IN ({placeholders})
+            ORDER BY file_id, node_id
+        """
+        df = self.conn.execute(query, file_ids).fetchdf()
+
+        result = {}
+        for file_id, group in df.groupby("file_id"):
+            coords = group[["x", "y", "z"]].values.astype(np.float64)
+            node_ids = group["node_id"].values
+            id_to_idx = {nid: idx for idx, nid in enumerate(node_ids)}
+
+            parent_ids = group["parent_id"].values
+            edges = []
+            for idx, parent_id in enumerate(parent_ids):
+                if parent_id in id_to_idx:
+                    edges.append([id_to_idx[parent_id], idx])
+
+            edges_arr = (
+                np.array(edges, dtype=np.int32)
+                if edges
+                else np.array([]).reshape(0, 2)
+            )
+            result[file_id] = (coords, edges_arr)
+
+        return result
+
     def get_statistics(self) -> dict:
         """Get summary statistics for the database.
 

@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QThread
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,6 +27,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -42,6 +43,7 @@ from .reference_layers import (
     add_region_mesh,
     remove_region_layers,
 )
+from .analysis_tab import AnalysisTabWidget
 from .region_selector import RegionSelectorWidget
 from .slice_projection import NeuronSliceProjector
 
@@ -75,7 +77,11 @@ class NeuronViewerWidget(QWidget):
         self._current_region_layers: list = []
 
         # Slice projection for 2D viewing
-        self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=2500.0)
+        self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
+
+        # Conversion worker state
+        self._convert_thread: QThread | None = None
+        self._convert_worker = None
 
         self._setup_ui()
 
@@ -107,9 +113,45 @@ class NeuronViewerWidget(QWidget):
         tabs.addTab(ref_tab, "Reference")
         self._setup_reference_tab(ref_tab)
 
+        # Analysis tab
+        self._analysis_tab = AnalysisTabWidget(self.viewer)
+        self._analysis_tab.set_slice_projector(self._slice_projector)
+        tabs.addTab(self._analysis_tab, "Analysis")
+
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
         layout = QVBoxLayout(parent)
+
+        # SWC to Parquet conversion
+        convert_group = QGroupBox("Convert SWC to Parquet")
+        convert_layout = QVBoxLayout(convert_group)
+
+        convert_btn_row = QHBoxLayout()
+        convert_dir_btn = QPushButton("From Directory...")
+        convert_dir_btn.clicked.connect(self._convert_from_directory)
+        convert_btn_row.addWidget(convert_dir_btn)
+
+        convert_files_btn = QPushButton("From Files...")
+        convert_files_btn.clicked.connect(self._convert_from_files)
+        convert_btn_row.addWidget(convert_files_btn)
+        convert_layout.addLayout(convert_btn_row)
+
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Resolution (μm):"))
+        self._convert_resolution_spin = QSpinBox()
+        self._convert_resolution_spin.setRange(10, 100)
+        self._convert_resolution_spin.setValue(25)
+        res_row.addWidget(self._convert_resolution_spin)
+        convert_layout.addLayout(res_row)
+
+        self._convert_progress = QProgressBar()
+        self._convert_progress.setVisible(False)
+        convert_layout.addWidget(self._convert_progress)
+
+        self._convert_status_label = QLabel("")
+        convert_layout.addWidget(self._convert_status_label)
+
+        layout.addWidget(convert_group)
 
         # File selection
         file_group = QGroupBox("Parquet Data")
@@ -257,7 +299,7 @@ class NeuronViewerWidget(QWidget):
         thickness_row.addWidget(QLabel("Slice thickness (μm):"))
         self._slice_thickness_spin = QSpinBox()
         self._slice_thickness_spin.setRange(10, 2500)
-        self._slice_thickness_spin.setValue(2500)
+        self._slice_thickness_spin.setValue(100)
         self._slice_thickness_spin.valueChanged.connect(self._update_slice_thickness)
         thickness_row.addWidget(self._slice_thickness_spin)
         slice_layout.addLayout(thickness_row)
@@ -365,6 +407,7 @@ class NeuronViewerWidget(QWidget):
             )
 
             self._query_btn.setEnabled(True)
+            self._analysis_tab.set_database(self._db)
             logger.info(f"Loaded Parquet file: {filepath}")
 
         except Exception as e:
@@ -385,6 +428,7 @@ class NeuronViewerWidget(QWidget):
             self._atlas_status_label.setText(
                 f"Atlas: {atlas_name} ({len(self._atlas.structures)} structures)"
             )
+            self._analysis_tab.set_atlas(self._atlas)
             logger.info(f"Loaded atlas: {atlas_name}")
 
         except Exception as e:
@@ -422,7 +466,12 @@ class NeuronViewerWidget(QWidget):
             logger.error(f"Query failed: {e}")
 
     def _render_selected_neurons(self) -> None:
-        """Render the selected neurons from the list."""
+        """Render the selected neurons from the list.
+
+        All neurons are batched into a single shapes layer (lines) and/or a
+        single points layer instead of one layer per neuron, which is vastly
+        faster for large selections.
+        """
         selected_items = self._neuron_list.selectedItems()
         if not selected_items or self._db is None:
             return
@@ -440,88 +489,109 @@ class NeuronViewerWidget(QWidget):
         cmap = plt.get_cmap("turbo")
         neuron_colors = [list(cmap(t)) for t in np.linspace(0, 1, n)]
 
-        for file_id, color in zip(file_ids, neuron_colors):
-            if render_mode in ("Lines", "Both"):
-                self._add_neuron_lines(file_id, opacity, color=color)
-            if render_mode in ("Points", "Both"):
-                self._add_neuron_points(file_id, opacity, color=color)
-
-    def _add_neuron_lines(
-        self, file_id: str, opacity: float, color: tuple = (0, 1, 1, 1)
-    ) -> None:
-        """Add a neuron as a shapes layer with lines."""
-        coords, edges = self._db.get_neuron_lines(file_id)
-
-        if len(coords) == 0 or len(edges) == 0:
-            return
-
-        # Create line segments
-        lines = []
-        for edge in edges:
-            lines.append([coords[edge[0]], coords[edge[1]]])
-
         # Scale to match atlas mesh (coordinates are in microns)
         scale = None
         if self._atlas is not None:
             scale = [1.0 / res for res in self._atlas.resolution]
 
-        layer = self.viewer.add_shapes(
-            lines,
-            shape_type="line",
-            edge_width=self._line_width_spin.value(),
-            edge_color=color,
-            name=f"Lines: {file_id}",
-            opacity=opacity,
-            scale=scale,
-        )
+        # --- Lines ---
+        if render_mode in ("Lines", "Both"):
+            # Single batch query for all neurons
+            all_data = self._db.get_neuron_lines_batch(file_ids)
 
-        self._current_neuron_layers.append(layer)
+            all_lines = []
+            all_edge_colors = []
+            projector_batch = {}
+            rendered_file_ids = []
+            segments_per_neuron = []
 
-        # Add to slice projector for 2D viewing
-        self._slice_projector.set_scale(scale)
-        self._slice_projector.add_neuron_data(file_id, coords, edges, color=color)
+            for file_id, color in zip(file_ids, neuron_colors):
+                if file_id not in all_data:
+                    continue
+                coords, edges = all_data[file_id]
+                if len(edges) == 0:
+                    continue
 
-    def _add_neuron_points(
-        self, file_id: str, opacity: float, color: tuple = (1, 0, 1, 1)
-    ) -> None:
-        """Add a neuron as a points layer."""
-        df = self._db.get_neurons_for_rendering([file_id])
+                # Vectorized line segment building
+                segments = np.stack(
+                    [coords[edges[:, 0]], coords[edges[:, 1]]], axis=1
+                )
+                all_lines.append(segments)
 
-        if df.empty:
-            return
+                color_arr = np.empty((len(edges), 4))
+                color_arr[:] = color[:4]
+                all_edge_colors.append(color_arr)
 
-        coords = df[["x", "y", "z"]].values
+                projector_batch[file_id] = (coords, edges, tuple(color))
+                rendered_file_ids.append(file_id)
+                segments_per_neuron.append(len(edges))
 
-        # Color by node type if enabled
-        if self._color_by_type_cb.isChecked():
-            # Node type colors
-            type_colors = {
-                1: [1, 0, 0, 1],  # Soma - red
-                2: [0, 0, 1, 1],  # Axon - blue
-                3: [0, 1, 0, 1],  # Basal dendrite - green
-                4: [1, 1, 0, 1],  # Apical dendrite - yellow
-            }
-            colors = np.array(
-                [type_colors.get(t, [0.5, 0.5, 0.5, 1]) for t in df["type"].values]
-            )
-        else:
-            colors = color
+            if all_lines:
+                merged_lines = np.concatenate(all_lines)
+                merged_colors = np.concatenate(all_edge_colors)
 
-        # Scale to match atlas mesh (coordinates are in microns)
-        scale = None
-        if self._atlas is not None:
-            scale = [1.0 / res for res in self._atlas.resolution]
+                layer = self.viewer.add_shapes(
+                    merged_lines,
+                    shape_type="line",
+                    edge_width=self._line_width_spin.value(),
+                    edge_color=merged_colors,
+                    name="Neuron Lines",
+                    opacity=opacity,
+                    scale=scale,
+                    metadata={
+                        "file_ids": rendered_file_ids,
+                        "segments_per_neuron": segments_per_neuron,
+                    },
+                )
+                self._current_neuron_layers.append(layer)
 
-        layer = self.viewer.add_points(
-            coords,
-            size=self._point_size_spin.value(),
-            face_color=colors,
-            name=f"Points: {file_id}",
-            opacity=opacity,
-            scale=scale,
-        )
+            # Batch update slice projector (single rebuild)
+            self._slice_projector.set_scale(scale)
+            self._slice_projector.add_neuron_data_batch(projector_batch)
 
-        self._current_neuron_layers.append(layer)
+        # --- Points ---
+        if render_mode in ("Points", "Both"):
+            # Single batch query for all neurons
+            df = self._db.get_neurons_for_rendering(file_ids)
+
+            if not df.empty:
+                coords = df[["x", "y", "z"]].values
+
+                if self._color_by_type_cb.isChecked():
+                    type_colors = {
+                        1: [1, 0, 0, 1],  # Soma - red
+                        2: [0, 0, 1, 1],  # Axon - blue
+                        3: [0, 1, 0, 1],  # Basal dendrite - green
+                        4: [1, 1, 0, 1],  # Apical dendrite - yellow
+                    }
+                    colors = np.array(
+                        [
+                            type_colors.get(t, [0.5, 0.5, 0.5, 1])
+                            for t in df["type"].values
+                        ]
+                    )
+                else:
+                    # Per-point color based on which neuron each point belongs to
+                    color_map = dict(zip(file_ids, neuron_colors))
+                    colors = np.array(
+                        [color_map[fid][:4] for fid in df["file_id"].values]
+                    )
+
+                layer = self.viewer.add_points(
+                    coords,
+                    size=self._point_size_spin.value(),
+                    face_color=colors,
+                    name="Neuron Points",
+                    opacity=opacity,
+                    scale=scale,
+                    metadata={
+                        "file_ids_per_point": df["file_id"].values.tolist(),
+                    },
+                )
+                self._current_neuron_layers.append(layer)
+
+        # Re-apply cluster colors if a clustering result exists
+        self._analysis_tab.apply_cluster_colors()
 
     def _clear_neuron_layers(self) -> None:
         """Remove all current neuron layers."""
@@ -639,3 +709,91 @@ class NeuronViewerWidget(QWidget):
             if hasattr(layer, "edge_width"):
                 layer.edge_width = value
         self._slice_projector.edge_width = value
+
+    # --- SWC-to-Parquet conversion ---
+
+    def _convert_from_directory(self) -> None:
+        """Pick a directory of SWC files and convert to Parquet."""
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Directory of SWC Files"
+        )
+        if not directory:
+            return
+
+        swc_files = sorted(Path(directory).rglob("*.swc"))
+        if not swc_files:
+            self._convert_status_label.setText("No SWC files found in directory.")
+            return
+
+        self._prompt_output_and_convert([str(f) for f in swc_files])
+
+    def _convert_from_files(self) -> None:
+        """Pick individual SWC files and convert to Parquet."""
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select SWC Files",
+            "",
+            "SWC Files (*.swc);;All Files (*)",
+        )
+        if not filepaths:
+            return
+
+        self._prompt_output_and_convert(filepaths)
+
+    def _prompt_output_and_convert(self, swc_paths: list[str]) -> None:
+        """Ask for output path and start conversion."""
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Parquet File",
+            "neurons.parquet",
+            "Parquet Files (*.parquet)",
+        )
+        if not output_path:
+            return
+
+        self._start_conversion(swc_paths, output_path)
+
+    def _start_conversion(self, swc_paths: list[str], output_path: str) -> None:
+        """Launch the background conversion worker."""
+        from ..workers import ConvertWorker
+
+        resolution = self._convert_resolution_spin.value()
+
+        self._convert_progress.setVisible(True)
+        self._convert_progress.setRange(0, len(swc_paths))
+        self._convert_progress.setValue(0)
+        self._convert_status_label.setText(
+            f"Converting {len(swc_paths)} SWC files..."
+        )
+
+        self._convert_thread = QThread()
+        self._convert_worker = ConvertWorker(swc_paths, output_path, resolution)
+        self._convert_worker.moveToThread(self._convert_thread)
+
+        self._convert_thread.started.connect(self._convert_worker.run)
+        self._convert_worker.progress.connect(self._on_convert_progress)
+        self._convert_worker.finished.connect(self._on_convert_finished)
+        self._convert_worker.error.connect(self._on_convert_error)
+        self._convert_worker.finished.connect(self._convert_thread.quit)
+        self._convert_worker.error.connect(self._convert_thread.quit)
+
+        self._convert_thread.start()
+
+    def _on_convert_progress(self, message: str, current: int, total: int) -> None:
+        """Handle conversion progress updates."""
+        self._convert_progress.setValue(current)
+        self._convert_status_label.setText(message)
+
+    def _on_convert_finished(self, output_path: str, n_files: int) -> None:
+        """Handle conversion completion."""
+        self._convert_progress.setVisible(False)
+        self._convert_status_label.setText(
+            f"Done! Converted {n_files} files → {Path(output_path).name}"
+        )
+        logger.info(f"SWC-to-Parquet conversion complete: {output_path}")
+
+    def _on_convert_error(self, error_msg: str) -> None:
+        """Handle conversion error."""
+        self._convert_progress.setVisible(False)
+        self._convert_status_label.setText(f"Error: {error_msg}")
+        logger.error(f"SWC-to-Parquet conversion failed: {error_msg}")
