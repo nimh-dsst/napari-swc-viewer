@@ -77,7 +77,7 @@ class NeuronViewerWidget(QWidget):
         self._current_region_layers: list = []
 
         # Slice projection for 2D viewing
-        self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=2500.0)
+        self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
 
         # Conversion worker state
         self._convert_thread: QThread | None = None
