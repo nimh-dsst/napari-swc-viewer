@@ -101,16 +101,25 @@ def compute_clustermap_data(
 
     # Extract cluster labels
     labels = fcluster(Z, t=n_clusters, criterion="maxclust").astype(np.int32)
+    actual_k = int(len(np.unique(labels)))
 
     # Get dendrogram leaf order (reorder indices)
     from scipy.cluster.hierarchy import leaves_list
 
     reorder = leaves_list(Z)
 
-    logger.info(
-        f"Clustering complete: {n_clusters} clusters, "
-        f"sizes: {dict(zip(*np.unique(labels, return_counts=True)))}"
-    )
+    if actual_k < n_clusters:
+        logger.warning(
+            f"Requested {n_clusters} clusters but fcluster produced only "
+            f"{actual_k}: the dendrogram does not support that many distinct "
+            f"groups. Label distribution: "
+            f"{dict(zip(*np.unique(labels, return_counts=True)))}"
+        )
+    else:
+        logger.info(
+            f"Clustering complete: {actual_k} clusters, "
+            f"sizes: {dict(zip(*np.unique(labels, return_counts=True)))}"
+        )
 
     return ClusterResult(
         correlation_matrix=corr_matrix,

@@ -61,6 +61,7 @@ class AnalysisTabWidget(QWidget):
         self._worker_thread: QThread | None = None
         self._last_cluster_result: ClusterResult | None = None
         self._cluster_color_map: dict[str, list[float]] | None = None
+        self._actual_n_clusters: int = 0
         self._heatmap_layer = None
         self._slice_projector = None
         self._setup_ui()
@@ -288,9 +289,18 @@ class AnalysisTabWidget(QWidget):
         self._last_cluster_result = result
         self._build_cluster_color_map()
         self._progress_bar.setVisible(False)
+
+        requested_k = self._n_clusters_spin.value()
+        actual_k = self._actual_n_clusters
+        if actual_k < requested_k:
+            cluster_msg = (
+                f"{actual_k} of {requested_k} requested clusters found"
+            )
+        else:
+            cluster_msg = f"{actual_k} clusters"
         self._progress_label.setText(
             f"Clustering complete: {len(result.neuron_ids)} neurons, "
-            f"{int(result.labels.max())} clusters"
+            f"{cluster_msg}"
         )
         self._update_button_states()
 
@@ -379,11 +389,20 @@ class AnalysisTabWidget(QWidget):
             return
 
         result = self._last_cluster_result
-        n_clusters = int(result.labels.max())
+        unique_labels = np.unique(result.labels)
+        n_clusters = int(len(unique_labels))
+
+        logger.info(
+            f"Building cluster color map: {len(result.neuron_ids)} neurons, "
+            f"{n_clusters} unique clusters (labels: {unique_labels.tolist()})"
+        )
 
         # Use explicit colors for small cluster counts to guarantee
         # visually distinct colors; fall back to tab10/tab20 otherwise.
         _CUSTOM_COLORS: dict[int, list[list[float]]] = {
+            1: [
+                [0.12, 0.47, 0.71, 1.0],  # blue (all same cluster)
+            ],
             2: [
                 [0.12, 0.47, 0.71, 1.0],  # blue
                 [0.84, 0.15, 0.16, 1.0],  # red
@@ -395,17 +414,23 @@ class AnalysisTabWidget(QWidget):
             ],
         }
 
+        # Map each unique label to a color index (0, 1, 2, ...) so colors
+        # are assigned correctly even when labels are non-contiguous.
+        label_to_idx = {int(lab): i for i, lab in enumerate(unique_labels)}
+
         color_map: dict[str, list[float]] = {}
         if n_clusters in _CUSTOM_COLORS:
             palette = _CUSTOM_COLORS[n_clusters]
             for neuron_id, label in zip(result.neuron_ids, result.labels):
-                color_map[neuron_id] = palette[int(label) - 1]
+                color_map[neuron_id] = palette[label_to_idx[int(label)]]
         else:
             cmap = plt.get_cmap("tab10" if n_clusters <= 10 else "tab20")
             for neuron_id, label in zip(result.neuron_ids, result.labels):
-                color_map[neuron_id] = list(cmap((label - 1) / n_clusters))
+                idx = label_to_idx[int(label)]
+                color_map[neuron_id] = list(cmap(idx / n_clusters))
 
         self._cluster_color_map = color_map
+        self._actual_n_clusters = n_clusters
         logger.info(
             f"Built cluster color map: {len(color_map)} neurons, "
             f"{n_clusters} clusters"
@@ -433,7 +458,7 @@ class AnalysisTabWidget(QWidget):
             return
 
         color_map = self._cluster_color_map
-        n_clusters = int(self._last_cluster_result.labels.max())
+        n_clusters = self._actual_n_clusters
         default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
 
