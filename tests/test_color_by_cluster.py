@@ -45,6 +45,8 @@ class TestColorByClusterLines:
         widget._last_cluster_result = _make_cluster_result(
             ["neuronA", "neuronB"], [1, 2]
         )
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
         widget._color_neurons_by_cluster()
@@ -78,6 +80,8 @@ class TestColorByClusterLines:
         widget._viewer = viewer
         widget._slice_projector = None
         widget._last_cluster_result = _make_cluster_result(["neuronA"], [1])
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
         widget._color_neurons_by_cluster()
@@ -102,6 +106,8 @@ class TestColorByClusterLines:
         widget._viewer = viewer
         widget._slice_projector = None
         widget._last_cluster_result = _make_cluster_result(["n1", "n2"], [1, 2])
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
         widget._color_neurons_by_cluster()
@@ -130,6 +136,8 @@ class TestColorByClusterPoints:
         widget._viewer = viewer
         widget._slice_projector = None
         widget._last_cluster_result = _make_cluster_result(["n1", "n2"], [1, 2])
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
         widget._color_neurons_by_cluster()
@@ -169,6 +177,8 @@ class TestColorByClusterBothLayers:
         widget._viewer = viewer
         widget._slice_projector = None
         widget._last_cluster_result = _make_cluster_result(["n1"], [1])
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
         widget._color_neurons_by_cluster()

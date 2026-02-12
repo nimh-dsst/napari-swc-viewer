@@ -60,6 +60,7 @@ class AnalysisTabWidget(QWidget):
         self._parquet_path: str | None = None
         self._worker_thread: QThread | None = None
         self._last_cluster_result: ClusterResult | None = None
+        self._cluster_color_map: dict[str, list[float]] | None = None
         self._heatmap_layer = None
         self._slice_projector = None
         self._setup_ui()
@@ -285,6 +286,7 @@ class AnalysisTabWidget(QWidget):
     def _on_correlation_finished(self, result: ClusterResult) -> None:
         """Handle completed correlation pipeline."""
         self._last_cluster_result = result
+        self._build_cluster_color_map()
         self._progress_bar.setVisible(False)
         self._progress_label.setText(
             f"Clustering complete: {len(result.neuron_ids)} neurons, "
@@ -364,6 +366,41 @@ class AnalysisTabWidget(QWidget):
             )
             self._canvas.draw()
 
+    def _build_cluster_color_map(self) -> None:
+        """Build and cache the neuron_id -> RGBA color mapping from cluster results.
+
+        Called once when clustering completes.  The cached map is reused
+        on every subsequent ``apply_cluster_colors`` / button-click so
+        that colors are deterministic regardless of which neurons are
+        currently rendered.
+        """
+        if self._last_cluster_result is None:
+            self._cluster_color_map = None
+            return
+
+        result = self._last_cluster_result
+        n_clusters = int(result.labels.max())
+        cmap = plt.get_cmap("tab10" if n_clusters <= 10 else "tab20")
+
+        color_map: dict[str, list[float]] = {}
+        for neuron_id, label in zip(result.neuron_ids, result.labels):
+            color_map[neuron_id] = list(cmap((label - 1) / n_clusters))
+
+        self._cluster_color_map = color_map
+        logger.info(
+            f"Built cluster color map: {len(color_map)} neurons, "
+            f"{n_clusters} clusters"
+        )
+
+    def apply_cluster_colors(self) -> None:
+        """Apply cached cluster colors to currently rendered neuron layers.
+
+        Safe to call at any time.  Does nothing if no cluster result exists.
+        Called automatically after neuron rendering and by the
+        'Color Neurons by Cluster' button.
+        """
+        self._color_neurons_by_cluster()
+
     def _color_neurons_by_cluster(self) -> None:
         """Color existing neuron layers by their cluster assignment.
 
@@ -373,18 +410,11 @@ class AnalysisTabWidget(QWidget):
         ``file_ids_per_point``) is used to map cluster labels back to
         individual segments/points.
         """
-        if self._last_cluster_result is None:
+        if self._cluster_color_map is None:
             return
 
-        result = self._last_cluster_result
-        n_clusters = int(result.labels.max())
-        cmap = plt.get_cmap("tab10" if n_clusters <= 10 else "tab20")
-
-        # Build neuron_id -> RGBA color mapping
-        color_map: dict[str, list[float]] = {}
-        for neuron_id, label in zip(result.neuron_ids, result.labels):
-            color_map[neuron_id] = list(cmap((label - 1) / n_clusters))
-
+        color_map = self._cluster_color_map
+        n_clusters = int(self._last_cluster_result.labels.max())
         default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
 

@@ -590,6 +590,9 @@ class NeuronViewerWidget(QWidget):
                 )
                 self._current_neuron_layers.append(layer)
 
+        # Re-apply cluster colors if a clustering result exists
+        self._analysis_tab.apply_cluster_colors()
+
     def _clear_neuron_layers(self) -> None:
         """Remove all current neuron layers."""
         for layer in self._current_neuron_layers:
