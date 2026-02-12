@@ -372,6 +372,9 @@ class TestSliceProjectorColorUpdate:
         projector._scale = None
         projector._connected = False
         projector._update_timer = MagicMock()
+        projector._axis_index = {}
+        projector._last_result_key = None
+        projector._last_result = None
 
         coords = np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2]], dtype=np.float64)
         edges = np.array([[0, 1], [1, 2]], dtype=np.int32)
@@ -400,6 +403,9 @@ class TestSliceProjectorColorUpdate:
         projector = NeuronSliceProjector.__new__(NeuronSliceProjector)
         projector._enabled = False
         projector._update_timer = MagicMock()
+        projector._axis_index = {}
+        projector._last_result_key = None
+        projector._last_result = None
 
         coords = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float64)
         edges = np.array([[0, 1]], dtype=np.int32)
@@ -419,6 +425,9 @@ class TestSliceProjectorColorUpdate:
         projector = NeuronSliceProjector.__new__(NeuronSliceProjector)
         projector._enabled = False
         projector._update_timer = MagicMock()
+        projector._axis_index = {}
+        projector._last_result_key = None
+        projector._last_result = None
 
         coords = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float64)
         edges = np.array([[0, 1]], dtype=np.int32)
@@ -455,3 +464,346 @@ class TestLayerMetadata:
             "file_ids_per_point": ["a", "a", "b", "b", "b"],
         }
         assert len(metadata["file_ids_per_point"]) == 5
+
+
+def _make_projector(**overrides):
+    """Create a NeuronSliceProjector via __new__ with sensible defaults."""
+    from napari_swc_viewer.widgets.slice_projection import NeuronSliceProjector
+
+    proj = NeuronSliceProjector.__new__(NeuronSliceProjector)
+    proj._viewer = MagicMock()
+    proj._enabled = False
+    proj._tolerance = 50.0
+    proj._edge_width = 4
+    proj._projection_layer = None
+    proj._scale = None
+    proj._connected = False
+    proj._update_timer = MagicMock()
+    proj._source_data = {}
+    proj._all_p1 = None
+    proj._all_p2 = None
+    proj._all_colors = None
+    proj._axis_index = {}
+    proj._last_result_key = None
+    proj._last_result = None
+    for k, v in overrides.items():
+        setattr(proj, k, v)
+    return proj
+
+
+def _brute_force_projection(projector, slice_position, slice_axis, tolerance):
+    """Reference brute-force projection for correctness checks."""
+    p1 = projector._all_p1
+    p2 = projector._all_p2
+    slab_min = slice_position - tolerance
+    slab_max = slice_position + tolerance
+    v1 = p1[:, slice_axis]
+    v2 = p2[:, slice_axis]
+    mask = (np.maximum(v1, v2) >= slab_min) & (np.minimum(v1, v2) <= slab_max)
+    return np.nonzero(mask)[0]
+
+
+class TestSpatialIndex:
+    """Test that the spatial index produces correct results."""
+
+    def test_index_matches_brute_force(self):
+        """Index-based query returns same segments as brute-force."""
+        rng = np.random.default_rng(42)
+        n_nodes = 500
+        coords = rng.uniform(0, 1000, (n_nodes, 3))
+        edges = np.column_stack([np.arange(n_nodes - 1), np.arange(1, n_nodes)])
+
+        proj = _make_projector(_tolerance=100.0)
+        proj._source_data = {"n1": (coords, edges, (1, 1, 0, 1))}
+        proj._rebuild_arrays()
+
+        for axis in range(3):
+            for pos in [0.0, 250.0, 500.0, 750.0, 1000.0]:
+                lines, colors = proj._compute_slice_projection(pos, axis)
+                expected = _brute_force_projection(proj, pos, axis, proj._tolerance)
+
+                if len(expected) == 0:
+                    assert lines is None
+                else:
+                    assert lines is not None
+                    assert len(lines) == len(expected)
+                    # Clear cache between calls so each is fresh
+                    proj._invalidate_cache()
+
+    def test_empty_data(self):
+        """Projection returns None when there are no segments."""
+        proj = _make_projector()
+        lines, colors = proj._compute_slice_projection(500.0, 0)
+        assert lines is None
+        assert colors is None
+
+    def test_single_segment(self):
+        """A single segment is correctly found or missed."""
+        coords = np.array([[100, 0, 0], [200, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=10.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        # Hit: position 150 is within [100, 200]
+        lines, colors = proj._compute_slice_projection(150.0, 0)
+        assert lines is not None
+        assert lines.shape == (1, 2, 3)
+        proj._invalidate_cache()
+
+        # Miss: position 0 is far from [100, 200]
+        lines, colors = proj._compute_slice_projection(0.0, 0)
+        assert lines is None
+
+    def test_all_segments_in_slab(self):
+        """When all segments are within the slab, all are returned."""
+        coords = np.array([[50, 0, 0], [51, 1, 1], [52, 2, 2]], dtype=np.float64)
+        edges = np.array([[0, 1], [1, 2]])
+        proj = _make_projector(_tolerance=100.0)
+        proj._source_data = {"n1": (coords, edges, (1, 1, 0, 1))}
+        proj._rebuild_arrays()
+
+        lines, colors = proj._compute_slice_projection(50.0, 0)
+        assert lines is not None
+        assert len(lines) == 2
+
+    def test_no_segments_in_slab(self):
+        """When no segments are within the slab, returns None."""
+        coords = np.array([[1000, 0, 0], [1001, 1, 1]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=10.0)
+        proj._source_data = {"n1": (coords, edges, (1, 1, 0, 1))}
+        proj._rebuild_arrays()
+
+        lines, colors = proj._compute_slice_projection(0.0, 0)
+        assert lines is None
+
+    def test_multiple_axes(self):
+        """Index works independently for each axis."""
+        coords = np.array(
+            [[0, 500, 1000], [10, 510, 990]], dtype=np.float64
+        )
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=20.0)
+        proj._source_data = {"n1": (coords, edges, (1, 1, 0, 1))}
+        proj._rebuild_arrays()
+
+        # Axis 0: segment spans [0, 10], query at 5 → hit
+        lines, _ = proj._compute_slice_projection(5.0, 0)
+        assert lines is not None
+        proj._invalidate_cache()
+
+        # Axis 1: segment spans [500, 510], query at 0 → miss
+        lines, _ = proj._compute_slice_projection(0.0, 1)
+        assert lines is None
+        proj._invalidate_cache()
+
+        # Axis 2: segment spans [990, 1000], query at 995 → hit
+        lines, _ = proj._compute_slice_projection(995.0, 2)
+        assert lines is not None
+
+
+class TestResultCache:
+    """Test the single-entry result cache."""
+
+    def test_cache_hit_returns_same_result(self):
+        """Repeated query with same params returns cached result."""
+        coords = np.array([[100, 0, 0], [200, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=50.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        lines1, colors1 = proj._compute_slice_projection(150.0, 0)
+        lines2, colors2 = proj._compute_slice_projection(150.0, 0)
+
+        # Should be the exact same objects (cached)
+        assert lines1 is lines2
+        assert colors1 is colors2
+
+    def test_cache_miss_on_different_position(self):
+        """Cache misses when position changes."""
+        coords = np.array([[100, 0, 0], [200, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=150.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        lines1, _ = proj._compute_slice_projection(150.0, 0)
+        lines2, _ = proj._compute_slice_projection(160.0, 0)
+
+        # Different position → different result objects
+        assert lines1 is not lines2
+
+    def test_cache_invalidated_on_data_change(self):
+        """Adding new data invalidates the cache."""
+        coords = np.array([[100, 0, 0], [200, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=50.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        proj._compute_slice_projection(150.0, 0)
+        assert proj._last_result_key is not None
+
+        # Rebuild arrays (as would happen on add_neuron_data)
+        proj._rebuild_arrays()
+        assert proj._last_result_key is None
+
+    def test_cache_invalidated_on_tolerance_change(self):
+        """Changing tolerance invalidates the cache."""
+        coords = np.array([[100, 0, 0], [200, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=50.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        proj._compute_slice_projection(150.0, 0)
+        assert proj._last_result_key is not None
+
+        proj.tolerance = 100.0
+        assert proj._last_result_key is None
+
+    def test_cache_invalidated_on_color_change(self):
+        """Changing colors invalidates the cache."""
+        coords = np.array([[100, 0, 0], [200, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=50.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        proj._compute_slice_projection(150.0, 0)
+        assert proj._last_result_key is not None
+
+        proj.update_neuron_colors({"n1": [0, 1, 0, 1]})
+        assert proj._last_result_key is None
+
+    def test_cache_none_result(self):
+        """Cache also works for None results (no segments in slab)."""
+        coords = np.array([[1000, 0, 0], [1001, 0, 0]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector(_tolerance=10.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        result1 = proj._compute_slice_projection(0.0, 0)
+        result2 = proj._compute_slice_projection(0.0, 0)
+
+        assert result1 == (None, None)
+        assert result2 == (None, None)
+        # Should be the same tuple object from cache
+        assert result1 is result2
+
+
+class TestColorOnlyRebuild:
+    """Test that _rebuild_colors_only preserves geometry and index."""
+
+    def test_preserves_geometry(self):
+        """Color-only rebuild does not change p1/p2 arrays."""
+        coords = np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2]], dtype=np.float64)
+        edges = np.array([[0, 1], [1, 2]])
+        proj = _make_projector()
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        p1_before = proj._all_p1.copy()
+        p2_before = proj._all_p2.copy()
+
+        proj._source_data["n1"] = (coords, edges, (0, 1, 0, 1))
+        proj._rebuild_colors_only()
+
+        np.testing.assert_array_equal(proj._all_p1, p1_before)
+        np.testing.assert_array_equal(proj._all_p2, p2_before)
+
+    def test_preserves_axis_index(self):
+        """Color-only rebuild does not change the spatial index."""
+        coords = np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2]], dtype=np.float64)
+        edges = np.array([[0, 1], [1, 2]])
+        proj = _make_projector()
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        index_before = {
+            ax: (order.copy(), zmin.copy(), zmax.copy(), span)
+            for ax, (order, zmin, zmax, span) in proj._axis_index.items()
+        }
+
+        proj._source_data["n1"] = (coords, edges, (0, 1, 0, 1))
+        proj._rebuild_colors_only()
+
+        for ax in range(3):
+            order_b, zmin_b, zmax_b, span_b = index_before[ax]
+            order_a, zmin_a, zmax_a, span_a = proj._axis_index[ax]
+            np.testing.assert_array_equal(order_a, order_b)
+            np.testing.assert_array_equal(zmin_a, zmin_b)
+            np.testing.assert_array_equal(zmax_a, zmax_b)
+            assert span_a == span_b
+
+    def test_updates_colors(self):
+        """Color-only rebuild correctly updates the color array."""
+        coords = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector()
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        np.testing.assert_array_almost_equal(
+            proj._all_colors[0], [1, 0, 0, 1]
+        )
+
+        proj._source_data["n1"] = (coords, edges, (0, 0, 1, 1))
+        proj._rebuild_colors_only()
+
+        np.testing.assert_array_almost_equal(
+            proj._all_colors[0], [0, 0, 1, 1]
+        )
+
+    def test_update_neuron_colors_uses_color_only_rebuild(self):
+        """update_neuron_colors preserves geometry and index."""
+        coords = np.array([[0, 0, 0], [100, 50, 50], [200, 100, 100]], dtype=np.float64)
+        edges = np.array([[0, 1], [1, 2]])
+        proj = _make_projector(_tolerance=10.0)
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+
+        p1_before = proj._all_p1.copy()
+        index_order_before = proj._axis_index[0][0].copy()
+
+        proj.update_neuron_colors({"n1": [0, 1, 0, 1]})
+
+        # Geometry unchanged
+        np.testing.assert_array_equal(proj._all_p1, p1_before)
+        # Index unchanged
+        np.testing.assert_array_equal(proj._axis_index[0][0], index_order_before)
+        # Colors updated
+        np.testing.assert_array_almost_equal(
+            proj._all_colors[0], [0, 1, 0, 1]
+        )
+
+
+class TestClearResetsState:
+    """Test that clear() resets index and cache."""
+
+    def test_clear_resets_all_state(self):
+        """clear() resets source data, arrays, index, and cache."""
+        coords = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float64)
+        edges = np.array([[0, 1]])
+        proj = _make_projector()
+        proj._source_data = {"n1": (coords, edges, (1, 0, 0, 1))}
+        proj._rebuild_arrays()
+        proj._compute_slice_projection(0.5, 0)
+
+        assert proj._all_p1 is not None
+        assert len(proj._axis_index) == 3
+        assert proj._last_result_key is not None
+
+        proj._projection_layer = None  # avoid mock layer removal issues
+        proj.clear()
+
+        assert proj._all_p1 is None
+        assert proj._all_p2 is None
+        assert proj._all_colors is None
+        assert len(proj._axis_index) == 0
+        assert proj._last_result_key is None
+        assert proj._last_result is None
+        assert len(proj._source_data) == 0

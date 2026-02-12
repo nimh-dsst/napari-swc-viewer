@@ -208,3 +208,6 @@ __marimo__/
 
 # Test data (downloaded SWC files)
 test_data/
+
+# Benchmark data (downloaded/generated neuron files)
+benchmark_data/
