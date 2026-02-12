@@ -380,11 +380,30 @@ class AnalysisTabWidget(QWidget):
 
         result = self._last_cluster_result
         n_clusters = int(result.labels.max())
-        cmap = plt.get_cmap("tab10" if n_clusters <= 10 else "tab20")
+
+        # Use explicit colors for small cluster counts to guarantee
+        # visually distinct colors; fall back to tab10/tab20 otherwise.
+        _CUSTOM_COLORS: dict[int, list[list[float]]] = {
+            2: [
+                [0.12, 0.47, 0.71, 1.0],  # blue
+                [0.84, 0.15, 0.16, 1.0],  # red
+            ],
+            3: [
+                [0.12, 0.47, 0.71, 1.0],  # blue
+                [0.84, 0.15, 0.16, 1.0],  # red
+                [0.17, 0.63, 0.17, 1.0],  # green
+            ],
+        }
 
         color_map: dict[str, list[float]] = {}
-        for neuron_id, label in zip(result.neuron_ids, result.labels):
-            color_map[neuron_id] = list(cmap((label - 1) / n_clusters))
+        if n_clusters in _CUSTOM_COLORS:
+            palette = _CUSTOM_COLORS[n_clusters]
+            for neuron_id, label in zip(result.neuron_ids, result.labels):
+                color_map[neuron_id] = palette[int(label) - 1]
+        else:
+            cmap = plt.get_cmap("tab10" if n_clusters <= 10 else "tab20")
+            for neuron_id, label in zip(result.neuron_ids, result.labels):
+                color_map[neuron_id] = list(cmap((label - 1) / n_clusters))
 
         self._cluster_color_map = color_map
         logger.info(

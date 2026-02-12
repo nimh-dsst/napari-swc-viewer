@@ -117,6 +117,96 @@ class TestColorByClusterLines:
         assert "0 layer(s)" in msg
 
 
+class TestCustomColorsSmallClusters:
+    """Test that 2- and 3-cluster cases use hard-coded distinct colors."""
+
+    def test_two_clusters_get_distinct_custom_colors(self):
+        """With n_clusters=2, neurons get explicit blue and red."""
+        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+
+        viewer = MagicMock()
+        lines_layer = MagicMock()
+        lines_layer.name = "Neuron Lines"
+        lines_layer.metadata = {
+            "file_ids": ["nA", "nB"],
+            "segments_per_neuron": [3, 4],
+        }
+        viewer.layers = [lines_layer]
+
+        widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+        widget._viewer = viewer
+        widget._slice_projector = None
+        widget._last_cluster_result = _make_cluster_result(
+            ["nA", "nB"], [1, 2]
+        )
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
+        widget._progress_label = MagicMock()
+
+        widget._color_neurons_by_cluster()
+
+        color_array = lines_layer.edge_color
+        assert isinstance(color_array, np.ndarray)
+
+        # Cluster 1 (nA) → blue [0.12, 0.47, 0.71, 1.0]
+        np.testing.assert_array_almost_equal(
+            color_array[0], [0.12, 0.47, 0.71, 1.0], decimal=2
+        )
+        # Cluster 2 (nB) → red [0.84, 0.15, 0.16, 1.0]
+        np.testing.assert_array_almost_equal(
+            color_array[3], [0.84, 0.15, 0.16, 1.0], decimal=2
+        )
+        # They must be different
+        assert not np.array_equal(color_array[0], color_array[3])
+
+    def test_three_clusters_get_distinct_custom_colors(self):
+        """With n_clusters=3, neurons get explicit blue, red, green."""
+        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+
+        viewer = MagicMock()
+        lines_layer = MagicMock()
+        lines_layer.name = "Neuron Lines"
+        lines_layer.metadata = {
+            "file_ids": ["nA", "nB", "nC"],
+            "segments_per_neuron": [2, 2, 2],
+        }
+        viewer.layers = [lines_layer]
+
+        widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+        widget._viewer = viewer
+        widget._slice_projector = None
+        widget._last_cluster_result = _make_cluster_result(
+            ["nA", "nB", "nC"], [1, 2, 3]
+        )
+        widget._cluster_color_map = None
+        widget._build_cluster_color_map()
+        widget._progress_label = MagicMock()
+
+        widget._color_neurons_by_cluster()
+
+        color_array = lines_layer.edge_color
+        assert isinstance(color_array, np.ndarray)
+
+        blue = color_array[0]  # nA = cluster 1
+        red = color_array[2]   # nB = cluster 2
+        green = color_array[4] # nC = cluster 3
+
+        np.testing.assert_array_almost_equal(
+            blue, [0.12, 0.47, 0.71, 1.0], decimal=2
+        )
+        np.testing.assert_array_almost_equal(
+            red, [0.84, 0.15, 0.16, 1.0], decimal=2
+        )
+        np.testing.assert_array_almost_equal(
+            green, [0.17, 0.63, 0.17, 1.0], decimal=2
+        )
+
+        # All three must be pairwise different
+        assert not np.array_equal(blue, red)
+        assert not np.array_equal(blue, green)
+        assert not np.array_equal(red, green)
+
+
 class TestColorByClusterPoints:
     """Test cluster coloring on the batched 'Neuron Points' layer."""
 
