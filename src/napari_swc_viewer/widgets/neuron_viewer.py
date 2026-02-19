@@ -994,8 +994,15 @@ class NeuronViewerWidget(QWidget):
         QTimer.singleShot(0, lambda: self._apply_layer_visibility(not is_2d))
 
     def _apply_layer_visibility(self, visible: bool) -> None:
-        """Set visibility on all neuron layers and clear the status message."""
+        """Set visibility on all neuron layers and clear the status message.
+
+        The "Soma Labels" layer is excluded from 2D hiding because napari
+        Points layers natively handle slice display, showing only points
+        near the current slice position.
+        """
         for layer in self._current_neuron_layers:
+            if not visible and layer.name == "Soma Labels":
+                continue
             layer.visible = visible
         self.viewer.status = "Ready"
 
