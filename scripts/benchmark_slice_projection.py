@@ -424,7 +424,7 @@ def _brute_force_projection(projector, slice_position, slice_axis, tolerance):
     p2 = projector._all_p2[mask].copy()
     p1[:, slice_axis] = slice_position
     p2[:, slice_axis] = slice_position
-    lines = np.stack([p1, p2], axis=1)
+    lines = np.stack([p1, p2 - p1], axis=1)
     colors = projector._all_colors[mask]
     return lines, colors
 

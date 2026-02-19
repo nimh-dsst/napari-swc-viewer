@@ -23,7 +23,7 @@ class NeuronSliceProjector:
     """Projects neuron line segments onto the current 2D slice.
 
     This class maintains a cache of neuron line data and dynamically updates
-    a 2D Shapes layer to show line segments within a configurable Z tolerance
+    a 2D Vectors layer to show line segments within a configurable Z tolerance
     of the current slice position.
 
     Parameters
@@ -388,7 +388,7 @@ class NeuronSliceProjector:
         Returns
         -------
         lines : ndarray or None
-            Array of shape (N, 2, 3) with flattened line segments, or None.
+            Array of shape (N, 2, 3) in vectors format [start, direction], or None.
         colors : ndarray or None
             Array of shape (N, 4) with RGBA colors, or None.
         """
@@ -440,8 +440,8 @@ class NeuronSliceProjector:
         p1[:, slice_axis] = slice_position
         p2[:, slice_axis] = slice_position
 
-        # Stack into (N, 2, 3) for napari shapes
-        lines = np.stack([p1, p2], axis=1)
+        # Stack into (N, 2, 3) for napari vectors: [start, direction]
+        lines = np.stack([p1, p2 - p1], axis=1)
         colors = self._all_colors[hit_indices]
 
         result = (lines, colors)
@@ -452,17 +452,16 @@ class NeuronSliceProjector:
     def _update_projection_layer(
         self, lines: np.ndarray, colors: np.ndarray
     ) -> None:
-        """Update or create the projection shapes layer.
+        """Update or create the projection vectors layer.
 
         Parameters
         ----------
         lines : np.ndarray
-            Array of shape (N, 2, 3) with line segments.
+            Array of shape (N, 2, 3) in vectors format [start, direction].
         colors : np.ndarray
             Array of shape (N, 4) with RGBA colors per segment.
         """
         layer_name = "Neuron Slice Projection"
-        edge_colors = colors
 
         if self._projection_layer is None:
             # Check if layer exists in viewer (may have been created before)
@@ -473,19 +472,19 @@ class NeuronSliceProjector:
 
         if self._projection_layer is None:
             # Create new layer
-            self._projection_layer = self._viewer.add_shapes(
+            self._projection_layer = self._viewer.add_vectors(
                 lines,
-                shape_type="line",
                 edge_width=self._edge_width,
-                edge_color=edge_colors,
+                edge_color=colors,
                 name=layer_name,
                 opacity=1.0,
                 scale=self._scale,
+                vector_style="line",
             )
         else:
             # Update existing layer
             self._projection_layer.data = lines
-            self._projection_layer.edge_color = edge_colors
+            self._projection_layer.edge_color = colors
             self._projection_layer.visible = True
             # Update scale if changed
             if self._scale is not None:
