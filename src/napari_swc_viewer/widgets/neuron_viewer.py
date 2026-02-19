@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info
-from qtpy.QtCore import Qt, QThread
+from qtpy.QtCore import Qt, QThread, QTimer
 from qtpy.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -758,16 +758,16 @@ class NeuronViewerWidget(QWidget):
         is_2d = self.viewer.dims.ndisplay == 2
         if is_2d:
             self.viewer.status = "Switching to 2D view..."
-            QApplication.processEvents()
-            for layer in self._current_neuron_layers:
-                layer.visible = False
-            self.viewer.status = "Ready"
         else:
             self.viewer.status = "Rendering 3D neuron layers..."
-            QApplication.processEvents()
-            for layer in self._current_neuron_layers:
-                layer.visible = True
-            self.viewer.status = "Ready"
+        # Defer the heavy work so the status bar paints first
+        QTimer.singleShot(0, lambda: self._apply_layer_visibility(not is_2d))
+
+    def _apply_layer_visibility(self, visible: bool) -> None:
+        """Set visibility on all neuron layers and clear the status message."""
+        for layer in self._current_neuron_layers:
+            layer.visible = visible
+        self.viewer.status = "Ready"
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
