@@ -114,7 +114,7 @@ class TestColorByClusterLines:
 
         widget._progress_label.setText.assert_called_once()
         msg = widget._progress_label.setText.call_args[0][0]
-        assert "0 layer(s)" in msg
+        assert "0/0 neurons" in msg
 
 
 class TestCustomColorsSmallClusters:
@@ -350,7 +350,7 @@ class TestColorByClusterBothLayers:
         widget._color_neurons_by_cluster()
 
         msg = widget._progress_label.setText.call_args[0][0]
-        assert "2 layer(s)" in msg
+        assert "1/1 neurons" in msg
 
 
 class TestSliceProjectorColorUpdate:

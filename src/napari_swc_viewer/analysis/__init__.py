@@ -4,7 +4,14 @@ Ported from the swc-mapper repository, adapted to use BrainGlobe Atlas API
 instead of Allen SDK.
 """
 
-from .clustering import ClusterResult, compute_clustermap_data, compute_linkage
+from .clustering import (
+    ClusterResult,
+    cluster_somas_dbscan,
+    cluster_somas_hierarchical,
+    cluster_somas_kmeans,
+    compute_clustermap_data,
+    compute_linkage,
+)
 from .correlation import (
     compute_pearson_correlation_matrix,
     correlation_long_to_matrix,
@@ -25,5 +32,8 @@ __all__ = [
     "build_node_counts_volume",
     "compute_linkage",
     "compute_clustermap_data",
+    "cluster_somas_hierarchical",
+    "cluster_somas_kmeans",
+    "cluster_somas_dbscan",
     "ClusterResult",
 ]
