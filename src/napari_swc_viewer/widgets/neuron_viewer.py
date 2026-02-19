@@ -85,6 +85,9 @@ class NeuronViewerWidget(QWidget):
 
         self._setup_ui()
 
+        # Auto-hide neuron line layers in 2D mode
+        self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
         layout = QVBoxLayout(self)
@@ -702,6 +705,15 @@ class NeuronViewerWidget(QWidget):
         opacity = self._mesh_opacity_slider.value() / 100.0
         for acronym in acronyms:
             add_region_mesh(self.viewer, self._atlas, acronym, opacity=opacity)
+
+    def _on_ndisplay_changed(self, event) -> None:
+        """Auto-hide neuron line/point layers in 2D to keep slice scrubbing fast."""
+        is_2d = self.viewer.dims.ndisplay == 2
+        for layer in self._current_neuron_layers:
+            if is_2d:
+                layer.visible = False
+            else:
+                layer.visible = True
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
