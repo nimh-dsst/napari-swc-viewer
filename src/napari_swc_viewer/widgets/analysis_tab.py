@@ -504,6 +504,7 @@ class AnalysisTabWidget(QWidget):
             name=layer_name,
             colormap=colormap,
             blending="additive",
+            rendering="mip",
             opacity=0.7,
             visible=True,
         )
