@@ -149,7 +149,10 @@ def add_region_segmentation(
     # For each selected parent acronym, collect all descendant annotation IDs
     # and map them to the parent's atlas-defined color.
     all_selected_ids: set[int] = set()
-    color_dict: dict[int, tuple[float, float, float]] = {}
+    color_dict: dict[int | None, np.ndarray] = {
+        None: np.array([0, 0, 0, 0], dtype=np.float32),  # unmapped: transparent
+        0: np.array([0, 0, 0, 0], dtype=np.float32),      # background: transparent
+    }
 
     for acronym in acronyms:
         try:
@@ -160,7 +163,10 @@ def add_region_segmentation(
 
         parent_id = structure["id"]
         rgb = structure.get("rgb_triplet", [128, 128, 128])
-        rgb_normalized = (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+        rgba = np.array(
+            [rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0],
+            dtype=np.float32,
+        )
 
         # Collect all descendants: any structure whose structure_id_path
         # contains this parent_id is a descendant (or the region itself).
@@ -175,7 +181,7 @@ def add_region_segmentation(
 
         # Map each descendant ID to the parent's color
         for did in descendant_ids:
-            color_dict[did] = rgb_normalized
+            color_dict[did] = rgba
 
     if not all_selected_ids:
         logger.warning("No valid annotation IDs found for selected regions")
@@ -192,12 +198,17 @@ def add_region_segmentation(
         f"{mask.sum():,} voxels"
     )
 
+    # Use DirectLabelColormap (napari >= 0.5.0)
+    from napari.utils import DirectLabelColormap
+
+    colormap = DirectLabelColormap(color_dict=color_dict)
+
     layer = viewer.add_labels(
         filtered,
         name=name,
         opacity=opacity,
         visible=visible,
-        color=color_dict,
+        colormap=colormap,
     )
 
     return layer
