@@ -596,6 +596,8 @@ class AnalysisTabWidget(QWidget):
         n_clusters = self._actual_n_clusters
         default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
+        n_rendered = 0
+        n_colored = 0
 
         for layer in self._viewer.layers:
             if layer.name == "Neuron Lines":
@@ -603,6 +605,8 @@ class AnalysisTabWidget(QWidget):
                 file_ids = meta.get("file_ids", [])
                 seg_counts = meta.get("segments_per_neuron", [])
                 if file_ids and seg_counts:
+                    n_rendered += len(file_ids)
+                    n_colored += sum(1 for fid in file_ids if fid in color_map)
                     parts = []
                     for fid, count in zip(file_ids, seg_counts):
                         c = color_map.get(fid, default_color)
@@ -616,6 +620,10 @@ class AnalysisTabWidget(QWidget):
                 meta = layer.metadata or {}
                 fids = meta.get("file_ids_per_point", [])
                 if fids:
+                    unique_fids = set(fids)
+                    if n_rendered == 0:
+                        n_rendered = len(unique_fids)
+                        n_colored = sum(1 for fid in unique_fids if fid in color_map)
                     colors = np.array(
                         [color_map.get(fid, default_color)[:4] for fid in fids]
                     )
@@ -626,6 +634,8 @@ class AnalysisTabWidget(QWidget):
         if self._slice_projector is not None:
             self._slice_projector.update_neuron_colors(color_map)
 
-        self._progress_label.setText(
-            f"Colored {updated} layer(s) by cluster ({n_clusters} clusters)"
-        )
+        n_gray = n_rendered - n_colored
+        msg = f"Colored {n_colored}/{n_rendered} neurons ({n_clusters} clusters)"
+        if n_gray > 0:
+            msg += f" — {n_gray} neuron(s) not in region shown in gray"
+        self._progress_label.setText(msg)
