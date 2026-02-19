@@ -77,6 +77,7 @@ class NeuronViewerWidget(QWidget):
         self._current_neuron_layers: list = []
         self._current_region_layers: list = []
         self._highlighted_file_ids: set[str] | None = None  # None = no highlight
+        self._last_soma_selection: set = set()  # track to skip no-op highlights
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -822,17 +823,22 @@ class NeuronViewerWidget(QWidget):
     def _on_soma_selected(self, event) -> None:
         """Handle point selection on the Soma Labels layer.
 
-        Maps selected point indices back to file_ids and selects the
-        corresponding rows in the neuron table.
+        The highlight event fires on every mouse hover, not just clicks.
+        We track the previous selection and only process when it actually
+        changes to avoid expensive color updates on every mouse move.
         """
         layer = event.source
-        selected_indices = list(layer.selected_data)
-        if not selected_indices:
+        current = set(layer.selected_data)
+        if current == self._last_soma_selection:
+            return
+        self._last_soma_selection = current
+
+        if not current:
             return
 
         file_ids = layer.metadata.get("file_ids", [])
         selected_fids = [
-            file_ids[i] for i in selected_indices if i < len(file_ids)
+            file_ids[i] for i in current if i < len(file_ids)
         ]
         if selected_fids:
             self._neuron_table.select_file_ids(selected_fids)
