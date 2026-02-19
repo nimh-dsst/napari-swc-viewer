@@ -674,6 +674,33 @@ class NeuronViewerWidget(QWidget):
                 )
                 self._current_neuron_layers.append(layer)
 
+        # --- Soma Labels ---
+        soma_df = self._db.get_soma_locations(file_ids)
+        if not soma_df.empty:
+            soma_coords = soma_df[["x", "y", "z"]].values
+            soma_fids = soma_df["file_id"].values.tolist()
+            soma_colors = np.array(
+                [self._neuron_table.get_color(fid)[:4] for fid in soma_fids]
+            )
+            # Use neuron_id for the label text (shorter than file_id)
+            labels = soma_df["neuron_id"].astype(str).values.tolist()
+
+            soma_layer = self.viewer.add_points(
+                soma_coords,
+                size=50,
+                face_color=soma_colors,
+                border_color="white",
+                border_width=0.05,
+                text={"string": labels, "size": 10, "color": "white"},
+                name="Soma Labels",
+                opacity=0.7,
+                scale=scale,
+                metadata={"file_ids": soma_fids},
+            )
+            soma_layer.mode = "select"
+            soma_layer.events.highlight.connect(self._on_soma_selected)
+            self._current_neuron_layers.append(soma_layer)
+
         # Re-apply cluster colors if a clustering result exists
         self._analysis_tab.apply_cluster_colors()
 
@@ -733,6 +760,15 @@ class NeuronViewerWidget(QWidget):
                     )
                     layer.face_color = colors
 
+            elif layer.name == "Soma Labels":
+                meta = layer.metadata or {}
+                fids = meta.get("file_ids", [])
+                if fids:
+                    colors = np.array(
+                        [color_map.get(fid, default_color)[:4] for fid in fids]
+                    )
+                    layer.face_color = colors
+
         # Update slice projector
         self._slice_projector.update_neuron_colors(color_map)
 
@@ -778,6 +814,24 @@ class NeuronViewerWidget(QWidget):
 
         color_map = self._build_effective_color_map()
         self._update_layer_colors(color_map)
+
+    def _on_soma_selected(self, event) -> None:
+        """Handle point selection on the Soma Labels layer.
+
+        Maps selected point indices back to file_ids and selects the
+        corresponding rows in the neuron table.
+        """
+        layer = event.source
+        selected_indices = list(layer.selected_data)
+        if not selected_indices:
+            return
+
+        file_ids = layer.metadata.get("file_ids", [])
+        selected_fids = [
+            file_ids[i] for i in selected_indices if i < len(file_ids)
+        ]
+        if selected_fids:
+            self._neuron_table.select_file_ids(selected_fids)
 
     def _on_cluster_colors_updated(self, result, color_map: dict) -> None:
         """Handle cluster color updates from the analysis tab."""

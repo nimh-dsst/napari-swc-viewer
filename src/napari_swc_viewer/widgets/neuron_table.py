@@ -262,6 +262,24 @@ class NeuronTableWidget(QWidget):
                 if item is not None:
                     item.setText(str(int(label)))
 
+    def select_file_ids(self, file_ids: list[str]) -> None:
+        """Programmatically select table rows matching *file_ids*.
+
+        Temporarily blocks the ``selection_changed`` signal to avoid
+        feedback loops (e.g. soma click → table select → signal → …).
+        """
+        self._table.blockSignals(True)
+        try:
+            self._table.clearSelection()
+            for fid in file_ids:
+                row = self._file_id_to_row(fid)
+                if row is not None:
+                    self._table.selectRow(row)
+        finally:
+            self._table.blockSignals(False)
+        # Emit once after all rows are selected
+        self.selection_changed.emit(self.get_selected_file_ids())
+
     def update_colors(self, color_map: dict[str, list[float]]) -> None:
         """Batch-update neuron colors from a color map.
 
