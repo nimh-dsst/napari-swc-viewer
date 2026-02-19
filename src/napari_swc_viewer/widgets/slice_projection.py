@@ -41,7 +41,7 @@ class NeuronSliceProjector:
         self._source_data: dict[str, tuple[np.ndarray, np.ndarray, tuple]] = {}
         self._projection_layer = None
         self._scale: list[float] | None = None
-        self._enabled = True
+        self._enabled = False
         self._connected = False
 
         # Precomputed arrays for vectorized projection (rebuilt on data change)
@@ -61,9 +61,6 @@ class NeuronSliceProjector:
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(50)  # 50ms debounce
         self._update_timer.timeout.connect(self._do_update_projection)
-
-        # Connect to viewer events immediately since we start enabled
-        self._connect_events()
 
     @property
     def tolerance(self) -> float:

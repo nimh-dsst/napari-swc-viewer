@@ -291,9 +291,17 @@ class NeuronViewerWidget(QWidget):
         slice_layout = QVBoxLayout(slice_group)
 
         self._show_slice_projection_cb = QCheckBox("Show in 2D slices")
-        self._show_slice_projection_cb.setChecked(True)
+        self._show_slice_projection_cb.setChecked(False)
         self._show_slice_projection_cb.stateChanged.connect(self._toggle_slice_projection)
         slice_layout.addWidget(self._show_slice_projection_cb)
+
+        self._slice_warning_label = QLabel(
+            "Warning: Slice navigation is slower when projection is on."
+        )
+        self._slice_warning_label.setStyleSheet("color: #cc7700; font-style: italic;")
+        self._slice_warning_label.setWordWrap(True)
+        self._slice_warning_label.setVisible(False)
+        slice_layout.addWidget(self._slice_warning_label)
 
         thickness_row = QHBoxLayout()
         thickness_row.addWidget(QLabel("Slice thickness (μm):"))
@@ -697,7 +705,9 @@ class NeuronViewerWidget(QWidget):
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
-        self._slice_projector.enabled = state == Qt.Checked
+        enabled = state == Qt.Checked
+        self._slice_projector.enabled = enabled
+        self._slice_warning_label.setVisible(enabled)
 
     def _update_slice_thickness(self, value: int) -> None:
         """Update the slice projection thickness/tolerance."""
