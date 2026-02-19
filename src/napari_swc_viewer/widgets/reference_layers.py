@@ -107,6 +107,127 @@ def add_annotation_volume(
     return layer
 
 
+def add_region_segmentation(
+    viewer: napari.Viewer,
+    atlas: BrainGlobeAtlas,
+    acronyms: list[str],
+    name: str = "Region Segmentation",
+    opacity: float = 0.3,
+    visible: bool = True,
+) -> napari.layers.Labels | None:
+    """Add a filtered annotation volume showing only selected brain regions.
+
+    Each selected region (and all its descendants in the annotation hierarchy)
+    is shown with the region's atlas-defined RGB color. Voxels outside the
+    selected regions are transparent (label 0).
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+        The napari viewer instance.
+    atlas : BrainGlobeAtlas
+        The atlas to use for annotations and structure metadata.
+    acronyms : list[str]
+        List of region acronyms to display (parent-level).
+    name : str, default="Region Segmentation"
+        Name for the layer.
+    opacity : float, default=0.3
+        Layer opacity.
+    visible : bool, default=True
+        Whether the layer is visible by default.
+
+    Returns
+    -------
+    napari.layers.Labels or None
+        The created labels layer, or None if no valid regions found.
+    """
+    if not acronyms:
+        return None
+
+    annotation = atlas.annotation
+
+    # For each selected parent acronym, collect all descendant annotation IDs
+    # and map them to the parent's atlas-defined color.
+    all_selected_ids: set[int] = set()
+    color_dict: dict[int, tuple[float, float, float]] = {}
+
+    for acronym in acronyms:
+        try:
+            structure = atlas.structures[acronym]
+        except KeyError:
+            logger.warning(f"Region '{acronym}' not found in atlas structures")
+            continue
+
+        parent_id = structure["id"]
+        rgb = structure.get("rgb_triplet", [128, 128, 128])
+        rgb_normalized = (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+
+        # Collect all descendants: any structure whose structure_id_path
+        # contains this parent_id is a descendant (or the region itself).
+        descendant_ids: set[int] = set()
+        for key, struct in atlas.structures.items():
+            if isinstance(key, int):
+                path = struct.get("structure_id_path", [])
+                if parent_id in path:
+                    descendant_ids.add(key)
+
+        all_selected_ids.update(descendant_ids)
+
+        # Map each descendant ID to the parent's color
+        for did in descendant_ids:
+            color_dict[did] = rgb_normalized
+
+    if not all_selected_ids:
+        logger.warning("No valid annotation IDs found for selected regions")
+        return None
+
+    # Build filtered annotation volume (keep only selected region voxels)
+    id_array = np.array(sorted(all_selected_ids), dtype=annotation.dtype)
+    mask = np.isin(annotation, id_array)
+    filtered = np.where(mask, annotation, np.zeros_like(annotation))
+
+    logger.info(
+        f"Region segmentation: {len(acronyms)} regions, "
+        f"{len(all_selected_ids)} annotation IDs, "
+        f"{mask.sum():,} voxels"
+    )
+
+    layer = viewer.add_labels(
+        filtered,
+        name=name,
+        opacity=opacity,
+        visible=visible,
+        color=color_dict,
+    )
+
+    return layer
+
+
+def remove_region_segmentation(
+    viewer: napari.Viewer,
+    name: str = "Region Segmentation",
+) -> bool:
+    """Remove the region segmentation layer if it exists.
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+        The napari viewer instance.
+    name : str, default="Region Segmentation"
+        The layer name to look for.
+
+    Returns
+    -------
+    bool
+        True if a layer was removed, False otherwise.
+    """
+    for layer in viewer.layers:
+        if layer.name == name:
+            viewer.layers.remove(layer)
+            return True
+    return False
+
+
 def add_region_mesh(
     viewer: napari.Viewer,
     atlas: BrainGlobeAtlas,

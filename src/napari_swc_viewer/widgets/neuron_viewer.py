@@ -42,7 +42,9 @@ from .reference_layers import (
     add_allen_template,
     add_brain_outline,
     add_region_mesh,
+    add_region_segmentation,
     remove_region_layers,
+    remove_region_segmentation,
 )
 from .analysis_tab import AnalysisTabWidget
 from .region_selector import RegionSelectorWidget
@@ -401,6 +403,26 @@ class NeuronViewerWidget(QWidget):
 
         layout.addWidget(mesh_group)
 
+        # Region Segmentation (2D)
+        seg_group = QGroupBox("Region Segmentation (2D)")
+        seg_layout = QVBoxLayout(seg_group)
+
+        self._show_region_seg_cb = QCheckBox("Show selected region segmentation")
+        self._show_region_seg_cb.setChecked(False)
+        self._show_region_seg_cb.stateChanged.connect(self._toggle_region_segmentation)
+        seg_layout.addWidget(self._show_region_seg_cb)
+
+        seg_opacity_row = QHBoxLayout()
+        seg_opacity_row.addWidget(QLabel("Opacity:"))
+        self._seg_opacity_slider = QSlider(Qt.Horizontal)
+        self._seg_opacity_slider.setRange(0, 100)
+        self._seg_opacity_slider.setValue(30)
+        self._seg_opacity_slider.valueChanged.connect(self._update_seg_opacity)
+        seg_opacity_row.addWidget(self._seg_opacity_slider)
+        seg_layout.addLayout(seg_opacity_row)
+
+        layout.addWidget(seg_group)
+
         layout.addStretch()
 
     def _load_parquet(self) -> None:
@@ -462,6 +484,13 @@ class NeuronViewerWidget(QWidget):
         # Update region meshes if enabled
         if self._show_region_meshes_cb.isChecked():
             self._update_region_meshes(acronyms)
+
+        # Update region segmentation if enabled
+        if self._show_region_seg_cb.isChecked():
+            parent_acronyms = self._region_selector.get_selected_acronyms(
+                include_children=False
+            )
+            self._update_region_segmentation(parent_acronyms)
 
     def _query_neurons_by_region(self) -> None:
         """Query neurons in selected regions."""
@@ -752,6 +781,42 @@ class NeuronViewerWidget(QWidget):
         opacity = self._mesh_opacity_slider.value() / 100.0
         for acronym in acronyms:
             add_region_mesh(self.viewer, self._atlas, acronym, opacity=opacity)
+
+    def _toggle_region_segmentation(self, state: int) -> None:
+        """Toggle region segmentation visibility."""
+        if state == Qt.Checked:
+            acronyms = self._region_selector.get_selected_acronyms(include_children=False)
+            self._update_region_segmentation(acronyms)
+        else:
+            remove_region_segmentation(self.viewer)
+
+    def _update_region_segmentation(self, acronyms: list[str]) -> None:
+        """Update the region segmentation layer for selected regions."""
+        if self._atlas is None:
+            self._load_atlas()
+            if self._atlas is None:
+                return
+
+        remove_region_segmentation(self.viewer)
+
+        if not self._show_region_seg_cb.isChecked():
+            return
+
+        if not acronyms:
+            return
+
+        opacity = self._seg_opacity_slider.value() / 100.0
+        add_region_segmentation(
+            self.viewer, self._atlas, acronyms, opacity=opacity
+        )
+
+    def _update_seg_opacity(self, value: int) -> None:
+        """Update the region segmentation layer opacity."""
+        opacity = value / 100.0
+        for layer in self.viewer.layers:
+            if layer.name == "Region Segmentation":
+                layer.opacity = opacity
+                break
 
     def _on_ndisplay_changed(self, event) -> None:
         """Auto-hide neuron line/point layers in 2D to keep slice scrubbing fast."""
