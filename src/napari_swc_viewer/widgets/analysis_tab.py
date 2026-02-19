@@ -467,12 +467,22 @@ class AnalysisTabWidget(QWidget):
         """Draw a seaborn clustermap into the embedded canvas."""
         self._figure.clear()
 
+        # Build per-neuron cluster color strip for row_colors / col_colors
+        cluster_colors = None
+        if self._cluster_color_map is not None:
+            cluster_colors = [
+                self._cluster_color_map.get(nid, [0.5, 0.5, 0.5, 1.0])[:3]
+                for nid in result.neuron_ids
+            ]
+
         # Use seaborn clustermap with precomputed linkage
         try:
             g = sns.clustermap(
                 result.distance_matrix,
                 row_linkage=result.linkage_matrix,
                 col_linkage=result.linkage_matrix,
+                row_colors=cluster_colors,
+                col_colors=cluster_colors,
                 cmap="coolwarm",
                 center=0,
                 figsize=(6, 6),
