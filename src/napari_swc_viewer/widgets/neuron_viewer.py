@@ -89,6 +89,9 @@ class NeuronViewerWidget(QWidget):
         # Auto-hide neuron line layers in 2D mode
         self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
 
+        # Load reference template after the widget is fully initialized
+        QTimer.singleShot(0, lambda: self._toggle_template(Qt.Checked))
+
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
         layout = QVBoxLayout(self)
@@ -353,7 +356,7 @@ class NeuronViewerWidget(QWidget):
         template_layout = QVBoxLayout(template_group)
 
         self._show_template_cb = QCheckBox("Show template")
-        self._show_template_cb.setChecked(False)
+        self._show_template_cb.setChecked(True)
         self._show_template_cb.stateChanged.connect(self._toggle_template)
         template_layout.addWidget(self._show_template_cb)
 
