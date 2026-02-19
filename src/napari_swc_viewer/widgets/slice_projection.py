@@ -468,16 +468,17 @@ class NeuronSliceProjector:
                     break
 
         if self._projection_layer is None:
-            # Create new layer
+            # Create new layer — set edge_color after creation so napari
+            # correctly enters DIRECT color mode for per-vector colors.
             self._projection_layer = self._viewer.add_vectors(
                 lines,
                 edge_width=self._edge_width,
-                edge_color=colors,
                 name=layer_name,
                 opacity=1.0,
                 scale=self._scale,
                 vector_style="line",
             )
+            self._projection_layer.edge_color = colors
         else:
             # Update existing layer
             self._projection_layer.data = lines
