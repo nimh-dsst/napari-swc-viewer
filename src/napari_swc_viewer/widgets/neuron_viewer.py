@@ -19,6 +19,7 @@ from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info
 from qtpy.QtCore import Qt, QThread
 from qtpy.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -220,6 +221,13 @@ class NeuronViewerWidget(QWidget):
         neuron_btn_row.addWidget(self._clear_neurons_btn)
 
         neurons_layout.addLayout(neuron_btn_row)
+
+        self._render_progress = QProgressBar()
+        self._render_progress.setVisible(False)
+        neurons_layout.addWidget(self._render_progress)
+
+        self._render_status_label = QLabel("")
+        neurons_layout.addWidget(self._render_status_label)
 
         layout.addWidget(neurons_group)
         layout.addStretch()
@@ -488,6 +496,15 @@ class NeuronViewerWidget(QWidget):
             return
 
         file_ids = [item.data(Qt.UserRole) for item in selected_items]
+        n = len(file_ids)
+
+        # Show progress UI
+        self._render_btn.setEnabled(False)
+        self._render_progress.setRange(0, n)
+        self._render_progress.setValue(0)
+        self._render_progress.setVisible(True)
+        self._render_status_label.setText(f"Querying {n} neurons...")
+        QApplication.processEvents()
 
         # Clear existing neuron layers
         self._clear_neuron_layers()
@@ -496,7 +513,6 @@ class NeuronViewerWidget(QWidget):
         opacity = self._opacity_slider.value() / 100.0
 
         # Sample turbo colormap at regular intervals for per-neuron colors
-        n = len(file_ids)
         cmap = plt.get_cmap("turbo")
         neuron_colors = [list(cmap(t)) for t in np.linspace(0, 1, n)]
 
@@ -510,13 +526,16 @@ class NeuronViewerWidget(QWidget):
             # Single batch query for all neurons
             all_data = self._db.get_neuron_lines_batch(file_ids)
 
+            self._render_status_label.setText(f"Building line segments for {n} neurons...")
+            QApplication.processEvents()
+
             all_lines = []
             all_edge_colors = []
             projector_batch = {}
             rendered_file_ids = []
             segments_per_neuron = []
 
-            for file_id, color in zip(file_ids, neuron_colors):
+            for i, (file_id, color) in enumerate(zip(file_ids, neuron_colors)):
                 if file_id not in all_data:
                     continue
                 coords, edges = all_data[file_id]
@@ -537,9 +556,20 @@ class NeuronViewerWidget(QWidget):
                 rendered_file_ids.append(file_id)
                 segments_per_neuron.append(len(edges))
 
+                self._render_progress.setValue(i + 1)
+                if (i + 1) % 10 == 0:
+                    QApplication.processEvents()
+
             if all_lines:
                 merged_lines = np.concatenate(all_lines)
                 merged_colors = np.concatenate(all_edge_colors)
+
+                total_segs = len(merged_lines)
+                self._render_status_label.setText(
+                    f"Adding {total_segs:,} line segments to viewer..."
+                )
+                self._render_progress.setRange(0, 0)  # indeterminate
+                QApplication.processEvents()
 
                 layer = self.viewer.add_shapes(
                     merged_lines,
@@ -562,10 +592,19 @@ class NeuronViewerWidget(QWidget):
 
         # --- Points ---
         if render_mode in ("Points", "Both"):
+            self._render_status_label.setText("Querying point data...")
+            self._render_progress.setRange(0, 0)  # indeterminate
+            QApplication.processEvents()
+
             # Single batch query for all neurons
             df = self._db.get_neurons_for_rendering(file_ids)
 
             if not df.empty:
+                self._render_status_label.setText(
+                    f"Adding {len(df):,} points to viewer..."
+                )
+                QApplication.processEvents()
+
                 coords = df[["x", "y", "z"]].values
 
                 if self._color_by_type_cb.isChecked():
@@ -603,6 +642,11 @@ class NeuronViewerWidget(QWidget):
 
         # Re-apply cluster colors if a clustering result exists
         self._analysis_tab.apply_cluster_colors()
+
+        # Hide progress UI
+        self._render_progress.setVisible(False)
+        self._render_status_label.setText(f"Rendered {n} neurons.")
+        self._render_btn.setEnabled(True)
 
     def _clear_neuron_layers(self) -> None:
         """Remove all current neuron layers."""
