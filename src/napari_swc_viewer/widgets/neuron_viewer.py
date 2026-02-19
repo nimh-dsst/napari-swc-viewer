@@ -752,12 +752,22 @@ class NeuronViewerWidget(QWidget):
 
     def _on_ndisplay_changed(self, event) -> None:
         """Auto-hide neuron line/point layers in 2D to keep slice scrubbing fast."""
+        if not self._current_neuron_layers:
+            return
+
         is_2d = self.viewer.dims.ndisplay == 2
-        for layer in self._current_neuron_layers:
-            if is_2d:
+        if is_2d:
+            self._render_status_label.setText("Switching to 2D view...")
+            QApplication.processEvents()
+            for layer in self._current_neuron_layers:
                 layer.visible = False
-            else:
+            self._render_status_label.setText("")
+        else:
+            self._render_status_label.setText("Rendering 3D neuron layers...")
+            QApplication.processEvents()
+            for layer in self._current_neuron_layers:
                 layer.visible = True
+            self._render_status_label.setText("")
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
