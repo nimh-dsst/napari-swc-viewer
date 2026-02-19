@@ -698,6 +698,10 @@ class NeuronViewerWidget(QWidget):
                 metadata={"file_ids": soma_fids},
             )
             soma_layer.mode = "select"
+            # Disable point movement — select mode allows clicking to
+            # select but dragging would move points; override _move to
+            # prevent that.
+            soma_layer._move = lambda indices, position: None
             soma_layer.events.highlight.connect(self._on_soma_selected)
             self._current_neuron_layers.append(soma_layer)
 
