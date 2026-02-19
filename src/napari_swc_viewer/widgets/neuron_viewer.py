@@ -677,6 +677,12 @@ class NeuronViewerWidget(QWidget):
         # Re-apply cluster colors if a clustering result exists
         self._analysis_tab.apply_cluster_colors()
 
+        # Hide neuron layers if currently in 2D mode (the ndisplay event
+        # only fires on *changes*, so layers added while already in 2D
+        # would otherwise stay visible).
+        if self.viewer.dims.ndisplay == 2:
+            self._apply_layer_visibility(False)
+
         # Hide progress UI
         self._render_progress.setVisible(False)
         self._render_status_label.setText(f"Rendered {n} neurons.")
