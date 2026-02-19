@@ -17,8 +17,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info
-from qtpy.QtCore import Qt, QThread
+from qtpy.QtCore import Qt, QThread, QTimer
 from qtpy.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -84,6 +85,12 @@ class NeuronViewerWidget(QWidget):
         self._convert_worker = None
 
         self._setup_ui()
+
+        # Auto-hide neuron line layers in 2D mode
+        self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+
+        # Load reference template after the widget is fully initialized
+        QTimer.singleShot(0, lambda: self._toggle_template(Qt.Checked))
 
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
@@ -218,6 +225,13 @@ class NeuronViewerWidget(QWidget):
 
         neurons_layout.addLayout(neuron_btn_row)
 
+        self._render_progress = QProgressBar()
+        self._render_progress.setVisible(False)
+        neurons_layout.addWidget(self._render_progress)
+
+        self._render_status_label = QLabel("")
+        neurons_layout.addWidget(self._render_status_label)
+
         layout.addWidget(neurons_group)
         layout.addStretch()
 
@@ -291,9 +305,17 @@ class NeuronViewerWidget(QWidget):
         slice_layout = QVBoxLayout(slice_group)
 
         self._show_slice_projection_cb = QCheckBox("Show in 2D slices")
-        self._show_slice_projection_cb.setChecked(True)
+        self._show_slice_projection_cb.setChecked(False)
         self._show_slice_projection_cb.stateChanged.connect(self._toggle_slice_projection)
         slice_layout.addWidget(self._show_slice_projection_cb)
+
+        self._slice_warning_label = QLabel(
+            "Warning: Slice navigation is slower when projection is on."
+        )
+        self._slice_warning_label.setStyleSheet("color: #cc7700; font-style: italic;")
+        self._slice_warning_label.setWordWrap(True)
+        self._slice_warning_label.setVisible(False)
+        slice_layout.addWidget(self._slice_warning_label)
 
         thickness_row = QHBoxLayout()
         thickness_row.addWidget(QLabel("Slice thickness (μm):"))
@@ -334,7 +356,7 @@ class NeuronViewerWidget(QWidget):
         template_layout = QVBoxLayout(template_group)
 
         self._show_template_cb = QCheckBox("Show template")
-        self._show_template_cb.setChecked(False)
+        self._show_template_cb.setChecked(True)
         self._show_template_cb.stateChanged.connect(self._toggle_template)
         template_layout.addWidget(self._show_template_cb)
 
@@ -477,6 +499,15 @@ class NeuronViewerWidget(QWidget):
             return
 
         file_ids = [item.data(Qt.UserRole) for item in selected_items]
+        n = len(file_ids)
+
+        # Show progress UI
+        self._render_btn.setEnabled(False)
+        self._render_progress.setRange(0, n)
+        self._render_progress.setValue(0)
+        self._render_progress.setVisible(True)
+        self._render_status_label.setText(f"Querying {n} neurons...")
+        QApplication.processEvents()
 
         # Clear existing neuron layers
         self._clear_neuron_layers()
@@ -485,7 +516,6 @@ class NeuronViewerWidget(QWidget):
         opacity = self._opacity_slider.value() / 100.0
 
         # Sample turbo colormap at regular intervals for per-neuron colors
-        n = len(file_ids)
         cmap = plt.get_cmap("turbo")
         neuron_colors = [list(cmap(t)) for t in np.linspace(0, 1, n)]
 
@@ -499,13 +529,16 @@ class NeuronViewerWidget(QWidget):
             # Single batch query for all neurons
             all_data = self._db.get_neuron_lines_batch(file_ids)
 
+            self._render_status_label.setText(f"Building line segments for {n} neurons...")
+            QApplication.processEvents()
+
             all_lines = []
             all_edge_colors = []
             projector_batch = {}
             rendered_file_ids = []
             segments_per_neuron = []
 
-            for file_id, color in zip(file_ids, neuron_colors):
+            for i, (file_id, color) in enumerate(zip(file_ids, neuron_colors)):
                 if file_id not in all_data:
                     continue
                 coords, edges = all_data[file_id]
@@ -526,9 +559,20 @@ class NeuronViewerWidget(QWidget):
                 rendered_file_ids.append(file_id)
                 segments_per_neuron.append(len(edges))
 
+                self._render_progress.setValue(i + 1)
+                if (i + 1) % 10 == 0:
+                    QApplication.processEvents()
+
             if all_lines:
                 merged_lines = np.concatenate(all_lines)
                 merged_colors = np.concatenate(all_edge_colors)
+
+                total_segs = len(merged_lines)
+                self._render_status_label.setText(
+                    f"Adding {total_segs:,} line segments to viewer..."
+                )
+                self._render_progress.setRange(0, 0)  # indeterminate
+                QApplication.processEvents()
 
                 layer = self.viewer.add_shapes(
                     merged_lines,
@@ -551,10 +595,19 @@ class NeuronViewerWidget(QWidget):
 
         # --- Points ---
         if render_mode in ("Points", "Both"):
+            self._render_status_label.setText("Querying point data...")
+            self._render_progress.setRange(0, 0)  # indeterminate
+            QApplication.processEvents()
+
             # Single batch query for all neurons
             df = self._db.get_neurons_for_rendering(file_ids)
 
             if not df.empty:
+                self._render_status_label.setText(
+                    f"Adding {len(df):,} points to viewer..."
+                )
+                QApplication.processEvents()
+
                 coords = df[["x", "y", "z"]].values
 
                 if self._color_by_type_cb.isChecked():
@@ -592,6 +645,11 @@ class NeuronViewerWidget(QWidget):
 
         # Re-apply cluster colors if a clustering result exists
         self._analysis_tab.apply_cluster_colors()
+
+        # Hide progress UI
+        self._render_progress.setVisible(False)
+        self._render_status_label.setText(f"Rendered {n} neurons.")
+        self._render_btn.setEnabled(True)
 
     def _clear_neuron_layers(self) -> None:
         """Remove all current neuron layers."""
@@ -695,9 +753,30 @@ class NeuronViewerWidget(QWidget):
         for acronym in acronyms:
             add_region_mesh(self.viewer, self._atlas, acronym, opacity=opacity)
 
+    def _on_ndisplay_changed(self, event) -> None:
+        """Auto-hide neuron line/point layers in 2D to keep slice scrubbing fast."""
+        if not self._current_neuron_layers:
+            return
+
+        is_2d = self.viewer.dims.ndisplay == 2
+        if is_2d:
+            self.viewer.status = "Switching to 2D view..."
+        else:
+            self.viewer.status = "Rendering 3D neuron layers..."
+        # Defer the heavy work so the status bar paints first
+        QTimer.singleShot(0, lambda: self._apply_layer_visibility(not is_2d))
+
+    def _apply_layer_visibility(self, visible: bool) -> None:
+        """Set visibility on all neuron layers and clear the status message."""
+        for layer in self._current_neuron_layers:
+            layer.visible = visible
+        self.viewer.status = "Ready"
+
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
-        self._slice_projector.enabled = state == Qt.Checked
+        enabled = state == Qt.Checked
+        self._slice_projector.enabled = enabled
+        self._slice_warning_label.setVisible(enabled)
 
     def _update_slice_thickness(self, value: int) -> None:
         """Update the slice projection thickness/tolerance."""

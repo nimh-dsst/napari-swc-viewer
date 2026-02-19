@@ -206,5 +206,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# setuptools-scm generated version file
+src/napari_swc_viewer/_version.py
+
 # Test data (downloaded SWC files)
 test_data/
+
+# Benchmark data (downloaded/generated neuron files)
+benchmark_data/
