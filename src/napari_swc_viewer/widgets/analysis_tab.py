@@ -66,6 +66,7 @@ class AnalysisTabWidget(QWidget):
         self._actual_n_clusters: int = 0
         self._heatmap_layer = None
         self._pending_heatmap_cluster: int | None = None  # cluster label for in-flight heatmap
+        self._pending_heatmap_region: str | None = None  # region acronym for in-flight heatmap
         self._slice_projector = None
         self._setup_ui()
 
@@ -384,6 +385,7 @@ class AnalysisTabWidget(QWidget):
         from ..workers import HeatmapWorker
 
         region = self._heat_region_combo.currentText().strip() or None
+        self._pending_heatmap_region = region
 
         # Determine cluster filter
         file_ids = None
@@ -468,20 +470,24 @@ class AnalysisTabWidget(QWidget):
         self._update_button_states()
 
         cluster_label = self._pending_heatmap_cluster
+        region = self._pending_heatmap_region
         self._pending_heatmap_cluster = None
+        self._pending_heatmap_region = None
+
+        region_part = f" {region}" if region else ""
 
         if cluster_label is not None:
             # Cluster-specific heatmap with derived colormap
             rgba = self._cluster_label_colors.get(
                 cluster_label, [0.5, 0.5, 0.5, 1.0]
             )
-            layer_name = f"Cluster {cluster_label} Heatmap"
+            layer_name = f"Cluster {cluster_label}{region_part} Heatmap"
             colormap = Colormap(
                 colors=[[0, 0, 0, 0], [rgba[0], rgba[1], rgba[2], 1.0]],
                 name=f"cluster_{cluster_label}",
             )
         else:
-            layer_name = "Node Count Heatmap"
+            layer_name = f"Node Count{region_part} Heatmap"
             colormap = "hot"
 
         self._progress_label.setText(
