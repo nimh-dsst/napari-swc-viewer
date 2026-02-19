@@ -757,17 +757,17 @@ class NeuronViewerWidget(QWidget):
 
         is_2d = self.viewer.dims.ndisplay == 2
         if is_2d:
-            self._render_status_label.setText("Switching to 2D view...")
+            self.viewer.status = "Switching to 2D view..."
             QApplication.processEvents()
             for layer in self._current_neuron_layers:
                 layer.visible = False
-            self._render_status_label.setText("")
+            self.viewer.status = "Ready"
         else:
-            self._render_status_label.setText("Rendering 3D neuron layers...")
+            self.viewer.status = "Rendering 3D neuron layers..."
             QApplication.processEvents()
             for layer in self._current_neuron_layers:
                 layer.visible = True
-            self._render_status_label.setText("")
+            self.viewer.status = "Ready"
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
