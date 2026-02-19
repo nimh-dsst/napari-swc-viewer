@@ -21,6 +21,7 @@ from matplotlib.figure import Figure
 from qtpy.QtCore import QThread, Qt
 from qtpy.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -97,9 +98,32 @@ class AnalysisTabWidget(QWidget):
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
-        # --- Correlation Clustering group ---
-        corr_group = QGroupBox("Correlation Clustering")
+        # --- Clustering group ---
+        corr_group = QGroupBox("Clustering")
         corr_layout = QVBoxLayout(corr_group)
+
+        # Clustering method
+        method_type_row = QHBoxLayout()
+        method_type_row.addWidget(QLabel("Method:"))
+        self._clustering_method_combo = QComboBox()
+        self._clustering_method_combo.addItems(["Voxel Correlation", "Soma Location"])
+        self._clustering_method_combo.currentTextChanged.connect(
+            self._on_clustering_method_changed
+        )
+        method_type_row.addWidget(self._clustering_method_combo)
+        corr_layout.addLayout(method_type_row)
+
+        # Algorithm (only for Soma Location)
+        self._algorithm_row = QHBoxLayout()
+        self._algorithm_label = QLabel("Algorithm:")
+        self._algorithm_row.addWidget(self._algorithm_label)
+        self._algorithm_combo = QComboBox()
+        self._algorithm_combo.addItems(["Hierarchical", "K-Means", "DBSCAN"])
+        self._algorithm_combo.currentTextChanged.connect(
+            self._on_algorithm_changed
+        )
+        self._algorithm_row.addWidget(self._algorithm_combo)
+        corr_layout.addLayout(self._algorithm_row)
 
         # Target region
         region_row = QHBoxLayout()
@@ -121,26 +145,50 @@ class AnalysisTabWidget(QWidget):
         corr_layout.addLayout(dilation_row)
 
         # Linkage method
-        method_row = QHBoxLayout()
-        method_row.addWidget(QLabel("Linkage:"))
+        self._linkage_row = QHBoxLayout()
+        self._linkage_label = QLabel("Linkage:")
+        self._linkage_row.addWidget(self._linkage_label)
         self._method_combo = QComboBox()
         self._method_combo.addItems(["average", "ward", "complete", "single"])
-        method_row.addWidget(self._method_combo)
-        corr_layout.addLayout(method_row)
+        self._linkage_row.addWidget(self._method_combo)
+        corr_layout.addLayout(self._linkage_row)
 
         # Number of clusters
-        clusters_row = QHBoxLayout()
-        clusters_row.addWidget(QLabel("Clusters:"))
+        self._clusters_row = QHBoxLayout()
+        self._clusters_label = QLabel("Clusters:")
+        self._clusters_row.addWidget(self._clusters_label)
         self._n_clusters_spin = QSpinBox()
         self._n_clusters_spin.setRange(2, 50)
         self._n_clusters_spin.setValue(5)
-        clusters_row.addWidget(self._n_clusters_spin)
-        corr_layout.addLayout(clusters_row)
+        self._clusters_row.addWidget(self._n_clusters_spin)
+        corr_layout.addLayout(self._clusters_row)
+
+        # DBSCAN eps
+        self._eps_row = QHBoxLayout()
+        self._eps_label = QLabel("Eps (μm):")
+        self._eps_row.addWidget(self._eps_label)
+        self._eps_spin = QDoubleSpinBox()
+        self._eps_spin.setRange(1.0, 10000.0)
+        self._eps_spin.setValue(100.0)
+        self._eps_spin.setSuffix(" μm")
+        self._eps_spin.setDecimals(1)
+        self._eps_row.addWidget(self._eps_spin)
+        corr_layout.addLayout(self._eps_row)
+
+        # DBSCAN min_samples
+        self._min_samples_row = QHBoxLayout()
+        self._min_samples_label = QLabel("Min samples:")
+        self._min_samples_row.addWidget(self._min_samples_label)
+        self._min_samples_spin = QSpinBox()
+        self._min_samples_spin.setRange(1, 100)
+        self._min_samples_spin.setValue(5)
+        self._min_samples_row.addWidget(self._min_samples_spin)
+        corr_layout.addLayout(self._min_samples_row)
 
         # Run button
-        self._run_corr_btn = QPushButton("Compute Correlation + Cluster")
+        self._run_corr_btn = QPushButton("Run Clustering")
         self._run_corr_btn.setEnabled(False)
-        self._run_corr_btn.clicked.connect(self._run_correlation_pipeline)
+        self._run_corr_btn.clicked.connect(self._run_clustering_pipeline)
         corr_layout.addWidget(self._run_corr_btn)
 
         # Color neurons by cluster
@@ -150,6 +198,9 @@ class AnalysisTabWidget(QWidget):
         corr_layout.addWidget(self._color_by_cluster_btn)
 
         layout.addWidget(corr_group)
+
+        # Set initial visibility
+        self._on_clustering_method_changed(self._clustering_method_combo.currentText())
 
         # --- Node Count Heatmap group ---
         heat_group = QGroupBox("Node Count Heatmap")
@@ -185,15 +236,48 @@ class AnalysisTabWidget(QWidget):
 
         layout.addStretch()
 
-    def _run_correlation_pipeline(self) -> None:
-        """Start the correlation + clustering pipeline in a background thread."""
+    def _on_clustering_method_changed(self, text: str) -> None:
+        """Show/hide UI rows based on the selected clustering method."""
+        is_soma = text == "Soma Location"
+
+        # Algorithm row: only for soma
+        self._algorithm_label.setVisible(is_soma)
+        self._algorithm_combo.setVisible(is_soma)
+
+        if is_soma:
+            self._on_algorithm_changed(self._algorithm_combo.currentText())
+        else:
+            # Voxel Correlation: show linkage + clusters, hide DBSCAN params
+            self._linkage_label.setVisible(True)
+            self._method_combo.setVisible(True)
+            self._clusters_label.setVisible(True)
+            self._n_clusters_spin.setVisible(True)
+            self._eps_label.setVisible(False)
+            self._eps_spin.setVisible(False)
+            self._min_samples_label.setVisible(False)
+            self._min_samples_spin.setVisible(False)
+
+    def _on_algorithm_changed(self, text: str) -> None:
+        """Show/hide UI rows based on the selected soma algorithm."""
+        is_dbscan = text == "DBSCAN"
+        is_hierarchical = text == "Hierarchical"
+
+        self._linkage_label.setVisible(is_hierarchical)
+        self._method_combo.setVisible(is_hierarchical)
+        self._clusters_label.setVisible(not is_dbscan)
+        self._n_clusters_spin.setVisible(not is_dbscan)
+        self._eps_label.setVisible(is_dbscan)
+        self._eps_spin.setVisible(is_dbscan)
+        self._min_samples_label.setVisible(is_dbscan)
+        self._min_samples_spin.setVisible(is_dbscan)
+
+    def _run_clustering_pipeline(self) -> None:
+        """Start the appropriate clustering pipeline in a background thread."""
         if self._db is None or self._atlas is None:
             return
 
         if self._worker_thread is not None and self._worker_thread.isRunning():
             return
-
-        from ..workers import CorrelationWorker
 
         region = self._region_combo.currentText().strip()
         if not region:
@@ -201,6 +285,17 @@ class AnalysisTabWidget(QWidget):
             return
 
         dilation = self._dilation_spin.value() / 100.0
+        clustering_method = self._clustering_method_combo.currentText()
+
+        if clustering_method == "Soma Location":
+            self._run_soma_clustering(region, dilation)
+        else:
+            self._run_correlation_clustering(region, dilation)
+
+    def _run_correlation_clustering(self, region: str, dilation: float) -> None:
+        """Start the voxel correlation + clustering pipeline."""
+        from ..workers import CorrelationWorker
+
         method = self._method_combo.currentText()
         n_clusters = self._n_clusters_spin.value()
 
@@ -213,6 +308,36 @@ class AnalysisTabWidget(QWidget):
             n_clusters=n_clusters,
         )
 
+        self._start_worker(worker)
+
+    def _run_soma_clustering(self, region: str, dilation: float) -> None:
+        """Start the soma-location clustering pipeline."""
+        from ..workers import SomaClusterWorker
+
+        algorithm_text = self._algorithm_combo.currentText()
+        algorithm_map = {
+            "Hierarchical": "hierarchical",
+            "K-Means": "kmeans",
+            "DBSCAN": "dbscan",
+        }
+        algorithm = algorithm_map[algorithm_text]
+
+        worker = SomaClusterWorker(
+            parquet_path=self._parquet_path,
+            atlas=self._atlas,
+            region_acronym=region,
+            dilation_fraction=dilation,
+            algorithm=algorithm,
+            linkage_method=self._method_combo.currentText(),
+            n_clusters=self._n_clusters_spin.value(),
+            eps=self._eps_spin.value(),
+            min_samples=self._min_samples_spin.value(),
+        )
+
+        self._start_worker(worker)
+
+    def _start_worker(self, worker) -> None:
+        """Wire up and start a clustering worker in a background thread."""
         thread = QThread()
         worker.moveToThread(thread)
 

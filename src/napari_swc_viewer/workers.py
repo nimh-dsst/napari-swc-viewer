@@ -191,6 +191,160 @@ class CorrelationWorker(QObject):
             self.error.emit(str(e))
 
 
+class SomaClusterWorker(QObject):
+    """Cluster neurons by soma location in a background thread.
+
+    Steps:
+    1. Build expanded region mask
+    2. Query soma locations from parquet
+    3. Filter somas to those inside the expanded region
+    4. Cluster using the chosen algorithm
+
+    Signals
+    -------
+    progress(str, int, int)
+        (step_name, current_step, total_steps)
+    finished(ClusterResult)
+        Emitted with the clustering result on success.
+    error(str)
+        Emitted with error message on failure.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        parquet_path: str,
+        atlas: BrainGlobeAtlas,
+        region_acronym: str,
+        dilation_fraction: float = 0.2,
+        algorithm: str = "hierarchical",
+        linkage_method: str = "ward",
+        n_clusters: int = 5,
+        eps: float = 100.0,
+        min_samples: int = 5,
+    ):
+        super().__init__()
+        self._parquet_path = parquet_path
+        self._atlas = atlas
+        self._region_acronym = region_acronym
+        self._dilation_fraction = dilation_fraction
+        self._algorithm = algorithm
+        self._linkage_method = linkage_method
+        self._n_clusters = n_clusters
+        self._eps = eps
+        self._min_samples = min_samples
+
+    def run(self) -> None:
+        """Execute the soma clustering pipeline."""
+        try:
+            import duckdb
+
+            from .analysis.clustering import (
+                cluster_somas_dbscan,
+                cluster_somas_hierarchical,
+                cluster_somas_kmeans,
+            )
+            from .analysis.mask import get_expanded_region_voxel_ids
+
+            total = 4
+            self.progress.emit("Extracting and dilating region mask...", 1, total)
+            voxel_id_map = get_expanded_region_voxel_ids(
+                self._atlas,
+                self._region_acronym,
+                self._dilation_fraction,
+            )
+
+            self.progress.emit("Querying soma locations...", 2, total)
+            resolution = float(self._atlas.resolution[0])
+            parquet_escaped = str(self._parquet_path).replace("\\", "/")
+            Z, Y, X = voxel_id_map.shape
+
+            conn = duckdb.connect()
+            try:
+                # Query soma locations (type=1) grouped by file
+                soma_df = conn.execute(f"""
+                    SELECT
+                        file_id,
+                        AVG(x) AS x, AVG(y) AS y, AVG(z) AS z
+                    FROM read_parquet('{parquet_escaped}')
+                    WHERE type = 1
+                    GROUP BY file_id
+                    ORDER BY file_id
+                """).fetchdf()
+            finally:
+                conn.close()
+
+            if soma_df.empty:
+                self.error.emit("No soma nodes found in the dataset.")
+                return
+
+            # Convert soma coordinates to voxel indices and filter to region
+            coords = soma_df[["x", "y", "z"]].values
+            # Axis mapping matches correlation.py: x->zi, y->yi, z->xi
+            zi = np.floor(coords[:, 0] / resolution).astype(int)
+            yi = np.floor(coords[:, 1] / resolution).astype(int)
+            xi = np.floor(coords[:, 2] / resolution).astype(int)
+
+            in_bounds = (
+                (xi >= 0) & (xi < X)
+                & (yi >= 0) & (yi < Y)
+                & (zi >= 0) & (zi < Z)
+            )
+            voxel_ids = np.full(len(coords), -1, dtype=np.int32)
+            voxel_ids[in_bounds] = voxel_id_map[
+                zi[in_bounds], yi[in_bounds], xi[in_bounds]
+            ]
+            in_region = voxel_ids >= 0
+
+            filtered_coords = coords[in_region]
+            filtered_ids = soma_df["file_id"].values[in_region].tolist()
+
+            logger.info(
+                f"Soma filtering: {len(coords)} total somas, "
+                f"{len(filtered_ids)} in region '{self._region_acronym}'"
+            )
+
+            if len(filtered_ids) < 2:
+                self.error.emit(
+                    f"Only {len(filtered_ids)} soma(s) found in "
+                    f"'{self._region_acronym}' — need at least 2 for clustering."
+                )
+                return
+
+            self.progress.emit(f"Clustering {len(filtered_ids)} somas ({self._algorithm})...", 3, total)
+
+            if self._algorithm == "hierarchical":
+                result = cluster_somas_hierarchical(
+                    filtered_coords, filtered_ids,
+                    method=self._linkage_method,
+                    n_clusters=self._n_clusters,
+                )
+            elif self._algorithm == "kmeans":
+                result = cluster_somas_kmeans(
+                    filtered_coords, filtered_ids,
+                    n_clusters=self._n_clusters,
+                )
+            elif self._algorithm == "dbscan":
+                result = cluster_somas_dbscan(
+                    filtered_coords, filtered_ids,
+                    eps=self._eps,
+                    min_samples=self._min_samples,
+                )
+            else:
+                self.error.emit(f"Unknown algorithm: {self._algorithm}")
+                return
+
+            self.progress.emit("Done", 4, total)
+            self.finished.emit(result)
+
+        except Exception as e:
+            logger.exception("Soma clustering pipeline failed")
+            self.error.emit(str(e))
+
+
 class HeatmapWorker(QObject):
     """Build a node-count heatmap volume in the background.
 

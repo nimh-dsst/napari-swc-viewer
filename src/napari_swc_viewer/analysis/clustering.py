@@ -3,6 +3,9 @@
 Ported from swc-mapper/compare_cluster_grids.py. Provides clustering
 of neurons based on their pairwise correlation matrix, plus tools for
 comparing different clustering solutions.
+
+Also provides soma-location-based clustering using hierarchical,
+k-means, and DBSCAN algorithms.
 """
 
 from __future__ import annotations
@@ -12,8 +15,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.cluster.hierarchy import cophenet, fcluster, linkage
-from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import cophenet, fcluster, leaves_list, linkage
+from scipy.spatial.distance import pdist, squareform
 from scipy.stats import spearmanr
 
 if TYPE_CHECKING:
@@ -104,8 +107,6 @@ def compute_clustermap_data(
     actual_k = int(len(np.unique(labels)))
 
     # Get dendrogram leaf order (reorder indices)
-    from scipy.cluster.hierarchy import leaves_list
-
     reorder = leaves_list(Z)
 
     if actual_k < n_clusters:
@@ -210,3 +211,175 @@ def compare_partitions(
         results.append((k, float(ari), float(nmi)))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Soma-location clustering
+# ---------------------------------------------------------------------------
+
+
+def _euclidean_distance_matrix(
+    coords: NDArray[np.float64],
+) -> NDArray[np.float32]:
+    """Compute a square Euclidean distance matrix from 3-D coordinates.
+
+    Parameters
+    ----------
+    coords : NDArray[np.float64]
+        (N, 3) array of soma coordinates in microns.
+
+    Returns
+    -------
+    NDArray[np.float32]
+        (N, N) symmetric distance matrix with zero diagonal.
+    """
+    return squareform(pdist(coords, metric="euclidean")).astype(np.float32)
+
+
+def cluster_somas_hierarchical(
+    coords: NDArray[np.float64],
+    neuron_ids: list[str],
+    method: str = "ward",
+    n_clusters: int = 5,
+) -> ClusterResult:
+    """Cluster neurons by soma location using hierarchical clustering.
+
+    Parameters
+    ----------
+    coords : NDArray[np.float64]
+        (N, 3) soma coordinates in microns.
+    neuron_ids : list[str]
+        Neuron identifiers matching rows of *coords*.
+    method : str
+        Linkage method (ward, average, complete, single).
+    n_clusters : int
+        Number of flat clusters to extract.
+
+    Returns
+    -------
+    ClusterResult
+    """
+    dist = _euclidean_distance_matrix(coords)
+    Z = compute_linkage(dist, method=method)
+    labels = fcluster(Z, t=n_clusters, criterion="maxclust").astype(np.int32)
+    reorder = leaves_list(Z)
+
+    actual_k = int(len(np.unique(labels)))
+    logger.info(
+        f"Soma hierarchical clustering: {len(neuron_ids)} neurons, "
+        f"{actual_k} clusters, method={method}"
+    )
+
+    return ClusterResult(
+        correlation_matrix=dist,
+        distance_matrix=dist,
+        linkage_matrix=Z,
+        neuron_ids=neuron_ids,
+        reorder_indices=reorder,
+        labels=labels,
+    )
+
+
+def cluster_somas_kmeans(
+    coords: NDArray[np.float64],
+    neuron_ids: list[str],
+    n_clusters: int = 5,
+) -> ClusterResult:
+    """Cluster neurons by soma location using k-means.
+
+    Requires scikit-learn.
+
+    Parameters
+    ----------
+    coords : NDArray[np.float64]
+        (N, 3) soma coordinates in microns.
+    neuron_ids : list[str]
+        Neuron identifiers matching rows of *coords*.
+    n_clusters : int
+        Number of clusters.
+
+    Returns
+    -------
+    ClusterResult
+    """
+    from sklearn.cluster import KMeans
+
+    dist = _euclidean_distance_matrix(coords)
+    # Linkage is computed for clustermap dendrogram visualisation only
+    Z = compute_linkage(dist, method="average")
+    reorder = leaves_list(Z)
+
+    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+    labels = km.fit_predict(coords).astype(np.int32) + 1  # 1-indexed like fcluster
+
+    actual_k = int(len(np.unique(labels)))
+    logger.info(
+        f"Soma k-means clustering: {len(neuron_ids)} neurons, "
+        f"{actual_k} clusters"
+    )
+
+    return ClusterResult(
+        correlation_matrix=dist,
+        distance_matrix=dist,
+        linkage_matrix=Z,
+        neuron_ids=neuron_ids,
+        reorder_indices=reorder,
+        labels=labels,
+    )
+
+
+def cluster_somas_dbscan(
+    coords: NDArray[np.float64],
+    neuron_ids: list[str],
+    eps: float = 100.0,
+    min_samples: int = 5,
+) -> ClusterResult:
+    """Cluster neurons by soma location using DBSCAN.
+
+    Requires scikit-learn.  Noise points (label == -1 from DBSCAN)
+    are assigned to cluster label 0 so all labels are non-negative.
+
+    Parameters
+    ----------
+    coords : NDArray[np.float64]
+        (N, 3) soma coordinates in microns.
+    neuron_ids : list[str]
+        Neuron identifiers matching rows of *coords*.
+    eps : float
+        Maximum distance between samples for DBSCAN (in microns).
+    min_samples : int
+        Minimum samples in a neighbourhood for DBSCAN.
+
+    Returns
+    -------
+    ClusterResult
+    """
+    from sklearn.cluster import DBSCAN
+
+    dist = _euclidean_distance_matrix(coords)
+    # Linkage is computed for clustermap dendrogram visualisation only
+    Z = compute_linkage(dist, method="average")
+    reorder = leaves_list(Z)
+
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
+    raw_labels = db.fit_predict(dist)
+
+    # Shift so that labels start at 1 (noise=-1 becomes 0)
+    labels = (raw_labels + 2).astype(np.int32)  # noise→1, cluster0→2, ...
+
+    actual_k = int(len(np.unique(labels)))
+    n_noise = int((raw_labels == -1).sum())
+    logger.info(
+        f"Soma DBSCAN clustering: {len(neuron_ids)} neurons, "
+        f"{actual_k} clusters (incl. noise), {n_noise} noise points, "
+        f"eps={eps}, min_samples={min_samples}"
+    )
+
+    return ClusterResult(
+        correlation_matrix=dist,
+        distance_matrix=dist,
+        linkage_matrix=Z,
+        neuron_ids=neuron_ids,
+        reorder_indices=reorder,
+        labels=labels,
+    )
