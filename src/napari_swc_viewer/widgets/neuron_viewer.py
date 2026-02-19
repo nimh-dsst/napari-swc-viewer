@@ -13,7 +13,6 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info
@@ -26,8 +25,6 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QProgressBar,
     QPushButton,
     QSlider,
@@ -47,6 +44,7 @@ from .reference_layers import (
     remove_region_segmentation,
 )
 from .analysis_tab import AnalysisTabWidget
+from .neuron_table import NeuronTableWidget
 from .region_selector import RegionSelectorWidget
 from .slice_projection import NeuronSliceProjector
 
@@ -125,6 +123,9 @@ class NeuronViewerWidget(QWidget):
         # Analysis tab
         self._analysis_tab = AnalysisTabWidget(self.viewer)
         self._analysis_tab.set_slice_projector(self._slice_projector)
+        self._analysis_tab.cluster_colors_updated.connect(
+            self._on_cluster_colors_updated
+        )
         tabs.addTab(self._analysis_tab, "Analysis")
 
     def _setup_data_tab(self, parent: QWidget) -> None:
@@ -208,13 +209,14 @@ class NeuronViewerWidget(QWidget):
         self._atlas_status_label = QLabel("Atlas: Not loaded")
         layout.addWidget(self._atlas_status_label)
 
-        # Selected neurons list
+        # Selected neurons table
         neurons_group = QGroupBox("Selected Neurons")
         neurons_layout = QVBoxLayout(neurons_group)
 
-        self._neuron_list = QListWidget()
-        self._neuron_list.setSelectionMode(QListWidget.ExtendedSelection)
-        neurons_layout.addWidget(self._neuron_list)
+        self._neuron_table = NeuronTableWidget()
+        self._neuron_table.colors_changed.connect(self._apply_neuron_colors)
+        self._neuron_table.visibility_changed.connect(self._apply_neuron_visibility)
+        neurons_layout.addWidget(self._neuron_table)
 
         neuron_btn_row = QHBoxLayout()
         self._render_btn = QPushButton("Render Selected")
@@ -504,12 +506,12 @@ class NeuronViewerWidget(QWidget):
         try:
             result = self._db.get_neurons_by_region(acronyms)
 
-            # Update neuron list
-            self._neuron_list.clear()
-            for _, row in result.iterrows():
-                item = QListWidgetItem(f"{row['file_id']} ({row['subject']})")
-                item.setData(Qt.UserRole, row["file_id"])
-                self._neuron_list.addItem(item)
+            # Populate neuron table
+            neurons = [
+                (row["file_id"], row["subject"])
+                for _, row in result.iterrows()
+            ]
+            self._neuron_table.populate(neurons)
 
             logger.info(f"Found {len(result)} neurons in selected regions")
 
@@ -517,17 +519,16 @@ class NeuronViewerWidget(QWidget):
             logger.error(f"Query failed: {e}")
 
     def _render_selected_neurons(self) -> None:
-        """Render the selected neurons from the list.
+        """Render the selected neurons from the table.
 
         All neurons are batched into a single shapes layer (lines) and/or a
         single points layer instead of one layer per neuron, which is vastly
         faster for large selections.
         """
-        selected_items = self._neuron_list.selectedItems()
-        if not selected_items or self._db is None:
+        file_ids = self._neuron_table.get_selected_file_ids()
+        if not file_ids or self._db is None:
             return
 
-        file_ids = [item.data(Qt.UserRole) for item in selected_items]
         n = len(file_ids)
 
         # Show progress UI
@@ -544,9 +545,8 @@ class NeuronViewerWidget(QWidget):
         render_mode = self._render_mode_combo.currentText()
         opacity = self._opacity_slider.value() / 100.0
 
-        # Sample turbo colormap at regular intervals for per-neuron colors
-        cmap = plt.get_cmap("turbo")
-        neuron_colors = [list(cmap(t)) for t in np.linspace(0, 1, n)]
+        # Read per-neuron colors from the table
+        neuron_colors = [self._neuron_table.get_color(fid) for fid in file_ids]
 
         # Scale to match atlas mesh (coordinates are in microns)
         scale = None
@@ -679,6 +679,65 @@ class NeuronViewerWidget(QWidget):
         self._render_progress.setVisible(False)
         self._render_status_label.setText(f"Rendered {n} neurons.")
         self._render_btn.setEnabled(True)
+
+    def _build_effective_color_map(self) -> dict[str, list[float]]:
+        """Build a color map with alpha=0 for hidden neurons."""
+        result = {}
+        for fid, entry in self._neuron_table._entries.items():
+            color = list(entry.color)
+            if not entry.visible:
+                color[3] = 0.0
+            result[fid] = color
+        return result
+
+    def _update_layer_colors(self, color_map: dict[str, list[float]]) -> None:
+        """Apply a color map to all neuron layers."""
+        default_color = [0.5, 0.5, 0.5, 1.0]
+
+        for layer in self._current_neuron_layers:
+            if layer.name == "Neuron Lines":
+                meta = layer.metadata or {}
+                file_ids = meta.get("file_ids", [])
+                seg_counts = meta.get("segments_per_neuron", [])
+                if file_ids and seg_counts:
+                    parts = []
+                    for fid, count in zip(file_ids, seg_counts):
+                        c = color_map.get(fid, default_color)
+                        arr = np.empty((count, 4))
+                        arr[:] = c[:4]
+                        parts.append(arr)
+                    layer.edge_color = np.concatenate(parts)
+
+            elif layer.name == "Neuron Points":
+                meta = layer.metadata or {}
+                fids = meta.get("file_ids_per_point", [])
+                if fids:
+                    colors = np.array(
+                        [color_map.get(fid, default_color)[:4] for fid in fids]
+                    )
+                    layer.face_color = colors
+
+        # Update slice projector
+        self._slice_projector.update_neuron_colors(color_map)
+
+    def _apply_neuron_colors(self, changed: dict[str, list[float]]) -> None:
+        """Handle color changes from the neuron table."""
+        if not self._current_neuron_layers:
+            return
+        color_map = self._build_effective_color_map()
+        self._update_layer_colors(color_map)
+
+    def _apply_neuron_visibility(self, visibility_map: dict[str, bool]) -> None:
+        """Handle visibility changes from the neuron table."""
+        if not self._current_neuron_layers:
+            return
+        color_map = self._build_effective_color_map()
+        self._update_layer_colors(color_map)
+
+    def _on_cluster_colors_updated(self, result, color_map: dict) -> None:
+        """Handle cluster color updates from the analysis tab."""
+        self._neuron_table.update_cluster_assignments(result)
+        self._neuron_table.update_colors(color_map)
 
     def _clear_neuron_layers(self) -> None:
         """Remove all current neuron layers."""

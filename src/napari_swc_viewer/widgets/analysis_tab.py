@@ -18,7 +18,7 @@ import numpy as np
 import seaborn as sns
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from qtpy.QtCore import QThread, Qt
+from qtpy.QtCore import QThread, Qt, Signal
 from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
     QComboBox,
@@ -53,6 +53,8 @@ class AnalysisTabWidget(QWidget):
     parent : QWidget, optional
         Parent widget.
     """
+
+    cluster_colors_updated = Signal(object, dict)
 
     def __init__(self, viewer: napari.Viewer, parent: QWidget | None = None):
         super().__init__(parent)
@@ -461,6 +463,10 @@ class AnalysisTabWidget(QWidget):
 
         # Draw clustermap
         self._draw_clustermap(result)
+
+        # Notify the neuron table of cluster assignments and colors
+        if self._cluster_color_map is not None:
+            self.cluster_colors_updated.emit(result, self._cluster_color_map)
 
     def _on_heatmap_finished(self, volume: np.ndarray) -> None:
         """Handle completed heatmap pipeline."""
