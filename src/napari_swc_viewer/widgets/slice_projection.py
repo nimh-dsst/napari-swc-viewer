@@ -480,21 +480,17 @@ class NeuronSliceProjector:
             )
             self._projection_layer.edge_color = colors
         else:
-            # Remove and recreate the layer.  Setting ``data`` and
-            # ``edge_color`` separately on an existing Vectors layer can
-            # cause a vispy face-color / face-count mismatch because the
-            # mesh is rebuilt from the new data before the new colors are
-            # applied.
-            self._remove_projection_layer()
-            self._projection_layer = self._viewer.add_vectors(
-                lines,
-                edge_width=self._edge_width,
-                name=layer_name,
-                opacity=1.0,
-                scale=self._scale,
-                vector_style="line",
-            )
-            self._projection_layer.edge_color = colors
+            # Block events while updating both data and edge_color so
+            # vispy only sees the final consistent state (setting them
+            # separately triggers an intermediate rebuild that causes a
+            # face-count / face-color mismatch).
+            with self._projection_layer.events.blocker_all():
+                self._projection_layer.data = lines
+                self._projection_layer.edge_color = colors
+                self._projection_layer.visible = True
+                if self._scale is not None:
+                    self._projection_layer.scale = self._scale
+            self._projection_layer.refresh()
 
     def _remove_projection_layer(self) -> None:
         """Remove the projection layer from the viewer."""
