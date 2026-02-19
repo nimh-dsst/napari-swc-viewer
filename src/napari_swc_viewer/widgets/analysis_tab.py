@@ -19,6 +19,7 @@ import seaborn as sns
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from qtpy.QtCore import QThread, Qt
+from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -64,6 +65,7 @@ class AnalysisTabWidget(QWidget):
         self._cluster_color_map: dict[str, list[float]] | None = None
         self._actual_n_clusters: int = 0
         self._heatmap_layer = None
+        self._pending_heatmap_cluster: int | None = None  # cluster label for in-flight heatmap
         self._slice_projector = None
         self._setup_ui()
 
@@ -213,6 +215,15 @@ class AnalysisTabWidget(QWidget):
         self._heat_region_combo.addItems(["", "CP", "GPe", "VISp"])
         heat_region_row.addWidget(self._heat_region_combo)
         heat_layout.addLayout(heat_region_row)
+
+        # Cluster filter
+        cluster_filter_row = QHBoxLayout()
+        cluster_filter_row.addWidget(QLabel("Cluster filter:"))
+        self._heat_cluster_combo = QComboBox()
+        self._heat_cluster_combo.addItem("All neurons")
+        self._heat_cluster_combo.setEnabled(False)
+        cluster_filter_row.addWidget(self._heat_cluster_combo)
+        heat_layout.addLayout(cluster_filter_row)
 
         self._run_heat_btn = QPushButton("Build Heatmap Volume")
         self._run_heat_btn.setEnabled(False)
@@ -374,10 +385,26 @@ class AnalysisTabWidget(QWidget):
 
         region = self._heat_region_combo.currentText().strip() or None
 
+        # Determine cluster filter
+        file_ids = None
+        cluster_idx = self._heat_cluster_combo.currentIndex()
+        if cluster_idx > 0:  # 0 = "All neurons"
+            cluster_label = self._heat_cluster_combo.itemData(cluster_idx)
+            self._pending_heatmap_cluster = cluster_label
+            result = self._last_cluster_result
+            if result is not None:
+                mask = result.labels == cluster_label
+                file_ids = [
+                    nid for nid, m in zip(result.neuron_ids, mask) if m
+                ]
+        else:
+            self._pending_heatmap_cluster = None
+
         worker = HeatmapWorker(
             parquet_path=self._parquet_path,
             atlas=self._atlas,
             region_acronym=region,
+            file_ids=file_ids,
         )
 
         thread = QThread()
@@ -428,21 +455,40 @@ class AnalysisTabWidget(QWidget):
             f"{cluster_msg}"
         )
         self._update_button_states()
+        self._update_cluster_filter_combo()
 
         # Draw clustermap
         self._draw_clustermap(result)
 
     def _on_heatmap_finished(self, volume: np.ndarray) -> None:
         """Handle completed heatmap pipeline."""
+        from napari.utils.colormaps import Colormap
+
         self._progress_bar.setVisible(False)
-        self._progress_label.setText(
-            f"Heatmap complete: {(volume > 0).sum():,} non-zero voxels"
-        )
         self._update_button_states()
 
-        # Add as napari image layer
-        layer_name = "Node Count Heatmap"
-        # Remove existing heatmap layer
+        cluster_label = self._pending_heatmap_cluster
+        self._pending_heatmap_cluster = None
+
+        if cluster_label is not None:
+            # Cluster-specific heatmap with derived colormap
+            rgba = self._cluster_label_colors.get(
+                cluster_label, [0.5, 0.5, 0.5, 1.0]
+            )
+            layer_name = f"Cluster {cluster_label} Heatmap"
+            colormap = Colormap(
+                colors=[[0, 0, 0, 0], [rgba[0], rgba[1], rgba[2], 1.0]],
+                name=f"cluster_{cluster_label}",
+            )
+        else:
+            layer_name = "Node Count Heatmap"
+            colormap = "hot"
+
+        self._progress_label.setText(
+            f"{layer_name}: {(volume > 0).sum():,} non-zero voxels"
+        )
+
+        # Remove existing layer with the same name
         for layer in list(self._viewer.layers):
             if layer.name == layer_name:
                 self._viewer.layers.remove(layer)
@@ -450,7 +496,7 @@ class AnalysisTabWidget(QWidget):
         self._heatmap_layer = self._viewer.add_image(
             volume,
             name=layer_name,
-            colormap="hot",
+            colormap=colormap,
             blending="additive",
             opacity=0.7,
             visible=True,
@@ -566,10 +612,50 @@ class AnalysisTabWidget(QWidget):
 
         self._cluster_color_map = color_map
         self._actual_n_clusters = n_clusters
+        # Build reverse map: cluster_label -> RGBA color (first neuron's color)
+        self._cluster_label_colors: dict[int, list[float]] = {}
+        for neuron_id, label in zip(result.neuron_ids, result.labels):
+            lab = int(label)
+            if lab not in self._cluster_label_colors:
+                self._cluster_label_colors[lab] = color_map[neuron_id]
         logger.info(
             f"Built cluster color map: {len(color_map)} neurons, "
             f"{n_clusters} clusters"
         )
+
+    def _update_cluster_filter_combo(self) -> None:
+        """Populate the heatmap cluster filter dropdown with cluster options.
+
+        Each item shows a color swatch icon, the cluster number, and the
+        neuron count for that cluster.
+        """
+        self._heat_cluster_combo.clear()
+        self._heat_cluster_combo.addItem("All neurons")
+
+        result = self._last_cluster_result
+        if result is None or not hasattr(self, "_cluster_label_colors"):
+            self._heat_cluster_combo.setEnabled(False)
+            return
+
+        unique_labels = sorted(np.unique(result.labels).tolist())
+        for label in unique_labels:
+            rgba = self._cluster_label_colors.get(label, [0.5, 0.5, 0.5, 1.0])
+            count = int(np.sum(result.labels == label))
+
+            # Create a small color swatch icon
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(QColor.fromRgbF(rgba[0], rgba[1], rgba[2], rgba[3]))
+            icon = QIcon(pixmap)
+
+            self._heat_cluster_combo.addItem(
+                icon, f"Cluster {label}  ({count} neurons)"
+            )
+            # Store the label as item data for retrieval
+            self._heat_cluster_combo.setItemData(
+                self._heat_cluster_combo.count() - 1, label
+            )
+
+        self._heat_cluster_combo.setEnabled(True)
 
     def apply_cluster_colors(self) -> None:
         """Apply cached cluster colors to currently rendered neuron layers.
