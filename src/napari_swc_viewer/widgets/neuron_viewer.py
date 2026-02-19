@@ -76,6 +76,7 @@ class NeuronViewerWidget(QWidget):
         self._atlas: BrainGlobeAtlas | None = None
         self._current_neuron_layers: list = []
         self._current_region_layers: list = []
+        self._highlighted_file_ids: set[str] | None = None  # None = no highlight
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -216,6 +217,7 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table = NeuronTableWidget()
         self._neuron_table.colors_changed.connect(self._apply_neuron_colors)
         self._neuron_table.visibility_changed.connect(self._apply_neuron_visibility)
+        self._neuron_table.selection_changed.connect(self._highlight_selected_neurons)
         neurons_layout.addWidget(self._neuron_table)
 
         neuron_btn_row = QHBoxLayout()
@@ -681,12 +683,20 @@ class NeuronViewerWidget(QWidget):
         self._render_btn.setEnabled(True)
 
     def _build_effective_color_map(self) -> dict[str, list[float]]:
-        """Build a color map with alpha=0 for hidden neurons."""
+        """Build a color map accounting for visibility and highlight state.
+
+        - Hidden neurons get alpha=0.
+        - When a highlight is active, non-highlighted neurons are dimmed to
+          alpha=0.1 so the highlighted ones stand out.
+        """
+        highlight = self._highlighted_file_ids
         result = {}
         for fid, entry in self._neuron_table._entries.items():
             color = list(entry.color)
             if not entry.visible:
                 color[3] = 0.0
+            elif highlight is not None and fid not in highlight:
+                color[3] = 0.1
             result[fid] = color
         return result
 
@@ -731,6 +741,35 @@ class NeuronViewerWidget(QWidget):
         """Handle visibility changes from the neuron table."""
         if not self._current_neuron_layers:
             return
+        color_map = self._build_effective_color_map()
+        self._update_layer_colors(color_map)
+
+    def _highlight_selected_neurons(self, selected_file_ids: list[str]) -> None:
+        """Highlight selected neurons by dimming all others.
+
+        When some (but not all) neurons are selected in the table, the
+        non-selected rendered neurons are dimmed to alpha=0.1. When nothing
+        is selected or all are selected, highlighting is cleared.
+        """
+        if not self._current_neuron_layers:
+            self._highlighted_file_ids = None
+            return
+
+        # Get the set of rendered file_ids from layer metadata
+        rendered_ids: set[str] = set()
+        for layer in self._current_neuron_layers:
+            meta = layer.metadata or {}
+            rendered_ids.update(meta.get("file_ids", []))
+            for fid in meta.get("file_ids_per_point", []):
+                rendered_ids.add(fid)
+
+        selected = set(selected_file_ids) & rendered_ids
+        if not selected or selected == rendered_ids:
+            # Nothing selected or everything selected → clear highlight
+            self._highlighted_file_ids = None
+        else:
+            self._highlighted_file_ids = selected
+
         color_map = self._build_effective_color_map()
         self._update_layer_colors(color_map)
 

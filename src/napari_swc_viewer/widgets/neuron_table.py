@@ -67,6 +67,7 @@ class NeuronTableWidget(QWidget):
 
     colors_changed = Signal(dict)
     visibility_changed = Signal(dict)
+    selection_changed = Signal(list)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -94,6 +95,7 @@ class NeuronTableWidget(QWidget):
         header.setSectionResizeMode(COL_COLOR, QHeaderView.ResizeToContents)
 
         self._table.verticalHeader().setVisible(False)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
 
         layout.addWidget(self._table)
 
@@ -184,6 +186,10 @@ class NeuronTableWidget(QWidget):
         entry.color = rgba
         self._update_color_swatch(file_id)
         self.colors_changed.emit({file_id: rgba})
+
+    def _on_selection_changed(self) -> None:
+        """Emit selection_changed when table row selection changes."""
+        self.selection_changed.emit(self.get_selected_file_ids())
 
     def _on_visibility_toggled(self, file_id: str, state: int) -> None:
         """Handle a visibility checkbox state change."""
