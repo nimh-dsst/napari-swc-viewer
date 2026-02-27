@@ -385,7 +385,7 @@ class NeuronSliceProjector:
         Returns
         -------
         lines : ndarray or None
-            Array of shape (N, 2, 3) as [start, end] line endpoints, or None.
+            Array of shape (N, 2, 3) in vectors format [start, direction], or None.
         colors : ndarray or None
             Array of shape (N, 4) with RGBA colors, or None.
         """
@@ -437,8 +437,8 @@ class NeuronSliceProjector:
         p1[:, slice_axis] = slice_position
         p2[:, slice_axis] = slice_position
 
-        # Stack into (N, 2, 3) for napari shapes: [start, end]
-        lines = np.stack([p1, p2], axis=1)
+        # Stack into (N, 2, 3) for napari vectors: [start, direction]
+        lines = np.stack([p1, p2 - p1], axis=1)
         colors = self._all_colors[hit_indices]
 
         result = (lines, colors)
@@ -449,15 +449,12 @@ class NeuronSliceProjector:
     def _update_projection_layer(
         self, lines: np.ndarray, colors: np.ndarray
     ) -> None:
-        """Update or create the projection shapes layer.
-
-        Uses a Shapes layer with shape_type="line" instead of a Vectors
-        layer for reliable rendering across PyQt5 and PyQt6.
+        """Update or create the projection vectors layer.
 
         Parameters
         ----------
         lines : np.ndarray
-            Array of shape (N, 2, 3) as [start, end] line endpoints.
+            Array of shape (N, 2, 3) in vectors format [start, direction].
         colors : np.ndarray
             Array of shape (N, 4) with RGBA colors per segment.
         """
@@ -471,15 +468,17 @@ class NeuronSliceProjector:
                     break
 
         if self._projection_layer is None:
-            self._projection_layer = self._viewer.add_shapes(
+            # Create new layer — set edge_color after creation so napari
+            # correctly enters DIRECT color mode for per-vector colors.
+            self._projection_layer = self._viewer.add_vectors(
                 lines,
-                shape_type="line",
                 edge_width=self._edge_width,
-                edge_color=colors,
                 name=layer_name,
                 opacity=1.0,
                 scale=self._scale,
+                vector_style="line",
             )
+            self._projection_layer.edge_color = colors
         else:
             # Block events while updating both data and edge_color so
             # vispy only sees the final consistent state (setting them
