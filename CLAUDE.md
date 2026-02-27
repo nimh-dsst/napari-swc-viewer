@@ -10,6 +10,10 @@ napari-swc-viewer is a napari plugin for viewing SWC files. SWC is a standard fi
 
 This project uses **pixi** for Python package management. Use `pixi` commands (not `uv`, `pip`, or `conda` directly) for dependency management and running tasks.
 
+## Qt Backend — NEVER use PyQt5
+
+This project uses **PyQt6** exclusively. **Never** add PyQt5 or PySide2 as a dependency. PyQt5 cannot find NVIDIA OpenGL drivers on Windows, causing hours of debugging pain. If napari or any dependency tries to pull in PyQt5, override it with PyQt6. The `napari[pyqt6]` extra in pyproject.toml and `pyqt6` in pixi.toml enforce this.
+
 ## Development Context
 
 This is a napari plugin that:

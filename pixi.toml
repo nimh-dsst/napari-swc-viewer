@@ -25,9 +25,9 @@ pyarrow = ">=14.0"
 pandas = ">=2.0"
 pytest = ">=7.0"
 pytest-cov = ">=4.0"
-pyqt = ">=5.15"
 pip = ">=23.0"
 setuptools-scm = ">=8.0"
+pyqt6 = ">=6.8.1,<7"
 
 [target.linux-64.dependencies]
 # Linux needs mesa for headless OpenGL
