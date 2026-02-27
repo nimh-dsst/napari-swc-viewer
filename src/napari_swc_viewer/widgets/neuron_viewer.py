@@ -92,7 +92,7 @@ class NeuronViewerWidget(QWidget):
         self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
 
         # Load reference template after the widget is fully initialized
-        QTimer.singleShot(0, lambda: self._toggle_template(Qt.Checked))
+        QTimer.singleShot(0, lambda: self._toggle_template(True))
 
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
@@ -871,7 +871,7 @@ class NeuronViewerWidget(QWidget):
 
         layer_name = "Allen Template"
 
-        if state == Qt.Checked:
+        if bool(state):
             # Check if layer already exists
             existing = [l for l in self.viewer.layers if l.name == layer_name]
             if not existing:
@@ -902,7 +902,7 @@ class NeuronViewerWidget(QWidget):
 
         layer_name = "Brain Outline"
 
-        if state == Qt.Checked:
+        if bool(state):
             existing = [l for l in self.viewer.layers if l.name == layer_name]
             if not existing:
                 # Switch to 3D mode for mesh viewing
@@ -918,7 +918,7 @@ class NeuronViewerWidget(QWidget):
 
     def _toggle_region_meshes(self, state: int) -> None:
         """Toggle region mesh visibility."""
-        if state == Qt.Checked:
+        if bool(state):
             acronyms = self._region_selector.get_selected_acronyms(include_children=False)
             self._update_region_meshes(acronyms)
         else:
@@ -952,7 +952,7 @@ class NeuronViewerWidget(QWidget):
 
     def _toggle_region_segmentation(self, state: int) -> None:
         """Toggle region segmentation visibility."""
-        if state == Qt.Checked:
+        if bool(state):
             acronyms = self._region_selector.get_selected_acronyms(include_children=False)
             self._update_region_segmentation(acronyms)
         else:
@@ -1014,7 +1014,7 @@ class NeuronViewerWidget(QWidget):
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
-        enabled = state == Qt.Checked
+        enabled = bool(state)
         self._slice_projector.enabled = enabled
         self._slice_warning_label.setVisible(enabled)
 

@@ -197,7 +197,7 @@ class NeuronTableWidget(QWidget):
         if entry is None:
             return
 
-        entry.visible = state == Qt.Checked
+        entry.visible = bool(state)
         self.visibility_changed.emit(
             {fid: e.visible for fid, e in self._entries.items()}
         )
