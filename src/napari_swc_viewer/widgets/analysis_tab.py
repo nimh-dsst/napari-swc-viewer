@@ -69,8 +69,14 @@ class AnalysisTabWidget(QWidget):
         self._heatmap_layer = None
         self._pending_heatmap_cluster: int | None = None  # cluster label for in-flight heatmap
         self._pending_heatmap_region: str | None = None  # region acronym for in-flight heatmap
+        self._pending_heatmap_depth_bin: int = 1
+        self._pending_heatmap_depth_axis: int = 0
+        self._last_heatmap_file_ids: list[str] | None = None
         self._slice_projector = None
         self._setup_ui()
+
+        # Rebuild heatmap when the user reorders axes in napari
+        self._viewer.dims.events.order.connect(self._on_dims_order_changed)
 
     def set_database(self, db: NeuronDatabase) -> None:
         """Set the database connection."""
@@ -82,6 +88,7 @@ class AnalysisTabWidget(QWidget):
         """Set the atlas instance."""
         self._atlas = atlas
         self._update_button_states()
+        self._update_voxel_depth_label()
 
     def set_slice_projector(self, projector) -> None:
         """Set the slice projector for updating 2D projection colors."""
@@ -227,6 +234,22 @@ class AnalysisTabWidget(QWidget):
         self._heat_cluster_combo.setEnabled(False)
         cluster_filter_row.addWidget(self._heat_cluster_combo)
         heat_layout.addLayout(cluster_filter_row)
+
+        # Depth bin factor
+        depth_bin_row = QHBoxLayout()
+        depth_bin_row.addWidget(QLabel("Depth bin factor:"))
+        self._depth_bin_spin = QSpinBox()
+        self._depth_bin_spin.setRange(1, 20)
+        self._depth_bin_spin.setValue(1)
+        self._depth_bin_spin.setToolTip(
+            "Merge N depth-planes into one voxel along the slicing axis"
+        )
+        self._depth_bin_spin.valueChanged.connect(self._update_voxel_depth_label)
+        depth_bin_row.addWidget(self._depth_bin_spin)
+        heat_layout.addLayout(depth_bin_row)
+
+        self._voxel_depth_label = QLabel("Voxel depth: — μm")
+        heat_layout.addWidget(self._voxel_depth_label)
 
         self._run_heat_btn = QPushButton("Build Heatmap Volume")
         self._run_heat_btn.setEnabled(False)
@@ -404,11 +427,21 @@ class AnalysisTabWidget(QWidget):
         else:
             self._pending_heatmap_cluster = None
 
+        # Determine depth axis from napari dims
+        depth_axis = self._current_depth_axis()
+        depth_bin_factor = self._depth_bin_spin.value()
+
+        self._pending_heatmap_depth_bin = depth_bin_factor
+        self._pending_heatmap_depth_axis = depth_axis
+        self._last_heatmap_file_ids = file_ids
+
         worker = HeatmapWorker(
             parquet_path=self._parquet_path,
             atlas=self._atlas,
             region_acronym=region,
             file_ids=file_ids,
+            depth_bin_factor=depth_bin_factor,
+            depth_axis=depth_axis,
         )
 
         thread = QThread()
@@ -505,6 +538,10 @@ class AnalysisTabWidget(QWidget):
             if layer.name == layer_name:
                 self._viewer.layers.remove(layer)
 
+        # Set scale so the binned depth axis stays spatially aligned
+        scale = [1.0, 1.0, 1.0]
+        scale[self._pending_heatmap_depth_axis] = float(self._pending_heatmap_depth_bin)
+
         self._heatmap_layer = self._viewer.add_image(
             volume,
             name=layer_name,
@@ -513,6 +550,7 @@ class AnalysisTabWidget(QWidget):
             rendering="mip",
             opacity=0.7,
             visible=True,
+            scale=scale,
         )
 
     def _on_error(self, message: str) -> None:
@@ -669,6 +707,39 @@ class AnalysisTabWidget(QWidget):
             )
 
         self._heat_cluster_combo.setEnabled(True)
+
+    def _current_depth_axis(self) -> int:
+        """Return the current depth (slicing) axis from napari dims.
+
+        The depth axis is the first non-displayed dimension. Falls back
+        to axis 0 if all dimensions are displayed.
+        """
+        try:
+            not_displayed = list(self._viewer.dims.not_displayed)
+            if not_displayed:
+                return int(not_displayed[0])
+        except Exception:
+            pass
+        return 0
+
+    def _update_voxel_depth_label(self, _value: int | None = None) -> None:
+        """Update the voxel depth label based on atlas resolution and bin factor."""
+        if self._atlas is None:
+            self._voxel_depth_label.setText("Voxel depth: — μm")
+            return
+        resolution = float(self._atlas.resolution[0])
+        depth = resolution * self._depth_bin_spin.value()
+        self._voxel_depth_label.setText(f"Voxel depth: {depth:g} μm")
+
+    def _on_dims_order_changed(self, event=None) -> None:
+        """Rebuild heatmap when the user reorders axes in napari."""
+        if self._heatmap_layer is None:
+            return
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            return
+        if self._db is None or self._atlas is None:
+            return
+        self._run_heatmap_pipeline()
 
     def apply_cluster_colors(self) -> None:
         """Apply cached cluster colors to currently rendered neuron layers.

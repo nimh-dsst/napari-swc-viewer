@@ -26,6 +26,8 @@ def build_node_counts_volume(
     atlas: BrainGlobeAtlas,
     region_acronym: str | None = None,
     file_ids: list[str] | None = None,
+    depth_bin_factor: int = 1,
+    depth_axis: int = 0,
 ) -> NDArray[np.float32]:
     """Build a 3D node-count volume from parquet data.
 
@@ -44,16 +46,30 @@ def build_node_counts_volume(
         Filter to nodes in this region only.
     file_ids : list[str], optional
         Filter to specific neurons.
+    depth_bin_factor : int
+        Merge this many planes along the depth axis into one voxel.
+        A factor of 1 (default) gives standard 1:1 voxels.
+    depth_axis : int
+        Which atlas axis (0, 1, or 2) is the depth/slicing axis.
+        Default 0 corresponds to the first (Z) axis.
 
     Returns
     -------
     NDArray[np.float32]
-        3D float32 volume matching atlas annotation shape. Each voxel
-        contains the count of neuron nodes within it.
+        3D float32 volume. The depth axis dimension is reduced by
+        ``depth_bin_factor``; other axes match the atlas shape.
     """
     parquet_path_escaped = str(parquet_path).replace("\\", "/")
     resolution = float(atlas.resolution[0])
-    shape = atlas.annotation.shape  # (Z, Y, X) in PIR order
+    atlas_shape = list(atlas.annotation.shape)  # (Z, Y, X) in PIR order
+
+    # Compute output shape: depth axis is binned, others unchanged
+    out_shape = list(atlas_shape)
+    out_shape[depth_axis] = -(-atlas_shape[depth_axis] // depth_bin_factor)  # ceiling division
+
+    # Resolution per axis for voxel-index computation
+    axis_res = [resolution, resolution, resolution]
+    axis_res[depth_axis] = resolution * depth_bin_factor
 
     # Build WHERE clauses
     where_clauses = []
@@ -75,19 +91,22 @@ def build_node_counts_volume(
     #   z -> xi (atlas dim 2), y -> yi (atlas dim 1), x -> zi (atlas dim 0)
     query = f"""
         SELECT
-            CAST(FLOOR(x / {resolution}) AS INTEGER) AS zi,
-            CAST(FLOOR(y / {resolution}) AS INTEGER) AS yi,
-            CAST(FLOOR(z / {resolution}) AS INTEGER) AS xi,
+            CAST(FLOOR(x / {axis_res[0]}) AS INTEGER) AS zi,
+            CAST(FLOOR(y / {axis_res[1]}) AS INTEGER) AS yi,
+            CAST(FLOOR(z / {axis_res[2]}) AS INTEGER) AS xi,
             COUNT(*) AS node_count
         FROM read_parquet('{parquet_path_escaped}')
         {where_sql}
         GROUP BY zi, yi, xi
-        HAVING zi >= 0 AND zi < {shape[0]}
-           AND yi >= 0 AND yi < {shape[1]}
-           AND xi >= 0 AND xi < {shape[2]}
+        HAVING zi >= 0 AND zi < {out_shape[0]}
+           AND yi >= 0 AND yi < {out_shape[1]}
+           AND xi >= 0 AND xi < {out_shape[2]}
     """
 
-    logger.info("Querying node counts per voxel...")
+    logger.info(
+        "Querying node counts per voxel "
+        f"(depth_bin_factor={depth_bin_factor}, depth_axis={depth_axis})..."
+    )
     if params:
         df = conn.execute(query, params).fetchdf()
     else:
@@ -96,7 +115,7 @@ def build_node_counts_volume(
     logger.info(f"Found {len(df)} non-empty voxels, total nodes: {df['node_count'].sum():,}")
 
     # Build dense volume
-    volume = np.zeros(shape, dtype=np.float32)
+    volume = np.zeros(out_shape, dtype=np.float32)
     if len(df) > 0:
         zi = df["zi"].values.astype(np.intp)
         yi = df["yi"].values.astype(np.intp)

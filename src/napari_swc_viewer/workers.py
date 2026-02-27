@@ -368,12 +368,16 @@ class HeatmapWorker(QObject):
         atlas: BrainGlobeAtlas,
         region_acronym: str | None = None,
         file_ids: list[str] | None = None,
+        depth_bin_factor: int = 1,
+        depth_axis: int = 0,
     ):
         super().__init__()
         self._parquet_path = parquet_path
         self._atlas = atlas
         self._region_acronym = region_acronym
         self._file_ids = file_ids
+        self._depth_bin_factor = depth_bin_factor
+        self._depth_axis = depth_axis
 
     def run(self) -> None:
         """Execute the heatmap pipeline."""
@@ -391,6 +395,8 @@ class HeatmapWorker(QObject):
                     self._atlas,
                     region_acronym=self._region_acronym,
                     file_ids=self._file_ids,
+                    depth_bin_factor=self._depth_bin_factor,
+                    depth_axis=self._depth_axis,
                 )
             finally:
                 conn.close()
