@@ -480,13 +480,17 @@ class NeuronSliceProjector:
             )
             self._projection_layer.edge_color = colors
         else:
-            # Update existing layer
-            self._projection_layer.data = lines
-            self._projection_layer.edge_color = colors
-            self._projection_layer.visible = True
-            # Update scale if changed
-            if self._scale is not None:
-                self._projection_layer.scale = self._scale
+            # Block events while updating both data and edge_color so
+            # vispy only sees the final consistent state (setting them
+            # separately triggers an intermediate rebuild that causes a
+            # face-count / face-color mismatch).
+            with self._projection_layer.events.blocker_all():
+                self._projection_layer.data = lines
+                self._projection_layer.edge_color = colors
+                self._projection_layer.visible = True
+                if self._scale is not None:
+                    self._projection_layer.scale = self._scale
+            self._projection_layer.refresh()
 
     def _remove_projection_layer(self) -> None:
         """Remove the projection layer from the viewer."""
