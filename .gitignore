@@ -214,3 +214,10 @@ test_data/
 
 # Benchmark data (downloaded/generated neuron files)
 benchmark_data/
+
+# Example data directories
+example_data/
+example_data_aligned/
+
+# Parquet data files
+*.parquet

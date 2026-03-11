@@ -34,6 +34,11 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ..auto_center import (
+    center_to_depth_world,
+    compute_center_of_rendered_neurons,
+    depth_axis_from_not_displayed,
+)
 from ..db import NeuronDatabase
 from .reference_layers import (
     add_allen_template,
@@ -78,6 +83,7 @@ class NeuronViewerWidget(QWidget):
         self._current_region_layers: list = []
         self._highlighted_file_ids: set[str] | None = None  # None = no highlight
         self._last_soma_selection: set = set()  # track to skip no-op highlights
+        self._auto_center_applied_once = False
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -556,10 +562,13 @@ class NeuronViewerWidget(QWidget):
         if self._atlas is not None:
             scale = [1.0 / res for res in self._atlas.resolution]
 
+        line_data: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
+        points_df = None
+
         # --- Lines ---
         if render_mode in ("Lines", "Both"):
             # Single batch query for all neurons
-            all_data = self._db.get_neuron_lines_batch(file_ids)
+            line_data = self._db.get_neuron_lines_batch(file_ids)
 
             self._render_status_label.setText(f"Building line segments for {n} neurons...")
             QApplication.processEvents()
@@ -571,9 +580,9 @@ class NeuronViewerWidget(QWidget):
             segments_per_neuron = []
 
             for i, (file_id, color) in enumerate(zip(file_ids, neuron_colors)):
-                if file_id not in all_data:
+                if file_id not in line_data:
                     continue
-                coords, edges = all_data[file_id]
+                coords, edges = line_data[file_id]
                 if len(edges) == 0:
                     continue
 
@@ -632,15 +641,15 @@ class NeuronViewerWidget(QWidget):
             QApplication.processEvents()
 
             # Single batch query for all neurons
-            df = self._db.get_neurons_for_rendering(file_ids)
+            points_df = self._db.get_neurons_for_rendering(file_ids)
 
-            if not df.empty:
+            if not points_df.empty:
                 self._render_status_label.setText(
-                    f"Adding {len(df):,} points to viewer..."
+                    f"Adding {len(points_df):,} points to viewer..."
                 )
                 QApplication.processEvents()
 
-                coords = df[["x", "y", "z"]].values
+                coords = points_df[["x", "y", "z"]].values
 
                 if self._color_by_type_cb.isChecked():
                     type_colors = {
@@ -652,14 +661,14 @@ class NeuronViewerWidget(QWidget):
                     colors = np.array(
                         [
                             type_colors.get(t, [0.5, 0.5, 0.5, 1])
-                            for t in df["type"].values
+                            for t in points_df["type"].values
                         ]
                     )
                 else:
                     # Per-point color based on which neuron each point belongs to
                     color_map = dict(zip(file_ids, neuron_colors))
                     colors = np.array(
-                        [color_map[fid][:4] for fid in df["file_id"].values]
+                        [color_map[fid][:4] for fid in points_df["file_id"].values]
                     )
 
                 layer = self.viewer.add_points(
@@ -670,7 +679,7 @@ class NeuronViewerWidget(QWidget):
                     opacity=opacity,
                     scale=scale,
                     metadata={
-                        "file_ids_per_point": df["file_id"].values.tolist(),
+                        "file_ids_per_point": points_df["file_id"].values.tolist(),
                     },
                 )
                 self._current_neuron_layers.append(layer)
@@ -715,10 +724,75 @@ class NeuronViewerWidget(QWidget):
         if self.viewer.dims.ndisplay == 2:
             self._apply_layer_visibility(False)
 
+        # Default to showing the 2D slice projection once neurons are present.
+        # This keeps "Show in 2D slices" on across subsequent additions.
+        if self._current_neuron_layers:
+            self._show_slice_projection_cb.setChecked(True)
+
+        self._maybe_auto_center_slice(
+            line_data=line_data,
+            points_df=points_df,
+            soma_df=soma_df,
+            scale=scale,
+        )
+
         # Hide progress UI
         self._render_progress.setVisible(False)
         self._render_status_label.setText(f"Rendered {n} neurons.")
         self._render_btn.setEnabled(True)
+
+    def _compute_center_of_rendered_neurons(
+        self,
+        line_data: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+        points_df,
+        soma_df,
+    ) -> np.ndarray | None:
+        """Compute a center point with line > points > soma fallback priority."""
+        return compute_center_of_rendered_neurons(
+            line_data=line_data,
+            points_df=points_df,
+            soma_df=soma_df,
+        )
+
+    def _set_slice_depth_from_center(
+        self,
+        center_xyz: np.ndarray,
+        scale: list[float] | None,
+    ) -> bool:
+        """Move the active depth slice to the center point."""
+        depth_axis = depth_axis_from_not_displayed(
+            getattr(self.viewer.dims, "not_displayed", None)
+        )
+        target_world = center_to_depth_world(center_xyz, depth_axis, scale)
+
+        try:
+            self.viewer.dims.set_point(depth_axis, target_world)
+            return True
+        except Exception:
+            logger.debug("Failed to auto-center depth slice.", exc_info=True)
+            return False
+
+    def _maybe_auto_center_slice(
+        self,
+        line_data: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+        points_df,
+        soma_df,
+        scale: list[float] | None,
+    ) -> None:
+        """Auto-center the depth slice once per widget session."""
+        if self._auto_center_applied_once:
+            return
+
+        center_xyz = self._compute_center_of_rendered_neurons(
+            line_data=line_data,
+            points_df=points_df,
+            soma_df=soma_df,
+        )
+        if center_xyz is None:
+            return
+
+        if self._set_slice_depth_from_center(center_xyz, scale):
+            self._auto_center_applied_once = True
 
     def _build_effective_color_map(self) -> dict[str, list[float]]:
         """Build a color map accounting for visibility and highlight state.
@@ -1006,8 +1080,13 @@ class NeuronViewerWidget(QWidget):
         Points layers natively handle slice display, showing only points
         near the current slice position.
         """
+        show_points_in_2d = (
+            not visible and self._render_mode_combo.currentText() == "Points"
+        )
         for layer in self._current_neuron_layers:
             if not visible and layer.name == "Soma Labels":
+                continue
+            if show_points_in_2d and layer.name == "Neuron Points":
                 continue
             layer.visible = visible
         self.viewer.status = "Ready"
