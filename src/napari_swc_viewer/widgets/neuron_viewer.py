@@ -227,16 +227,58 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.selection_changed.connect(self._highlight_selected_neurons)
         neurons_layout.addWidget(self._neuron_table)
 
+        cluster_row = QHBoxLayout()
+        cluster_row.addWidget(QLabel("Cluster:"))
+
+        self._cluster_filter_combo = QComboBox()
+        self._cluster_filter_combo.addItem("All")
+        self._cluster_filter_combo.setItemData(0, None)
+        self._cluster_filter_combo.currentIndexChanged.connect(
+            self._on_cluster_filter_changed
+        )
+        cluster_row.addWidget(self._cluster_filter_combo)
+
+        self._hide_others_btn = QPushButton("Hide Others")
+        self._hide_others_btn.setEnabled(False)
+        self._hide_others_btn.clicked.connect(self._hide_not_in_selected_cluster)
+        cluster_row.addWidget(self._hide_others_btn)
+
+        self._show_all_btn = QPushButton("Show All")
+        self._show_all_btn.setEnabled(False)
+        self._show_all_btn.clicked.connect(self._show_all_neurons)
+        cluster_row.addWidget(self._show_all_btn)
+
+        self._recolor_cluster_btn = QPushButton("Recolor Cluster")
+        self._recolor_cluster_btn.setEnabled(False)
+        self._recolor_cluster_btn.clicked.connect(self._recolor_selected_cluster)
+        cluster_row.addWidget(self._recolor_cluster_btn)
+
+        neurons_layout.addLayout(cluster_row)
+
         neuron_btn_row = QHBoxLayout()
         self._render_btn = QPushButton("Add Selected")
         self._render_btn.clicked.connect(self._render_selected_neurons)
         neuron_btn_row.addWidget(self._render_btn)
 
-        self._clear_neurons_btn = QPushButton("Clear")
+        self._remove_selected_btn = QPushButton("Remove Selected")
+        self._remove_selected_btn.clicked.connect(self._remove_selected_neurons)
+        neuron_btn_row.addWidget(self._remove_selected_btn)
+
+        self._clear_neurons_btn = QPushButton("Clear All")
         self._clear_neurons_btn.clicked.connect(self._clear_neuron_layers)
         neuron_btn_row.addWidget(self._clear_neurons_btn)
 
         neurons_layout.addLayout(neuron_btn_row)
+
+        centering_row = QHBoxLayout()
+        centering_row.addWidget(QLabel("Centering:"))
+        self._centering_mode_combo = QComboBox()
+        self._centering_mode_combo.addItem("Same", "same")
+        self._centering_mode_combo.addItem("Auto", "auto")
+        self._centering_mode_combo.setCurrentIndex(0)
+        centering_row.addWidget(self._centering_mode_combo)
+        centering_row.addStretch()
+        neurons_layout.addLayout(centering_row)
 
         self._render_progress = QProgressBar()
         self._render_progress.setVisible(False)
@@ -521,27 +563,140 @@ class NeuronViewerWidget(QWidget):
                 for _, row in result.iterrows()
             ]
             self._neuron_table.populate(neurons)
+            self._neuron_table.set_added_file_ids(set())
+            self._refresh_cluster_filter_controls()
 
             logger.info(f"Found {len(result)} neurons in selected regions")
 
         except Exception as e:
             logger.error(f"Query failed: {e}")
 
-    def _render_selected_neurons(self) -> None:
-        """Render the selected neurons from the table.
+    def _selected_cluster_from_filter(self) -> int | None:
+        """Return selected cluster from the Data tab dropdown."""
+        idx = self._cluster_filter_combo.currentIndex()
+        if idx < 0:
+            return None
+        data = self._cluster_filter_combo.itemData(idx)
+        if data is None:
+            return None
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return None
 
-        All neurons are batched into a single shapes layer (lines) and/or a
-        single points layer instead of one layer per neuron, which is vastly
-        faster for large selections.
-        """
-        file_ids = self._neuron_table.get_selected_file_ids()
+    def _refresh_cluster_filter_controls(self) -> None:
+        """Refresh cluster filter dropdown options from table cluster assignments."""
+        previous = self._selected_cluster_from_filter()
+
+        self._cluster_filter_combo.blockSignals(True)
+        try:
+            self._cluster_filter_combo.clear()
+            self._cluster_filter_combo.addItem("All")
+            self._cluster_filter_combo.setItemData(0, None)
+
+            for cluster_id in self._neuron_table.available_cluster_ids():
+                self._cluster_filter_combo.addItem(f"Cluster {cluster_id}")
+                self._cluster_filter_combo.setItemData(
+                    self._cluster_filter_combo.count() - 1,
+                    int(cluster_id),
+                )
+
+            if previous is not None:
+                idx = self._cluster_filter_combo.findData(previous)
+                self._cluster_filter_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            else:
+                self._cluster_filter_combo.setCurrentIndex(0)
+        finally:
+            self._cluster_filter_combo.blockSignals(False)
+
+        self._on_cluster_filter_changed(self._cluster_filter_combo.currentIndex())
+
+    def _on_cluster_filter_changed(self, _index: int) -> None:
+        """Filter table rows by selected cluster and update action buttons."""
+        selected_cluster = self._selected_cluster_from_filter()
+        self._neuron_table.apply_cluster_filter(selected_cluster)
+
+        has_selected_cluster = selected_cluster is not None
+        has_entries = bool(self._neuron_table.get_visibility_map())
+        self._hide_others_btn.setEnabled(has_selected_cluster)
+        self._recolor_cluster_btn.setEnabled(has_selected_cluster)
+        self._show_all_btn.setEnabled(has_entries)
+
+    def _hide_not_in_selected_cluster(self) -> None:
+        """Set visibility off for neurons not in the selected cluster."""
+        selected_cluster = self._selected_cluster_from_filter()
+        if selected_cluster is None:
+            return
+        self._neuron_table.hide_all_not_in_cluster(selected_cluster)
+
+    def _show_all_neurons(self) -> None:
+        """Restore visibility on for all neurons in the table."""
+        self._neuron_table.set_all_visible()
+
+    def _recolor_selected_cluster(self) -> None:
+        """Recolor selected cluster with turbo and gray non-selected neurons."""
+        selected_cluster = self._selected_cluster_from_filter()
+        if selected_cluster is None:
+            return
+        self._neuron_table.recolor_cluster_turbo(
+            selected_cluster,
+            gray_others=True,
+        )
+
+    def _render_selected_neurons(self) -> None:
+        """Add selected neurons to the scene without removing existing neurons."""
+        selected_file_ids = self._neuron_table.get_selected_file_ids()
+        if not selected_file_ids:
+            return
+
+        current_file_ids = self._current_scene_file_ids()
+        new_file_ids = [fid for fid in selected_file_ids if fid not in current_file_ids]
+        if not new_file_ids:
+            self._render_status_label.setText("All selected neurons are already in the scene.")
+            return
+
+        target_file_ids = sorted(current_file_ids.union(new_file_ids), key=str)
+        self._render_file_ids(target_file_ids)
+
+    def _remove_selected_neurons(self) -> None:
+        """Remove selected neurons from the scene while leaving others in place."""
+        selected_file_ids = set(self._neuron_table.get_selected_file_ids())
+        if not selected_file_ids:
+            return
+
+        current_file_ids = self._current_scene_file_ids()
+        if not current_file_ids:
+            return
+
+        removed_file_ids = current_file_ids & selected_file_ids
+        if not removed_file_ids:
+            self._render_status_label.setText(
+                "No selected neurons are currently in the scene."
+            )
+            return
+
+        remaining_file_ids = sorted(current_file_ids - removed_file_ids, key=str)
+        if not remaining_file_ids:
+            depth_state = self._capture_depth_state()
+            self._clear_neuron_layers()
+            self._restore_depth_state(depth_state)
+            self._render_status_label.setText("Cleared all neurons from the scene.")
+            return
+
+        self._render_file_ids(remaining_file_ids)
+
+    def _render_file_ids(self, file_ids: list[object]) -> None:
+        """Render exactly ``file_ids`` by rebuilding all neuron scene layers."""
         if not file_ids or self._db is None:
             return
 
         n = len(file_ids)
+        depth_state = self._capture_depth_state()
+        use_auto_centering = self._use_auto_centering()
 
         # Show progress UI
         self._render_btn.setEnabled(False)
+        self._remove_selected_btn.setEnabled(False)
         self._render_progress.setRange(0, n)
         self._render_progress.setValue(0)
         self._render_progress.setVisible(True)
@@ -668,7 +823,10 @@ class NeuronViewerWidget(QWidget):
                     # Per-point color based on which neuron each point belongs to
                     color_map = dict(zip(file_ids, neuron_colors))
                     colors = np.array(
-                        [color_map[fid][:4] for fid in points_df["file_id"].values]
+                        [
+                            color_map.get(fid, [0.5, 0.5, 0.5, 1.0])[:4]
+                            for fid in points_df["file_id"].values
+                        ]
                     )
 
                 layer = self.viewer.add_points(
@@ -729,17 +887,76 @@ class NeuronViewerWidget(QWidget):
         if self._current_neuron_layers:
             self._show_slice_projection_cb.setChecked(True)
 
-        self._maybe_auto_center_slice(
-            line_data=line_data,
-            points_df=points_df,
-            soma_df=soma_df,
-            scale=scale,
-        )
+        if use_auto_centering:
+            centered = self._maybe_auto_center_slice(
+                line_data=line_data,
+                points_df=points_df,
+                soma_df=soma_df,
+                scale=scale,
+            )
+            if not centered:
+                self._restore_depth_state(depth_state)
+        else:
+            self._restore_depth_state(depth_state)
+        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
 
         # Hide progress UI
         self._render_progress.setVisible(False)
         self._render_status_label.setText(f"Rendered {n} neurons.")
         self._render_btn.setEnabled(True)
+        self._remove_selected_btn.setEnabled(True)
+
+    def _use_auto_centering(self) -> bool:
+        """Return whether the Data tab centering mode is set to Auto."""
+        return self._centering_mode_combo.currentData() == "auto"
+
+    def _capture_depth_state(self) -> tuple[int, float] | None:
+        """Capture current depth axis and point so Add/Remove can restore it."""
+        depth_axis = depth_axis_from_not_displayed(
+            getattr(self.viewer.dims, "not_displayed", None)
+        )
+        try:
+            depth_value = float(self.viewer.dims.point[depth_axis])
+        except Exception:
+            return None
+        return depth_axis, depth_value
+
+    def _restore_depth_state(self, depth_state: tuple[int, float] | None) -> None:
+        """Restore a previously captured depth state."""
+        if depth_state is None:
+            return
+
+        depth_axis, depth_value = depth_state
+        try:
+            self.viewer.dims.set_point(depth_axis, depth_value)
+            return
+        except Exception:
+            pass
+
+        fallback_axis = depth_axis_from_not_displayed(
+            getattr(self.viewer.dims, "not_displayed", None)
+        )
+        try:
+            self.viewer.dims.set_point(fallback_axis, depth_value)
+        except Exception:
+            logger.debug("Failed to restore depth slice position.", exc_info=True)
+
+    def _current_scene_file_ids(self) -> set[object]:
+        """Collect neuron file IDs currently represented by scene layers."""
+        file_ids: set[object] = set()
+        for layer in self._current_neuron_layers:
+            meta = layer.metadata or {}
+            for fid in meta.get("file_ids", []):
+                try:
+                    file_ids.add(fid)
+                except TypeError:
+                    file_ids.add(str(fid))
+            for fid in meta.get("file_ids_per_point", []):
+                try:
+                    file_ids.add(fid)
+                except TypeError:
+                    file_ids.add(str(fid))
+        return file_ids
 
     def _compute_center_of_rendered_neurons(
         self,
@@ -778,10 +995,10 @@ class NeuronViewerWidget(QWidget):
         points_df,
         soma_df,
         scale: list[float] | None,
-    ) -> None:
+    ) -> bool:
         """Auto-center the depth slice once per widget session."""
         if self._auto_center_applied_once:
-            return
+            return False
 
         center_xyz = self._compute_center_of_rendered_neurons(
             line_data=line_data,
@@ -789,10 +1006,12 @@ class NeuronViewerWidget(QWidget):
             soma_df=soma_df,
         )
         if center_xyz is None:
-            return
+            return False
 
         if self._set_slice_depth_from_center(center_xyz, scale):
             self._auto_center_applied_once = True
+            return True
+        return False
 
     def _build_effective_color_map(self) -> dict[str, list[float]]:
         """Build a color map accounting for visibility and highlight state.
@@ -921,6 +1140,7 @@ class NeuronViewerWidget(QWidget):
         """Handle cluster color updates from the analysis tab."""
         self._neuron_table.update_cluster_assignments(result)
         self._neuron_table.update_colors(color_map)
+        self._refresh_cluster_filter_controls()
 
     def _clear_neuron_layers(self) -> None:
         """Remove all current neuron layers."""
@@ -934,6 +1154,7 @@ class NeuronViewerWidget(QWidget):
 
         # Clear slice projector data
         self._slice_projector.clear()
+        self._neuron_table.set_added_file_ids(set())
 
     def _toggle_template(self, state: int) -> None:
         """Toggle the template layer visibility."""

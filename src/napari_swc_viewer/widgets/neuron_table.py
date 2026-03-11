@@ -2,6 +2,7 @@
 
 Provides an interactive table for viewing and controlling neurons:
 - Toggle neuron visibility on/off
+- Track whether a neuron is currently added to the scene
 - View neuron ID, subject, and cluster assignment
 - Edit neuron colors via color picker
 """
@@ -30,6 +31,16 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ..neuron_table_ops import (
+    GRAY_RGBA,
+    added_flags,
+    cluster_filter_matches,
+    cluster_ids_available,
+    cluster_sort_value,
+    recolor_cluster_turbo,
+    visibility_for_selected_cluster,
+)
+
 if TYPE_CHECKING:
     from ..analysis.clustering import ClusterResult
 
@@ -37,21 +48,34 @@ logger = logging.getLogger(__name__)
 
 # Column indices
 COL_VISIBLE = 0
-COL_NEURON_ID = 1
-COL_SUBJECT = 2
-COL_CLUSTER = 3
-COL_COLOR = 4
+COL_ADDED = 1
+COL_NEURON_ID = 2
+COL_SUBJECT = 3
+COL_CLUSTER = 4
+COL_COLOR = 5
+
+
+class _NumericSortItem(QTableWidgetItem):
+    """Table item that sorts by numeric key stored in ``Qt.UserRole``."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(Qt.UserRole)
+        right = other.data(Qt.UserRole)
+        if left is not None and right is not None:
+            return float(left) < float(right)
+        return super().__lt__(other)
 
 
 @dataclass
 class NeuronEntry:
     """Per-neuron state tracked by the neuron selection table."""
 
-    file_id: str
+    file_id: object
     subject: str
-    color: list[float] = field(default_factory=lambda: [0.5, 0.5, 0.5, 1.0])
+    color: list[float] = field(default_factory=lambda: list(GRAY_RGBA))
     cluster_id: int | None = None
     visible: bool = True
+    added_to_scene: bool = False
 
 
 class NeuronTableWidget(QWidget):
@@ -71,17 +95,16 @@ class NeuronTableWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._entries: dict[str, NeuronEntry] = {}
-        self._row_to_file_id: list[str] = []
+        self._entries: dict[object, NeuronEntry] = {}
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["Vis", "Neuron ID", "Subject", "Cluster", "Color"]
+            ["Vis", "Added", "Neuron ID", "Subject", "Cluster", "Color"]
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -89,6 +112,7 @@ class NeuronTableWidget(QWidget):
         # Column sizing
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(COL_VISIBLE, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ADDED, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_NEURON_ID, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_CLUSTER, QHeaderView.ResizeToContents)
@@ -96,6 +120,7 @@ class NeuronTableWidget(QWidget):
 
         self._table.verticalHeader().setVisible(False)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.setSortingEnabled(True)
 
         layout.addWidget(self._table)
 
@@ -107,9 +132,11 @@ class NeuronTableWidget(QWidget):
         neurons : list[tuple[str, str]]
             List of (file_id, subject) tuples.
         """
+        sorting_enabled = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
+
         self._table.setRowCount(0)
         self._entries.clear()
-        self._row_to_file_id.clear()
 
         n = len(neurons)
         cmap = plt.get_cmap("turbo")
@@ -118,13 +145,12 @@ class NeuronTableWidget(QWidget):
         self._table.setRowCount(n)
 
         for row, (file_id, subject) in enumerate(neurons):
-            color = colors[row] if row < len(colors) else [0.5, 0.5, 0.5, 1.0]
-            entry = NeuronEntry(
-                file_id=file_id, subject=subject, color=color
-            )
+            color = colors[row] if row < len(colors) else list(GRAY_RGBA)
+            entry = NeuronEntry(file_id=file_id, subject=subject, color=color)
             self._entries[file_id] = entry
-            self._row_to_file_id.append(file_id)
             self._populate_row(row, entry)
+
+        self._table.setSortingEnabled(sorting_enabled)
 
     def _populate_row(self, row: int, entry: NeuronEntry) -> None:
         """Populate a single table row from a NeuronEntry."""
@@ -139,9 +165,13 @@ class NeuronTableWidget(QWidget):
         cb_layout.setContentsMargins(0, 0, 0, 0)
         self._table.setCellWidget(row, COL_VISIBLE, cb_widget)
 
+        # Added state
+        self._set_added_cell(row, entry.added_to_scene)
+
         # Neuron ID
-        id_item = QTableWidgetItem(entry.file_id)
+        id_item = QTableWidgetItem(str(entry.file_id))
         id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
+        id_item.setData(Qt.UserRole, entry.file_id)
         self._table.setItem(row, COL_NEURON_ID, id_item)
 
         # Subject
@@ -150,10 +180,7 @@ class NeuronTableWidget(QWidget):
         self._table.setItem(row, COL_SUBJECT, subj_item)
 
         # Cluster
-        cluster_text = str(entry.cluster_id) if entry.cluster_id is not None else ""
-        cluster_item = QTableWidgetItem(cluster_text)
-        cluster_item.setFlags(cluster_item.flags() & ~Qt.ItemIsEditable)
-        self._table.setItem(row, COL_CLUSTER, cluster_item)
+        self._set_cluster_cell(row, entry.cluster_id)
 
         # Color swatch button
         btn = QPushButton()
@@ -161,6 +188,28 @@ class NeuronTableWidget(QWidget):
         self._apply_color_style(btn, entry.color)
         btn.clicked.connect(partial(self._on_color_clicked, entry.file_id))
         self._table.setCellWidget(row, COL_COLOR, btn)
+
+    def _set_added_cell(self, row: int, added: bool) -> None:
+        """Set the Added column cell text and sort key."""
+        item = self._table.item(row, COL_ADDED)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(row, COL_ADDED, item)
+
+        item.setText("Yes" if added else "No")
+        item.setData(Qt.UserRole, 1 if added else 0)
+
+    def _set_cluster_cell(self, row: int, cluster_id: int | None) -> None:
+        """Set cluster cell text and numeric sort key."""
+        item = self._table.item(row, COL_CLUSTER)
+        if item is None or not isinstance(item, _NumericSortItem):
+            item = _NumericSortItem()
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(row, COL_CLUSTER, item)
+
+        item.setText("" if cluster_id is None else str(cluster_id))
+        item.setData(Qt.UserRole, cluster_sort_value(cluster_id))
 
     def _apply_color_style(self, btn: QPushButton, color: list[float]) -> None:
         """Set the button background to the given RGBA color."""
@@ -182,7 +231,12 @@ class NeuronTableWidget(QWidget):
         if not new_color.isValid():
             return
 
-        rgba = [new_color.redF(), new_color.greenF(), new_color.blueF(), new_color.alphaF()]
+        rgba = [
+            new_color.redF(),
+            new_color.greenF(),
+            new_color.blueF(),
+            new_color.alphaF(),
+        ]
         entry.color = rgba
         self._update_color_swatch(file_id)
         self.colors_changed.emit({file_id: rgba})
@@ -198,9 +252,51 @@ class NeuronTableWidget(QWidget):
             return
 
         entry.visible = bool(state)
-        self.visibility_changed.emit(
-            {fid: e.visible for fid, e in self._entries.items()}
-        )
+        self.visibility_changed.emit({fid: e.visible for fid, e in self._entries.items()})
+
+    def _file_id_from_row(self, row: int) -> object | None:
+        """Resolve a row to its file_id using item metadata."""
+        item = self._table.item(row, COL_NEURON_ID)
+        if item is None:
+            return None
+
+        file_id = item.data(Qt.UserRole)
+        if file_id is not None:
+            return file_id
+
+        text = item.text()
+        return text if text else None
+
+    def _iter_rows_with_file_ids(self) -> list[tuple[int, object]]:
+        """Return all table rows that map to a neuron file_id."""
+        out: list[tuple[int, object]] = []
+        for row in range(self._table.rowCount()):
+            file_id = self._file_id_from_row(row)
+            if file_id is not None:
+                out.append((row, file_id))
+        return out
+
+    def _file_id_to_row_map(self) -> dict[object, int]:
+        """Build a map from file_id to current table row."""
+        return {file_id: row for row, file_id in self._iter_rows_with_file_ids()}
+
+    def _file_id_to_row(self, file_id: object) -> int | None:
+        """Get the current table row for a given file_id."""
+        return self._file_id_to_row_map().get(file_id)
+
+    def _update_visibility_checkbox(self, row: int, visible: bool) -> None:
+        """Set row visibility checkbox state without emitting checkbox signals."""
+        cb_widget = self._table.cellWidget(row, COL_VISIBLE)
+        if cb_widget is None:
+            return
+
+        cb = cb_widget.findChild(QCheckBox)
+        if cb is None:
+            return
+
+        was_blocked = cb.blockSignals(True)
+        cb.setChecked(visible)
+        cb.blockSignals(was_blocked)
 
     def _update_color_swatch(self, file_id: str) -> None:
         """Update the color swatch button for a given neuron."""
@@ -216,24 +312,22 @@ class NeuronTableWidget(QWidget):
         if btn is not None:
             self._apply_color_style(btn, entry.color)
 
-    def _file_id_to_row(self, file_id: str) -> int | None:
-        """Get the table row index for a given file_id."""
-        try:
-            return self._row_to_file_id.index(file_id)
-        except ValueError:
-            return None
-
     # --- Public API ---
 
-    def get_selected_file_ids(self) -> list[str]:
+    def get_selected_file_ids(self) -> list[object]:
         """Return the file_ids of the currently selected rows."""
         rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
-        return [self._row_to_file_id[r] for r in rows if r < len(self._row_to_file_id)]
+        selected: list[object] = []
+        for row in rows:
+            file_id = self._file_id_from_row(row)
+            if file_id is not None:
+                selected.append(file_id)
+        return selected
 
     def get_color(self, file_id: str) -> list[float]:
         """Return the RGBA color for a neuron."""
         entry = self._entries.get(file_id)
-        return list(entry.color) if entry else [0.5, 0.5, 0.5, 1.0]
+        return list(entry.color) if entry else list(GRAY_RGBA)
 
     def get_full_color_map(self) -> dict[str, list[float]]:
         """Return a mapping of all file_ids to their current RGBA colors."""
@@ -243,6 +337,98 @@ class NeuronTableWidget(QWidget):
         """Return a mapping of all file_ids to their visibility state."""
         return {fid: e.visible for fid, e in self._entries.items()}
 
+    def set_added_file_ids(self, file_ids_in_scene: set[object] | list[object]) -> None:
+        """Set whether each neuron is currently added to the scene."""
+        flags = added_flags(self._entries.keys(), file_ids_in_scene)
+        row_map = self._file_id_to_row_map()
+
+        sorting_enabled = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
+        try:
+            for file_id, added in flags.items():
+                entry = self._entries.get(file_id)
+                if entry is None:
+                    continue
+
+                entry.added_to_scene = added
+                row = row_map.get(file_id)
+                if row is not None:
+                    self._set_added_cell(row, added)
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
+
+    def available_cluster_ids(self) -> list[int]:
+        """Return sorted unique cluster IDs in the table."""
+        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        return cluster_ids_available(cluster_map)
+
+    def apply_cluster_filter(self, cluster_id: int | None) -> None:
+        """Hide rows not in ``cluster_id``. ``None`` means show all rows."""
+        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        matches = cluster_filter_matches(cluster_map, cluster_id)
+        for row, file_id in self._iter_rows_with_file_ids():
+            self._table.setRowHidden(row, not matches.get(file_id, True))
+
+    def hide_all_not_in_cluster(self, cluster_id: int) -> None:
+        """Set visibility off for all neurons not in ``cluster_id``."""
+        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        visibility = visibility_for_selected_cluster(cluster_map, cluster_id)
+
+        row_map = self._file_id_to_row_map()
+        changed = False
+        for file_id, visible in visibility.items():
+            entry = self._entries.get(file_id)
+            if entry is None:
+                continue
+            if entry.visible != visible:
+                changed = True
+            entry.visible = visible
+            row = row_map.get(file_id)
+            if row is not None:
+                self._update_visibility_checkbox(row, visible)
+
+        if changed:
+            self.visibility_changed.emit(self.get_visibility_map())
+
+    def set_all_visible(self) -> None:
+        """Set visibility on for all neurons."""
+        row_map = self._file_id_to_row_map()
+        changed = False
+        for file_id, entry in self._entries.items():
+            if not entry.visible:
+                changed = True
+            entry.visible = True
+            row = row_map.get(file_id)
+            if row is not None:
+                self._update_visibility_checkbox(row, True)
+
+        if changed:
+            self.visibility_changed.emit(self.get_visibility_map())
+
+    def recolor_cluster_turbo(self, cluster_id: int, gray_others: bool = True) -> None:
+        """Recolor selected cluster with turbo; optionally gray non-selected neurons."""
+        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        updates = recolor_cluster_turbo(cluster_map, cluster_id, gray_others=gray_others)
+        if not updates:
+            return
+
+        row_map = self._file_id_to_row_map()
+        changed: dict[str, list[float]] = {}
+        for file_id, rgba in updates.items():
+            entry = self._entries.get(file_id)
+            if entry is None:
+                continue
+            if list(entry.color) == list(rgba):
+                continue
+            entry.color = list(rgba)
+            row = row_map.get(file_id)
+            if row is not None:
+                self._update_color_swatch(file_id)
+            changed[file_id] = list(rgba)
+
+        if changed:
+            self.colors_changed.emit(changed)
+
     def update_cluster_assignments(self, result: ClusterResult) -> None:
         """Update the Cluster column from a ClusterResult.
 
@@ -251,16 +437,21 @@ class NeuronTableWidget(QWidget):
         result : ClusterResult
             Clustering result containing neuron_ids and labels.
         """
-        for neuron_id, label in zip(result.neuron_ids, result.labels):
-            entry = self._entries.get(neuron_id)
-            if entry is None:
-                continue
-            entry.cluster_id = int(label)
-            row = self._file_id_to_row(neuron_id)
-            if row is not None:
-                item = self._table.item(row, COL_CLUSTER)
-                if item is not None:
-                    item.setText(str(int(label)))
+        row_map = self._file_id_to_row_map()
+
+        sorting_enabled = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
+        try:
+            for neuron_id, label in zip(result.neuron_ids, result.labels):
+                entry = self._entries.get(neuron_id)
+                if entry is None:
+                    continue
+                entry.cluster_id = int(label)
+                row = row_map.get(neuron_id)
+                if row is not None:
+                    self._set_cluster_cell(row, entry.cluster_id)
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
 
     def select_file_ids(self, file_ids: list[str]) -> None:
         """Programmatically select table rows matching *file_ids*.
@@ -268,12 +459,14 @@ class NeuronTableWidget(QWidget):
         Temporarily blocks the ``selection_changed`` signal to avoid
         feedback loops (e.g. soma click → table select → signal → …).
         """
+        row_map = self._file_id_to_row_map()
+
         self._table.blockSignals(True)
         try:
             self._table.clearSelection()
             for fid in file_ids:
-                row = self._file_id_to_row(fid)
-                if row is not None:
+                row = row_map.get(fid)
+                if row is not None and not self._table.isRowHidden(row):
                     self._table.selectRow(row)
         finally:
             self._table.blockSignals(False)
