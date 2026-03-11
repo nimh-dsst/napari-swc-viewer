@@ -109,8 +109,8 @@ In the table you can:
 
 Buttons:
 
-- `Render Selected`: render currently selected table rows
-- `Clear`: remove rendered neuron layers
+- `Add Selected`: add currently selected neurons to the scence. They will not be visualized yet.
+- `Clear`: remove the neuron layers
 
 ### 5. Configure rendering (Visualization tab)
 

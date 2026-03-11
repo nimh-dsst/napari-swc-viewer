@@ -222,7 +222,7 @@ class NeuronViewerWidget(QWidget):
         neurons_layout.addWidget(self._neuron_table)
 
         neuron_btn_row = QHBoxLayout()
-        self._render_btn = QPushButton("Render Selected")
+        self._render_btn = QPushButton("Add Selected")
         self._render_btn.clicked.connect(self._render_selected_neurons)
         neuron_btn_row.addWidget(self._render_btn)
 
