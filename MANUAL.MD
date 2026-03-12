@@ -109,8 +109,10 @@ In the table you can:
 
 Buttons:
 
-- `Render Selected`: render currently selected table rows
-- `Clear`: remove rendered neuron layers
+- `Add Selected`: add currently selected neurons to the scene while keeping neurons already added.
+- `Remove Selected`: remove only currently selected neurons from the scene.
+- `Clear All`: remove all neuron layers.
+- Centering mode (`Same` | `Auto`): `Same` keeps the current depth slice after add/remove. `Auto` auto-centers once on first add/remove in the widget session.
 
 ### 5. Configure rendering (Visualization tab)
 
