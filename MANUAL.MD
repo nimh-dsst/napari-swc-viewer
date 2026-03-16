@@ -22,6 +22,7 @@ The plugin adds:
 - napari `>=0.5`
 - `pyqt6`
 - BrainGlobe atlas API dependencies (for atlas-backed features)
+- Internet access for first-time atlas downloads
 
 This repo is configured to use Pixi.
 
@@ -35,6 +36,21 @@ pixi run napari
 ```
 
 When napari is open, launch the widget from the Plugins menu and choose **Neuron Viewer**.
+
+## Quick validation commands
+
+Run from the repository root:
+
+```bash
+pixi run test
+pixi run test-cov
+```
+
+If you need sample data used by tests/examples:
+
+```bash
+pixi run download-test-data
+```
 
 ## Supported data inputs
 
@@ -88,6 +104,7 @@ Notes:
 - Atlas features need a loaded atlas
 - First atlas load may download data and take time
 - The template toggle attempts to load atlas automatically
+- If atlas download fails, see Troubleshooting below
 
 ### 3. Select regions (Regions tab)
 
@@ -224,8 +241,9 @@ Useful flags:
 ### “No neurons found in selected regions”
 
 - Confirm region acronyms exist in your atlas
-- Toggle `Include child regions`
-- Verify your Parquet contains `region_acronym` annotations
+- Verify the selected regions match dataset `region_id` / `region_acronym`
+- Toggle `Include child regions` and retry
+- Confirm parquet stats report non-zero nodes/files/regions
 
 ### Clustering errors or empty results
 
