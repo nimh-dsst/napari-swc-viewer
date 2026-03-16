@@ -56,6 +56,14 @@ Recommended Parquet schema columns:
 - `region_id`, `region_name`, `region_acronym`
 - `subject`, `neuron_id`
 
+### Standard point Parquet files
+
+- Produced from raw CSVs using `scripts/convert_point_csv.py`
+- Imported through the widget Data tab with `Import Point Parquet...`
+- Required columns: `label`, `x`, `y`, `z`
+- Optional columns: `region_name`, `acronym`, `id`, `hemisphere`
+- Any additional columns are preserved and added as napari point properties
+
 ## Typical workflow
 
 ### 1. Open Neuron Viewer
@@ -82,6 +90,13 @@ In **Atlas**:
 
 1. Choose atlas (`allen_mouse_10um`, `25um`, or `50um`)
 2. Click `Load Atlas`
+
+In **Point Parquet Import**:
+
+1. Click `Import Point Parquet...`
+2. Choose a standardized point `.parquet` file
+3. The app adds one `Points` layer per unique `label`
+4. If optional atlas metadata columns are present, the app checks them against the selected atlas and warns on mismatches
 
 Notes:
 
@@ -197,6 +212,36 @@ Data tab, **Convert SWC to Parquet**:
 
 Conversion runs in a background worker with progress updates.
 
+## CSV to standard point Parquet conversion
+
+This repo also provides a converter for atlas-registered point CSV files:
+
+```bash
+python scripts/convert_point_csv.py raw_points.csv mapping.json points.parquet
+```
+
+Mapping JSON format:
+
+```json
+{
+  "label": "marker",
+  "x": "atlas_x",
+  "y": "atlas_y",
+  "z": "atlas_z",
+  "region_name": "region_name",
+  "acronym": "acronym",
+  "id": "id",
+  "hemisphere": "hemisphere"
+}
+```
+
+Notes:
+
+- Mapping keys are the standard target column names
+- `label`, `x`, `y`, and `z` mappings are required
+- The converter preserves any unmapped source columns in the output Parquet
+- The converter validates numeric `x`, `y`, `z`, and `id` values before writing output
+
 ## Command-line hemisphere utility
 
 This repo also provides a script for hemisphere detection and coordinate flipping:
@@ -232,6 +277,13 @@ Useful flags:
 - Ensure both a Parquet file and atlas are loaded
 - Use a region containing enough neurons/somas
 - For DBSCAN, increase `eps` or reduce `min_samples` if clusters are not found
+
+### “Point Parquet import failed”
+
+- Confirm the file contains standardized `label`, `x`, `y`, `z` columns
+- Re-run `scripts/convert_point_csv.py` if you started from a raw CSV
+- Load the target atlas before importing point Parquet
+- If the app warns about metadata mismatches, the point layers are still imported; review optional `region_name`, `acronym`, `id`, and `hemisphere` values
 
 ### Slow 2D slicing
 

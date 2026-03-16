@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
-from napari.utils.notifications import show_info
+from napari.utils.notifications import show_info, show_warning
 from qtpy.QtCore import Qt, QThread, QTimer
 from qtpy.QtWidgets import (
     QApplication,
@@ -40,6 +40,13 @@ from ..auto_center import (
     depth_axis_from_not_displayed,
 )
 from ..db import NeuronDatabase
+from ..point_import import (
+    PointImportError,
+    dataframe_to_point_properties,
+    format_atlas_validation_summary,
+    load_standard_point_parquet,
+    validate_point_metadata_against_atlas,
+)
 from .reference_layers import (
     add_allen_template,
     add_brain_outline,
@@ -216,6 +223,26 @@ class NeuronViewerWidget(QWidget):
         # Atlas status label
         self._atlas_status_label = QLabel("Atlas: Not loaded")
         layout.addWidget(self._atlas_status_label)
+
+        # Standardized point Parquet import
+        point_group = QGroupBox("Point Parquet Import")
+        point_layout = QVBoxLayout(point_group)
+
+        point_row = QHBoxLayout()
+        self._point_file_label = QLabel("No point parquet imported")
+        self._point_file_label.setWordWrap(True)
+        point_row.addWidget(self._point_file_label)
+
+        import_point_btn = QPushButton("Import Point Parquet...")
+        import_point_btn.clicked.connect(self._import_point_parquet)
+        point_row.addWidget(import_point_btn)
+        point_layout.addLayout(point_row)
+
+        self._point_import_status_label = QLabel("")
+        self._point_import_status_label.setWordWrap(True)
+        point_layout.addWidget(self._point_import_status_label)
+
+        layout.addWidget(point_group)
 
         # Selected neurons table
         neurons_group = QGroupBox("Selected Neurons")
@@ -531,6 +558,87 @@ class NeuronViewerWidget(QWidget):
         except Exception as e:
             logger.error(f"Failed to load atlas: {e}")
             self._atlas_status_label.setText(f"Atlas: Error - {e}")
+
+    def _import_point_parquet(self) -> None:
+        """Open file dialog and import standardized point Parquet."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Point Parquet File",
+            "",
+            "Parquet Files (*.parquet);;All Files (*)",
+        )
+        if not filepath:
+            return
+
+        self._load_point_parquet_file(filepath)
+
+    def _load_point_parquet_file(self, filepath: str) -> None:
+        """Load standardized point Parquet and add one layer per label."""
+        if self._atlas is None:
+            message = "Load an atlas before importing point Parquet."
+            self._point_import_status_label.setText(message)
+            show_warning(message)
+            return
+
+        try:
+            points_df = load_standard_point_parquet(filepath)
+        except PointImportError as e:
+            logger.error(f"Failed to load point Parquet: {e}")
+            self._point_import_status_label.setText(f"Error: {e}")
+            return
+
+        if points_df.empty:
+            self._point_file_label.setText(Path(filepath).name)
+            self._point_import_status_label.setText("No points found in file.")
+            return
+
+        validation_summary = validate_point_metadata_against_atlas(
+            points_df,
+            self._atlas,
+        )
+        if validation_summary.has_mismatches:
+            show_warning(format_atlas_validation_summary(validation_summary))
+
+        scale = [1.0 / res for res in self._atlas.resolution]
+        opacity = self._opacity_slider.value() / 100.0
+        label_order = list(dict.fromkeys(points_df["label"].tolist()))
+
+        for label in label_order:
+            label_df = points_df.loc[points_df["label"] == label]
+            coords = label_df[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
+            properties = dataframe_to_point_properties(label_df)
+
+            self.viewer.add_points(
+                coords,
+                size=self._point_size_spin.value(),
+                name=f"Points: {label}",
+                opacity=opacity,
+                scale=scale,
+                properties=properties,
+                metadata={
+                    "source_path": filepath,
+                    "label": label,
+                    "point_count": len(label_df),
+                },
+            )
+
+        self._point_file_label.setText(Path(filepath).name)
+        message = (
+            f"Imported {len(points_df):,} point(s) across {len(label_order)} "
+            f"label(s)."
+        )
+        if validation_summary.has_mismatches:
+            message += (
+                f" Atlas validation found "
+                f"{validation_summary.total_mismatched_rows} mismatched row(s)."
+            )
+        self._point_import_status_label.setText(message)
+        logger.info(
+            "Imported point Parquet %s with %d labels and %d points",
+            filepath,
+            len(label_order),
+            len(points_df),
+        )
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
