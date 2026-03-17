@@ -9,6 +9,7 @@ This widget provides a unified interface for:
 
 from __future__ import annotations
 
+import colorsys
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -64,6 +65,28 @@ if TYPE_CHECKING:
     import napari
 
 logger = logging.getLogger(__name__)
+
+_POINT_HEATMAP_BASE_COLORS = [
+    (1.0, 0.0, 0.0, 1.0),    # red
+    (0.0, 0.8, 0.0, 1.0),    # green
+    (1.0, 0.9, 0.0, 1.0),    # yellow
+    (0.1, 0.4, 1.0, 1.0),    # blue
+    (1.0, 0.4, 0.0, 1.0),    # orange
+    (0.8, 0.0, 0.8, 1.0),    # magenta
+    (0.0, 0.8, 0.8, 1.0),    # cyan
+    (0.6, 0.3, 0.0, 1.0),    # brown
+]
+
+
+def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
+    """Return a distinct RGBA color for a heatmap layer."""
+    if index < len(_POINT_HEATMAP_BASE_COLORS):
+        return _POINT_HEATMAP_BASE_COLORS[index]
+
+    # Spread additional labels across the hue wheel to avoid reusing colors.
+    hue = (index * 0.618033988749895) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
+    return (red, green, blue, 1.0)
 
 
 class NeuronViewerWidget(QWidget):
@@ -574,6 +597,8 @@ class NeuronViewerWidget(QWidget):
 
     def _load_point_parquet_file(self, filepath: str) -> None:
         """Load standardized point Parquet and add one heatmap layer per label."""
+        from napari.utils.colormaps import Colormap
+
         if self._atlas is None:
             message = "Load an atlas before importing point Parquet."
             self._point_import_status_label.setText(message)
@@ -602,7 +627,7 @@ class NeuronViewerWidget(QWidget):
         opacity = self._opacity_slider.value() / 100.0
         label_heatmaps = build_label_heatmap_volumes(points_df, self._atlas)
 
-        for label, volume in label_heatmaps.items():
+        for color_idx, (label, volume) in enumerate(label_heatmaps.items()):
             layer_name = f"Points Heatmap: {label}"
             for layer in list(self.viewer.layers):
                 if layer.name == layer_name:
@@ -610,12 +635,17 @@ class NeuronViewerWidget(QWidget):
 
             label_df = points_df.loc[points_df["label"] == label]
             nonzero_voxels = int((volume > 0).sum())
+            rgba = _point_heatmap_color(color_idx)
+            colormap = Colormap(
+                colors=[[0.0, 0.0, 0.0, 0.0], list(rgba)],
+                name=f"point_heatmap_{color_idx}",
+            )
             self.viewer.add_image(
                 volume,
                 name=layer_name,
                 blending="additive",
                 rendering="mip",
-                colormap="hot",
+                colormap=colormap,
                 opacity=opacity,
                 metadata={
                     "source_path": filepath,
@@ -623,6 +653,7 @@ class NeuronViewerWidget(QWidget):
                     "point_count": len(label_df),
                     "nonzero_voxels": nonzero_voxels,
                     "columns": list(label_df.columns),
+                    "color": rgba,
                 },
             )
 

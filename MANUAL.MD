@@ -95,7 +95,7 @@ In **Point Parquet Import**:
 
 1. Click `Import Point Parquet...`
 2. Choose a standardized point `.parquet` file
-3. The app adds one heatmap image layer per unique `label`
+3. The app adds one heatmap image layer per unique `label`, using a different color for each layer
 4. If optional atlas metadata columns are present, the app checks them against the selected atlas and warns on mismatches
 
 Notes:
@@ -283,7 +283,7 @@ Useful flags:
 - Confirm the file contains standardized `label`, `x`, `y`, `z` columns
 - Re-run `scripts/convert_point_csv.py` if you started from a raw CSV
 - Load the target atlas before importing point Parquet
-- If the app warns about metadata mismatches, the point layers are still imported; review optional `region_name`, `acronym`, `id`, and `hemisphere` values
+- If the app warns about metadata mismatches, the heatmap layers are still imported; review optional `region_name`, `acronym`, `id`, and `hemisphere` values
 
 ### Slow 2D slicing
 

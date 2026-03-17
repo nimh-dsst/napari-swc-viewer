@@ -80,6 +80,8 @@ In the plugin Data tab, use `Import Point Parquet...` to load the standardized
 Parquet. The selected atlas must already be loaded. If optional atlas metadata
 columns are present, the app validates them against the selected atlas,
 warns on mismatches, and imports one heatmap image layer per unique `label`.
+Each heatmap layer is assigned a distinct color so labels are easier to
+differentiate in the viewer.
 
 ## Hemisphere Detection and Coordinate Flipping
 
