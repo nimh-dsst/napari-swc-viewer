@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .atlas_utils import world_coords_xyz_to_atlas_voxels
 from .hemisphere import get_atlas_midline
 
 REQUIRED_POINT_COLUMNS = ("label", "x", "y", "z")
@@ -304,7 +305,7 @@ def _world_coords_to_atlas_region_ids(
     """Map world-space XYZ micron coordinates to atlas annotation region IDs."""
 
     annotation = np.asarray(atlas.annotation)
-    voxel_coords = _world_coords_to_atlas_voxel_coords(coords_xyz, atlas)
+    voxel_coords = world_coords_xyz_to_atlas_voxels(coords_xyz, atlas)
 
     region_ids = np.zeros(len(voxel_coords), dtype=np.int64)
     in_bounds = np.all(
@@ -315,18 +316,6 @@ def _world_coords_to_atlas_region_ids(
     if len(valid) > 0:
         region_ids[in_bounds] = annotation[valid[:, 0], valid[:, 1], valid[:, 2]]
     return region_ids
-
-
-def _world_coords_to_atlas_voxel_coords(
-    coords_xyz: np.ndarray,
-    atlas: Any,
-) -> np.ndarray:
-    """Convert world-space XYZ micron coordinates to atlas ZYX voxel indices."""
-
-    resolution = np.asarray(atlas.resolution, dtype=float)
-    lookup_coords = np.asarray(coords_xyz, dtype=float)[:, [2, 1, 0]]
-    return np.round(lookup_coords / resolution).astype(int)
-
 
 def validate_point_metadata_against_atlas(
     df: pd.DataFrame,
@@ -483,7 +472,7 @@ def build_label_heatmap_volumes(
 
     standardized = validate_standard_point_dataframe(df)
     coords = standardized[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
-    voxel_coords = _world_coords_to_atlas_voxel_coords(coords, atlas)
+    voxel_coords = world_coords_xyz_to_atlas_voxels(coords, atlas)
     atlas_shape = np.asarray(atlas.annotation.shape)
     in_bounds = np.all((voxel_coords >= 0) & (voxel_coords < atlas_shape), axis=1)
 

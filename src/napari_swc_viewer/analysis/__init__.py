@@ -18,15 +18,23 @@ from .correlation import (
 )
 from .heatmap import build_node_counts_volume
 from .mask import (
+    build_binary_mask_from_heatmap,
     dilate_mask_to_volume_increase,
     get_expanded_region_voxel_ids,
     get_region_mask,
+    merge_heatmap_volumes,
+    otsu_threshold_positive,
+    smooth_heatmap_volume,
 )
 
 __all__ = [
     "get_region_mask",
     "dilate_mask_to_volume_increase",
     "get_expanded_region_voxel_ids",
+    "smooth_heatmap_volume",
+    "merge_heatmap_volumes",
+    "otsu_threshold_positive",
+    "build_binary_mask_from_heatmap",
     "compute_pearson_correlation_matrix",
     "correlation_long_to_matrix",
     "build_node_counts_volume",

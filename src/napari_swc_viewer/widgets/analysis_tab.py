@@ -551,6 +551,16 @@ class AnalysisTabWidget(QWidget):
             opacity=0.7,
             visible=True,
             scale=scale,
+            metadata={
+                "heatmap_source": True,
+                "heatmap_native_grid": self._pending_heatmap_depth_bin == 1,
+                "atlas_name": getattr(self._atlas, "atlas_name", None),
+                "heatmap_kind": "analysis",
+                "heatmap_region": region,
+                "heatmap_cluster": cluster_label,
+                "depth_bin_factor": self._pending_heatmap_depth_bin,
+                "depth_axis": self._pending_heatmap_depth_axis,
+            },
         )
 
     def _on_error(self, message: str) -> None:

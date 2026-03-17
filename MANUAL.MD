@@ -106,14 +106,29 @@ Notes:
 
 ### 3. Select regions (Regions tab)
 
-1. Use search to find structures
-2. Check regions in the tree
-3. Optionally enable/disable `Include child regions`
-4. Click `Find Neurons in Selected Regions`
+1. Choose `Query source`
+2. For `Atlas Regions`, use search to find structures, check regions in the tree, and optionally enable/disable `Include child regions`
+3. For `Mask Layer`, check one or more generated mask layers and select either `Any node in mask` or `Soma in mask`
+4. Click the query button for the active source
 
 This fills the **Selected Neurons** table in the Data tab.
 
-### 4. Manage selected neurons (Data tab table)
+### 4. Build masks from heatmaps (Tools tab)
+
+1. Select one or more eligible heatmap layers
+2. Choose `Separate masks` or `Merged mask`
+3. Set Gaussian sigma in atlas voxels
+4. Choose `Otsu` or `Manual` thresholding
+5. Click `Create Mask Layer`
+
+Notes:
+
+- Only app-created heatmaps on the native atlas voxel grid are eligible
+- Depth-binned analysis heatmaps are excluded from mask creation in this version
+- Generated masks are added as binary `Labels` layers and can be used from the `Regions` tab
+- Gaussian sigma is in atlas voxels; for example, on `allen_mouse_25um`, `1.0` means `1 voxel = 25 µm`
+
+### 5. Manage selected neurons (Data tab table)
 
 In the table you can:
 
@@ -129,7 +144,7 @@ Buttons:
 - `Clear All`: remove all neuron layers.
 - Centering mode (`Same` | `Auto`): `Same` keeps the current depth slice after add/remove. `Auto` auto-centers once on first add/remove in the widget session.
 
-### 5. Configure rendering (Visualization tab)
+### 6. Configure rendering (Visualization tab)
 
 Controls:
 
@@ -145,7 +160,7 @@ Rendering behavior:
 - In 2D mode, line/point layers are auto-hidden to keep navigation responsive
 - Optional `Neuron Slice Projection` (vectors layer) shows line segments near current slice
 
-### 6. Add reference context (Reference tab)
+### 7. Add reference context (Reference tab)
 
 Available layers:
 
@@ -159,7 +174,7 @@ Notes:
 - Mesh display auto-switches napari to 3D mode
 - Segmentation is intended for 2D context overlays
 
-### 7. Run analysis (Analysis tab)
+### 8. Run analysis (Analysis tab)
 
 ### Clustering
 
@@ -284,6 +299,18 @@ Useful flags:
 - Re-run `scripts/convert_point_csv.py` if you started from a raw CSV
 - Load the target atlas before importing point Parquet
 - If the app warns about metadata mismatches, the heatmap layers are still imported; review optional `region_name`, `acronym`, `id`, and `hemisphere` values
+
+### “No eligible heatmaps” in Tools
+
+- Only app-created heatmap image layers are listed
+- The heatmap must match the currently loaded atlas
+- Depth-binned analysis heatmaps are excluded because they are not on the native atlas voxel grid
+
+### “No neurons found” for a mask query
+
+- Confirm the selected mask layer contains nonzero voxels
+- Try `Any node in mask` before `Soma in mask`
+- Check that the mask was created from heatmaps for the same atlas resolution as the loaded dataset
 
 ### Slow 2D slicing
 

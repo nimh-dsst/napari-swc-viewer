@@ -85,6 +85,14 @@ class _DummyImageLayer:
         self.metadata = kwargs.get("metadata", {})
 
 
+class _DummyLabelsLayer:
+    def __init__(self, data: np.ndarray, **kwargs) -> None:
+        self.data = np.asarray(data)
+        self.name = kwargs["name"]
+        self.opacity = kwargs.get("opacity")
+        self.metadata = kwargs.get("metadata", {})
+
+
 class _DummyViewer:
     def __init__(self) -> None:
         self.layers: list[_DummyPointsLayer] = []
@@ -97,6 +105,11 @@ class _DummyViewer:
 
     def add_image(self, data: np.ndarray, **kwargs) -> _DummyImageLayer:
         layer = _DummyImageLayer(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_labels(self, data: np.ndarray, **kwargs) -> _DummyLabelsLayer:
+        layer = _DummyLabelsLayer(data, **kwargs)
         self.layers.append(layer)
         return layer
 

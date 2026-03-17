@@ -83,6 +83,12 @@ warns on mismatches, and imports one heatmap image layer per unique `label`.
 Each heatmap layer is assigned a distinct color so labels are easier to
 differentiate in the viewer.
 
+In the `Tools` tab, eligible native-grid heatmaps can be converted into 3D
+binary mask `Labels` layers using Gaussian smoothing plus either Otsu or manual
+thresholding. The `Regions` tab can then query neurons either by Allen regions
+or by one or more of these generated mask layers, using either any-node or soma-only
+membership.
+
 ## Hemisphere Detection and Coordinate Flipping
 
 This plugin includes functionality to detect which brain hemisphere an SWC morphology is located in and to flip coordinates from one hemisphere to the other. This is useful for standardizing neuron reconstructions to a common hemisphere for analysis.

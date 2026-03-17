@@ -19,22 +19,27 @@ from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info, show_warning
 from qtpy.QtCore import Qt, QThread, QTimer
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from ..analysis.mask import build_binary_mask_from_heatmap, merge_heatmap_volumes
 from ..auto_center import (
     center_to_depth_world,
     compute_center_of_rendered_neurons,
@@ -57,6 +62,7 @@ from .reference_layers import (
     remove_region_segmentation,
 )
 from .analysis_tab import AnalysisTabWidget
+from .mask_layer_selector import MaskLayerSelectorWidget
 from .neuron_table import NeuronTableWidget
 from .region_selector import RegionSelectorWidget
 from .slice_projection import NeuronSliceProjector
@@ -89,6 +95,37 @@ def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
     return (red, green, blue, 1.0)
 
 
+def _layer_metadata(layer) -> dict:
+    """Return layer metadata as a mutable dict-like object."""
+    metadata = getattr(layer, "metadata", None)
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _mask_layer_color(source_layers: list) -> tuple[float, float, float, float] | None:
+    """Derive a labels-layer color from source heatmap metadata."""
+    colors = []
+    for layer in source_layers:
+        color = _layer_metadata(layer).get("color")
+        if color is None:
+            continue
+        rgba = np.asarray(color, dtype=float).reshape(-1)
+        if rgba.size == 3:
+            rgba = np.append(rgba, 1.0)
+        if rgba.size >= 4:
+            colors.append(rgba[:4])
+
+    if not colors:
+        return None
+
+    if len(colors) == 1:
+        rgba = colors[0]
+    else:
+        rgba = np.mean(np.vstack(colors), axis=0)
+        rgba[3] = 1.0
+    rgba = np.clip(rgba, 0.0, 1.0)
+    return tuple(float(value) for value in rgba[:4])
+
+
 class NeuronViewerWidget(QWidget):
     """Main widget for viewing neurons with brain region filtering.
 
@@ -114,6 +151,7 @@ class NeuronViewerWidget(QWidget):
         self._highlighted_file_ids: set[str] | None = None  # None = no highlight
         self._last_soma_selection: set = set()  # track to skip no-op highlights
         self._auto_center_applied_once = False
+        self._region_query_source = "Atlas Regions"
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -123,6 +161,9 @@ class NeuronViewerWidget(QWidget):
         self._convert_worker = None
 
         self._setup_ui()
+        self._connect_layer_events()
+        self._refresh_heatmap_layer_list()
+        self._refresh_mask_layer_options()
 
         # Auto-hide neuron line layers in 2D mode
         self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
@@ -166,6 +207,10 @@ class NeuronViewerWidget(QWidget):
         )
         tabs.addTab(self._analysis_tab, "Analysis")
 
+        tools_tab = QWidget()
+        tabs.addTab(tools_tab, "Tools")
+        self._setup_tools_tab(tools_tab)
+
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
         layout = QVBoxLayout(parent)
@@ -202,7 +247,7 @@ class NeuronViewerWidget(QWidget):
         layout.addWidget(convert_group)
 
         # File selection
-        file_group = QGroupBox("Parquet Data")
+        file_group = QGroupBox("SWC Parquet Data")
         file_layout = QVBoxLayout(file_group)
 
         file_row = QHBoxLayout()
@@ -344,18 +389,140 @@ class NeuronViewerWidget(QWidget):
         """Set up the region selection tab."""
         layout = QVBoxLayout(parent)
 
-        # Region selector widget
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Query source:"))
+        self._region_query_source_combo = QComboBox()
+        self._region_query_source_combo.addItems(["Atlas Regions", "Mask Layer"])
+        self._region_query_source_combo.currentTextChanged.connect(
+            self._on_region_query_source_changed
+        )
+        source_row.addWidget(self._region_query_source_combo)
+        layout.addLayout(source_row)
+
+        self._region_query_stack = QStackedWidget()
+
+        atlas_page = QWidget()
+        atlas_layout = QVBoxLayout(atlas_page)
+        atlas_layout.setContentsMargins(0, 0, 0, 0)
         self._region_selector = RegionSelectorWidget()
         self._region_selector.selection_changed.connect(self._on_regions_selected)
-        layout.addWidget(self._region_selector)
+        atlas_layout.addWidget(self._region_selector)
+        self._region_query_stack.addWidget(atlas_page)
+
+        mask_page = QWidget()
+        mask_layout = QVBoxLayout(mask_page)
+        mask_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._mask_layer_selector = MaskLayerSelectorWidget()
+        self._mask_layer_selector.selection_changed.connect(
+            self._on_mask_layer_selection_changed
+        )
+        mask_layout.addWidget(self._mask_layer_selector)
+
+        membership_row = QHBoxLayout()
+        membership_row.addWidget(QLabel("Membership:"))
+        self._mask_query_membership_combo = QComboBox()
+        self._mask_query_membership_combo.addItem("Any node in mask", False)
+        self._mask_query_membership_combo.addItem("Soma in mask", True)
+        membership_row.addWidget(self._mask_query_membership_combo)
+        mask_layout.addLayout(membership_row)
+
+        self._mask_query_hint_label = QLabel("")
+        self._mask_query_hint_label.setWordWrap(True)
+        mask_layout.addWidget(self._mask_query_hint_label)
+        mask_layout.addStretch()
+        self._region_query_stack.addWidget(mask_page)
+
+        layout.addWidget(self._region_query_stack)
 
         # Query button
         btn_row = QHBoxLayout()
         self._query_btn = QPushButton("Find Neurons in Selected Regions")
-        self._query_btn.clicked.connect(self._query_neurons_by_region)
+        self._query_btn.clicked.connect(self._query_neurons)
         self._query_btn.setEnabled(False)
         btn_row.addWidget(self._query_btn)
         layout.addLayout(btn_row)
+
+        self._regions_status_label = QLabel("")
+        self._regions_status_label.setWordWrap(True)
+        layout.addWidget(self._regions_status_label)
+        self._on_region_query_source_changed(self._region_query_source_combo.currentText())
+
+    def _setup_tools_tab(self, parent: QWidget) -> None:
+        """Set up the heatmap-to-mask tools tab."""
+        layout = QVBoxLayout(parent)
+
+        sources_group = QGroupBox("Heatmap Sources")
+        sources_layout = QVBoxLayout(sources_group)
+        self._heatmap_layer_list = QListWidget()
+        self._heatmap_layer_list.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+        )
+        sources_layout.addWidget(self._heatmap_layer_list)
+        self._tools_hint_label = QLabel("")
+        self._tools_hint_label.setWordWrap(True)
+        sources_layout.addWidget(self._tools_hint_label)
+        layout.addWidget(sources_group)
+
+        settings_group = QGroupBox("Mask Creation")
+        settings_layout = QVBoxLayout(settings_group)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Output mode:"))
+        self._mask_output_mode_combo = QComboBox()
+        self._mask_output_mode_combo.addItems(["Separate masks", "Merged mask"])
+        mode_row.addWidget(self._mask_output_mode_combo)
+        settings_layout.addLayout(mode_row)
+
+        sigma_row = QHBoxLayout()
+        self._mask_sigma_label = QLabel("Gaussian sigma (voxels):")
+        sigma_row.addWidget(self._mask_sigma_label)
+        self._mask_sigma_spin = QDoubleSpinBox()
+        self._mask_sigma_spin.setRange(0.0, 20.0)
+        self._mask_sigma_spin.setDecimals(2)
+        self._mask_sigma_spin.setSingleStep(0.25)
+        self._mask_sigma_spin.setValue(1.0)
+        sigma_row.addWidget(self._mask_sigma_spin)
+        settings_layout.addLayout(sigma_row)
+        self._mask_sigma_units_label = QLabel(
+            "1 voxel = atlas voxel size; load an atlas to see the micron equivalent."
+        )
+        self._mask_sigma_units_label.setWordWrap(True)
+        settings_layout.addWidget(self._mask_sigma_units_label)
+
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(QLabel("Threshold:"))
+        self._mask_threshold_mode_combo = QComboBox()
+        self._mask_threshold_mode_combo.addItems(["Otsu", "Manual"])
+        self._mask_threshold_mode_combo.currentTextChanged.connect(
+            self._on_mask_threshold_mode_changed
+        )
+        threshold_row.addWidget(self._mask_threshold_mode_combo)
+        settings_layout.addLayout(threshold_row)
+
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(QLabel("Manual value:"))
+        self._mask_manual_threshold_spin = QDoubleSpinBox()
+        self._mask_manual_threshold_spin.setRange(-1_000_000.0, 1_000_000.0)
+        self._mask_manual_threshold_spin.setDecimals(4)
+        self._mask_manual_threshold_spin.setValue(1.0)
+        manual_row.addWidget(self._mask_manual_threshold_spin)
+        settings_layout.addLayout(manual_row)
+
+        self._create_mask_btn = QPushButton("Create Mask Layer")
+        self._create_mask_btn.clicked.connect(self._create_masks_from_heatmaps)
+        settings_layout.addWidget(self._create_mask_btn)
+
+        self._tools_status_label = QLabel("")
+        self._tools_status_label.setWordWrap(True)
+        settings_layout.addWidget(self._tools_status_label)
+
+        layout.addWidget(settings_group)
+        layout.addStretch()
+        self._on_mask_threshold_mode_changed(
+            self._mask_threshold_mode_combo.currentText()
+        )
+        self._update_mask_sigma_units_label()
 
     def _setup_viz_tab(self, parent: QWidget) -> None:
         """Set up the visualization settings tab."""
@@ -555,6 +722,7 @@ class NeuronViewerWidget(QWidget):
 
             self._query_btn.setEnabled(True)
             self._analysis_tab.set_database(self._db)
+            self._regions_status_label.setText("")
             logger.info(f"Loaded Parquet file: {filepath}")
 
         except Exception as e:
@@ -576,11 +744,15 @@ class NeuronViewerWidget(QWidget):
                 f"Atlas: {atlas_name} ({len(self._atlas.structures)} structures)"
             )
             self._analysis_tab.set_atlas(self._atlas)
+            self._update_mask_sigma_units_label()
+            self._refresh_heatmap_layer_list()
+            self._refresh_mask_layer_options()
             logger.info(f"Loaded atlas: {atlas_name}")
 
         except Exception as e:
             logger.error(f"Failed to load atlas: {e}")
             self._atlas_status_label.setText(f"Atlas: Error - {e}")
+            self._update_mask_sigma_units_label()
 
     def _import_point_parquet(self) -> None:
         """Open file dialog and import standardized point Parquet."""
@@ -654,6 +826,10 @@ class NeuronViewerWidget(QWidget):
                     "nonzero_voxels": nonzero_voxels,
                     "columns": list(label_df.columns),
                     "color": rgba,
+                    "heatmap_source": True,
+                    "heatmap_native_grid": True,
+                    "atlas_name": getattr(self._atlas, "atlas_name", None),
+                    "heatmap_kind": "point_import",
                 },
             )
 
@@ -674,6 +850,344 @@ class NeuronViewerWidget(QWidget):
             len(label_heatmaps),
             len(points_df),
         )
+        self._refresh_heatmap_layer_list()
+        self._refresh_mask_layer_options()
+
+    def _connect_layer_events(self) -> None:
+        """Refresh tool and mask selectors when viewer layers change."""
+        layer_events = getattr(getattr(self.viewer, "layers", None), "events", None)
+        if layer_events is None:
+            return
+        for event_name in ("inserted", "removed", "reordered"):
+            signal = getattr(layer_events, event_name, None)
+            if signal is not None:
+                signal.connect(self._on_viewer_layers_changed)
+
+    def _on_viewer_layers_changed(self, _event=None) -> None:
+        """Refresh UI that depends on viewer layers."""
+        self._refresh_heatmap_layer_list()
+        self._refresh_mask_layer_options()
+
+    def _iter_viewer_layers(self) -> list:
+        """Return current viewer layers as a list."""
+        try:
+            return list(self.viewer.layers)
+        except Exception:
+            return []
+
+    def _current_atlas_name(self) -> str | None:
+        """Return the currently loaded atlas name, if any."""
+        if self._atlas is None:
+            return None
+        return str(getattr(self._atlas, "atlas_name", "")) or None
+
+    def _update_mask_sigma_units_label(self) -> None:
+        """Show Gaussian sigma units in voxels with atlas micron equivalence."""
+        if not hasattr(self, "_mask_sigma_units_label"):
+            return
+
+        if self._atlas is None:
+            self._mask_sigma_units_label.setText(
+                "Sigma is measured in atlas voxels. Load an atlas to see the micron equivalent."
+            )
+            return
+
+        resolution = np.asarray(self._atlas.resolution, dtype=float)
+        if np.allclose(resolution, resolution[0]):
+            self._mask_sigma_units_label.setText(
+                f"Sigma is measured in atlas voxels. "
+                f"With the current atlas, 1 voxel = {resolution[0]:g} µm."
+            )
+        else:
+            self._mask_sigma_units_label.setText(
+                "Sigma is measured in atlas voxels. "
+                f"With the current atlas, 1 voxel = "
+                f"{resolution[2]:g} µm (X), {resolution[1]:g} µm (Y), "
+                f"{resolution[0]:g} µm (Z)."
+            )
+
+    def _heatmap_layer_eligibility(self, layer) -> tuple[bool, str]:
+        """Return whether a layer is eligible as a Tools heatmap source."""
+        if self._atlas is None:
+            return False, "Load an atlas to select heatmaps."
+
+        metadata = _layer_metadata(layer)
+        if not metadata.get("heatmap_source"):
+            return False, "Not an app heatmap layer."
+        if not metadata.get("heatmap_native_grid", False):
+            return False, "Heatmap is not on the native atlas voxel grid."
+        if metadata.get("atlas_name") != self._current_atlas_name():
+            return False, "Heatmap atlas does not match the loaded atlas."
+
+        data = np.asarray(getattr(layer, "data", np.array([])))
+        atlas_shape = tuple(np.asarray(self._atlas.annotation).shape)
+        if data.ndim != 3 or tuple(data.shape) != atlas_shape:
+            return False, "Heatmap shape does not match the loaded atlas."
+        return True, ""
+
+    def _generated_mask_layers(self) -> list:
+        """Return generated mask layers eligible for Regions queries."""
+        masks = []
+        atlas_name = self._current_atlas_name()
+        for layer in self._iter_viewer_layers():
+            metadata = _layer_metadata(layer)
+            if not metadata.get("mask_query_source"):
+                continue
+            if atlas_name is not None and metadata.get("atlas_name") != atlas_name:
+                continue
+            masks.append(layer)
+        return masks
+
+    def _refresh_heatmap_layer_list(self) -> None:
+        """Refresh the Tools heatmap selector list."""
+        if not hasattr(self, "_heatmap_layer_list"):
+            return
+
+        previous = {
+            item.text()
+            for item in self._heatmap_layer_list.selectedItems()
+        }
+        self._heatmap_layer_list.clear()
+
+        eligible_names: list[str] = []
+        excluded_messages: list[str] = []
+        for layer in self._iter_viewer_layers():
+            eligible, reason = self._heatmap_layer_eligibility(layer)
+            if eligible:
+                self._heatmap_layer_list.addItem(layer.name)
+                eligible_names.append(layer.name)
+            elif _layer_metadata(layer).get("heatmap_source"):
+                excluded_messages.append(f"{layer.name}: {reason}")
+
+        for index in range(self._heatmap_layer_list.count()):
+            item = self._heatmap_layer_list.item(index)
+            if item.text() in previous:
+                item.setSelected(True)
+
+        if not eligible_names:
+            if excluded_messages:
+                self._tools_hint_label.setText(
+                    "No eligible native-grid heatmaps. "
+                    + " ".join(excluded_messages[:3])
+                )
+            else:
+                self._tools_hint_label.setText(
+                    "No eligible heatmap layers are available."
+                )
+        elif excluded_messages:
+            self._tools_hint_label.setText(
+                f"{len(eligible_names)} eligible heatmap layer(s). "
+                + "Excluded: "
+                + "; ".join(excluded_messages[:3])
+            )
+        else:
+            self._tools_hint_label.setText(
+                f"{len(eligible_names)} eligible heatmap layer(s)."
+            )
+
+    def _refresh_mask_layer_options(self) -> None:
+        """Refresh Regions-tab mask layer options."""
+        if not hasattr(self, "_mask_layer_selector"):
+            return
+
+        masks = self._generated_mask_layers()
+        mask_entries = []
+        for layer in masks:
+            metadata = _layer_metadata(layer)
+            mask_entries.append(
+                {
+                    "name": layer.name,
+                    "sources": metadata.get("source_heatmap_layers", []),
+                }
+            )
+        self._mask_layer_selector.set_mask_layers(mask_entries)
+        hint = (
+            f"{len(masks)} generated mask layer(s) available."
+            if masks
+            else "No generated mask layers are available."
+        )
+        self._mask_query_hint_label.setText(hint)
+
+    def _on_mask_threshold_mode_changed(self, text: str) -> None:
+        """Enable manual threshold input only for manual mode."""
+        if hasattr(self, "_mask_manual_threshold_spin"):
+            self._mask_manual_threshold_spin.setEnabled(text == "Manual")
+
+    def _selected_heatmap_layers(self) -> list:
+        """Return selected eligible heatmap layers from the Tools tab."""
+        selected_names = {
+            item.text() for item in self._heatmap_layer_list.selectedItems()
+        }
+        if not selected_names:
+            return []
+        layers = []
+        for layer in self._iter_viewer_layers():
+            if layer.name in selected_names and self._heatmap_layer_eligibility(layer)[0]:
+                layers.append(layer)
+        return layers
+
+    def _selected_mask_query_layers(self) -> list:
+        """Return the currently selected generated mask layers."""
+        if not hasattr(self, "_mask_layer_selector"):
+            return []
+        names = set(self._mask_layer_selector.get_selected_layer_names())
+        if not names:
+            return []
+        return [
+            layer for layer in self._generated_mask_layers()
+            if layer.name in names
+        ]
+
+    def _on_mask_layer_selection_changed(self, selected_names: list[str]) -> None:
+        """Update Regions status text when mask selection changes."""
+        count = len(selected_names)
+        if count == 0:
+            self._regions_status_label.setText("")
+        elif count == 1:
+            self._regions_status_label.setText("1 mask layer selected for querying.")
+        else:
+            self._regions_status_label.setText(
+                f"{count} mask layers selected for querying."
+            )
+
+    def _create_masks_from_heatmaps(self) -> None:
+        """Create binary mask label layers from selected heatmap image layers."""
+        if self._atlas is None:
+            message = "Load an atlas before creating mask layers."
+            self._tools_status_label.setText(message)
+            show_warning(message)
+            return
+
+        selected_layers = self._selected_heatmap_layers()
+        if not selected_layers:
+            message = "Select at least one eligible heatmap layer."
+            self._tools_status_label.setText(message)
+            return
+
+        sigma = float(self._mask_sigma_spin.value())
+        threshold_mode = self._mask_threshold_mode_combo.currentText().strip().lower()
+        manual_threshold = None
+        if threshold_mode == "manual":
+            manual_threshold = float(self._mask_manual_threshold_spin.value())
+
+        output_mode = self._mask_output_mode_combo.currentText()
+        created_layers = []
+
+        if output_mode == "Merged mask":
+            merged_volume = merge_heatmap_volumes(
+                [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+            )
+            mask, threshold, _smoothed = build_binary_mask_from_heatmap(
+                merged_volume,
+                sigma=sigma,
+                threshold_mode=threshold_mode,
+                manual_threshold=manual_threshold,
+            )
+            layer_name = f"Mask: merged {len(selected_layers)} heatmaps"
+            created_layers.append(
+                self._add_mask_layer(
+                    layer_name=layer_name,
+                    mask=mask,
+                    source_layers=selected_layers,
+                    sigma=sigma,
+                    threshold_mode=threshold_mode,
+                    threshold=threshold,
+                    merge_mode="merged_sum",
+                )
+            )
+        else:
+            for layer in selected_layers:
+                mask, threshold, _smoothed = build_binary_mask_from_heatmap(
+                    np.asarray(layer.data, dtype=np.float32),
+                    sigma=sigma,
+                    threshold_mode=threshold_mode,
+                    manual_threshold=manual_threshold,
+                )
+                created_layers.append(
+                    self._add_mask_layer(
+                        layer_name=f"Mask: {layer.name}",
+                        mask=mask,
+                        source_layers=[layer],
+                        sigma=sigma,
+                        threshold_mode=threshold_mode,
+                        threshold=threshold,
+                        merge_mode="separate",
+                    )
+                )
+
+        nonempty = sum(int(np.asarray(layer.data).sum() > 0) for layer in created_layers)
+        self._tools_status_label.setText(
+            f"Created {len(created_layers)} mask layer(s); {nonempty} contain nonzero voxels."
+        )
+        self._refresh_mask_layer_options()
+
+    def _add_mask_layer(
+        self,
+        layer_name: str,
+        mask: np.ndarray,
+        source_layers: list,
+        sigma: float,
+        threshold_mode: str,
+        threshold: float,
+        merge_mode: str,
+    ):
+        """Add or replace a generated binary mask layer."""
+        from napari.utils import DirectLabelColormap
+
+        for layer in list(self._iter_viewer_layers()):
+            if layer.name == layer_name:
+                self.viewer.layers.remove(layer)
+
+        labels = np.asarray(mask, dtype=np.uint8)
+        rgba = _mask_layer_color(source_layers)
+        color_dict = {
+            None: np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            0: np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        }
+        color_dict[1] = np.array(
+            rgba if rgba is not None else (0.8, 0.8, 0.8, 1.0),
+            dtype=np.float32,
+        )
+
+        layer = self.viewer.add_labels(
+            labels,
+            name=layer_name,
+            opacity=self._opacity_slider.value() / 100.0,
+            visible=True,
+            colormap=DirectLabelColormap(color_dict=color_dict),
+            metadata={
+                "mask_query_source": True,
+                "source_heatmap_layers": [layer.name for layer in source_layers],
+                "sigma": sigma,
+                "threshold_mode": threshold_mode,
+                "threshold_value": float(threshold),
+                "merge_mode": merge_mode,
+                "atlas_name": self._current_atlas_name(),
+                "color": rgba,
+            },
+        )
+        return layer
+
+    def _on_region_query_source_changed(self, text: str) -> None:
+        """Switch Regions tab between atlas and mask query modes."""
+        self._region_query_source = text
+        if not hasattr(self, "_region_query_stack"):
+            return
+
+        if text == "Mask Layer":
+            self._region_query_stack.setCurrentIndex(1)
+            self._query_btn.setText("Find Neurons in Selected Mask Layers")
+        else:
+            self._region_query_stack.setCurrentIndex(0)
+            self._query_btn.setText("Find Neurons in Selected Regions")
+        self._regions_status_label.setText("")
+
+    def _query_neurons(self) -> None:
+        """Dispatch Regions-tab queries by the selected source type."""
+        if self._region_query_source == "Mask Layer":
+            self._query_neurons_by_mask()
+        else:
+            self._query_neurons_by_region()
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
@@ -695,24 +1209,66 @@ class NeuronViewerWidget(QWidget):
 
         acronyms = self._region_selector.get_selected_acronyms(include_children=True)
         if not acronyms:
+            self._regions_status_label.setText("Select at least one atlas region.")
             return
 
         try:
             result = self._db.get_neurons_by_region(acronyms)
-
-            # Populate neuron table
-            neurons = [
-                (row["file_id"], row["subject"])
-                for _, row in result.iterrows()
-            ]
-            self._neuron_table.populate(neurons)
-            self._neuron_table.set_added_file_ids(set())
-            self._refresh_cluster_filter_controls()
-
+            self._populate_neuron_table(result)
+            self._regions_status_label.setText(
+                f"Found {len(result)} neuron(s) in selected atlas regions."
+            )
             logger.info(f"Found {len(result)} neurons in selected regions")
 
         except Exception as e:
             logger.error(f"Query failed: {e}")
+
+    def _query_neurons_by_mask(self) -> None:
+        """Query neurons using a generated mask layer."""
+        if self._db is None or self._atlas is None:
+            return
+
+        layers = self._selected_mask_query_layers()
+        if not layers:
+            self._regions_status_label.setText("Select at least one generated mask layer.")
+            return
+
+        mask = np.logical_or.reduce([np.asarray(layer.data) > 0 for layer in layers])
+        if not mask.any():
+            message = "Selected mask layer selection is empty and cannot be queried."
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+
+        soma_only = bool(self._mask_query_membership_combo.currentData())
+        try:
+            result = self._db.get_neurons_by_mask(mask, self._atlas, soma_only=soma_only)
+            self._populate_neuron_table(result)
+            mode = "somas" if soma_only else "nodes"
+            selected_names = ", ".join(layer.name for layer in layers[:3])
+            if len(layers) > 3:
+                selected_names += ", ..."
+            self._regions_status_label.setText(
+                f"Found {len(result)} neuron(s) with {mode} in {len(layers)} selected mask layer(s): {selected_names}"
+            )
+            logger.info(
+                "Found %d neurons in %d selected mask layers",
+                len(result),
+                len(layers),
+            )
+        except Exception as e:
+            logger.error(f"Mask query failed: {e}")
+            self._regions_status_label.setText(f"Mask query failed: {e}")
+
+    def _populate_neuron_table(self, result) -> None:
+        """Populate the neuron table from a query result."""
+        neurons = [
+            (row["file_id"], row["subject"])
+            for _, row in result.iterrows()
+        ]
+        self._neuron_table.populate(neurons)
+        self._neuron_table.set_added_file_ids(set())
+        self._refresh_cluster_filter_controls()
 
     def _selected_cluster_from_filter(self) -> int | None:
         """Return selected cluster from the Data tab dropdown."""
