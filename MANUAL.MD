@@ -62,7 +62,7 @@ Recommended Parquet schema columns:
 - Imported through the widget Data tab with `Import Point Parquet...`
 - Required columns: `label`, `x`, `y`, `z`
 - Optional columns: `region_name`, `acronym`, `id`, `hemisphere`
-- Any additional columns are preserved and added as napari point properties
+- Any additional columns are preserved in the standardized Parquet
 
 ## Typical workflow
 
@@ -95,7 +95,7 @@ In **Point Parquet Import**:
 
 1. Click `Import Point Parquet...`
 2. Choose a standardized point `.parquet` file
-3. The app adds one `Points` layer per unique `label`
+3. The app adds one heatmap image layer per unique `label`
 4. If optional atlas metadata columns are present, the app checks them against the selected atlas and warns on mismatches
 
 Notes:

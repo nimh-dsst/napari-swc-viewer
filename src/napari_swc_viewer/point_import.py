@@ -1,4 +1,4 @@
-"""Standard point Parquet import and CSV normalization utilities."""
+"""Standard point Parquet import, heatmap generation, and CSV normalization."""
 
 from __future__ import annotations
 
@@ -304,9 +304,7 @@ def _world_coords_to_atlas_region_ids(
     """Map world-space XYZ micron coordinates to atlas annotation region IDs."""
 
     annotation = np.asarray(atlas.annotation)
-    resolution = np.asarray(atlas.resolution, dtype=float)
-    lookup_coords = np.asarray(coords_xyz, dtype=float)[:, [2, 1, 0]]
-    voxel_coords = np.round(lookup_coords / resolution).astype(int)
+    voxel_coords = _world_coords_to_atlas_voxel_coords(coords_xyz, atlas)
 
     region_ids = np.zeros(len(voxel_coords), dtype=np.int64)
     in_bounds = np.all(
@@ -317,6 +315,17 @@ def _world_coords_to_atlas_region_ids(
     if len(valid) > 0:
         region_ids[in_bounds] = annotation[valid[:, 0], valid[:, 1], valid[:, 2]]
     return region_ids
+
+
+def _world_coords_to_atlas_voxel_coords(
+    coords_xyz: np.ndarray,
+    atlas: Any,
+) -> np.ndarray:
+    """Convert world-space XYZ micron coordinates to atlas ZYX voxel indices."""
+
+    resolution = np.asarray(atlas.resolution, dtype=float)
+    lookup_coords = np.asarray(coords_xyz, dtype=float)[:, [2, 1, 0]]
+    return np.round(lookup_coords / resolution).astype(int)
 
 
 def validate_point_metadata_against_atlas(
@@ -465,3 +474,31 @@ def dataframe_to_point_properties(df: pd.DataFrame) -> dict[str, list[Any]]:
         properties[column] = values
     return properties
 
+
+def build_label_heatmap_volumes(
+    df: pd.DataFrame,
+    atlas: Any,
+) -> dict[str, np.ndarray]:
+    """Build one dense atlas-space count volume per label."""
+
+    standardized = validate_standard_point_dataframe(df)
+    coords = standardized[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
+    voxel_coords = _world_coords_to_atlas_voxel_coords(coords, atlas)
+    atlas_shape = np.asarray(atlas.annotation.shape)
+    in_bounds = np.all((voxel_coords >= 0) & (voxel_coords < atlas_shape), axis=1)
+
+    volumes: dict[str, np.ndarray] = {}
+    labels = standardized["label"].tolist()
+    for label in dict.fromkeys(labels):
+        label_mask = standardized["label"].eq(label).to_numpy() & in_bounds
+        volume = np.zeros(atlas.annotation.shape, dtype=np.float32)
+        label_voxels = voxel_coords[label_mask]
+        if len(label_voxels) > 0:
+            np.add.at(
+                volume,
+                (label_voxels[:, 0], label_voxels[:, 1], label_voxels[:, 2]),
+                1.0,
+            )
+        volumes[str(label)] = volume
+
+    return volumes

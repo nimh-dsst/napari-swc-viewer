@@ -52,7 +52,7 @@ point Parquet schema:
 
 - Required columns: `label`, `x`, `y`, `z`
 - Optional columns: `region_name`, `acronym`, `id`, `hemisphere`
-- Additional source columns are preserved and imported as point properties
+- Additional source columns are preserved in the standardized Parquet
 
 To convert a raw CSV into standardized point Parquet, provide a JSON
 mapping from standard target names to source CSV headers:
@@ -79,7 +79,7 @@ pixi run python scripts/convert_point_csv.py raw_points.csv mapping.json points.
 In the plugin Data tab, use `Import Point Parquet...` to load the standardized
 Parquet. The selected atlas must already be loaded. If optional atlas metadata
 columns are present, the app validates them against the selected atlas,
-warns on mismatches, and still imports one `Points` layer per unique `label`.
+warns on mismatches, and imports one heatmap image layer per unique `label`.
 
 ## Hemisphere Detection and Coordinate Flipping
 

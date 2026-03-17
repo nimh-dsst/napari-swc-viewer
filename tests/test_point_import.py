@@ -14,6 +14,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from napari_swc_viewer.point_import import (
+    build_label_heatmap_volumes,
     PointImportError,
     convert_point_csv_to_parquet,
     format_atlas_validation_summary,
@@ -76,6 +77,14 @@ class _DummyPointsLayer:
         self.metadata = kwargs.get("metadata", {})
 
 
+class _DummyImageLayer:
+    def __init__(self, data: np.ndarray, **kwargs) -> None:
+        self.data = np.asarray(data)
+        self.name = kwargs["name"]
+        self.opacity = kwargs.get("opacity")
+        self.metadata = kwargs.get("metadata", {})
+
+
 class _DummyViewer:
     def __init__(self) -> None:
         self.layers: list[_DummyPointsLayer] = []
@@ -83,6 +92,11 @@ class _DummyViewer:
 
     def add_points(self, data: np.ndarray, **kwargs) -> _DummyPointsLayer:
         layer = _DummyPointsLayer(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_image(self, data: np.ndarray, **kwargs) -> _DummyImageLayer:
+        layer = _DummyImageLayer(data, **kwargs)
         self.layers.append(layer)
         return layer
 
@@ -260,6 +274,28 @@ def test_validate_point_metadata_against_atlas_reports_field_counts(
     assert "row 1 label=A" in message
 
 
+def test_build_label_heatmap_volumes_groups_counts_by_label(
+    fake_atlas: FakeAtlas,
+) -> None:
+    df = pd.DataFrame(
+        {
+            "label": ["A", "A", "B"],
+            "x": [50.0, 50.0, 25.0],
+            "y": [75.0, 75.0, 50.0],
+            "z": [100.0, 100.0, 50.0],
+        }
+    )
+
+    volumes = build_label_heatmap_volumes(df, fake_atlas)
+
+    assert set(volumes) == {"A", "B"}
+    assert volumes["A"].shape == fake_atlas.annotation.shape
+    assert float(volumes["A"][4, 3, 2]) == 2.0
+    assert float(volumes["B"][2, 2, 1]) == 1.0
+    assert int((volumes["A"] > 0).sum()) == 1
+    assert int((volumes["B"] > 0).sum()) == 1
+
+
 def test_standardize_point_dataframe_rejects_conflicting_extra_columns() -> None:
     raw_df = pd.DataFrame(
         {
@@ -385,13 +421,12 @@ def test_widget_import_point_parquet_creates_layers_and_warns(
     widget._load_point_parquet_file(str(parquet_path))
 
     layer_names = [layer.name for layer in viewer.layers]
-    assert layer_names == ["Points: A", "Points: B"]
+    assert layer_names == ["Points Heatmap: A", "Points Heatmap: B"]
     assert warnings
     assert "mismatched point(s)" in warnings[0]
-    assert "3 point(s) across 2 label(s)" in widget._point_import_status_label.text()
+    assert "3 point(s) into 2 heatmap layer(s)" in widget._point_import_status_label.text()
     assert "mismatched row(s)" in widget._point_import_status_label.text()
 
     layer_a = viewer.layers[0]
-    assert np.allclose(layer_a.scale, [1 / 25.0, 1 / 25.0, 1 / 25.0])
-    assert list(layer_a.properties["score"]) == [0.1, 0.2]
-    assert list(layer_a.properties["acronym"]) == ["R1", None]
+    assert float(layer_a.data[4, 3, 2]) == 2.0
+    assert layer_a.metadata["point_count"] == 2

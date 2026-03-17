@@ -42,7 +42,7 @@ from ..auto_center import (
 from ..db import NeuronDatabase
 from ..point_import import (
     PointImportError,
-    dataframe_to_point_properties,
+    build_label_heatmap_volumes,
     format_atlas_validation_summary,
     load_standard_point_parquet,
     validate_point_metadata_against_atlas,
@@ -573,7 +573,7 @@ class NeuronViewerWidget(QWidget):
         self._load_point_parquet_file(filepath)
 
     def _load_point_parquet_file(self, filepath: str) -> None:
-        """Load standardized point Parquet and add one layer per label."""
+        """Load standardized point Parquet and add one heatmap layer per label."""
         if self._atlas is None:
             message = "Load an atlas before importing point Parquet."
             self._point_import_status_label.setText(message)
@@ -599,33 +599,37 @@ class NeuronViewerWidget(QWidget):
         if validation_summary.has_mismatches:
             show_warning(format_atlas_validation_summary(validation_summary))
 
-        scale = [1.0 / res for res in self._atlas.resolution]
         opacity = self._opacity_slider.value() / 100.0
-        label_order = list(dict.fromkeys(points_df["label"].tolist()))
+        label_heatmaps = build_label_heatmap_volumes(points_df, self._atlas)
 
-        for label in label_order:
+        for label, volume in label_heatmaps.items():
+            layer_name = f"Points Heatmap: {label}"
+            for layer in list(self.viewer.layers):
+                if layer.name == layer_name:
+                    self.viewer.layers.remove(layer)
+
             label_df = points_df.loc[points_df["label"] == label]
-            coords = label_df[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
-            properties = dataframe_to_point_properties(label_df)
-
-            self.viewer.add_points(
-                coords,
-                size=self._point_size_spin.value(),
-                name=f"Points: {label}",
+            nonzero_voxels = int((volume > 0).sum())
+            self.viewer.add_image(
+                volume,
+                name=layer_name,
+                blending="additive",
+                rendering="mip",
+                colormap="hot",
                 opacity=opacity,
-                scale=scale,
-                properties=properties,
                 metadata={
                     "source_path": filepath,
                     "label": label,
                     "point_count": len(label_df),
+                    "nonzero_voxels": nonzero_voxels,
+                    "columns": list(label_df.columns),
                 },
             )
 
         self._point_file_label.setText(Path(filepath).name)
         message = (
-            f"Imported {len(points_df):,} point(s) across {len(label_order)} "
-            f"label(s)."
+            f"Imported {len(points_df):,} point(s) into {len(label_heatmaps)} "
+            f"heatmap layer(s)."
         )
         if validation_summary.has_mismatches:
             message += (
@@ -636,7 +640,7 @@ class NeuronViewerWidget(QWidget):
         logger.info(
             "Imported point Parquet %s with %d labels and %d points",
             filepath,
-            len(label_order),
+            len(label_heatmaps),
             len(points_df),
         )
 
