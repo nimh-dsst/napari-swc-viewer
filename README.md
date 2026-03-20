@@ -45,6 +45,50 @@ To run tests with coverage:
 pixi run test-cov
 ```
 
+## Standard Point Parquet Workflow
+
+This repo now supports atlas-registered point datasets via a standardized
+point Parquet schema:
+
+- Required columns: `label`, `x`, `y`, `z`
+- Optional columns: `region_name`, `acronym`, `id`, `hemisphere`
+- Additional source columns are preserved in the standardized Parquet
+
+To convert a raw CSV into standardized point Parquet, provide a JSON
+mapping from standard target names to source CSV headers:
+
+```json
+{
+  "label": "marker",
+  "x": "atlas_x",
+  "y": "atlas_y",
+  "z": "atlas_z",
+  "region_name": "region_name",
+  "acronym": "acronym",
+  "id": "id",
+  "hemisphere": "hemisphere"
+}
+```
+
+Run the converter from the repository root:
+
+```bash
+pixi run python scripts/convert_point_csv.py raw_points.csv mapping.json points.parquet
+```
+
+In the plugin Data tab, use `Import Point Parquet...` to load the standardized
+Parquet. The selected atlas must already be loaded. If optional atlas metadata
+columns are present, the app validates them against the selected atlas,
+warns on mismatches, and imports one heatmap image layer per unique `label`.
+Each heatmap layer is assigned a distinct color so labels are easier to
+differentiate in the viewer.
+
+In the `Tools` tab, eligible native-grid heatmaps can be converted into 3D
+binary mask `Labels` layers using Gaussian smoothing plus either Otsu or manual
+thresholding. The `Regions` tab can then query neurons either by Allen regions
+or by one or more of these generated mask layers, using either any-node or soma-only
+membership.
+
 ## Hemisphere Detection and Coordinate Flipping
 
 This plugin includes functionality to detect which brain hemisphere an SWC morphology is located in and to flip coordinates from one hemisphere to the other. This is useful for standardizing neuron reconstructions to a common hemisphere for analysis.

@@ -7,11 +7,13 @@ neuron data stored in Parquet format using DuckDB.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import numpy as np
 import pandas as pd
+
+from .atlas_utils import mask_to_world_xyz_bounds, world_coords_xyz_to_atlas_voxels
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -334,6 +336,73 @@ class NeuronDatabase:
         stats["n_regions"] = result[0]
 
         return stats
+
+    def get_neurons_by_mask(
+        self,
+        mask_volume: NDArray[np.bool_] | NDArray[np.uint8] | np.ndarray,
+        atlas: Any,
+        soma_only: bool = False,
+    ) -> pd.DataFrame:
+        """Get neurons whose nodes fall inside a binary atlas-space mask."""
+        mask = np.asarray(mask_volume) > 0
+        if mask.ndim != 3:
+            raise ValueError(f"Expected a 3D mask volume, got shape {mask.shape}")
+
+        atlas_shape = tuple(np.asarray(atlas.annotation).shape)
+        if mask.shape != atlas_shape:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not match atlas shape {atlas_shape}"
+            )
+
+        bounds = mask_to_world_xyz_bounds(mask, atlas)
+        if bounds is None:
+            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+
+        lower_xyz, upper_xyz = bounds
+        where_parts = [
+            "x >= ?",
+            "x <= ?",
+            "y >= ?",
+            "y <= ?",
+            "z >= ?",
+            "z <= ?",
+        ]
+        params: list[object] = [
+            float(lower_xyz[0]),
+            float(upper_xyz[0]),
+            float(lower_xyz[1]),
+            float(upper_xyz[1]),
+            float(lower_xyz[2]),
+            float(upper_xyz[2]),
+        ]
+        if soma_only:
+            where_parts.append("type = 1")
+
+        query = f"""
+            SELECT file_id, neuron_id, subject, x, y, z
+            FROM neurons
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY file_id
+        """
+        candidates = self.conn.execute(query, params).fetchdf()
+        if candidates.empty:
+            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+
+        coords = candidates[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
+        voxel_coords = world_coords_xyz_to_atlas_voxels(coords, atlas)
+        in_bounds = np.all(
+            (voxel_coords >= 0) & (voxel_coords < np.asarray(mask.shape)),
+            axis=1,
+        )
+        hits = np.zeros(len(candidates), dtype=bool)
+        valid = voxel_coords[in_bounds]
+        if len(valid) > 0:
+            hits[in_bounds] = mask[valid[:, 0], valid[:, 1], valid[:, 2]]
+
+        matched = candidates.loc[hits, ["file_id", "neuron_id", "subject"]]
+        if matched.empty:
+            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+        return matched.drop_duplicates().sort_values("file_id").reset_index(drop=True)
 
     def get_region_neuron_counts(self) -> pd.DataFrame:
         """Get neuron counts per region.

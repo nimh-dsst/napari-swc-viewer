@@ -11,13 +11,105 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 if TYPE_CHECKING:
     from brainglobe_atlasapi import BrainGlobeAtlas
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
+
+
+def smooth_heatmap_volume(
+    volume: NDArray[np.floating] | np.ndarray,
+    sigma: float = 1.0,
+) -> NDArray[np.float32]:
+    """Smooth a 3D heatmap volume with a Gaussian kernel."""
+    arr = np.asarray(volume, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, got shape {arr.shape}")
+    if sigma <= 0:
+        return arr.copy()
+    return gaussian_filter(arr, sigma=float(sigma), mode="nearest").astype(np.float32)
+
+
+def merge_heatmap_volumes(
+    volumes: list[NDArray[np.floating] | np.ndarray],
+) -> NDArray[np.float32]:
+    """Sum multiple heatmap volumes voxelwise."""
+    if not volumes:
+        raise ValueError("At least one heatmap volume is required.")
+
+    arrays = [np.asarray(volume, dtype=np.float32) for volume in volumes]
+    first_shape = arrays[0].shape
+    if any(arr.ndim != 3 for arr in arrays):
+        raise ValueError("All heatmap volumes must be 3D.")
+    if any(arr.shape != first_shape for arr in arrays[1:]):
+        raise ValueError("All heatmap volumes must have the same shape.")
+    return np.sum(arrays, axis=0, dtype=np.float32)
+
+
+def otsu_threshold_positive(
+    volume: NDArray[np.floating] | np.ndarray,
+    bins: int = 256,
+) -> float:
+    """Compute an Otsu threshold using only positive voxels."""
+    positive = np.asarray(volume, dtype=np.float32)
+    positive = positive[np.isfinite(positive) & (positive > 0)]
+    if positive.size == 0:
+        return 0.0
+
+    min_value = float(positive.min())
+    max_value = float(positive.max())
+    if max_value <= min_value:
+        return min_value
+
+    hist, bin_edges = np.histogram(positive, bins=min(int(bins), int(positive.size)))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) * 0.5
+    weight1 = np.cumsum(hist)
+    weight2 = hist.sum() - weight1
+    weighted = hist * bin_centers
+    mean1 = np.divide(
+        np.cumsum(weighted),
+        weight1,
+        out=np.zeros_like(bin_centers),
+        where=weight1 > 0,
+    )
+    mean2 = np.divide(
+        np.cumsum(weighted[::-1])[::-1],
+        weight2,
+        out=np.zeros_like(bin_centers),
+        where=weight2 > 0,
+    )
+    between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    if between.size == 0:
+        return min_value
+    return float(bin_centers[int(np.argmax(between))])
+
+
+def build_binary_mask_from_heatmap(
+    volume: NDArray[np.floating] | np.ndarray,
+    sigma: float = 1.0,
+    threshold_mode: str = "otsu",
+    manual_threshold: float | None = None,
+) -> tuple[NDArray[np.uint8], float, NDArray[np.float32]]:
+    """Create a binary mask from a heatmap via smoothing and thresholding."""
+    smoothed = smooth_heatmap_volume(volume, sigma=sigma)
+    mode = str(threshold_mode).strip().lower()
+    if mode == "manual":
+        if manual_threshold is None:
+            raise ValueError("Manual threshold mode requires a threshold value.")
+        threshold = float(manual_threshold)
+    elif mode == "otsu":
+        threshold = otsu_threshold_positive(smoothed)
+    else:
+        raise ValueError(f"Unknown threshold mode: {threshold_mode}")
+
+    if mode == "otsu" and not np.any(smoothed > 0):
+        mask = np.zeros(smoothed.shape, dtype=np.uint8)
+    else:
+        mask = (smoothed >= threshold).astype(np.uint8, copy=False)
+    return mask, threshold, smoothed
 
 
 def get_region_mask(atlas: BrainGlobeAtlas, acronym: str) -> NDArray[np.bool_]:
