@@ -227,3 +227,12 @@ example_data_aligned/
 
 # JSON conversion files
 *.json
+
+# SWC files
+*.swc
+
+# ZIP files
+*.zip
+
+# DS_Store
+.DS_Store

@@ -152,6 +152,7 @@ class NeuronViewerWidget(QWidget):
         self._last_soma_selection: set = set()  # track to skip no-op highlights
         self._auto_center_applied_once = False
         self._region_query_source = "Atlas Regions"
+        self._analysis_point_region_acronyms: set[str] = set()
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -236,6 +237,15 @@ class NeuronViewerWidget(QWidget):
         self._convert_resolution_spin.setValue(25)
         res_row.addWidget(self._convert_resolution_spin)
         convert_layout.addLayout(res_row)
+
+        hemisphere_row = QHBoxLayout()
+        hemisphere_row.addWidget(QLabel("Hemisphere alignment:"))
+        self._convert_hemisphere_combo = QComboBox()
+        self._convert_hemisphere_combo.addItem("None", None)
+        self._convert_hemisphere_combo.addItem("Left", "left")
+        self._convert_hemisphere_combo.addItem("Right", "right")
+        hemisphere_row.addWidget(self._convert_hemisphere_combo)
+        convert_layout.addLayout(hemisphere_row)
 
         self._convert_progress = QProgressBar()
         self._convert_progress.setVisible(False)
@@ -834,6 +844,14 @@ class NeuronViewerWidget(QWidget):
             )
 
         self._point_file_label.setText(Path(filepath).name)
+        imported_acronyms = {
+            str(acronym).strip()
+            for acronym in points_df["acronym"].dropna().tolist()
+            if str(acronym).strip()
+        }
+        if imported_acronyms:
+            self._analysis_point_region_acronyms.update(imported_acronyms)
+            self._refresh_analysis_available_regions()
         message = (
             f"Imported {len(points_df):,} point(s) into {len(label_heatmaps)} "
             f"heatmap layer(s)."
@@ -1191,6 +1209,8 @@ class NeuronViewerWidget(QWidget):
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
+        self._refresh_analysis_available_regions(acronyms)
+
         # Update region meshes if enabled
         if self._show_region_meshes_cb.isChecked():
             self._update_region_meshes(acronyms)
@@ -1259,6 +1279,21 @@ class NeuronViewerWidget(QWidget):
         except Exception as e:
             logger.error(f"Mask query failed: {e}")
             self._regions_status_label.setText(f"Mask query failed: {e}")
+
+    def _refresh_analysis_available_regions(
+        self,
+        selected_atlas_regions: list[str] | None = None,
+    ) -> None:
+        """Limit Analysis-tab region choices to selected atlas/point regions."""
+        if selected_atlas_regions is None:
+            selected_atlas_regions = self._region_selector.get_selected_acronyms(
+                include_children=True
+            )
+
+        available = sorted(
+            set(selected_atlas_regions).union(self._analysis_point_region_acronyms)
+        )
+        self._analysis_tab.set_available_regions(available)
 
     def _populate_neuron_table(self, result) -> None:
         """Populate the neuron table from a query result."""
@@ -2076,16 +2111,29 @@ class NeuronViewerWidget(QWidget):
         from ..workers import ConvertWorker
 
         resolution = self._convert_resolution_spin.value()
+        hemisphere = self._convert_hemisphere_combo.currentData()
+        atlas_name = self._atlas_combo.currentText()
+
+        status = f"Converting {len(swc_paths)} SWC files..."
+        if hemisphere is not None:
+            status = (
+                f"Converting {len(swc_paths)} SWC files "
+                f"(aligning to {str(hemisphere).title()})..."
+            )
 
         self._convert_progress.setVisible(True)
         self._convert_progress.setRange(0, len(swc_paths))
         self._convert_progress.setValue(0)
-        self._convert_status_label.setText(
-            f"Converting {len(swc_paths)} SWC files..."
-        )
+        self._convert_status_label.setText(status)
 
         self._convert_thread = QThread()
-        self._convert_worker = ConvertWorker(swc_paths, output_path, resolution)
+        self._convert_worker = ConvertWorker(
+            swc_paths,
+            output_path,
+            resolution,
+            hemisphere=hemisphere,
+            atlas_name=atlas_name,
+        )
         self._convert_worker.moveToThread(self._convert_thread)
 
         self._convert_thread.started.connect(self._convert_worker.run)
@@ -2102,11 +2150,16 @@ class NeuronViewerWidget(QWidget):
         self._convert_progress.setValue(current)
         self._convert_status_label.setText(message)
 
-    def _on_convert_finished(self, output_path: str, n_files: int) -> None:
+    def _on_convert_finished(self, output_path: str, summary: object) -> None:
         """Handle conversion completion."""
         self._convert_progress.setVisible(False)
+        summary_parts = [f"Converted {summary.processed_files} file(s)"]
+        if summary.failed_files:
+            summary_parts.append(f"skipped {summary.failed_files}")
+        if summary.flipped_files:
+            summary_parts.append(f"flipped {summary.flipped_files}")
         self._convert_status_label.setText(
-            f"Done! Converted {n_files} files → {Path(output_path).name}"
+            f"Done! {', '.join(summary_parts)} -> {Path(output_path).name}"
         )
         logger.info(f"SWC-to-Parquet conversion complete: {output_path}")
 

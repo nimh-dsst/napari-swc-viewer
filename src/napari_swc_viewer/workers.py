@@ -29,14 +29,14 @@ class ConvertWorker(QObject):
     -------
     progress(str, int, int)
         (message, files_processed, total_files)
-    finished(str, int)
-        (output_path, n_files_processed)
+    finished(str, object)
+        (output_path, BatchParquetConversionSummary)
     error(str)
         Emitted with error message on failure.
     """
 
     progress = Signal(str, int, int)
-    finished = Signal(str, int)
+    finished = Signal(str, object)
     error = Signal(str)
 
     def __init__(
@@ -44,54 +44,45 @@ class ConvertWorker(QObject):
         swc_paths: list[str],
         output_path: str,
         resolution: int = 25,
+        hemisphere: str | None = None,
+        atlas_name: str = "allen_mouse_25um",
+        coord_axis: int = 2,
     ):
         super().__init__()
         self._swc_paths = [Path(p) for p in swc_paths]
         self._output_path = Path(output_path)
         self._resolution = resolution
+        self._hemisphere = hemisphere
+        self._atlas_name = atlas_name
+        self._coord_axis = coord_axis
 
     def run(self) -> None:
         """Execute the conversion pipeline."""
         try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-
-            from .parquet import NEURON_SCHEMA, swc_to_annotated_rows
-            from .region import build_region_lookup, setup_allen_sdk
+            from .parquet import batch_convert_swc_to_parquet
 
             total = len(self._swc_paths)
-            self.progress.emit("Setting up Allen SDK...", 0, total)
-
-            _, annotation_volume, structure_tree = setup_allen_sdk(
-                self._resolution
+            self.progress.emit(
+                "Preparing SWC-to-Parquet conversion...",
+                0,
+                total,
             )
-            region_lookup = build_region_lookup(structure_tree)
+            summary = batch_convert_swc_to_parquet(
+                self._swc_paths,
+                self._output_path,
+                recursive=False,
+                hemisphere=self._hemisphere,
+                atlas_name=self._atlas_name,
+                coord_axis=self._coord_axis,
+                annotate_regions=True,
+                resolution=self._resolution,
+                progress_callback=self.progress.emit,
+            )
+            if summary.processed_files == 0:
+                raise ValueError("No SWC files were successfully processed")
 
-            all_rows: list[dict] = []
-            processed = 0
-
-            for swc_path in self._swc_paths:
-                try:
-                    self.progress.emit(
-                        f"Processing {swc_path.name}...", processed, total
-                    )
-                    rows = swc_to_annotated_rows(
-                        swc_path,
-                        annotation_volume,
-                        structure_tree,
-                        region_lookup,
-                        self._resolution,
-                    )
-                    all_rows.extend(rows)
-                    processed += 1
-                except Exception as e:
-                    logger.error(f"Error processing {swc_path}: {e}")
-
-            if all_rows:
-                table = pa.Table.from_pylist(all_rows, schema=NEURON_SCHEMA)
-                pq.write_table(table, self._output_path, compression="snappy")
-
-            self.finished.emit(str(self._output_path), processed)
+            self.progress.emit("Finalizing Parquet...", total, total)
+            self.finished.emit(str(self._output_path), summary)
 
         except Exception as e:
             logger.exception("SWC-to-Parquet conversion failed")

@@ -73,6 +73,7 @@ class AnalysisTabWidget(QWidget):
         self._pending_heatmap_depth_axis: int = 0
         self._last_heatmap_file_ids: list[str] | None = None
         self._slice_projector = None
+        self._available_regions: list[str] = []
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -142,7 +143,6 @@ class AnalysisTabWidget(QWidget):
         region_row.addWidget(QLabel("Target region:"))
         self._region_combo = QComboBox()
         self._region_combo.setEditable(True)
-        self._region_combo.addItems(["GPe", "CP", "VISp", "MOp", "SSp"])
         region_row.addWidget(self._region_combo)
         corr_layout.addLayout(region_row)
 
@@ -222,7 +222,6 @@ class AnalysisTabWidget(QWidget):
         heat_region_row.addWidget(QLabel("Region filter:"))
         self._heat_region_combo = QComboBox()
         self._heat_region_combo.setEditable(True)
-        self._heat_region_combo.addItems(["", "CP", "GPe", "VISp"])
         heat_region_row.addWidget(self._heat_region_combo)
         heat_layout.addLayout(heat_region_row)
 
@@ -272,6 +271,55 @@ class AnalysisTabWidget(QWidget):
         layout.addWidget(self._canvas)
 
         layout.addStretch()
+        self.set_available_regions([])
+
+    def _set_region_combo_items(
+        self,
+        combo: QComboBox,
+        items: list[str],
+        *,
+        allow_blank: bool,
+    ) -> None:
+        """Replace combo options while preserving the current value when possible."""
+        current = combo.currentText().strip()
+        entries = [""] if allow_blank else []
+        entries.extend(items)
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(entries)
+
+        if current and current in entries:
+            combo.setCurrentText(current)
+        elif allow_blank:
+            combo.setCurrentText("")
+        elif entries:
+            combo.setCurrentText(entries[0])
+        else:
+            combo.setEditText("")
+
+        combo.blockSignals(False)
+
+    def set_available_regions(self, regions: list[str]) -> None:
+        """Limit analysis region dropdowns to the supplied acronyms."""
+        normalized = sorted(
+            {
+                str(region).strip()
+                for region in regions
+                if region is not None and str(region).strip()
+            }
+        )
+        self._available_regions = normalized
+        self._set_region_combo_items(
+            self._region_combo,
+            normalized,
+            allow_blank=False,
+        )
+        self._set_region_combo_items(
+            self._heat_region_combo,
+            normalized,
+            allow_blank=True,
+        )
 
     def _on_clustering_method_changed(self, text: str) -> None:
         """Show/hide UI rows based on the selected clustering method."""
