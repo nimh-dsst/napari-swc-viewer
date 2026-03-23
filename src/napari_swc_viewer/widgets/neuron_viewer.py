@@ -237,6 +237,15 @@ class NeuronViewerWidget(QWidget):
         res_row.addWidget(self._convert_resolution_spin)
         convert_layout.addLayout(res_row)
 
+        hemisphere_row = QHBoxLayout()
+        hemisphere_row.addWidget(QLabel("Hemisphere alignment:"))
+        self._convert_hemisphere_combo = QComboBox()
+        self._convert_hemisphere_combo.addItem("None", None)
+        self._convert_hemisphere_combo.addItem("Left", "left")
+        self._convert_hemisphere_combo.addItem("Right", "right")
+        hemisphere_row.addWidget(self._convert_hemisphere_combo)
+        convert_layout.addLayout(hemisphere_row)
+
         self._convert_progress = QProgressBar()
         self._convert_progress.setVisible(False)
         convert_layout.addWidget(self._convert_progress)
@@ -1207,7 +1216,7 @@ class NeuronViewerWidget(QWidget):
         if self._db is None:
             return
 
-        acronyms = self._region_selector.get_selected_acronyms(include_children=True)
+        acronyms = self._region_selector.get_query_acronyms()
         if not acronyms:
             self._regions_status_label.setText("Select at least one atlas region.")
             return
@@ -2076,16 +2085,29 @@ class NeuronViewerWidget(QWidget):
         from ..workers import ConvertWorker
 
         resolution = self._convert_resolution_spin.value()
+        hemisphere = self._convert_hemisphere_combo.currentData()
+        atlas_name = self._atlas_combo.currentText()
+
+        status = f"Converting {len(swc_paths)} SWC files..."
+        if hemisphere is not None:
+            status = (
+                f"Converting {len(swc_paths)} SWC files "
+                f"(aligning to {str(hemisphere).title()})..."
+            )
 
         self._convert_progress.setVisible(True)
         self._convert_progress.setRange(0, len(swc_paths))
         self._convert_progress.setValue(0)
-        self._convert_status_label.setText(
-            f"Converting {len(swc_paths)} SWC files..."
-        )
+        self._convert_status_label.setText(status)
 
         self._convert_thread = QThread()
-        self._convert_worker = ConvertWorker(swc_paths, output_path, resolution)
+        self._convert_worker = ConvertWorker(
+            swc_paths,
+            output_path,
+            resolution,
+            hemisphere=hemisphere,
+            atlas_name=atlas_name,
+        )
         self._convert_worker.moveToThread(self._convert_thread)
 
         self._convert_thread.started.connect(self._convert_worker.run)
@@ -2102,11 +2124,16 @@ class NeuronViewerWidget(QWidget):
         self._convert_progress.setValue(current)
         self._convert_status_label.setText(message)
 
-    def _on_convert_finished(self, output_path: str, n_files: int) -> None:
+    def _on_convert_finished(self, output_path: str, summary: object) -> None:
         """Handle conversion completion."""
         self._convert_progress.setVisible(False)
+        summary_parts = [f"Converted {summary.processed_files} file(s)"]
+        if summary.failed_files:
+            summary_parts.append(f"skipped {summary.failed_files}")
+        if summary.flipped_files:
+            summary_parts.append(f"flipped {summary.flipped_files}")
         self._convert_status_label.setText(
-            f"Done! Converted {n_files} files → {Path(output_path).name}"
+            f"Done! {', '.join(summary_parts)} -> {Path(output_path).name}"
         )
         logger.info(f"SWC-to-Parquet conversion complete: {output_path}")
 

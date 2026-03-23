@@ -73,6 +73,7 @@ class AnalysisTabWidget(QWidget):
         self._pending_heatmap_depth_axis: int = 0
         self._last_heatmap_file_ids: list[str] | None = None
         self._slice_projector = None
+        self._available_regions: list[str] = []
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -82,7 +83,17 @@ class AnalysisTabWidget(QWidget):
         """Set the database connection."""
         self._db = db
         self._parquet_path = str(db.parquet_path)
+        self.refresh_available_regions_from_database()
         self._update_button_states()
+
+    def refresh_available_regions_from_database(self) -> None:
+        """Populate analysis-region dropdowns from the loaded neuron parquet."""
+        if self._db is None:
+            self.set_available_regions([])
+            return
+
+        regions_df = self._db.get_unique_regions()
+        self.set_available_regions(regions_df["region_acronym"].tolist())
 
     def set_atlas(self, atlas: BrainGlobeAtlas) -> None:
         """Set the atlas instance."""
@@ -142,7 +153,6 @@ class AnalysisTabWidget(QWidget):
         region_row.addWidget(QLabel("Target region:"))
         self._region_combo = QComboBox()
         self._region_combo.setEditable(True)
-        self._region_combo.addItems(["GPe", "CP", "VISp", "MOp", "SSp"])
         region_row.addWidget(self._region_combo)
         corr_layout.addLayout(region_row)
 
@@ -222,7 +232,6 @@ class AnalysisTabWidget(QWidget):
         heat_region_row.addWidget(QLabel("Region filter:"))
         self._heat_region_combo = QComboBox()
         self._heat_region_combo.setEditable(True)
-        self._heat_region_combo.addItems(["", "CP", "GPe", "VISp"])
         heat_region_row.addWidget(self._heat_region_combo)
         heat_layout.addLayout(heat_region_row)
 
@@ -272,6 +281,62 @@ class AnalysisTabWidget(QWidget):
         layout.addWidget(self._canvas)
 
         layout.addStretch()
+        self.set_available_regions([])
+
+    def _set_region_combo_items(
+        self,
+        combo: QComboBox,
+        items: list[str],
+        *,
+        allow_blank: bool,
+    ) -> None:
+        """Replace combo options while preserving the current value when possible."""
+        current = combo.currentText().strip()
+        entries = [""] if allow_blank else []
+        entries.extend(items)
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(entries)
+
+        if current and current in entries:
+            combo.setCurrentText(current)
+        elif allow_blank:
+            combo.setCurrentText("")
+        elif entries:
+            combo.setCurrentText(entries[0])
+        else:
+            combo.setEditText("")
+
+        combo.blockSignals(False)
+
+    def set_available_regions(self, regions: list[str]) -> None:
+        """Limit analysis region dropdowns to the supplied acronyms."""
+        normalized_regions: set[str] = set()
+        for region in regions:
+            if region is None:
+                continue
+            if isinstance(region, (float, np.floating)) and np.isnan(region):
+                continue
+
+            text = str(region).strip()
+            if not text:
+                continue
+
+            normalized_regions.add(text)
+
+        normalized = sorted(normalized_regions)
+        self._available_regions = normalized
+        self._set_region_combo_items(
+            self._region_combo,
+            normalized,
+            allow_blank=False,
+        )
+        self._set_region_combo_items(
+            self._heat_region_combo,
+            normalized,
+            allow_blank=True,
+        )
 
     def _on_clustering_method_changed(self, text: str) -> None:
         """Show/hide UI rows based on the selected clustering method."""

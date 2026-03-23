@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
@@ -19,6 +19,18 @@ from qtpy.QtWidgets import (
 
 if TYPE_CHECKING:
     from brainglobe_atlasapi import BrainGlobeAtlas
+
+
+def _get_parent_structure_id(struct: dict[str, Any]) -> int | None:
+    """Return a structure's parent ID, deriving it from the hierarchy path if needed."""
+    parent_id = struct.get("parent_structure_id")
+    if parent_id is not None:
+        return int(parent_id)
+
+    structure_id_path = struct.get("structure_id_path") or []
+    if len(structure_id_path) < 2:
+        return None
+    return int(structure_id_path[-2])
 
 
 class RegionSelectorWidget(QWidget):
@@ -119,7 +131,7 @@ class RegionSelectorWidget(QWidget):
         # Find root structures (those without a parent in our map)
         root_ids = set()
         for struct_id, struct in self._structure_map.items():
-            parent_id = struct.get("parent_structure_id")
+            parent_id = _get_parent_structure_id(struct)
             if parent_id is None or parent_id not in self._structure_map:
                 root_ids.add(struct_id)
 
@@ -188,7 +200,7 @@ class RegionSelectorWidget(QWidget):
         """
         children = []
         for struct_id, struct in self._structure_map.items():
-            if struct.get("parent_structure_id") == parent_id:
+            if _get_parent_structure_id(struct) == parent_id:
                 children.append(struct_id)
         return children
 
@@ -270,10 +282,18 @@ class RegionSelectorWidget(QWidget):
 
     def _emit_selection_changed(self) -> None:
         """Emit the selection_changed signal with current selection."""
-        acronyms = self.get_selected_acronyms(
-            include_children=self._include_children_cb.isChecked()
-        )
+        acronyms = self.get_query_acronyms()
         self.selection_changed.emit(acronyms)
+
+    def include_children_enabled(self) -> bool:
+        """Return whether descendant regions should be included in queries."""
+        return self._include_children_cb.isChecked()
+
+    def get_query_acronyms(self) -> list[str]:
+        """Return selected acronyms using the current include-children toggle."""
+        return self.get_selected_acronyms(
+            include_children=self.include_children_enabled()
+        )
 
     def get_selected_acronyms(self, include_children: bool = True) -> list[str]:
         """Get the list of selected region acronyms.

@@ -1,29 +1,21 @@
-"""Parquet schema and SWC-to-Parquet conversion with brain region annotation.
-
-This module provides functionality to:
-1. Define the Parquet schema for annotated neuron data
-2. Convert SWC files to Parquet format with region annotations
-3. Batch process multiple SWC files with parallel processing
-"""
+"""Parquet schema and SWC-to-Parquet conversion helpers."""
 
 from __future__ import annotations
 
 import logging
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .region import (
-    build_region_lookup,
-    get_region_ids_vectorized,
-    setup_allen_sdk,
-)
-from .swc import parse_swc
+from .hemisphere import Hemisphere, detect_soma_hemisphere, flip_swc, get_atlas_midline
+from .region import build_region_lookup, get_region_ids_vectorized, setup_allen_sdk
+from .swc import SWCData, parse_swc
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -48,6 +40,20 @@ NEURON_SCHEMA = pa.schema(
         pa.field("neuron_id", pa.string()),  # Neuron identifier (from filename)
     ]
 )
+
+
+@dataclass
+class BatchParquetConversionSummary:
+    """Summary statistics for a batch SWC-to-Parquet conversion."""
+
+    discovered_files: int = 0
+    processed_files: int = 0
+    failed_files: int = 0
+    flipped_files: int = 0
+    already_target_files: int = 0
+    midline_files: int = 0
+    rows_written: int = 0
+    failures: list[tuple[str, str]] = field(default_factory=list)
 
 
 def parse_filename_metadata(filename: str) -> dict[str, str]:
@@ -92,6 +98,82 @@ def parse_filename_metadata(filename: str) -> dict[str, str]:
     }
 
 
+def _require_nonempty_swc(swc_data: SWCData, source: Path | str) -> None:
+    """Raise when an SWC file parses to zero valid nodes."""
+    if swc_data.n_nodes == 0:
+        raise ValueError(f"No valid SWC nodes found in {source}")
+
+
+def swc_data_to_table(
+    swc_data: SWCData,
+    filename: str,
+    region_ids: NDArray[np.int32] | None = None,
+    region_lookup: dict[int, dict] | None = None,
+) -> pa.Table:
+    """Convert parsed SWC data into a plugin-compatible Parquet table."""
+    n_nodes = swc_data.n_nodes
+    metadata = parse_filename_metadata(filename)
+
+    if region_ids is None:
+        region_id_values = np.zeros(n_nodes, dtype=np.int32)
+        region_names = [""] * n_nodes
+        region_acronyms = [""] * n_nodes
+    else:
+        region_id_values = np.asarray(region_ids, dtype=np.int32)
+        if region_id_values.shape != (n_nodes,):
+            raise ValueError("region_ids must have one entry per SWC node")
+
+        lookup = region_lookup or {}
+        region_names = [
+            lookup.get(int(region_id), {}).get("name", "")
+            for region_id in region_id_values.tolist()
+        ]
+        region_acronyms = [
+            lookup.get(int(region_id), {}).get("acronym", "")
+            for region_id in region_id_values.tolist()
+        ]
+
+    columns = {
+        "file_id": [filename] * n_nodes,
+        "node_id": swc_data.ids,
+        "type": swc_data.types,
+        "x": swc_data.coords[:, 0],
+        "y": swc_data.coords[:, 1],
+        "z": swc_data.coords[:, 2],
+        "radius": swc_data.radii,
+        "parent_id": swc_data.parents,
+        "region_id": region_id_values,
+        "region_name": region_names,
+        "region_acronym": region_acronyms,
+        "subject": [metadata["subject"]] * n_nodes,
+        "neuron_id": [metadata["neuron_id"]] * n_nodes,
+    }
+
+    return pa.Table.from_pydict(columns, schema=NEURON_SCHEMA)
+
+
+def swc_to_annotated_table(
+    swc_path: Path,
+    annotation_volume: NDArray[np.int32],
+    region_lookup: dict[int, dict],
+    resolution: int = 25,
+) -> pa.Table:
+    """Convert a single SWC file to an annotated pyarrow table."""
+    swc_data = parse_swc(swc_path)
+    _require_nonempty_swc(swc_data, swc_path)
+
+    region_ids = np.asarray(
+        get_region_ids_vectorized(swc_data.coords, annotation_volume, resolution),
+        dtype=np.int32,
+    )
+    return swc_data_to_table(
+        swc_data,
+        swc_path.name,
+        region_ids=region_ids,
+        region_lookup=region_lookup,
+    )
+
+
 def swc_to_annotated_rows(
     swc_path: Path,
     annotation_volume: NDArray[np.int32],
@@ -119,39 +201,13 @@ def swc_to_annotated_rows(
     list[dict]
         List of row dictionaries matching NEURON_SCHEMA.
     """
-    swc_data = parse_swc(swc_path)
-    filename = swc_path.name
-    metadata = parse_filename_metadata(filename)
-
-    # Get region IDs for all coordinates (vectorized)
-    region_ids = get_region_ids_vectorized(
-        swc_data.coords, annotation_volume, resolution
-    )
-
-    rows = []
-    for i in range(swc_data.n_nodes):
-        region_id = int(region_ids[i])
-        region_info = region_lookup.get(region_id, {})
-
-        rows.append(
-            {
-                "file_id": filename,
-                "node_id": int(swc_data.ids[i]),
-                "type": int(swc_data.types[i]),
-                "x": float(swc_data.coords[i, 0]),
-                "y": float(swc_data.coords[i, 1]),
-                "z": float(swc_data.coords[i, 2]),
-                "radius": float(swc_data.radii[i]),
-                "parent_id": int(swc_data.parents[i]),
-                "region_id": region_id,
-                "region_name": region_info.get("name", ""),
-                "region_acronym": region_info.get("acronym", ""),
-                "subject": metadata["subject"],
-                "neuron_id": metadata["neuron_id"],
-            }
-        )
-
-    return rows
+    _ = structure_tree
+    return swc_to_annotated_table(
+        swc_path,
+        annotation_volume,
+        region_lookup,
+        resolution=resolution,
+    ).to_pylist()
 
 
 def _process_single_swc(args: tuple) -> list[dict]:
@@ -194,6 +250,185 @@ def discover_swc_files(input_path: Path, recursive: bool = True) -> list[Path]:
     return sorted(input_path.glob("*.swc"))
 
 
+def _resolve_swc_files(
+    input_source: Path | str | Iterable[Path | str],
+    recursive: bool = True,
+) -> list[Path]:
+    """Resolve either a path-like input or explicit SWC paths to file paths."""
+    if isinstance(input_source, (str, Path)):
+        return discover_swc_files(Path(input_source), recursive=recursive)
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for item in input_source:
+        path = Path(item)
+        if path.suffix.lower() != ".swc":
+            continue
+        normalized = path.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(path)
+    return sorted(resolved)
+
+
+def _normalize_target_hemisphere(
+    hemisphere: Hemisphere | str | None,
+) -> Hemisphere | None:
+    """Normalize an optional target hemisphere value."""
+    if hemisphere is None:
+        return None
+
+    if isinstance(hemisphere, Hemisphere):
+        target = hemisphere
+    else:
+        target = Hemisphere(str(hemisphere).lower())
+
+    if target == Hemisphere.MIDLINE:
+        raise ValueError("Target hemisphere must be 'left' or 'right'")
+
+    return target
+
+
+def _write_table_batch(
+    writer: pq.ParquetWriter | None,
+    output_path: Path,
+    tables: list[pa.Table],
+) -> pq.ParquetWriter | None:
+    """Write a batch of tables to an output Parquet file."""
+    if not tables:
+        return writer
+
+    table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+    if writer is None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = pq.ParquetWriter(
+            output_path,
+            NEURON_SCHEMA,
+            compression="snappy",
+        )
+    writer.write_table(table)
+    return writer
+
+
+def batch_convert_swc_to_parquet(
+    input_path: Path | str | Iterable[Path | str],
+    output_path: Path | str,
+    *,
+    recursive: bool = True,
+    hemisphere: Hemisphere | str | None = None,
+    atlas_name: str = "allen_mouse_10um",
+    coord_axis: int = 2,
+    midline: float | None = None,
+    annotate_regions: bool = False,
+    resolution: int = 25,
+    cache_dir: Path | str | None = None,
+    batch_size: int = 100,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> BatchParquetConversionSummary:
+    """Convert SWC files into one Parquet file with optional alignment."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
+    output_path = Path(output_path)
+    summary = BatchParquetConversionSummary()
+    swc_files = _resolve_swc_files(input_path, recursive=recursive)
+    summary.discovered_files = len(swc_files)
+    total_files = len(swc_files)
+
+    target_hemisphere = _normalize_target_hemisphere(hemisphere)
+
+    atlas = None
+    if target_hemisphere is not None and midline is None:
+        from brainglobe_atlasapi import BrainGlobeAtlas
+
+        atlas = BrainGlobeAtlas(atlas_name)
+        midline = get_atlas_midline(atlas, coord_axis)
+
+    annotation_volume = None
+    region_lookup: dict[int, dict] | None = None
+    if annotate_regions:
+        _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
+        region_lookup = build_region_lookup(structure_tree)
+
+    writer: pq.ParquetWriter | None = None
+    buffered_tables: list[pa.Table] = []
+
+    try:
+        for swc_path in swc_files:
+            try:
+                if progress_callback is not None:
+                    progress_callback(
+                        f"Processing {swc_path.name}...",
+                        summary.processed_files + summary.failed_files,
+                        total_files,
+                    )
+                swc_data = parse_swc(swc_path)
+                _require_nonempty_swc(swc_data, swc_path)
+
+                if target_hemisphere is not None:
+                    detected = detect_soma_hemisphere(
+                        swc_data,
+                        atlas=atlas,
+                        atlas_name=atlas_name,
+                        midline=midline,
+                        coord_axis=coord_axis,
+                        validate=False,
+                    )
+
+                    if detected == Hemisphere.MIDLINE:
+                        summary.midline_files += 1
+                    elif detected == target_hemisphere:
+                        summary.already_target_files += 1
+                    else:
+                        swc_data = flip_swc(
+                            swc_data,
+                            atlas=atlas,
+                            atlas_name=atlas_name,
+                            midline=midline,
+                            coord_axis=coord_axis,
+                        )
+                        summary.flipped_files += 1
+
+                region_ids = None
+                if annotate_regions:
+                    assert annotation_volume is not None
+                    region_ids = np.asarray(
+                        get_region_ids_vectorized(
+                            swc_data.coords,
+                            annotation_volume,
+                            resolution,
+                        ),
+                        dtype=np.int32,
+                    )
+
+                table = swc_data_to_table(
+                    swc_data,
+                    swc_path.name,
+                    region_ids=region_ids,
+                    region_lookup=region_lookup,
+                )
+                buffered_tables.append(table)
+                summary.processed_files += 1
+                summary.rows_written += table.num_rows
+
+                if len(buffered_tables) >= batch_size:
+                    writer = _write_table_batch(writer, output_path, buffered_tables)
+                    buffered_tables = []
+
+            except Exception as exc:
+                summary.failed_files += 1
+                summary.failures.append((str(swc_path), str(exc)))
+                logger.error("Error processing %s: %s", swc_path, exc)
+
+        writer = _write_table_batch(writer, output_path, buffered_tables)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    return summary
+
+
 def swc_files_to_parquet(
     input_path: Path | str,
     output_path: Path | str,
@@ -233,10 +468,10 @@ def swc_files_to_parquet(
     # Discover SWC files
     swc_files = discover_swc_files(input_path, recursive)
     if not swc_files:
-        logger.warning(f"No SWC files found in {input_path}")
+        logger.warning("No SWC files found in %s", input_path)
         return 0
 
-    logger.info(f"Found {len(swc_files)} SWC files to process")
+    logger.info("Found %d SWC files to process", len(swc_files))
 
     # Set up Allen SDK (for serial processing or building lookup)
     _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
@@ -246,7 +481,6 @@ def swc_files_to_parquet(
     processed = 0
 
     if n_workers > 1:
-        # Parallel processing
         args_list = [
             (swc_path, resolution, str(cache_dir) if cache_dir else None)
             for swc_path in swc_files
@@ -266,13 +500,16 @@ def swc_files_to_parquet(
                     processed += 1
 
                     if processed % 10 == 0:
-                        logger.info(f"Processed {processed}/{len(swc_files)} files")
+                        logger.info(
+                            "Processed %d/%d files",
+                            processed,
+                            len(swc_files),
+                        )
 
-                except Exception as e:
-                    logger.error(f"Error processing {swc_path}: {e}")
+                except Exception as exc:
+                    logger.error("Error processing %s: %s", swc_path, exc)
     else:
-        # Serial processing
-        for i, swc_path in enumerate(swc_files):
+        for swc_path in swc_files:
             try:
                 rows = swc_to_annotated_rows(
                     swc_path,
@@ -285,17 +522,19 @@ def swc_files_to_parquet(
                 processed += 1
 
                 if processed % 10 == 0:
-                    logger.info(f"Processed {processed}/{len(swc_files)} files")
+                    logger.info("Processed %d/%d files", processed, len(swc_files))
 
-            except Exception as e:
-                logger.error(f"Error processing {swc_path}: {e}")
+            except Exception as exc:
+                logger.error("Error processing %s: %s", swc_path, exc)
 
-    # Write to Parquet
     if all_rows:
         table = pa.Table.from_pylist(all_rows, schema=NEURON_SCHEMA)
         pq.write_table(table, output_path, compression="snappy")
         logger.info(
-            f"Wrote {len(all_rows)} rows from {processed} files to {output_path}"
+            "Wrote %d rows from %d files to %s",
+            len(all_rows),
+            processed,
+            output_path,
         )
 
     return processed
@@ -328,11 +567,9 @@ def append_to_parquet(
     existing_path = Path(existing_path)
     new_swc_path = Path(new_swc_path)
 
-    # Load existing data
     existing_table = pq.read_table(existing_path)
     existing_files = set(existing_table.column("file_id").to_pylist())
 
-    # Discover new files
     new_files = discover_swc_files(new_swc_path)
     new_files = [f for f in new_files if f.name not in existing_files]
 
@@ -340,7 +577,6 @@ def append_to_parquet(
         logger.info("No new files to append")
         return 0
 
-    # Process new files
     _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
     region_lookup = build_region_lookup(structure_tree)
 
@@ -355,14 +591,14 @@ def append_to_parquet(
                 resolution,
             )
             new_rows.extend(rows)
-        except Exception as e:
-            logger.error(f"Error processing {swc_path}: {e}")
+        except Exception as exc:
+            logger.error("Error processing %s: %s", swc_path, exc)
 
     if new_rows:
         new_table = pa.Table.from_pylist(new_rows, schema=NEURON_SCHEMA)
         combined = pa.concat_tables([existing_table, new_table])
         pq.write_table(combined, existing_path, compression="snappy")
-        logger.info(f"Appended {len(new_files)} files to {existing_path}")
+        logger.info("Appended %d files to %s", len(new_files), existing_path)
 
     return len(new_files)
 
@@ -387,25 +623,21 @@ def get_parquet_summary(parquet_path: Path | str) -> dict:
 
     stats = {}
 
-    # Row count
     result = conn.execute(
         f"SELECT COUNT(*) as n FROM read_parquet('{path_str}')"
     ).fetchone()
     stats["n_rows"] = result[0]
 
-    # File count
     result = conn.execute(
         f"SELECT COUNT(DISTINCT file_id) as n FROM read_parquet('{path_str}')"
     ).fetchone()
     stats["n_files"] = result[0]
 
-    # Subject count
     result = conn.execute(
         f"SELECT COUNT(DISTINCT subject) as n FROM read_parquet('{path_str}')"
     ).fetchone()
     stats["n_subjects"] = result[0]
 
-    # Region count and list
     result = conn.execute(
         f"""
         SELECT region_acronym, COUNT(*) as n
