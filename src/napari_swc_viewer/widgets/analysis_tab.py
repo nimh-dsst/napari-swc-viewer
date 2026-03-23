@@ -83,7 +83,17 @@ class AnalysisTabWidget(QWidget):
         """Set the database connection."""
         self._db = db
         self._parquet_path = str(db.parquet_path)
+        self.refresh_available_regions_from_database()
         self._update_button_states()
+
+    def refresh_available_regions_from_database(self) -> None:
+        """Populate analysis-region dropdowns from the loaded neuron parquet."""
+        if self._db is None:
+            self.set_available_regions([])
+            return
+
+        regions_df = self._db.get_unique_regions()
+        self.set_available_regions(regions_df["region_acronym"].tolist())
 
     def set_atlas(self, atlas: BrainGlobeAtlas) -> None:
         """Set the atlas instance."""

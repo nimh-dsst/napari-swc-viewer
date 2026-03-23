@@ -152,7 +152,6 @@ class NeuronViewerWidget(QWidget):
         self._last_soma_selection: set = set()  # track to skip no-op highlights
         self._auto_center_applied_once = False
         self._region_query_source = "Atlas Regions"
-        self._analysis_point_region_acronyms: set[str] = set()
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -844,14 +843,6 @@ class NeuronViewerWidget(QWidget):
             )
 
         self._point_file_label.setText(Path(filepath).name)
-        imported_acronyms = {
-            str(acronym).strip()
-            for acronym in points_df["acronym"].dropna().tolist()
-            if str(acronym).strip()
-        }
-        if imported_acronyms:
-            self._analysis_point_region_acronyms.update(imported_acronyms)
-            self._refresh_analysis_available_regions()
         message = (
             f"Imported {len(points_df):,} point(s) into {len(label_heatmaps)} "
             f"heatmap layer(s)."
@@ -1209,8 +1200,6 @@ class NeuronViewerWidget(QWidget):
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
-        self._refresh_analysis_available_regions(acronyms)
-
         # Update region meshes if enabled
         if self._show_region_meshes_cb.isChecked():
             self._update_region_meshes(acronyms)
@@ -1227,7 +1216,7 @@ class NeuronViewerWidget(QWidget):
         if self._db is None:
             return
 
-        acronyms = self._region_selector.get_selected_acronyms(include_children=True)
+        acronyms = self._region_selector.get_query_acronyms()
         if not acronyms:
             self._regions_status_label.setText("Select at least one atlas region.")
             return
@@ -1279,21 +1268,6 @@ class NeuronViewerWidget(QWidget):
         except Exception as e:
             logger.error(f"Mask query failed: {e}")
             self._regions_status_label.setText(f"Mask query failed: {e}")
-
-    def _refresh_analysis_available_regions(
-        self,
-        selected_atlas_regions: list[str] | None = None,
-    ) -> None:
-        """Limit Analysis-tab region choices to selected atlas/point regions."""
-        if selected_atlas_regions is None:
-            selected_atlas_regions = self._region_selector.get_selected_acronyms(
-                include_children=True
-            )
-
-        available = sorted(
-            set(selected_atlas_regions).union(self._analysis_point_region_acronyms)
-        )
-        self._analysis_tab.set_available_regions(available)
 
     def _populate_neuron_table(self, result) -> None:
         """Populate the neuron table from a query result."""

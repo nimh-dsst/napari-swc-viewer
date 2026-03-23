@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pandas as pd
+
 
 class _Signal:
     """Minimal stand-in for qtpy.QtCore.Signal."""
@@ -150,3 +152,32 @@ def test_set_available_regions_resets_invalid_current_values():
     assert widget._region_combo.currentText() == "CP"
     assert widget._heat_region_combo.items == ["", "CP", "VISp"]
     assert widget._heat_region_combo.currentText() == ""
+
+
+def test_set_database_populates_regions_from_loaded_parquet_dataset():
+    """Database-backed region controls should list only acronyms present in the parquet."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._region_combo = _DummyCombo(current_text="")
+    widget._heat_region_combo = _DummyCombo(current_text="")
+    widget._available_regions = []
+    widget._update_button_states = lambda: None
+
+    class _DummyDb:
+        parquet_path = Path("/tmp/example.parquet")
+
+        @staticmethod
+        def get_unique_regions() -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "region_acronym": ["VISp", "CP", "", None, "VISp"],
+                }
+            )
+
+    widget.set_database(_DummyDb())
+
+    assert widget._parquet_path == "/tmp/example.parquet"
+    assert widget._available_regions == ["CP", "VISp"]
+    assert widget._region_combo.items == ["CP", "VISp"]
+    assert widget._heat_region_combo.items == ["", "CP", "VISp"]
