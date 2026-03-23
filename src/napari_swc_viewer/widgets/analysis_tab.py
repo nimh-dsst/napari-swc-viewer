@@ -312,13 +312,20 @@ class AnalysisTabWidget(QWidget):
 
     def set_available_regions(self, regions: list[str]) -> None:
         """Limit analysis region dropdowns to the supplied acronyms."""
-        normalized = sorted(
-            {
-                str(region).strip()
-                for region in regions
-                if region is not None and str(region).strip()
-            }
-        )
+        normalized_regions: set[str] = set()
+        for region in regions:
+            if region is None:
+                continue
+            if isinstance(region, (float, np.floating)) and np.isnan(region):
+                continue
+
+            text = str(region).strip()
+            if not text:
+                continue
+
+            normalized_regions.add(text)
+
+        normalized = sorted(normalized_regions)
         self._available_regions = normalized
         self._set_region_combo_items(
             self._region_combo,
