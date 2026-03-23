@@ -177,7 +177,7 @@ def test_set_database_populates_regions_from_loaded_parquet_dataset():
 
     widget.set_database(_DummyDb())
 
-    assert widget._parquet_path == "/tmp/example.parquet"
+    assert Path(widget._parquet_path) == _DummyDb.parquet_path
     assert widget._available_regions == ["CP", "VISp"]
     assert widget._region_combo.items == ["CP", "VISp"]
     assert widget._heat_region_combo.items == ["", "CP", "VISp"]
