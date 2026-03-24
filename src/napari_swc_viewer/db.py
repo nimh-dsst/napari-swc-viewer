@@ -183,6 +183,34 @@ class NeuronDatabase:
             """
             return self.conn.execute(query).fetchdf()
 
+    def get_soma_points(
+        self,
+        file_ids: list[str],
+    ) -> pd.DataFrame:
+        """Get raw soma/body node coordinates for rendering or projection.
+
+        Parameters
+        ----------
+        file_ids : list[str]
+            List of file IDs to retrieve soma nodes for.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns: file_id, neuron_id, x, y, z.
+        """
+        if not file_ids:
+            return pd.DataFrame(columns=["file_id", "neuron_id", "x", "y", "z"])
+
+        placeholders = ", ".join(["?"] * len(file_ids))
+        query = f"""
+            SELECT file_id, neuron_id, x, y, z
+            FROM neurons
+            WHERE type = 1 AND file_id IN ({placeholders})
+            ORDER BY file_id, node_id
+        """
+        return self.conn.execute(query, file_ids).fetchdf()
+
     def get_neurons_for_rendering(
         self,
         file_ids: list[str],

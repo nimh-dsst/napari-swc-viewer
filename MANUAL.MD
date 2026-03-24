@@ -169,13 +169,15 @@ Controls:
 - Point size and optional `Color by node type`
 - Line width
 - Opacity slider
-- 2D Slice Projection toggle (`Show in 2D slices`) and slice thickness (µm)
+- Shared 2D Slice Projection toggle (`Show in 2D slices`) and slice thickness (µm)
 
 Rendering behavior:
 
 - Batch rendering is used (single layers for performance): `Neuron Lines` (`Shapes`), `Neuron Points` (`Points`), and `Soma Labels` (`Points`, labeled by `neuron_id`)
 - In 2D mode, line/point layers are auto-hidden to keep navigation responsive
 - Optional `Neuron Slice Projection` (vectors layer) shows line segments near current slice
+- Optional `Soma Slice Projection` (points layer) shows raw soma/body nodes (`type = 1`) near the current slice using the same shared slice thickness
+- In 2D with projection enabled, `Soma Labels` are hidden to avoid duplicate soma markers, and `Points` render mode suppresses raw soma-node duplicates from `Neuron Points`
 
 ### 7. Add reference context (Reference tab)
 
@@ -332,7 +334,7 @@ Useful flags:
 
 ### Slow 2D slicing
 
-- Keep `Show in 2D slices` disabled unless needed
+- Keep `Show in 2D slices` disabled unless needed for either neuron lines or soma/body-point projection
 - Reduce rendered neuron count
 - Use `Lines` or `Points` selectively instead of `Both`
 

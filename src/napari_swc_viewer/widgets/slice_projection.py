@@ -1,14 +1,14 @@
-"""Dynamic 2D slice projection for neuron line segments.
+"""Dynamic 2D slice projection helpers for neuron geometry.
 
-This module provides functionality to display neuron line segments in napari's
-2D slice view. Since thin line segments rarely intersect the exact slice plane,
-this projector shows all line segments within a configurable Z tolerance.
+This module provides functionality to display neuron line segments and soma
+points in napari's 2D slice view. Since thin structures rarely intersect the
+exact slice plane, these projectors show geometry within a configurable slab.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from qtpy.QtCore import QTimer
@@ -17,6 +17,19 @@ if TYPE_CHECKING:
     import napari
 
 logger = logging.getLogger(__name__)
+
+_SOMA_PROJECTION_BORDER_COLOR = "#39ff14"
+_SOMA_PROJECTION_BORDER_WIDTH = 0.15
+
+
+def _configure_selectable_points_layer(layer, highlight_callback: Callable | None) -> None:
+    """Configure a points layer for click selection without drag movement."""
+    if highlight_callback is None:
+        return
+
+    layer.mode = "select"
+    layer._move = lambda indices, position: None
+    layer.events.highlight.connect(highlight_callback)
 
 
 class NeuronSliceProjector:
@@ -499,6 +512,406 @@ class NeuronSliceProjector:
                 self._viewer.layers.remove(self._projection_layer)
             except ValueError:
                 pass  # Layer already removed
+            self._projection_layer = None
+
+    def cleanup(self) -> None:
+        """Clean up resources when the widget is destroyed."""
+        self._update_timer.stop()
+        self._disconnect_events()
+        self._remove_projection_layer()
+        self._source_data.clear()
+
+
+class SomaSliceProjector:
+    """Projects soma/body points onto the current 2D slice.
+
+    This class maintains raw soma-node coordinates and dynamically updates a
+    2D Points layer to show soma points within a configurable slab centered on
+    the active slice.
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+        The napari viewer instance.
+    tolerance : float
+        Slab half-thickness in microns. Points within this distance of the
+        slice are shown.
+    point_size : int
+        Marker size for the projected soma points.
+    highlight_callback : callable, optional
+        Callback connected to the projection layer highlight event so projected
+        soma selection matches the existing soma-label selection behavior.
+    """
+
+    def __init__(
+        self,
+        viewer: napari.Viewer,
+        tolerance: float = 50.0,
+        point_size: int = 10,
+        highlight_callback: Callable | None = None,
+    ):
+        self._viewer = viewer
+        self._tolerance = tolerance
+        self._point_size = point_size
+        self._highlight_callback = highlight_callback
+        self._source_data: dict[str, tuple[np.ndarray, tuple]] = {}
+        self._projection_layer = None
+        self._scale: list[float] | None = None
+        self._enabled = False
+        self._connected = False
+
+        self._all_coords: np.ndarray | None = None
+        self._all_colors: np.ndarray | None = None
+        self._all_file_ids: np.ndarray | None = None
+        self._axis_index: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+        self._last_result_key: tuple | None = None
+        self._last_result: tuple | None = None
+
+        self._update_timer = QTimer()
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(50)
+        self._update_timer.timeout.connect(self._do_update_projection)
+
+    @property
+    def tolerance(self) -> float:
+        """Get the current slab half-thickness in microns."""
+        return self._tolerance
+
+    @tolerance.setter
+    def tolerance(self, value: float) -> None:
+        """Set the slab half-thickness and trigger an update."""
+        self._tolerance = value
+        self._invalidate_cache()
+        if self._enabled:
+            self._schedule_update()
+
+    @property
+    def point_size(self) -> int:
+        """Get the current point size."""
+        return self._point_size
+
+    @point_size.setter
+    def point_size(self, value: int) -> None:
+        """Set the point size and update the projection layer."""
+        self._point_size = value
+        if self._projection_layer is not None:
+            self._projection_layer.size = value
+
+    @property
+    def enabled(self) -> bool:
+        """Check if the projector is enabled."""
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        """Enable or disable the projector."""
+        self._enabled = value
+        if value:
+            self._connect_events()
+            self._schedule_update()
+        else:
+            self._disconnect_events()
+            self._remove_projection_layer()
+
+    @property
+    def projection_layer(self):
+        """Return the underlying napari Points layer if present."""
+        return self._projection_layer
+
+    def set_scale(self, scale: list[float] | None) -> None:
+        """Set the coordinate scale for the projection layer."""
+        self._scale = scale
+
+    def add_soma_data(
+        self,
+        file_id: str,
+        coords: np.ndarray,
+        color: tuple = (1, 0, 0, 1),
+    ) -> None:
+        """Add or update soma point data for projection."""
+        self._source_data[file_id] = (coords.copy(), color)
+        self._rebuild_arrays()
+        if self._enabled:
+            self._schedule_update()
+
+    def add_soma_data_batch(
+        self,
+        data: dict[str, tuple[np.ndarray, tuple]],
+    ) -> None:
+        """Add multiple soma-point datasets at once."""
+        for file_id, (coords, color) in data.items():
+            self._source_data[file_id] = (coords.copy(), color)
+        self._rebuild_arrays()
+        if self._enabled:
+            self._schedule_update()
+
+    def update_neuron_colors(
+        self,
+        color_map: dict[str, list[float]],
+    ) -> None:
+        """Update projected soma colors without changing geometry."""
+        changed = False
+        for file_id, (coords, old_color) in list(self._source_data.items()):
+            if file_id in color_map:
+                new_color = tuple(color_map[file_id][:4])
+                if new_color != old_color:
+                    self._source_data[file_id] = (coords, new_color)
+                    changed = True
+        if changed:
+            self._rebuild_colors_only()
+            self._invalidate_cache()
+            if self._enabled:
+                self._schedule_update()
+
+    def remove_neuron_data(self, file_id: str) -> None:
+        """Remove projected soma data for one neuron."""
+        if file_id in self._source_data:
+            del self._source_data[file_id]
+            self._rebuild_arrays()
+            if self._enabled:
+                self._schedule_update()
+
+    def clear(self) -> None:
+        """Clear all soma data and remove the projection layer."""
+        self._source_data.clear()
+        self._all_coords = None
+        self._all_colors = None
+        self._all_file_ids = None
+        self._axis_index.clear()
+        self._invalidate_cache()
+        self._remove_projection_layer()
+
+    def _rebuild_arrays(self) -> None:
+        """Precompute flat arrays of all projected soma coordinates."""
+        if not self._source_data:
+            self._all_coords = None
+            self._all_colors = None
+            self._all_file_ids = None
+            self._axis_index.clear()
+            self._invalidate_cache()
+            return
+
+        coord_list = []
+        color_list = []
+        file_id_list = []
+        for file_id, (coords, color) in self._source_data.items():
+            if len(coords) == 0:
+                continue
+            coord_list.append(coords)
+            color_arr = np.empty((len(coords), len(color)))
+            color_arr[:] = color
+            color_list.append(color_arr)
+            file_id_list.extend([file_id] * len(coords))
+
+        if coord_list:
+            self._all_coords = np.concatenate(coord_list)
+            self._all_colors = np.concatenate(color_list)
+            self._all_file_ids = np.asarray(file_id_list, dtype=object)
+        else:
+            self._all_coords = None
+            self._all_colors = None
+            self._all_file_ids = None
+
+        self._rebuild_axis_index()
+        self._invalidate_cache()
+
+    def _rebuild_axis_index(self) -> None:
+        """Build a per-axis sorted index for slab point queries."""
+        self._axis_index.clear()
+        if self._all_coords is None:
+            return
+
+        for axis in range(3):
+            axis_values = self._all_coords[:, axis]
+            order = np.argsort(axis_values)
+            self._axis_index[axis] = (order, axis_values[order])
+
+    def _rebuild_colors_only(self) -> None:
+        """Rebuild only the flat color array from source data."""
+        if not self._source_data or self._all_coords is None:
+            return
+
+        color_list = []
+        for coords, color in self._source_data.values():
+            if len(coords) == 0:
+                continue
+            color_arr = np.empty((len(coords), len(color)))
+            color_arr[:] = color
+            color_list.append(color_arr)
+
+        if color_list:
+            self._all_colors = np.concatenate(color_list)
+
+    def _invalidate_cache(self) -> None:
+        """Invalidate the single-entry result cache."""
+        self._last_result_key = None
+        self._last_result = None
+
+    def _connect_events(self) -> None:
+        """Connect to viewer dimension events."""
+        if not self._connected:
+            self._viewer.dims.events.current_step.connect(self._on_dims_changed)
+            self._viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+            self._viewer.dims.events.order.connect(self._on_dims_changed)
+            self._connected = True
+
+    def _disconnect_events(self) -> None:
+        """Disconnect from viewer dimension events."""
+        if self._connected:
+            try:
+                self._viewer.dims.events.current_step.disconnect(self._on_dims_changed)
+                self._viewer.dims.events.ndisplay.disconnect(self._on_ndisplay_changed)
+                self._viewer.dims.events.order.disconnect(self._on_dims_changed)
+            except (TypeError, RuntimeError):
+                pass
+            self._connected = False
+
+    def _on_dims_changed(self, event) -> None:
+        """Handle dimension or slice changes."""
+        if self._enabled and self._viewer.dims.ndisplay == 2:
+            self._schedule_update()
+
+    def _on_ndisplay_changed(self, event) -> None:
+        """Handle display mode changes (2D/3D toggle)."""
+        if not self._enabled:
+            return
+
+        if self._viewer.dims.ndisplay == 2:
+            self._schedule_update()
+        elif self._projection_layer is not None:
+            self._projection_layer.visible = False
+
+    def _schedule_update(self) -> None:
+        """Schedule a debounced projection update."""
+        self._update_timer.start()
+
+    def _do_update_projection(self) -> None:
+        """Actually perform the soma projection update."""
+        if not self._enabled:
+            return
+
+        if self._viewer.dims.ndisplay != 2:
+            if self._projection_layer is not None:
+                self._projection_layer.visible = False
+            return
+
+        not_displayed = self._viewer.dims.not_displayed
+        if not not_displayed:
+            return
+        slice_axis = not_displayed[0]
+
+        slice_world = self._viewer.dims.point[slice_axis]
+        if self._scale is not None:
+            slice_position_microns = slice_world / self._scale[slice_axis]
+        else:
+            slice_position_microns = slice_world
+
+        points, colors, file_ids = self._compute_slice_projection(
+            slice_position_microns,
+            slice_axis,
+        )
+
+        if points is None:
+            self._remove_projection_layer()
+            return
+
+        self._update_projection_layer(points, colors, file_ids)
+
+    def _compute_slice_projection(
+        self,
+        slice_position: float,
+        slice_axis: int,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, list[str] | None]:
+        """Compute soma points within the slab, flattened onto the slice."""
+        if self._all_coords is None or self._all_file_ids is None:
+            return None, None, None
+
+        cache_key = (slice_axis, slice_position, self._tolerance)
+        if self._last_result_key == cache_key:
+            return self._last_result
+
+        slab_min = slice_position - self._tolerance
+        slab_max = slice_position + self._tolerance
+
+        if slice_axis in self._axis_index:
+            order, sorted_axis_values = self._axis_index[slice_axis]
+            left = np.searchsorted(sorted_axis_values, slab_min, side="left")
+            right = np.searchsorted(sorted_axis_values, slab_max, side="right")
+            hit_indices = order[left:right]
+        else:
+            axis_values = self._all_coords[:, slice_axis]
+            mask = (axis_values >= slab_min) & (axis_values <= slab_max)
+            hit_indices = np.nonzero(mask)[0]
+
+        if len(hit_indices) == 0:
+            result = (None, None, None)
+            self._last_result_key = cache_key
+            self._last_result = result
+            return result
+
+        points = self._all_coords[hit_indices].copy()
+        points[:, slice_axis] = slice_position
+        colors = self._all_colors[hit_indices]
+        file_ids = self._all_file_ids[hit_indices].tolist()
+
+        result = (points, colors, file_ids)
+        self._last_result_key = cache_key
+        self._last_result = result
+        return result
+
+    def _update_projection_layer(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        file_ids: list[str],
+    ) -> None:
+        """Update or create the projected soma points layer."""
+        layer_name = "Soma Slice Projection"
+
+        if self._projection_layer is None:
+            for layer in self._viewer.layers:
+                if layer.name == layer_name:
+                    self._projection_layer = layer
+                    break
+
+        if self._projection_layer is None:
+            self._projection_layer = self._viewer.add_points(
+                points,
+                size=self._point_size,
+                face_color=colors,
+                border_color=_SOMA_PROJECTION_BORDER_COLOR,
+                border_width=_SOMA_PROJECTION_BORDER_WIDTH,
+                name=layer_name,
+                opacity=1.0,
+                scale=self._scale,
+                metadata={"file_ids": file_ids},
+            )
+            _configure_selectable_points_layer(
+                self._projection_layer,
+                self._highlight_callback,
+            )
+            return
+
+        with self._projection_layer.events.blocker_all():
+            self._projection_layer.data = points
+            self._projection_layer.face_color = colors
+            self._projection_layer.metadata = {"file_ids": file_ids}
+            self._projection_layer.visible = True
+            self._projection_layer.size = self._point_size
+            self._projection_layer.border_color = _SOMA_PROJECTION_BORDER_COLOR
+            self._projection_layer.border_width = _SOMA_PROJECTION_BORDER_WIDTH
+            if self._scale is not None:
+                self._projection_layer.scale = self._scale
+        self._projection_layer.refresh()
+
+    def _remove_projection_layer(self) -> None:
+        """Remove the projection layer from the viewer."""
+        if self._projection_layer is not None:
+            try:
+                self._viewer.layers.remove(self._projection_layer)
+            except ValueError:
+                pass
             self._projection_layer = None
 
     def cleanup(self) -> None:
