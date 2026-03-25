@@ -65,7 +65,7 @@ from .analysis_tab import AnalysisTabWidget
 from .mask_layer_selector import MaskLayerSelectorWidget
 from .neuron_table import NeuronTableWidget
 from .region_selector import RegionSelectorWidget
-from .slice_projection import NeuronSliceProjector
+from .slice_projection import NeuronSliceProjector, SomaSliceProjector
 
 if TYPE_CHECKING:
     import napari
@@ -82,6 +82,8 @@ _POINT_HEATMAP_BASE_COLORS = [
     (0.0, 0.8, 0.8, 1.0),    # cyan
     (0.6, 0.3, 0.0, 1.0),    # brown
 ]
+
+_SOMA_SLICE_PROJECTION_POINT_SIZE = 100
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -155,6 +157,12 @@ class NeuronViewerWidget(QWidget):
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
+        self._soma_slice_projector = SomaSliceProjector(
+            napari_viewer,
+            tolerance=100.0,
+            point_size=_SOMA_SLICE_PROJECTION_POINT_SIZE,
+            highlight_callback=self._on_soma_selected,
+        )
 
         # Conversion worker state
         self._convert_thread: QThread | None = None
@@ -1546,6 +1554,8 @@ class NeuronViewerWidget(QWidget):
                     scale=scale,
                     metadata={
                         "file_ids_per_point": points_df["file_id"].values.tolist(),
+                        "point_types": points_df["type"].values.tolist(),
+                        "base_face_colors": colors.copy(),
                     },
                 )
                 self._current_neuron_layers.append(layer)
@@ -1580,6 +1590,15 @@ class NeuronViewerWidget(QWidget):
             soma_layer._move = lambda indices, position: None
             soma_layer.events.highlight.connect(self._on_soma_selected)
             self._current_neuron_layers.append(soma_layer)
+
+        soma_projection_batch = self._build_soma_projection_batch(
+            file_ids=file_ids,
+            neuron_colors=neuron_colors,
+            points_df=points_df,
+        )
+        self._soma_slice_projector.set_scale(scale)
+        self._soma_slice_projector.point_size = _SOMA_SLICE_PROJECTION_POINT_SIZE
+        self._soma_slice_projector.add_soma_data_batch(soma_projection_batch)
 
         # Re-apply cluster colors if a clustering result exists
         self._analysis_tab.apply_cluster_colors()
@@ -1665,6 +1684,86 @@ class NeuronViewerWidget(QWidget):
                 except TypeError:
                     file_ids.add(str(fid))
         return file_ids
+
+    def _build_soma_projection_batch(
+        self,
+        file_ids: list[object],
+        neuron_colors: list[list[float]],
+        points_df,
+    ) -> dict[str, tuple[np.ndarray, tuple]]:
+        """Build a per-neuron soma-point batch for the 2D projection layer."""
+        soma_points_df = None
+        if points_df is not None and not points_df.empty and "type" in points_df:
+            soma_points_df = points_df[points_df["type"] == 1]
+
+        if soma_points_df is None or soma_points_df.empty:
+            if self._db is None:
+                return {}
+            soma_points_df = self._db.get_soma_points(file_ids)
+
+        if soma_points_df.empty:
+            return {}
+
+        color_map = {
+            fid: tuple(color[:4])
+            for fid, color in zip(file_ids, neuron_colors)
+        }
+        default_color = (0.5, 0.5, 0.5, 1.0)
+        batch = {}
+        for file_id, group in soma_points_df.groupby("file_id", sort=True):
+            coords = group[["x", "y", "z"]].values.astype(np.float64)
+            batch[file_id] = (coords, color_map.get(file_id, default_color))
+        return batch
+
+    def _soma_projection_active_in_2d(self) -> bool:
+        """Return whether the shared 2D projection is active in 2D mode."""
+        return bool(
+            self.viewer.dims.ndisplay == 2
+            and self._show_slice_projection_cb.isChecked()
+        )
+
+    def _set_neuron_points_soma_visibility(
+        self,
+        layer,
+        hide_soma_points: bool,
+    ) -> None:
+        """Hide or restore soma-node entries within the Neuron Points layer."""
+        meta = _layer_metadata(layer)
+        point_types = np.asarray(meta.get("point_types", []))
+        if point_types.size == 0:
+            return
+
+        base_colors = meta.get("base_face_colors")
+        if base_colors is None:
+            face_color = getattr(layer, "face_color", None)
+            if face_color is None:
+                return
+            base_colors = np.asarray(face_color, dtype=float)
+        else:
+            base_colors = np.asarray(base_colors, dtype=float)
+
+        if base_colors.ndim != 2 or base_colors.shape[0] != point_types.shape[0]:
+            return
+
+        meta["base_face_colors"] = base_colors.copy()
+        layer.metadata = meta
+
+        colors = base_colors.copy()
+        if hide_soma_points:
+            colors[point_types == 1, 3] = 0.0
+        layer.face_color = colors
+
+    def _sync_soma_projection_overlay_state(self) -> None:
+        """Keep soma labels and raw soma nodes in sync with 2D projection state."""
+        projection_active = self._soma_projection_active_in_2d()
+        hide_soma_points = projection_active and (
+            self._render_mode_combo.currentText() == "Points"
+        )
+        for layer in self._current_neuron_layers:
+            if layer.name == "Soma Labels" and self.viewer.dims.ndisplay == 2:
+                layer.visible = not projection_active
+            elif layer.name == "Neuron Points":
+                self._set_neuron_points_soma_visibility(layer, hide_soma_points)
 
     def _compute_center_of_rendered_neurons(
         self,
@@ -1764,6 +1863,8 @@ class NeuronViewerWidget(QWidget):
                     colors = np.array(
                         [color_map.get(fid, default_color)[:4] for fid in fids]
                     )
+                    meta["base_face_colors"] = colors.copy()
+                    layer.metadata = meta
                     layer.face_color = colors
 
             elif layer.name == "Soma Labels":
@@ -1777,6 +1878,8 @@ class NeuronViewerWidget(QWidget):
 
         # Update slice projector
         self._slice_projector.update_neuron_colors(color_map)
+        self._soma_slice_projector.update_neuron_colors(color_map)
+        self._sync_soma_projection_overlay_state()
 
     def _apply_neuron_colors(self, changed: dict[str, list[float]]) -> None:
         """Handle color changes from the neuron table."""
@@ -1862,6 +1965,7 @@ class NeuronViewerWidget(QWidget):
 
         # Clear slice projector data
         self._slice_projector.clear()
+        self._soma_slice_projector.clear()
         self._neuron_table.set_added_file_ids(set())
 
     def _toggle_template(self, state: int) -> None:
@@ -2005,30 +2109,36 @@ class NeuronViewerWidget(QWidget):
     def _apply_layer_visibility(self, visible: bool) -> None:
         """Set visibility on all neuron layers and clear the status message.
 
-        The "Soma Labels" layer is excluded from 2D hiding because napari
-        Points layers natively handle slice display, showing only points
-        near the current slice position.
+        In 2D mode, the raw points layer can stay visible for `Points` render
+        mode while line layers are hidden for responsiveness.
         """
         show_points_in_2d = (
             not visible and self._render_mode_combo.currentText() == "Points"
         )
         for layer in self._current_neuron_layers:
             if not visible and layer.name == "Soma Labels":
+                layer.visible = True
                 continue
             if show_points_in_2d and layer.name == "Neuron Points":
+                layer.visible = True
                 continue
             layer.visible = visible
+        self._sync_soma_projection_overlay_state()
         self.viewer.status = "Ready"
 
     def _toggle_slice_projection(self, state: int) -> None:
         """Toggle the 2D slice projection visibility."""
         enabled = bool(state)
         self._slice_projector.enabled = enabled
+        self._soma_slice_projector.enabled = enabled
         self._slice_warning_label.setVisible(enabled)
+        if self._current_neuron_layers and self.viewer.dims.ndisplay == 2:
+            self._apply_layer_visibility(False)
 
     def _update_slice_thickness(self, value: int) -> None:
         """Update the slice projection thickness/tolerance."""
         self._slice_projector.tolerance = float(value)
+        self._soma_slice_projector.tolerance = float(value)
 
     def _update_line_width(self, value: int) -> None:
         """Update line width for both neuron layers and projection."""
