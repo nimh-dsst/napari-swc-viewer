@@ -108,8 +108,32 @@ def build_binary_mask_from_heatmap(
     if mode == "otsu" and not np.any(smoothed > 0):
         mask = np.zeros(smoothed.shape, dtype=np.uint8)
     else:
-        mask = (smoothed >= threshold).astype(np.uint8, copy=False)
+        mask = build_binary_mask_from_threshold_range(
+            smoothed,
+            lower_threshold=threshold,
+        )
     return mask, threshold, smoothed
+
+
+def build_binary_mask_from_threshold_range(
+    volume: NDArray[np.floating] | np.ndarray,
+    lower_threshold: float,
+    upper_threshold: float | None = None,
+) -> NDArray[np.uint8]:
+    """Create a binary mask from explicit lower and optional upper bounds."""
+    arr = np.asarray(volume, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, got shape {arr.shape}")
+
+    lower = float(lower_threshold)
+    upper = None if upper_threshold is None else float(upper_threshold)
+    if upper is not None and upper < lower:
+        raise ValueError("Upper threshold must be greater than or equal to lower threshold.")
+
+    mask = arr >= lower
+    if upper is not None:
+        mask &= arr <= upper
+    return mask.astype(np.uint8, copy=False)
 
 
 def get_region_mask(atlas: BrainGlobeAtlas, acronym: str) -> NDArray[np.bool_]:

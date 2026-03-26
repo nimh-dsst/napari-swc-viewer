@@ -93,6 +93,8 @@ Tabs:
 - Visualization
 - Reference
 - Analysis
+- Tools
+- Histogram
 
 ### 2. Load data (Data tab)
 
@@ -130,22 +132,37 @@ Notes:
 
 This fills the **Selected Neurons** table in the Data tab.
 
-### 4. Build masks from heatmaps (Tools tab)
+### 4. Generate blurred heatmaps (Tools tab)
 
 1. Select one or more eligible heatmap layers
-2. Choose `Separate masks` or `Merged mask`
+2. Choose `Separate layers` or `Merged layer`
 3. Set Gaussian sigma in atlas voxels
-4. Choose `Otsu` or `Manual` thresholding
-5. Click `Create Mask Layer`
+4. Click `Create Blurred Layer`
 
 Notes:
 
 - Only app-created heatmaps on the native atlas voxel grid are eligible
 - Depth-binned analysis heatmaps are excluded from mask creation in this version
-- Generated masks are added as binary `Labels` layers and can be used from the `Regions` tab
+- Generated blurred layers are also eligible native-grid sources in both the `Tools` and `Histogram` tabs
 - Gaussian sigma is in atlas voxels; for example, on `allen_mouse_25um`, `1.0` means `1 voxel = 25 µm`
 
-### 5. Manage selected neurons (Data tab table)
+### 5. Inspect histograms and build masks (Histogram tab)
+
+1. Select one or more eligible heatmap or blurred heatmap layers
+2. Review the overlaid interactive histogram traces for the selected layers
+3. Optionally enable `Include zero-valued background` to inspect the zero spike
+4. Choose `Separate layers` or `Merged layer` for mask creation
+5. Set a `Lower bound`, optionally enable `Use upper bound`, and use either `Use Otsu Lower` or `Use Layer Contrast` to populate the bounds
+6. Click `Create Mask Layer`
+
+Notes:
+
+- Generated masks are added as binary `Labels` layers and can be used from the `Regions` tab
+- `Use Layer Contrast` requires exactly one selected heatmap or blurred heatmap layer
+- Zero-valued background voxels are hidden from the histogram by default
+- The histogram plot supports zooming and panning for tighter threshold inspection
+
+### 6. Manage selected neurons (Data tab table)
 
 In the table you can:
 
@@ -161,7 +178,7 @@ Buttons:
 - `Clear All`: remove all neuron layers.
 - Centering mode (`Same` | `Auto`): `Same` keeps the current depth slice after add/remove. `Auto` auto-centers once on first add/remove in the widget session.
 
-### 6. Configure rendering (Visualization tab)
+### 7. Configure rendering (Visualization tab)
 
 Controls:
 
@@ -179,7 +196,7 @@ Rendering behavior:
 - Optional `Soma Slice Projection` (points layer) shows raw soma/body nodes (`type = 1`) near the current slice using the same shared slice thickness
 - In 2D with projection enabled, `Soma Labels` are hidden to avoid duplicate soma markers, and `Points` render mode suppresses raw soma-node duplicates from `Neuron Points`
 
-### 7. Add reference context (Reference tab)
+### 8. Add reference context (Reference tab)
 
 Available layers:
 
@@ -193,7 +210,7 @@ Notes:
 - Mesh display auto-switches napari to 3D mode
 - Segmentation is intended for 2D context overlays
 
-### 8. Run analysis (Analysis tab)
+### 9. Run analysis (Analysis tab)
 
 ### Clustering
 
@@ -320,9 +337,9 @@ Useful flags:
 - Load the target atlas before importing point Parquet
 - If the app warns about metadata mismatches, the heatmap layers are still imported; review optional `region_name`, `acronym`, `id`, and `hemisphere` values
 
-### “No eligible heatmaps” in Tools
+### “No eligible heatmaps” in Tools or Histogram
 
-- Only app-created heatmap image layers are listed
+- Only app-created native-grid heatmap and blurred heatmap image layers are listed
 - The heatmap must match the currently loaded atlas
 - Depth-binned analysis heatmaps are excluded because they are not on the native atlas voxel grid
 

@@ -31,6 +31,7 @@ dependencies = [
     "duckdb>=0.9",
     "pandas>=2.0",
     "qtpy>=2.0",
+    "pyqtgraph>=0.13",
     "scikit-learn>=1.2",
     "scipy>=1.10",
     "seaborn>=0.13",

@@ -344,6 +344,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyqt6-6.8.1-py312h1289d80_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyqt6-sip-13.10.0-py312h1289d80_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyside6-6.8.3-py312h91f0f75_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pysocks-1.7.1-pyha55dd90_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.0.2-pyhcf101f3_0.conda
@@ -766,6 +767,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyqt6-6.8.1-py312h6d95f44_2.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyqt6-sip-13.10.0-py312h6d95f44_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pysocks-1.7.1-pyha55dd90_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.0.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-cov-7.0.0-pyhcf101f3_1.conda
@@ -1126,6 +1128,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyqt6-6.8.1-py312hbb81ca0_2.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyqt6-sip-13.10.0-py312hbb81ca0_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyside6-6.8.3-py312h2ee7485_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pysocks-1.7.1-pyh09c184e_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.0.2-pyhcf101f3_0.conda
@@ -1576,6 +1579,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyqt6-6.8.1-py310hea6c23e_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyqt6-sip-13.10.0-py310hea6c23e_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyside6-6.8.3-py310hfd10a26_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pysocks-1.7.1-pyha55dd90_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.0.2-pyhcf101f3_0.conda
@@ -2007,6 +2011,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyqt6-6.8.1-py310h8616463_2.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyqt6-sip-13.10.0-py310h8616463_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pysocks-1.7.1-pyha55dd90_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.0.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-cov-7.0.0-pyhcf101f3_1.conda
@@ -2371,6 +2376,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyqt6-6.8.1-py310h73ae2b4_2.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyqt6-sip-13.10.0-py310h73ae2b4_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyside6-6.8.3-py310h60c6385_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pysocks-1.7.1-pyh09c184e_7.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.0.2-pyhcf101f3_0.conda
@@ -15679,6 +15685,20 @@ packages:
   license_family: GPL
   size: 72807
   timestamp: 1770737431823
+- conda: https://conda.anaconda.org/conda-forge/noarch/pyqtgraph-0.14.0-pyhd8ed1ab_0.conda
+  sha256: f1bc737d8c525a6aeaa687fd4e6ab9d07871be089ec1824349c9dd598e0420ea
+  md5: 1a9d422262ef2e0928a90dde1da5b33a
+  depends:
+  - colorama
+  - numpy >=1.25
+  - python >=3.10
+  constrains:
+  - pyqt >=5.15
+  - pyside2 >=5.15
+  license: MIT
+  license_family: MIT
+  size: 1436545
+  timestamp: 1763549841016
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pyside6-6.8.3-py310hfd10a26_0.conda
   sha256: 08f4f3f7b731e4f7efc21fdbf2fb55c5e141f28546200008a86ac88a90de592f
   md5: dd3dd65ec785c86ed90e8cb4890361f2

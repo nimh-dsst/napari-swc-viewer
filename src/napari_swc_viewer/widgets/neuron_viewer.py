@@ -39,7 +39,13 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ..analysis.mask import build_binary_mask_from_heatmap, merge_heatmap_volumes
+from ..analysis.mask import (
+    build_binary_mask_from_threshold_range,
+    merge_heatmap_volumes,
+    otsu_threshold_positive,
+    smooth_heatmap_volume,
+)
+from ..analysis.histogram import _build_histogram_plot_series
 from ..auto_center import (
     center_to_depth_world,
     compute_center_of_rendered_neurons,
@@ -84,6 +90,7 @@ _POINT_HEATMAP_BASE_COLORS = [
 ]
 
 _SOMA_SLICE_PROJECTION_POINT_SIZE = 100
+_HISTOGRAM_BIN_COUNT = 256
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -128,6 +135,26 @@ def _mask_layer_color(source_layers: list) -> tuple[float, float, float, float] 
     return tuple(float(value) for value in rgba[:4])
 
 
+def _shared_blur_sigma(source_layers: list) -> float | None:
+    """Return a common blur sigma if all source layers share one."""
+    values: list[float] = []
+    for layer in source_layers:
+        value = _layer_metadata(layer).get("blur_sigma")
+        if value is None:
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    if not values:
+        return None
+    first = values[0]
+    if all(np.isclose(first, value) for value in values[1:]):
+        return first
+    return None
+
+
 class NeuronViewerWidget(QWidget):
     """Main widget for viewing neurons with brain region filtering.
 
@@ -154,6 +181,8 @@ class NeuronViewerWidget(QWidget):
         self._last_soma_selection: set = set()  # track to skip no-op highlights
         self._auto_center_applied_once = False
         self._region_query_source = "Atlas Regions"
+        self._mask_bounds_source = "manual"
+        self._histogram_line_sync_active = False
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -171,6 +200,7 @@ class NeuronViewerWidget(QWidget):
         self._setup_ui()
         self._connect_layer_events()
         self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
 
         # Auto-hide neuron line layers in 2D mode
@@ -218,6 +248,10 @@ class NeuronViewerWidget(QWidget):
         tools_tab = QWidget()
         tabs.addTab(tools_tab, "Tools")
         self._setup_tools_tab(tools_tab)
+
+        histogram_tab = QWidget()
+        tabs.addTab(histogram_tab, "Histogram")
+        self._setup_histogram_tab(histogram_tab)
 
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
@@ -466,7 +500,7 @@ class NeuronViewerWidget(QWidget):
         self._on_region_query_source_changed(self._region_query_source_combo.currentText())
 
     def _setup_tools_tab(self, parent: QWidget) -> None:
-        """Set up the heatmap-to-mask tools tab."""
+        """Set up the blur-generation tools tab."""
         layout = QVBoxLayout(parent)
 
         sources_group = QGroupBox("Heatmap Sources")
@@ -475,21 +509,28 @@ class NeuronViewerWidget(QWidget):
         self._heatmap_layer_list.setSelectionMode(
             QAbstractItemView.ExtendedSelection
         )
+        self._heatmap_layer_list.itemSelectionChanged.connect(
+            self._update_tools_controls
+        )
         sources_layout.addWidget(self._heatmap_layer_list)
         self._tools_hint_label = QLabel("")
         self._tools_hint_label.setWordWrap(True)
         sources_layout.addWidget(self._tools_hint_label)
         layout.addWidget(sources_group)
 
-        settings_group = QGroupBox("Mask Creation")
-        settings_layout = QVBoxLayout(settings_group)
+        blur_group = QGroupBox("Blur Generation")
+        blur_layout = QVBoxLayout(blur_group)
 
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Output mode:"))
-        self._mask_output_mode_combo = QComboBox()
-        self._mask_output_mode_combo.addItems(["Separate masks", "Merged mask"])
-        mode_row.addWidget(self._mask_output_mode_combo)
-        settings_layout.addLayout(mode_row)
+        mode_row.addWidget(QLabel("Create mode:"))
+        self._tools_create_mode_combo = QComboBox()
+        self._tools_create_mode_combo.addItem("Separate layers", "separate")
+        self._tools_create_mode_combo.addItem("Merged layer", "merged")
+        self._tools_create_mode_combo.currentIndexChanged.connect(
+            self._update_tools_controls
+        )
+        mode_row.addWidget(self._tools_create_mode_combo)
+        blur_layout.addLayout(mode_row)
 
         sigma_row = QHBoxLayout()
         self._mask_sigma_label = QLabel("Gaussian sigma (voxels):")
@@ -500,46 +541,164 @@ class NeuronViewerWidget(QWidget):
         self._mask_sigma_spin.setSingleStep(0.25)
         self._mask_sigma_spin.setValue(1.0)
         sigma_row.addWidget(self._mask_sigma_spin)
-        settings_layout.addLayout(sigma_row)
+        blur_layout.addLayout(sigma_row)
         self._mask_sigma_units_label = QLabel(
             "1 voxel = atlas voxel size; load an atlas to see the micron equivalent."
         )
         self._mask_sigma_units_label.setWordWrap(True)
-        settings_layout.addWidget(self._mask_sigma_units_label)
+        blur_layout.addWidget(self._mask_sigma_units_label)
 
-        threshold_row = QHBoxLayout()
-        threshold_row.addWidget(QLabel("Threshold:"))
-        self._mask_threshold_mode_combo = QComboBox()
-        self._mask_threshold_mode_combo.addItems(["Otsu", "Manual"])
-        self._mask_threshold_mode_combo.currentTextChanged.connect(
-            self._on_mask_threshold_mode_changed
-        )
-        threshold_row.addWidget(self._mask_threshold_mode_combo)
-        settings_layout.addLayout(threshold_row)
+        self._create_blur_btn = QPushButton("Create Blurred Layer")
+        self._create_blur_btn.clicked.connect(self._create_blurred_layers_from_heatmaps)
+        blur_layout.addWidget(self._create_blur_btn)
 
-        manual_row = QHBoxLayout()
-        manual_row.addWidget(QLabel("Manual value:"))
-        self._mask_manual_threshold_spin = QDoubleSpinBox()
-        self._mask_manual_threshold_spin.setRange(-1_000_000.0, 1_000_000.0)
-        self._mask_manual_threshold_spin.setDecimals(4)
-        self._mask_manual_threshold_spin.setValue(1.0)
-        manual_row.addWidget(self._mask_manual_threshold_spin)
-        settings_layout.addLayout(manual_row)
-
-        self._create_mask_btn = QPushButton("Create Mask Layer")
-        self._create_mask_btn.clicked.connect(self._create_masks_from_heatmaps)
-        settings_layout.addWidget(self._create_mask_btn)
+        layout.addWidget(blur_group)
 
         self._tools_status_label = QLabel("")
         self._tools_status_label.setWordWrap(True)
-        settings_layout.addWidget(self._tools_status_label)
+        layout.addWidget(self._tools_status_label)
 
-        layout.addWidget(settings_group)
         layout.addStretch()
-        self._on_mask_threshold_mode_changed(
-            self._mask_threshold_mode_combo.currentText()
-        )
         self._update_mask_sigma_units_label()
+        self._update_tools_controls()
+
+    def _setup_histogram_tab(self, parent: QWidget) -> None:
+        """Set up the histogram and thresholding tab."""
+        import pyqtgraph as pg
+
+        layout = QVBoxLayout(parent)
+        self._histogram_pg = pg
+
+        sources_group = QGroupBox("Histogram Sources")
+        sources_layout = QVBoxLayout(sources_group)
+        self._histogram_layer_list = QListWidget()
+        self._histogram_layer_list.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+        )
+        self._histogram_layer_list.itemSelectionChanged.connect(
+            self._on_histogram_layer_selection_changed
+        )
+        sources_layout.addWidget(self._histogram_layer_list)
+        self._histogram_hint_label = QLabel("")
+        self._histogram_hint_label.setWordWrap(True)
+        sources_layout.addWidget(self._histogram_hint_label)
+        layout.addWidget(sources_group)
+
+        plot_group = QGroupBox("Intensity Histogram")
+        plot_layout = QVBoxLayout(plot_group)
+
+        self._histogram_include_zero_cb = QCheckBox("Include zero-valued background")
+        self._histogram_include_zero_cb.setChecked(False)
+        self._histogram_include_zero_cb.toggled.connect(self._update_histogram_plot)
+        plot_layout.addWidget(self._histogram_include_zero_cb)
+
+        self._histogram_plot_widget = pg.PlotWidget()
+        self._histogram_plot_widget.setMinimumHeight(260)
+        self._histogram_plot_item = self._histogram_plot_widget.getPlotItem()
+        self._histogram_plot_item.setTitle("Intensity Histogram")
+        self._histogram_plot_item.setLabel("bottom", "Intensity")
+        self._histogram_plot_item.setLabel("left", "Voxel count")
+        self._histogram_plot_item.showGrid(x=True, y=True, alpha=0.15)
+        self._histogram_plot_item.getViewBox().setMouseEnabled(x=True, y=True)
+        self._histogram_curve_items: list = []
+        self._histogram_message_item = None
+        self._histogram_plot_legend = None
+        self._histogram_lower_line = pg.InfiniteLine(
+            angle=90,
+            movable=True,
+            pen=pg.mkPen(color="#c43c39", width=2),
+        )
+        self._histogram_lower_line.setBounds((-1_000_000.0, 1_000_000.0))
+        self._histogram_lower_line.sigPositionChanged.connect(
+            lambda _line: self._on_histogram_bound_line_moved("lower")
+        )
+        self._histogram_lower_line.sigPositionChangeFinished.connect(
+            lambda _line: self._on_histogram_bound_line_move_finished("lower")
+        )
+        self._histogram_upper_line = pg.InfiniteLine(
+            angle=90,
+            movable=True,
+            pen=pg.mkPen(color="#2f6db2", width=2),
+        )
+        self._histogram_upper_line.setBounds((-1_000_000.0, 1_000_000.0))
+        self._histogram_upper_line.sigPositionChanged.connect(
+            lambda _line: self._on_histogram_bound_line_moved("upper")
+        )
+        self._histogram_upper_line.sigPositionChangeFinished.connect(
+            lambda _line: self._on_histogram_bound_line_move_finished("upper")
+        )
+        plot_layout.addWidget(self._histogram_plot_widget)
+
+        layout.addWidget(plot_group)
+
+        mask_group = QGroupBox("Mask Creation")
+        mask_layout = QVBoxLayout(mask_group)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Create mode:"))
+        self._histogram_create_mode_combo = QComboBox()
+        self._histogram_create_mode_combo.addItem("Separate layers", "separate")
+        self._histogram_create_mode_combo.addItem("Merged layer", "merged")
+        self._histogram_create_mode_combo.currentIndexChanged.connect(
+            self._update_histogram_controls
+        )
+        mask_layout.addLayout(mode_row)
+        mode_row.addWidget(self._histogram_create_mode_combo)
+
+        lower_row = QHBoxLayout()
+        lower_row.addWidget(QLabel("Lower bound:"))
+        self._mask_lower_threshold_spin = QDoubleSpinBox()
+        self._mask_lower_threshold_spin.setRange(-1_000_000.0, 1_000_000.0)
+        self._mask_lower_threshold_spin.setDecimals(4)
+        self._mask_lower_threshold_spin.setSingleStep(0.01)
+        self._mask_lower_threshold_spin.setValue(1.0)
+        self._mask_lower_threshold_spin.valueChanged.connect(
+            self._mark_mask_bounds_manual
+        )
+        lower_row.addWidget(self._mask_lower_threshold_spin)
+        mask_layout.addLayout(lower_row)
+
+        bounds_btn_row = QHBoxLayout()
+        self._mask_use_otsu_btn = QPushButton("Use Otsu Lower")
+        self._mask_use_otsu_btn.clicked.connect(self._fill_mask_lower_bound_from_otsu)
+        bounds_btn_row.addWidget(self._mask_use_otsu_btn)
+
+        self._mask_use_contrast_btn = QPushButton("Use Layer Contrast")
+        self._mask_use_contrast_btn.clicked.connect(
+            self._copy_selected_layer_contrast_to_bounds
+        )
+        bounds_btn_row.addWidget(self._mask_use_contrast_btn)
+        mask_layout.addLayout(bounds_btn_row)
+
+        upper_row = QHBoxLayout()
+        self._mask_use_upper_bound_cb = QCheckBox("Use upper bound")
+        self._mask_use_upper_bound_cb.toggled.connect(self._on_mask_upper_bound_toggled)
+        upper_row.addWidget(self._mask_use_upper_bound_cb)
+        self._mask_upper_threshold_spin = QDoubleSpinBox()
+        self._mask_upper_threshold_spin.setRange(-1_000_000.0, 1_000_000.0)
+        self._mask_upper_threshold_spin.setDecimals(4)
+        self._mask_upper_threshold_spin.setSingleStep(0.01)
+        self._mask_upper_threshold_spin.setValue(0.0)
+        self._mask_upper_threshold_spin.valueChanged.connect(
+            self._mark_mask_bounds_manual
+        )
+        upper_row.addWidget(self._mask_upper_threshold_spin)
+        mask_layout.addLayout(upper_row)
+
+        self._create_mask_btn = QPushButton("Create Mask Layer")
+        self._create_mask_btn.clicked.connect(self._create_masks_from_heatmaps)
+        mask_layout.addWidget(self._create_mask_btn)
+
+        layout.addWidget(mask_group)
+
+        self._histogram_status_label = QLabel("")
+        self._histogram_status_label.setWordWrap(True)
+        layout.addWidget(self._histogram_status_label)
+
+        layout.addStretch()
+        self._on_mask_upper_bound_toggled(False)
+        self._update_histogram_controls()
+        self._update_histogram_plot()
 
     def _setup_viz_tab(self, parent: QWidget) -> None:
         """Set up the visualization settings tab."""
@@ -763,6 +922,7 @@ class NeuronViewerWidget(QWidget):
             self._analysis_tab.set_atlas(self._atlas)
             self._update_mask_sigma_units_label()
             self._refresh_heatmap_layer_list()
+            self._refresh_histogram_layer_list()
             self._refresh_mask_layer_options()
             logger.info(f"Loaded atlas: {atlas_name}")
 
@@ -868,6 +1028,7 @@ class NeuronViewerWidget(QWidget):
             len(points_df),
         )
         self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
 
     def _connect_layer_events(self) -> None:
@@ -883,7 +1044,10 @@ class NeuronViewerWidget(QWidget):
     def _on_viewer_layers_changed(self, _event=None) -> None:
         """Refresh UI that depends on viewer layers."""
         self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
+        self._update_tools_controls()
+        self._update_histogram_controls()
 
     def _iter_viewer_layers(self) -> list:
         """Return current viewer layers as a list."""
@@ -955,6 +1119,18 @@ class NeuronViewerWidget(QWidget):
             masks.append(layer)
         return masks
 
+    def _eligible_heatmap_layers_with_exclusions(self) -> tuple[list, list[str]]:
+        """Return eligible heatmap layers and exclusion messages."""
+        eligible_layers = []
+        excluded_messages: list[str] = []
+        for layer in self._iter_viewer_layers():
+            eligible, reason = self._heatmap_layer_eligibility(layer)
+            if eligible:
+                eligible_layers.append(layer)
+            elif _layer_metadata(layer).get("heatmap_source"):
+                excluded_messages.append(f"{layer.name}: {reason}")
+        return eligible_layers, excluded_messages
+
     def _refresh_heatmap_layer_list(self) -> None:
         """Refresh the Tools heatmap selector list."""
         if not hasattr(self, "_heatmap_layer_list"):
@@ -966,15 +1142,10 @@ class NeuronViewerWidget(QWidget):
         }
         self._heatmap_layer_list.clear()
 
-        eligible_names: list[str] = []
-        excluded_messages: list[str] = []
-        for layer in self._iter_viewer_layers():
-            eligible, reason = self._heatmap_layer_eligibility(layer)
-            if eligible:
-                self._heatmap_layer_list.addItem(layer.name)
-                eligible_names.append(layer.name)
-            elif _layer_metadata(layer).get("heatmap_source"):
-                excluded_messages.append(f"{layer.name}: {reason}")
+        eligible_layers, excluded_messages = self._eligible_heatmap_layers_with_exclusions()
+        eligible_names = [layer.name for layer in eligible_layers]
+        for layer in eligible_layers:
+            self._heatmap_layer_list.addItem(layer.name)
 
         for index in range(self._heatmap_layer_list.count()):
             item = self._heatmap_layer_list.item(index)
@@ -1001,6 +1172,51 @@ class NeuronViewerWidget(QWidget):
             self._tools_hint_label.setText(
                 f"{len(eligible_names)} eligible heatmap layer(s)."
             )
+        self._update_tools_controls()
+
+    def _refresh_histogram_layer_list(self) -> None:
+        """Refresh the Histogram-tab source list."""
+        if not hasattr(self, "_histogram_layer_list"):
+            return
+
+        previous = {
+            item.text()
+            for item in self._histogram_layer_list.selectedItems()
+        }
+        self._histogram_layer_list.clear()
+
+        eligible_layers, excluded_messages = self._eligible_heatmap_layers_with_exclusions()
+        eligible_names = [layer.name for layer in eligible_layers]
+        for layer in eligible_layers:
+            self._histogram_layer_list.addItem(layer.name)
+
+        for index in range(self._histogram_layer_list.count()):
+            item = self._histogram_layer_list.item(index)
+            if item.text() in previous:
+                item.setSelected(True)
+
+        if not eligible_names:
+            if excluded_messages:
+                self._histogram_hint_label.setText(
+                    "No eligible native-grid heatmaps. "
+                    + " ".join(excluded_messages[:3])
+                )
+            else:
+                self._histogram_hint_label.setText(
+                    "No eligible heatmap layers are available."
+                )
+        elif excluded_messages:
+            self._histogram_hint_label.setText(
+                f"{len(eligible_names)} eligible heatmap layer(s). "
+                + "Excluded: "
+                + "; ".join(excluded_messages[:3])
+            )
+        else:
+            self._histogram_hint_label.setText(
+                f"{len(eligible_names)} eligible heatmap layer(s)."
+            )
+        self._update_histogram_controls()
+        self._update_histogram_plot()
 
     def _refresh_mask_layer_options(self) -> None:
         """Refresh Regions-tab mask layer options."""
@@ -1025,16 +1241,27 @@ class NeuronViewerWidget(QWidget):
         )
         self._mask_query_hint_label.setText(hint)
 
-    def _on_mask_threshold_mode_changed(self, text: str) -> None:
-        """Enable manual threshold input only for manual mode."""
-        if hasattr(self, "_mask_manual_threshold_spin"):
-            self._mask_manual_threshold_spin.setEnabled(text == "Manual")
+    def _current_tools_create_mode(self) -> str:
+        """Return the active Tools create mode."""
+        combo = getattr(self, "_tools_create_mode_combo", None)
+        mode = combo.currentData() if combo is not None else None
+        return "merged" if mode == "merged" else "separate"
 
-    def _selected_heatmap_layers(self) -> list:
-        """Return selected eligible heatmap layers from the Tools tab."""
-        selected_names = {
-            item.text() for item in self._heatmap_layer_list.selectedItems()
-        }
+    def _current_histogram_create_mode(self) -> str:
+        """Return the active Histogram create mode."""
+        combo = getattr(self, "_histogram_create_mode_combo", None)
+        mode = combo.currentData() if combo is not None else None
+        return "merged" if mode == "merged" else "separate"
+
+    def _selected_layer_names_from_widget(self, widget: QListWidget | None) -> set[str]:
+        """Return selected layer names from a list widget."""
+        if widget is None:
+            return set()
+        return {item.text() for item in widget.selectedItems()}
+
+    def _selected_layers_from_widget(self, widget: QListWidget | None) -> list:
+        """Return selected eligible heatmap layers for a list widget."""
+        selected_names = self._selected_layer_names_from_widget(widget)
         if not selected_names:
             return []
         layers = []
@@ -1042,6 +1269,446 @@ class NeuronViewerWidget(QWidget):
             if layer.name in selected_names and self._heatmap_layer_eligibility(layer)[0]:
                 layers.append(layer)
         return layers
+
+    def _selected_heatmap_layers(self) -> list:
+        """Return selected eligible heatmap layers from the Tools tab."""
+        return self._selected_layers_from_widget(
+            getattr(self, "_heatmap_layer_list", None)
+        )
+
+    def _selected_histogram_layers(self) -> list:
+        """Return selected eligible heatmap layers from the Histogram tab."""
+        return self._selected_layers_from_widget(
+            getattr(self, "_histogram_layer_list", None)
+        )
+
+    def _layer_contrast_limits(self, layer) -> tuple[float, float] | None:
+        """Return a layer's contrast limits if available."""
+        contrast_limits = getattr(layer, "contrast_limits", None)
+        if contrast_limits is None:
+            return None
+        try:
+            limits_array = np.asarray(contrast_limits, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if limits_array.size < 2:
+            return None
+        lower, upper = sorted((float(limits_array[0]), float(limits_array[1])))
+        return lower, upper
+
+    def _histogram_plot_color(self, layer) -> tuple[float, float, float, float] | None:
+        """Return a plotting color derived from layer metadata."""
+        color = _layer_metadata(layer).get("color")
+        if color is None:
+            return None
+        rgba = np.asarray(color, dtype=float).reshape(-1)
+        if rgba.size == 3:
+            rgba = np.append(rgba, 1.0)
+        if rgba.size < 4:
+            return None
+        rgba = np.clip(rgba[:4], 0.0, 1.0)
+        return tuple(float(value) for value in rgba)
+
+    def _histogram_plot_pen(self, layer, series_index: int):
+        """Return a pyqtgraph pen for one histogram series."""
+        pg = getattr(self, "_histogram_pg", None)
+        if pg is None:
+            return None
+
+        rgba = self._histogram_plot_color(layer)
+        if rgba is None:
+            return pg.mkPen(color=pg.intColor(series_index), width=2)
+
+        rgba255 = tuple(int(round(value * 255.0)) for value in rgba)
+        return pg.mkPen(color=rgba255, width=2)
+
+    def _reset_histogram_plot_items(self) -> None:
+        """Clear histogram curves and annotations while keeping the widget."""
+        plot_item = getattr(self, "_histogram_plot_item", None)
+        if plot_item is None:
+            return
+
+        legend = getattr(self, "_histogram_plot_legend", None)
+        if legend is not None:
+            scene = legend.scene()
+            if scene is not None:
+                scene.removeItem(legend)
+            if getattr(plot_item, "legend", None) is legend:
+                plot_item.legend = None
+            self._histogram_plot_legend = None
+
+        plot_item.clear()
+        plot_item.setTitle("Intensity Histogram")
+        plot_item.setLabel("bottom", "Intensity")
+        plot_item.setLabel("left", "Voxel count")
+        plot_item.showGrid(x=True, y=True, alpha=0.15)
+
+        self._histogram_curve_items = []
+        self._histogram_message_item = None
+        self._histogram_plot_legend = plot_item.addLegend(offset=(12, 12))
+        plot_item.addItem(self._histogram_lower_line, ignoreBounds=True)
+        plot_item.addItem(self._histogram_upper_line, ignoreBounds=True)
+
+    def _set_histogram_message(
+        self,
+        message: str,
+        *,
+        x_center: float = 0.5,
+        y_center: float = 0.5,
+    ) -> None:
+        """Display a centered placeholder message in the histogram plot."""
+        plot_item = getattr(self, "_histogram_plot_item", None)
+        pg = getattr(self, "_histogram_pg", None)
+        if plot_item is None or pg is None:
+            return
+
+        message_item = pg.TextItem(text=message, anchor=(0.5, 0.5))
+        message_item.setPos(float(x_center), float(y_center))
+        plot_item.addItem(message_item)
+        self._histogram_message_item = message_item
+
+    def _refresh_histogram_threshold_lines(self) -> None:
+        """Update threshold guide positions without rebuilding the chart."""
+        lower_line = getattr(self, "_histogram_lower_line", None)
+        upper_line = getattr(self, "_histogram_upper_line", None)
+        if lower_line is None or upper_line is None:
+            return
+
+        has_selection = bool(self._selected_histogram_layers())
+        lower_value = (
+            float(self._mask_lower_threshold_spin.value())
+            if hasattr(self, "_mask_lower_threshold_spin")
+            else 0.0
+        )
+        show_upper = bool(
+            has_selection
+            and hasattr(self, "_mask_use_upper_bound_cb")
+            and self._mask_use_upper_bound_cb.isChecked()
+        )
+
+        self._histogram_line_sync_active = True
+        try:
+            lower_line.setPos(lower_value)
+            lower_line.setVisible(has_selection)
+            lower_line.setMovable(has_selection)
+
+            if show_upper and hasattr(self, "_mask_upper_threshold_spin"):
+                upper_line.setPos(float(self._mask_upper_threshold_spin.value()))
+            upper_line.setVisible(show_upper)
+            upper_line.setMovable(show_upper)
+        finally:
+            self._histogram_line_sync_active = False
+
+    def _sync_mask_bounds_from_lines(
+        self,
+        *,
+        lower: float,
+        upper: float | None,
+    ) -> None:
+        """Update mask bound widgets from dragged histogram lines."""
+        self._mask_lower_threshold_spin.blockSignals(True)
+        self._mask_upper_threshold_spin.blockSignals(True)
+        try:
+            self._mask_lower_threshold_spin.setValue(float(lower))
+            if upper is not None:
+                self._mask_upper_threshold_spin.setValue(float(upper))
+        finally:
+            self._mask_upper_threshold_spin.blockSignals(False)
+            self._mask_lower_threshold_spin.blockSignals(False)
+
+    def _on_histogram_bound_line_moved(self, which: str) -> None:
+        """Sync dragged histogram guide lines back into the bound controls."""
+        if self._histogram_line_sync_active:
+            return
+
+        selected_layers = self._selected_histogram_layers()
+        if not selected_layers:
+            return
+
+        lower_line = getattr(self, "_histogram_lower_line", None)
+        upper_line = getattr(self, "_histogram_upper_line", None)
+        if lower_line is None or upper_line is None:
+            return
+
+        lower = float(self._mask_lower_threshold_spin.value())
+        use_upper = bool(self._mask_use_upper_bound_cb.isChecked())
+        upper = (
+            float(self._mask_upper_threshold_spin.value())
+            if use_upper
+            else None
+        )
+
+        if which == "lower":
+            lower = float(lower_line.value())
+            if upper is not None and lower > upper:
+                upper = lower
+        else:
+            if upper is None:
+                return
+            upper = float(upper_line.value())
+            if upper < lower:
+                lower = upper
+
+        self._sync_mask_bounds_from_lines(lower=lower, upper=upper)
+        self._refresh_histogram_threshold_lines()
+
+    def _on_histogram_bound_line_move_finished(self, which: str) -> None:
+        """Mark dragged histogram bounds as manual after the user releases them."""
+        if self._histogram_line_sync_active:
+            return
+        if which == "upper" and not self._mask_use_upper_bound_cb.isChecked():
+            return
+        self._mask_bounds_source = "manual"
+
+    def _update_tools_controls(self) -> None:
+        """Enable or disable Tools actions based on current selection."""
+        if not hasattr(self, "_heatmap_layer_list"):
+            return
+
+        ready = self._atlas is not None and bool(self._selected_heatmap_layers())
+        if hasattr(self, "_create_blur_btn"):
+            self._create_blur_btn.setEnabled(ready)
+
+    def _update_histogram_controls(self) -> None:
+        """Enable or disable Histogram actions based on current selection."""
+        if not hasattr(self, "_histogram_layer_list"):
+            return
+
+        selected_layers = self._selected_histogram_layers()
+        has_selection = bool(selected_layers)
+        ready = self._atlas is not None and has_selection
+        can_use_otsu = ready and (
+            len(selected_layers) == 1
+            or self._current_histogram_create_mode() == "merged"
+        )
+
+        contrast_reason = None
+        if self._atlas is None:
+            contrast_reason = "Load an atlas before syncing layer contrast."
+        elif not selected_layers:
+            contrast_reason = "Select one eligible heatmap layer to sync contrast limits."
+        elif len(selected_layers) != 1:
+            contrast_reason = "Select exactly one eligible heatmap layer to sync contrast limits."
+        elif self._layer_contrast_limits(selected_layers[0]) is None:
+            contrast_reason = "The selected layer does not expose contrast limits."
+
+        if hasattr(self, "_create_mask_btn"):
+            self._create_mask_btn.setEnabled(ready)
+        if hasattr(self, "_mask_use_otsu_btn"):
+            self._mask_use_otsu_btn.setEnabled(can_use_otsu)
+            self._mask_use_otsu_btn.setToolTip(
+                ""
+                if can_use_otsu
+                else "Select one heatmap layer, or switch Create mode to Merged layer."
+            )
+        if hasattr(self, "_mask_use_contrast_btn"):
+            can_use_contrast = contrast_reason is None
+            self._mask_use_contrast_btn.setEnabled(can_use_contrast)
+            self._mask_use_contrast_btn.setToolTip(
+                "" if can_use_contrast else contrast_reason
+            )
+        self._refresh_histogram_threshold_lines()
+
+    def _mark_mask_bounds_manual(self, *_args) -> None:
+        """Record that mask bounds were edited manually."""
+        self._mask_bounds_source = "manual"
+        self._refresh_histogram_threshold_lines()
+
+    def _on_mask_upper_bound_toggled(self, checked: bool) -> None:
+        """Enable or disable the upper threshold input."""
+        if hasattr(self, "_mask_upper_threshold_spin"):
+            self._mask_upper_threshold_spin.setEnabled(bool(checked))
+        self._mask_bounds_source = "manual"
+        self._refresh_histogram_threshold_lines()
+
+    def _set_mask_bounds(
+        self,
+        lower: float,
+        *,
+        upper: float | None = None,
+        enable_upper: bool,
+        bounds_source: str,
+    ) -> None:
+        """Update Histogram mask bounds without marking them as manual edits."""
+        self._mask_lower_threshold_spin.blockSignals(True)
+        self._mask_upper_threshold_spin.blockSignals(True)
+        self._mask_use_upper_bound_cb.blockSignals(True)
+
+        self._mask_lower_threshold_spin.setValue(float(lower))
+        if upper is not None:
+            self._mask_upper_threshold_spin.setValue(float(upper))
+        self._mask_use_upper_bound_cb.setChecked(bool(enable_upper))
+
+        self._mask_use_upper_bound_cb.blockSignals(False)
+        self._mask_upper_threshold_spin.blockSignals(False)
+        self._mask_lower_threshold_spin.blockSignals(False)
+
+        self._mask_upper_threshold_spin.setEnabled(bool(enable_upper))
+        self._mask_bounds_source = bounds_source
+        self._refresh_histogram_threshold_lines()
+
+    def _on_histogram_layer_selection_changed(self) -> None:
+        """Refresh histogram controls and plot after source selection changes."""
+        self._update_histogram_controls()
+        self._update_histogram_plot()
+
+    def _update_histogram_plot(self, *_args) -> None:
+        """Redraw the histogram plot for the selected layers."""
+        plot_item = getattr(self, "_histogram_plot_item", None)
+        if plot_item is None:
+            return
+
+        self._reset_histogram_plot_items()
+        selected_layers = self._selected_histogram_layers()
+
+        if not selected_layers:
+            plot_item.setXRange(0.0, 1.0, padding=0.0)
+            plot_item.setYRange(0.0, 1.0, padding=0.0)
+            self._set_histogram_message("Select one or more eligible heatmap layers.")
+            self._refresh_histogram_threshold_lines()
+            return
+
+        include_zero = bool(self._histogram_include_zero_cb.isChecked())
+        _, series = _build_histogram_plot_series(
+            [
+                (layer.name, np.asarray(layer.data, dtype=np.float32))
+                for layer in selected_layers
+            ],
+            bins=_HISTOGRAM_BIN_COUNT,
+            include_zero=include_zero,
+        )
+
+        has_values = False
+        for index, (layer, entry) in enumerate(zip(selected_layers, series)):
+            x = np.asarray(entry["x"], dtype=np.float32)
+            y = np.asarray(entry["y"], dtype=np.float32)
+            if x.size == 0 or y.size == 0:
+                continue
+            has_values = True
+            curve = plot_item.plot(
+                x=x,
+                y=y,
+                pen=self._histogram_plot_pen(layer, index),
+            )
+            self._histogram_curve_items.append(curve)
+            if self._histogram_plot_legend is not None:
+                self._histogram_plot_legend.addItem(curve, str(entry["name"]))
+
+        if not has_values:
+            message = (
+                "No finite values remain after excluding zero-valued voxels."
+                if not include_zero
+                else "No finite values are available for the selected layers."
+            )
+            plot_item.setXRange(0.0, 1.0, padding=0.0)
+            plot_item.setYRange(0.0, 1.0, padding=0.0)
+            self._set_histogram_message(message)
+        else:
+            plot_item.autoRange()
+
+        self._refresh_histogram_threshold_lines()
+
+    def _fill_mask_lower_bound_from_otsu(self) -> None:
+        """Populate the lower bound from an Otsu threshold."""
+        selected_layers = self._selected_histogram_layers()
+        if not selected_layers:
+            message = "Select at least one eligible heatmap layer."
+            self._histogram_status_label.setText(message)
+            return
+
+        if len(selected_layers) > 1 and self._current_histogram_create_mode() != "merged":
+            message = (
+                "Use Otsu Lower with one selected layer, or switch Create mode to Merged layer."
+            )
+            self._histogram_status_label.setText(message)
+            return
+
+        if len(selected_layers) == 1:
+            volume = np.asarray(selected_layers[0].data, dtype=np.float32)
+        else:
+            volume = merge_heatmap_volumes(
+                [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+            )
+
+        threshold = otsu_threshold_positive(volume)
+        self._set_mask_bounds(
+            threshold,
+            upper=float(self._mask_upper_threshold_spin.value())
+            if self._mask_use_upper_bound_cb.isChecked()
+            else None,
+            enable_upper=self._mask_use_upper_bound_cb.isChecked(),
+            bounds_source="otsu_lower",
+        )
+        self._histogram_status_label.setText(
+            f"Lower bound set to Otsu threshold {threshold:.4f}."
+        )
+
+    def _copy_selected_layer_contrast_to_bounds(self) -> None:
+        """Copy the selected layer contrast limits into the mask bounds."""
+        selected_layers = self._selected_histogram_layers()
+        if len(selected_layers) != 1:
+            message = "Select exactly one eligible heatmap layer to sync contrast limits."
+            self._histogram_status_label.setText(message)
+            return
+
+        limits = self._layer_contrast_limits(selected_layers[0])
+        if limits is None:
+            message = "The selected layer does not expose contrast limits."
+            self._histogram_status_label.setText(message)
+            return
+
+        lower, upper = limits
+        self._set_mask_bounds(
+            lower,
+            upper=upper,
+            enable_upper=True,
+            bounds_source="contrast_limits",
+        )
+        self._histogram_status_label.setText(
+            f"Copied contrast limits to mask bounds: {lower:.4f} to {upper:.4f}."
+        )
+
+    def _selected_mask_threshold_bounds(self) -> tuple[float, float | None] | None:
+        """Return the configured lower and optional upper bounds."""
+        lower = float(self._mask_lower_threshold_spin.value())
+        upper = None
+        if self._mask_use_upper_bound_cb.isChecked():
+            upper = float(self._mask_upper_threshold_spin.value())
+            if upper < lower:
+                self._histogram_status_label.setText(
+                    "Upper bound must be greater than or equal to lower bound."
+                )
+                return None
+        return lower, upper
+
+    def _select_heatmap_layer_names(self, names: list[str]) -> None:
+        """Select Tools heatmap list items by name."""
+        if not hasattr(self, "_heatmap_layer_list"):
+            return
+
+        selected_names = set(names)
+        self._heatmap_layer_list.blockSignals(True)
+        self._heatmap_layer_list.clearSelection()
+        for index in range(self._heatmap_layer_list.count()):
+            item = self._heatmap_layer_list.item(index)
+            item.setSelected(item.text() in selected_names)
+        self._heatmap_layer_list.blockSignals(False)
+        self._update_tools_controls()
+
+    def _select_histogram_layer_names(self, names: list[str]) -> None:
+        """Select Histogram heatmap list items by name."""
+        if not hasattr(self, "_histogram_layer_list"):
+            return
+
+        selected_names = set(names)
+        self._histogram_layer_list.blockSignals(True)
+        self._histogram_layer_list.clearSelection()
+        for index in range(self._histogram_layer_list.count()):
+            item = self._histogram_layer_list.item(index)
+            item.setSelected(item.text() in selected_names)
+        self._histogram_layer_list.blockSignals(False)
+        self._update_histogram_controls()
+        self._update_histogram_plot()
 
     def _selected_mask_query_layers(self) -> list:
         """Return the currently selected generated mask layers."""
@@ -1067,10 +1734,10 @@ class NeuronViewerWidget(QWidget):
                 f"{count} mask layers selected for querying."
             )
 
-    def _create_masks_from_heatmaps(self) -> None:
-        """Create binary mask label layers from selected heatmap image layers."""
+    def _create_blurred_layers_from_heatmaps(self) -> None:
+        """Create blurred image layers from the selected heatmaps."""
         if self._atlas is None:
-            message = "Load an atlas before creating mask layers."
+            message = "Load an atlas before creating blurred heatmap layers."
             self._tools_status_label.setText(message)
             show_warning(message)
             return
@@ -1082,70 +1749,194 @@ class NeuronViewerWidget(QWidget):
             return
 
         sigma = float(self._mask_sigma_spin.value())
-        threshold_mode = self._mask_threshold_mode_combo.currentText().strip().lower()
-        manual_threshold = None
-        if threshold_mode == "manual":
-            manual_threshold = float(self._mask_manual_threshold_spin.value())
-
-        output_mode = self._mask_output_mode_combo.currentText()
+        create_mode = self._current_tools_create_mode()
         created_layers = []
 
-        if output_mode == "Merged mask":
-            merged_volume = merge_heatmap_volumes(
-                [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
-            )
-            mask, threshold, _smoothed = build_binary_mask_from_heatmap(
-                merged_volume,
-                sigma=sigma,
-                threshold_mode=threshold_mode,
-                manual_threshold=manual_threshold,
-            )
-            layer_name = f"Mask: merged {len(selected_layers)} heatmaps"
-            created_layers.append(
-                self._add_mask_layer(
-                    layer_name=layer_name,
-                    mask=mask,
-                    source_layers=selected_layers,
-                    sigma=sigma,
-                    threshold_mode=threshold_mode,
-                    threshold=threshold,
-                    merge_mode="merged_sum",
-                )
-            )
-        else:
-            for layer in selected_layers:
-                mask, threshold, _smoothed = build_binary_mask_from_heatmap(
-                    np.asarray(layer.data, dtype=np.float32),
-                    sigma=sigma,
-                    threshold_mode=threshold_mode,
-                    manual_threshold=manual_threshold,
+        try:
+            if create_mode == "merged":
+                merged_volume = merge_heatmap_volumes(
+                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
                 )
                 created_layers.append(
-                    self._add_mask_layer(
-                        layer_name=f"Mask: {layer.name}",
-                        mask=mask,
-                        source_layers=[layer],
+                    self._add_blurred_heatmap_layer(
+                        layer_name=f"Blurred: merged {len(selected_layers)} heatmaps",
+                        volume=merged_volume,
+                        source_layers=selected_layers,
                         sigma=sigma,
-                        threshold_mode=threshold_mode,
-                        threshold=threshold,
-                        merge_mode="separate",
+                        merge_mode="merged_sum",
                     )
                 )
+            else:
+                for layer in selected_layers:
+                    created_layers.append(
+                        self._add_blurred_heatmap_layer(
+                            layer_name=f"Blurred: {layer.name}",
+                            volume=np.asarray(layer.data, dtype=np.float32),
+                            source_layers=[layer],
+                            sigma=sigma,
+                            merge_mode="separate",
+                        )
+                    )
+        except Exception as e:
+            logger.error("Failed to create blurred heatmap layers: %s", e)
+            self._tools_status_label.setText(f"Failed to create blurred heatmap layers: {e}")
+            return
+
+        self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
+        self._select_heatmap_layer_names([layer.name for layer in created_layers])
+        self._select_histogram_layer_names([layer.name for layer in created_layers])
+        nonempty = sum(int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers)
+        self._tools_status_label.setText(
+            f"Created {len(created_layers)} blurred layer(s); {nonempty} contain nonzero voxels."
+        )
+
+    def _create_masks_from_heatmaps(self) -> None:
+        """Create binary mask label layers from selected heatmap image layers."""
+        if self._atlas is None:
+            message = "Load an atlas before creating mask layers."
+            self._histogram_status_label.setText(message)
+            show_warning(message)
+            return
+
+        selected_layers = self._selected_histogram_layers()
+        if not selected_layers:
+            message = "Select at least one eligible heatmap layer."
+            self._histogram_status_label.setText(message)
+            return
+
+        bounds = self._selected_mask_threshold_bounds()
+        if bounds is None:
+            return
+        lower_threshold, upper_threshold = bounds
+
+        create_mode = self._current_histogram_create_mode()
+        created_layers = []
+
+        try:
+            if create_mode == "merged":
+                merged_volume = merge_heatmap_volumes(
+                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+                )
+                mask = build_binary_mask_from_threshold_range(
+                    merged_volume,
+                    lower_threshold=lower_threshold,
+                    upper_threshold=upper_threshold,
+                )
+                layer_name = f"Mask: merged {len(selected_layers)} heatmaps"
+                created_layers.append(
+                    self._add_mask_layer(
+                        layer_name=layer_name,
+                        mask=mask,
+                        source_layers=selected_layers,
+                        lower_threshold=lower_threshold,
+                        upper_threshold=upper_threshold,
+                        bounds_source=self._mask_bounds_source,
+                        merge_mode="merged_sum",
+                    )
+                )
+            else:
+                for layer in selected_layers:
+                    mask = build_binary_mask_from_threshold_range(
+                        np.asarray(layer.data, dtype=np.float32),
+                        lower_threshold=lower_threshold,
+                        upper_threshold=upper_threshold,
+                    )
+                    created_layers.append(
+                        self._add_mask_layer(
+                            layer_name=f"Mask: {layer.name}",
+                            mask=mask,
+                            source_layers=[layer],
+                            lower_threshold=lower_threshold,
+                            upper_threshold=upper_threshold,
+                            bounds_source=self._mask_bounds_source,
+                            merge_mode="separate",
+                        )
+                    )
+        except Exception as e:
+            logger.error("Failed to create mask layers: %s", e)
+            self._histogram_status_label.setText(f"Failed to create mask layers: {e}")
+            return
 
         nonempty = sum(int(np.asarray(layer.data).sum() > 0) for layer in created_layers)
-        self._tools_status_label.setText(
-            f"Created {len(created_layers)} mask layer(s); {nonempty} contain nonzero voxels."
+        bounds_text = f"lower {lower_threshold:.4f}"
+        if upper_threshold is not None:
+            bounds_text += f", upper {upper_threshold:.4f}"
+        self._histogram_status_label.setText(
+            f"Created {len(created_layers)} mask layer(s); {nonempty} contain nonzero voxels ({bounds_text})."
         )
         self._refresh_mask_layer_options()
+
+    def _add_blurred_heatmap_layer(
+        self,
+        layer_name: str,
+        volume: np.ndarray,
+        source_layers: list,
+        sigma: float,
+        merge_mode: str,
+    ):
+        """Add or replace a blurred heatmap image layer."""
+        from napari.utils.colormaps import Colormap
+
+        for layer in list(self._iter_viewer_layers()):
+            if layer.name == layer_name:
+                self.viewer.layers.remove(layer)
+
+        blurred = smooth_heatmap_volume(volume, sigma=sigma)
+        first_layer = source_layers[0]
+        rgba = _mask_layer_color(source_layers)
+
+        colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        if colormap is None and rgba is not None:
+            colormap = Colormap(
+                colors=[[0.0, 0.0, 0.0, 0.0], list(rgba)],
+                name=f"blurred_{layer_name.lower().replace(' ', '_')}",
+            )
+        elif colormap is None:
+            colormap = "hot"
+
+        metadata = dict(_layer_metadata(first_layer)) if len(source_layers) == 1 else {}
+        metadata.update(
+            {
+                "heatmap_source": True,
+                "heatmap_native_grid": True,
+                "heatmap_kind": "blurred",
+                "blur_sigma": float(sigma),
+                "source_heatmap_layers": [layer.name for layer in source_layers],
+                "atlas_name": self._current_atlas_name(),
+                "color": rgba,
+                "merge_mode": merge_mode,
+            }
+        )
+
+        add_kwargs = {
+            "name": layer_name,
+            "colormap": colormap,
+            "blending": getattr(first_layer, "blending", "additive"),
+            "rendering": getattr(first_layer, "rendering", "mip"),
+            "opacity": getattr(first_layer, "opacity", self._opacity_slider.value() / 100.0),
+            "visible": True,
+            "metadata": metadata,
+        }
+        for attr_name in ("scale", "translate"):
+            value = getattr(first_layer, attr_name, None)
+            if value is not None:
+                add_kwargs[attr_name] = value
+
+        layer = self.viewer.add_image(
+            blurred,
+            **add_kwargs,
+        )
+        return layer
 
     def _add_mask_layer(
         self,
         layer_name: str,
         mask: np.ndarray,
         source_layers: list,
-        sigma: float,
-        threshold_mode: str,
-        threshold: float,
+        lower_threshold: float,
+        upper_threshold: float | None,
+        bounds_source: str,
         merge_mode: str,
     ):
         """Add or replace a generated binary mask layer."""
@@ -1175,9 +1966,14 @@ class NeuronViewerWidget(QWidget):
             metadata={
                 "mask_query_source": True,
                 "source_heatmap_layers": [layer.name for layer in source_layers],
-                "sigma": sigma,
-                "threshold_mode": threshold_mode,
-                "threshold_value": float(threshold),
+                "sigma": _shared_blur_sigma(source_layers),
+                "threshold_mode": "range",
+                "threshold_value": float(lower_threshold),
+                "lower_threshold": float(lower_threshold),
+                "upper_threshold": (
+                    None if upper_threshold is None else float(upper_threshold)
+                ),
+                "bounds_source": bounds_source,
                 "merge_mode": merge_mode,
                 "atlas_name": self._current_atlas_name(),
                 "color": rgba,
