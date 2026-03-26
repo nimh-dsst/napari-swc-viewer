@@ -28,6 +28,7 @@ pytest-cov = ">=4.0"
 pip = ">=23.0"
 setuptools-scm = ">=8.0"
 pyqt6 = ">=6.8.1,<7"
+pyqtgraph = ">=0.13"
 
 [target.linux-64.dependencies]
 # Linux needs mesa for headless OpenGL

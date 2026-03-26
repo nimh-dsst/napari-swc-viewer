@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from napari_swc_viewer.analysis.mask import (
     build_binary_mask_from_heatmap,
+    build_binary_mask_from_threshold_range,
     merge_heatmap_volumes,
     otsu_threshold_positive,
     smooth_heatmap_volume,
@@ -67,6 +72,48 @@ def test_build_binary_mask_from_heatmap_all_zero_volume_stays_empty() -> None:
     assert threshold == 0.0
     assert smoothed.shape == volume.shape
     assert int(mask.sum()) == 0
+
+
+def test_build_binary_mask_from_threshold_range_lower_only() -> None:
+    volume = np.zeros((3, 3, 3), dtype=np.float32)
+    volume[1, 1, 1] = 5.0
+    volume[1, 1, 2] = 1.0
+
+    mask = build_binary_mask_from_threshold_range(
+        volume,
+        lower_threshold=2.0,
+    )
+
+    assert int(mask[1, 1, 1]) == 1
+    assert int(mask[1, 1, 2]) == 0
+
+
+def test_build_binary_mask_from_threshold_range_lower_and_upper() -> None:
+    volume = np.zeros((3, 3, 3), dtype=np.float32)
+    volume[1, 1, 0] = 1.0
+    volume[1, 1, 1] = 5.0
+    volume[1, 1, 2] = 10.0
+
+    mask = build_binary_mask_from_threshold_range(
+        volume,
+        lower_threshold=2.0,
+        upper_threshold=6.0,
+    )
+
+    assert int(mask[1, 1, 0]) == 0
+    assert int(mask[1, 1, 1]) == 1
+    assert int(mask[1, 1, 2]) == 0
+
+
+def test_build_binary_mask_from_threshold_range_rejects_upper_below_lower() -> None:
+    volume = np.zeros((3, 3, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="Upper threshold"):
+        build_binary_mask_from_threshold_range(
+            volume,
+            lower_threshold=2.0,
+            upper_threshold=1.0,
+        )
 
 
 def test_build_binary_mask_from_heatmap_manual_threshold() -> None:
