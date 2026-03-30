@@ -130,6 +130,20 @@ def _get_cached_atlas(resolution: int = 25) -> tuple:
     return setup_allen_sdk(resolution)
 
 
+def _coords_to_annotation_indices(
+    coords: NDArray[np.float64] | tuple[float, float, float],
+    resolution: int | tuple[float, float, float],
+) -> NDArray[np.int_]:
+    """Convert micron coordinates to atlas indices using BrainGlobe semantics.
+
+    BrainGlobeAtlas.structure_from_coords divides by the atlas resolution and
+    then applies ``int(...)`` component-wise, which truncates toward zero.
+    """
+    resolution_array = np.asarray(resolution, dtype=float)
+    coords_array = np.asarray(coords, dtype=float)
+    return np.trunc(coords_array / resolution_array).astype(int)
+
+
 def get_region_at_coords(
     coords: NDArray[np.float64] | tuple[float, float, float],
     annotation_volume: NDArray[np.int32],
@@ -155,9 +169,8 @@ def get_region_at_coords(
         Region info with keys: id, name, acronym, structure_id_path, color_hex_triplet
         Returns None if coordinate is outside the brain.
     """
-    # Convert microns to voxel indices
-    coords = np.asarray(coords)
-    voxel_coords = np.round(coords / resolution).astype(int)
+    # Match BrainGlobeAtlas.structure_from_coords for micron input.
+    voxel_coords = _coords_to_annotation_indices(coords, resolution)
 
     # Check bounds
     if not all(0 <= voxel_coords[i] < annotation_volume.shape[i] for i in range(3)):
@@ -239,8 +252,8 @@ def get_region_ids_vectorized(
     coords = np.atleast_2d(coords)
     n_coords = len(coords)
 
-    # Convert microns to voxel indices
-    voxel_coords = np.round(coords / resolution).astype(int)
+    # Match BrainGlobeAtlas.structure_from_coords for micron input.
+    voxel_coords = _coords_to_annotation_indices(coords, resolution)
 
     # Initialize result with zeros (outside brain)
     region_ids = np.zeros(n_coords, dtype=np.int32)

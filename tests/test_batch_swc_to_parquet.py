@@ -296,6 +296,47 @@ def test_annotated_mode_uses_aligned_coordinates_before_region_annotation(
     assert set(rows["region_acronym"]) == {"RR"}
 
 
+def test_batch_convert_annotate_regions_uses_truncation_lookup(tmp_path, monkeypatch):
+    """Annotated conversion should match BrainGlobe's truncation voxel semantics."""
+
+    class _BoundaryStructureTree:
+        def get_structures_by_set_id(self, set_ids):
+            return [
+                {"id": 0, "name": "", "acronym": ""},
+                {"id": 5, "name": "Voxel One", "acronym": "V1"},
+                {"id": 11, "name": "Voxel Two", "acronym": "V2"},
+            ]
+
+    def fake_setup_allen_sdk(resolution, cache_dir):
+        assert resolution == 25
+        assert cache_dir is None
+        annotation = np.zeros((8, 8, 8), dtype=np.int32)
+        annotation[0, 0, 1] = 5
+        annotation[0, 0, 2] = 11
+        return None, annotation, _BoundaryStructureTree()
+
+    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fake_setup_allen_sdk)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "boundary.swc", soma_z=37.6, child_z=37.6)
+
+    output_path = tmp_path / "annotated_boundary.parquet"
+    summary = batch_convert_swc_to_parquet(
+        input_dir,
+        output_path,
+        annotate_regions=True,
+        resolution=25,
+    )
+
+    assert summary.processed_files == 1
+
+    rows = _read_parquet_rows(output_path)
+    assert set(rows["region_id"]) == {5}
+    assert set(rows["region_name"]) == {"Voxel One"}
+    assert set(rows["region_acronym"]) == {"V1"}
+
+
 def test_parallel_raw_output_matches_serial_output(tmp_path, monkeypatch):
     """The chunked path should preserve the same raw aligned rows and summary."""
     _install_inline_process_pool(monkeypatch)
