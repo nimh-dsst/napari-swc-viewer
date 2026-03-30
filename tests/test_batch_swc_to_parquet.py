@@ -3,13 +3,56 @@
 from __future__ import annotations
 
 import importlib.util
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
 from napari_swc_viewer.db import NeuronDatabase
-from napari_swc_viewer.parquet import NEURON_SCHEMA, batch_convert_swc_to_parquet
+from napari_swc_viewer.parquet import (
+    NEURON_SCHEMA,
+    batch_convert_swc_to_parquet,
+    swc_files_to_parquet,
+)
+
+
+class _InlineProcessPoolExecutor:
+    """Synchronous stand-in for ``ProcessPoolExecutor`` used in tests."""
+
+    def __init__(self, max_workers=None, initializer=None, initargs=()):
+        self._initializer = initializer
+        self._initargs = initargs
+        self._initialized = False
+
+    def __enter__(self):
+        self._ensure_initialized()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def _ensure_initialized(self) -> None:
+        if not self._initialized and self._initializer is not None:
+            self._initializer(*self._initargs)
+        self._initialized = True
+
+    def submit(self, fn, *args, **kwargs):
+        self._ensure_initialized()
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as exc:  # pragma: no cover - mirrors executor behavior
+            future.set_exception(exc)
+        return future
+
+
+def _install_inline_process_pool(monkeypatch) -> None:
+    """Route the parallel code path through a synchronous fake executor."""
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.ProcessPoolExecutor",
+        _InlineProcessPoolExecutor,
+    )
 
 
 def _load_script_module():
@@ -55,6 +98,37 @@ def _read_parquet_rows(path: Path):
         .to_pandas()
         .sort_values(["file_id", "node_id"])
         .reset_index(drop=True)
+    )
+
+
+def _install_fake_annotation(monkeypatch, seen_coords: list[np.ndarray] | None = None) -> None:
+    """Replace atlas setup and region lookup with a tiny deterministic fixture."""
+
+    def fake_setup_allen_sdk(resolution, cache_dir):
+        assert resolution == 25
+        assert cache_dir is None
+        return None, np.zeros((8, 8, 8), dtype=np.int32), object()
+
+    def fake_build_region_lookup(structure_tree):
+        assert structure_tree is not None
+        return {
+            0: {"name": "", "acronym": ""},
+            5: {"name": "Left Region", "acronym": "LR"},
+            11: {"name": "Right Region", "acronym": "RR"},
+        }
+
+    def fake_get_region_ids_vectorized(coords, annotation_volume, resolution):
+        assert annotation_volume.shape == (8, 8, 8)
+        assert resolution == 25
+        if seen_coords is not None:
+            seen_coords.append(coords.copy())
+        return np.where(coords[:, 2] > 50.0, 11, 5)
+
+    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fake_setup_allen_sdk)
+    monkeypatch.setattr("napari_swc_viewer.parquet.build_region_lookup", fake_build_region_lookup)
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.get_region_ids_vectorized",
+        fake_get_region_ids_vectorized,
     )
 
 
@@ -197,31 +271,7 @@ def test_annotated_mode_uses_aligned_coordinates_before_region_annotation(
     _write_two_node_swc(input_dir / "left.swc", soma_z=10.0, child_z=20.0)
 
     seen_coords = []
-
-    def fake_setup_allen_sdk(resolution, cache_dir):
-        assert resolution == 25
-        assert cache_dir is None
-        return None, np.zeros((2, 2, 2), dtype=np.int32), object()
-
-    def fake_build_region_lookup(structure_tree):
-        assert structure_tree is not None
-        return {
-            11: {"name": "Right Region", "acronym": "RR"},
-            5: {"name": "Left Region", "acronym": "LR"},
-        }
-
-    def fake_get_region_ids_vectorized(coords, annotation_volume, resolution):
-        assert annotation_volume.shape == (2, 2, 2)
-        assert resolution == 25
-        seen_coords.append(coords.copy())
-        return np.where(coords[:, 2] > 50.0, 11, 5)
-
-    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fake_setup_allen_sdk)
-    monkeypatch.setattr("napari_swc_viewer.parquet.build_region_lookup", fake_build_region_lookup)
-    monkeypatch.setattr(
-        "napari_swc_viewer.parquet.get_region_ids_vectorized",
-        fake_get_region_ids_vectorized,
-    )
+    _install_fake_annotation(monkeypatch, seen_coords)
 
     output_path = tmp_path / "annotated.parquet"
     summary = batch_convert_swc_to_parquet(
@@ -243,3 +293,229 @@ def test_annotated_mode_uses_aligned_coordinates_before_region_annotation(
     assert set(rows["region_id"]) == {11}
     assert set(rows["region_name"]) == {"Right Region"}
     assert set(rows["region_acronym"]) == {"RR"}
+
+
+def test_parallel_raw_output_matches_serial_output(tmp_path, monkeypatch):
+    """The chunked path should preserve the same raw aligned rows and summary."""
+    _install_inline_process_pool(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "left.swc", soma_z=10.0, child_z=20.0)
+    _write_two_node_swc(input_dir / "right.swc", soma_z=90.0, child_z=80.0)
+    _write_two_node_swc(input_dir / "midline.swc", soma_z=50.0, child_z=60.0)
+
+    serial_output = tmp_path / "serial.parquet"
+    parallel_output = tmp_path / "parallel.parquet"
+
+    serial = batch_convert_swc_to_parquet(
+        input_dir,
+        serial_output,
+        hemisphere="right",
+        midline=50.0,
+        batch_size=2,
+        n_workers=1,
+    )
+    parallel = batch_convert_swc_to_parquet(
+        input_dir,
+        parallel_output,
+        hemisphere="right",
+        midline=50.0,
+        batch_size=2,
+        n_workers=2,
+    )
+
+    assert parallel.discovered_files == serial.discovered_files == 3
+    assert parallel.processed_files == serial.processed_files == 3
+    assert parallel.failed_files == serial.failed_files == 0
+    assert parallel.flipped_files == serial.flipped_files == 1
+    assert parallel.already_target_files == serial.already_target_files == 1
+    assert parallel.midline_files == serial.midline_files == 1
+    assert parallel.rows_written == serial.rows_written == 6
+
+    serial_rows = _read_parquet_rows(serial_output)
+    parallel_rows = _read_parquet_rows(parallel_output)
+    assert parallel_rows.equals(serial_rows)
+
+
+def test_parallel_annotated_output_matches_serial_and_cleans_temp_dir(tmp_path, monkeypatch):
+    """Annotated chunked conversion should match serial output and clean scratch data."""
+    _install_inline_process_pool(monkeypatch)
+    _install_fake_annotation(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "left.swc", soma_z=10.0, child_z=20.0)
+    _write_two_node_swc(input_dir / "right.swc", soma_z=90.0, child_z=80.0)
+    _write_two_node_swc(input_dir / "midline.swc", soma_z=50.0, child_z=60.0)
+
+    temp_root = tmp_path / "scratch"
+    temp_root.mkdir()
+    serial_output = tmp_path / "serial_annotated.parquet"
+    parallel_output = tmp_path / "parallel_annotated.parquet"
+
+    serial = batch_convert_swc_to_parquet(
+        input_dir,
+        serial_output,
+        hemisphere="right",
+        midline=50.0,
+        annotate_regions=True,
+        resolution=25,
+        batch_size=2,
+        n_workers=1,
+    )
+    parallel = batch_convert_swc_to_parquet(
+        input_dir,
+        parallel_output,
+        hemisphere="right",
+        midline=50.0,
+        annotate_regions=True,
+        resolution=25,
+        batch_size=2,
+        n_workers=2,
+        temp_dir=temp_root,
+    )
+
+    assert parallel.processed_files == serial.processed_files == 3
+    assert parallel.failed_files == serial.failed_files == 0
+    assert parallel.rows_written == serial.rows_written == 6
+    assert _read_parquet_rows(parallel_output).equals(_read_parquet_rows(serial_output))
+    assert list(temp_root.iterdir()) == []
+
+
+def test_parallel_progress_reports_completed_chunks_and_finalization(tmp_path, monkeypatch):
+    """Parallel progress messages should reflect completed work, not chunk IDs."""
+    _install_inline_process_pool(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for index, soma_z in enumerate((10.0, 90.0, 10.0, 90.0, 10.0), start=1):
+        _write_two_node_swc(input_dir / f"cell_{index}.swc", soma_z=soma_z, child_z=soma_z + 10.0)
+
+    events: list[tuple[str, int, int]] = []
+    output_path = tmp_path / "parallel_progress.parquet"
+
+    summary = batch_convert_swc_to_parquet(
+        input_dir,
+        output_path,
+        hemisphere="right",
+        midline=50.0,
+        batch_size=2,
+        n_workers=2,
+        progress_callback=lambda message, current, total: events.append((message, current, total)),
+    )
+
+    assert summary.processed_files == 5
+    assert any("Processed 2/5 files (1/3 chunks)..." == message for message, _, _ in events)
+    assert any("Processed 4/5 files (2/3 chunks)..." == message for message, _, _ in events)
+    assert any("Processed 5/5 files (3/3 chunks)..." == message for message, _, _ in events)
+    assert any(message.startswith("Finalizing Parquet (1/3 shards)...") for message, _, _ in events)
+    assert any(message.startswith("Finalizing Parquet (3/3 shards)...") for message, _, _ in events)
+
+
+def test_parallel_partial_success_still_writes_output_and_cleans_temp_dir(tmp_path, monkeypatch):
+    """A chunked run should keep successful rows even when some files are skipped."""
+    _install_inline_process_pool(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "good.swc", soma_z=10.0, child_z=20.0)
+    _write_swc_file(
+        input_dir / "no_soma.swc",
+        [
+            (1, 3, 10.0, 20.0, 10.0, 5.0, -1),
+            (2, 3, 11.0, 21.0, 20.0, 1.0, 1),
+        ],
+    )
+    (input_dir / "malformed.swc").write_text("not a valid swc\n")
+
+    temp_root = tmp_path / "scratch"
+    temp_root.mkdir()
+    output_path = tmp_path / "parallel_output.parquet"
+
+    summary = batch_convert_swc_to_parquet(
+        input_dir,
+        output_path,
+        hemisphere="right",
+        midline=50.0,
+        batch_size=1,
+        n_workers=2,
+        temp_dir=temp_root,
+    )
+
+    assert summary.processed_files == 1
+    assert summary.failed_files == 2
+    rows = _read_parquet_rows(output_path)
+    assert rows["file_id"].unique().tolist() == ["good.swc"]
+    assert list(temp_root.iterdir()) == []
+
+
+def test_swc_files_to_parquet_delegates_to_batch_converter(monkeypatch, tmp_path):
+    """The legacy wrapper should now forward to the unified batch helper."""
+    calls: dict[str, object] = {}
+
+    def fake_batch_convert(
+        input_path,
+        output_path,
+        *,
+        recursive,
+        annotate_regions,
+        resolution,
+        cache_dir,
+        batch_size,
+        n_workers,
+        **_kwargs,
+    ):
+        calls["input_path"] = input_path
+        calls["output_path"] = output_path
+        calls["recursive"] = recursive
+        calls["annotate_regions"] = annotate_regions
+        calls["resolution"] = resolution
+        calls["cache_dir"] = cache_dir
+        calls["batch_size"] = batch_size
+        calls["n_workers"] = n_workers
+        return type("Summary", (), {"processed_files": 7})()
+
+    monkeypatch.setattr("napari_swc_viewer.parquet.batch_convert_swc_to_parquet", fake_batch_convert)
+
+    processed = swc_files_to_parquet(
+        tmp_path / "input",
+        tmp_path / "output.parquet",
+        resolution=50,
+        cache_dir=tmp_path / "cache",
+        recursive=False,
+        n_workers=4,
+        batch_size=12,
+    )
+
+    assert processed == 7
+    assert calls["recursive"] is False
+    assert calls["annotate_regions"] is True
+    assert calls["resolution"] == 50
+    assert calls["cache_dir"] == tmp_path / "cache"
+    assert calls["batch_size"] == 12
+    assert calls["n_workers"] == 4
+
+
+def test_cli_parses_worker_and_temp_dir_options(tmp_path):
+    """The CLI should expose the new worker and scratch-directory controls."""
+    script = _load_script_module()
+
+    parsed_default = script.parse_args(["input.swc", "out.parquet"])
+    parsed_auto = script.parse_args(["input.swc", "out.parquet", "--workers", "auto"])
+    parsed_explicit = script.parse_args(
+        [
+            "input.swc",
+            "out.parquet",
+            "--workers",
+            "4",
+            "--temp-dir",
+            str(tmp_path / "scratch"),
+        ]
+    )
+
+    assert parsed_default.batch_size == 25
+    assert parsed_default.workers is None
+    assert parsed_auto.workers is None
+    assert parsed_explicit.workers == 4
+    assert parsed_explicit.temp_dir == tmp_path / "scratch"

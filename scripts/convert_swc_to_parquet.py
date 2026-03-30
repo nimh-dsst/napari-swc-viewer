@@ -22,6 +22,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _worker_count(value: str) -> int | None:
+    """Parse worker count where ``auto`` maps to the library default."""
+    if value.lower() == "auto":
+        return None
+    return _positive_int(value)
+
+
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -102,8 +109,20 @@ Examples:
     parser.add_argument(
         "--batch-size",
         type=_positive_int,
-        default=100,
-        help="Number of SWC files to buffer before each Parquet flush",
+        default=25,
+        help="Files per serial flush or parallel worker chunk (default: 25)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=_worker_count,
+        default=None,
+        help="Parallel worker count or 'auto' (default: auto)",
+    )
+    parser.add_argument(
+        "--temp-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for temporary shard and memmap files",
     )
     return parser.parse_args(args)
 
@@ -141,6 +160,8 @@ def main(args: list[str] | None = None) -> int:
             resolution=parsed.resolution,
             cache_dir=parsed.cache_dir,
             batch_size=parsed.batch_size,
+            n_workers=parsed.workers,
+            temp_dir=parsed.temp_dir,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
