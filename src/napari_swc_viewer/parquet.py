@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable
@@ -682,21 +682,30 @@ def _run_parallel_batch_conversion(
                 for chunk_index, chunk in enumerate(chunks)
             }
 
-            for future in as_completed(futures):
-                chunk_index = futures[future]
-                chunk_result = future.result()
-                chunk_results[chunk_index] = chunk_result
-                completed_files += chunk_result.processed_files + chunk_result.failed_files
-                completed_chunks += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        (
-                            f"Processed {completed_files}/{total_files} files "
-                            f"({completed_chunks}/{len(chunks)} chunks)..."
-                        ),
-                        completed_files,
-                        total_files,
-                    )
+            pending_futures = futures.copy()
+            while pending_futures:
+                done_futures, _ = wait(
+                    tuple(pending_futures),
+                    return_when=FIRST_COMPLETED,
+                )
+                ready_chunks = sorted(
+                    ((pending_futures.pop(future), future) for future in done_futures),
+                    key=lambda item: item[0],
+                )
+                for chunk_index, future in ready_chunks:
+                    chunk_result = future.result()
+                    chunk_results[chunk_index] = chunk_result
+                    completed_files += chunk_result.processed_files + chunk_result.failed_files
+                    completed_chunks += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            (
+                                f"Processed {completed_files}/{total_files} files "
+                                f"({completed_chunks}/{len(chunks)} chunks)..."
+                            ),
+                            completed_files,
+                            total_files,
+                        )
 
         shard_paths: list[Path] = []
         for chunk_index in range(len(chunks)):
