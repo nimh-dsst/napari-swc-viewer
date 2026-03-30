@@ -146,6 +146,49 @@ class TestParseSWC:
         swc = parse_swc(swc_file)
         assert swc.n_nodes == 1
 
+    def test_parse_single_row_file(self, tmp_path):
+        """Single-row SWCs should keep a stable 2D coordinate shape."""
+        swc_file = tmp_path / "single.swc"
+        swc_file.write_text("1 1 1.0 2.0 3.0 4.0 -1\n")
+
+        swc = parse_swc(swc_file)
+
+        assert swc.n_nodes == 1
+        assert swc.coords.shape == (1, 3)
+        np.testing.assert_array_equal(swc.ids, [1])
+        np.testing.assert_array_equal(swc.parents, [-1])
+
+    def test_parse_comment_only_file_returns_empty_arrays(self, tmp_path):
+        """Comment-only SWCs should parse to an empty morphology."""
+        swc_file = tmp_path / "empty.swc"
+        swc_file.write_text("# header\n# comment only\n")
+
+        swc = parse_swc(swc_file)
+
+        assert swc.n_nodes == 0
+        assert swc.coords.shape == (0, 3)
+
+    def test_parse_falls_back_for_short_malformed_lines(self, tmp_path):
+        """Short malformed lines should be skipped by the tolerant fallback."""
+        swc_file = tmp_path / "fallback.swc"
+        swc_file.write_text(
+            "\n".join(
+                [
+                    "# mixed quality swc",
+                    "1 1 0.0 0.0 0.0 1.0 -1",
+                    "this line is malformed",
+                    "2 3 1.0 2.0 3.0 0.5 1",
+                    "",
+                ]
+            )
+        )
+
+        swc = parse_swc(swc_file)
+
+        assert swc.n_nodes == 2
+        np.testing.assert_array_equal(swc.ids, [1, 2])
+        np.testing.assert_array_equal(swc.types, [1, 3])
+
 
 class TestWriteSWC:
     """Tests for write_swc function."""

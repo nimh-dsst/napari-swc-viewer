@@ -6,10 +6,13 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
+import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .atlas_utils import world_coords_xyz_to_atlas_voxels
 from .hemisphere import get_atlas_midline
@@ -17,6 +20,25 @@ from .hemisphere import get_atlas_midline
 REQUIRED_POINT_COLUMNS = ("label", "x", "y", "z")
 OPTIONAL_POINT_COLUMNS = ("region_name", "acronym", "id", "hemisphere")
 STANDARD_POINT_COLUMNS = REQUIRED_POINT_COLUMNS + OPTIONAL_POINT_COLUMNS
+POINT_PARQUET_ORIGIN_NOT_RECORDED = "(not recorded)"
+
+BLTR_STANDARD_MAPPING = {
+    "label": "marker",
+    "x": "atlas_x",
+    "y": "atlas_y",
+    "z": "atlas_z",
+    "region_name": "region_name",
+    "acronym": "region_acronym",
+    "id": "region_id",
+    "hemisphere": "region_hemisphere",
+}
+BLTR_EXTRA_COLUMNS = (
+    "experiment_x",
+    "experiment_y",
+    "experiment_z",
+    "strength",
+    "channel_mono_channel",
+)
 
 _STRING_OPTIONAL_COLUMNS = ("region_name", "acronym", "hemisphere")
 
@@ -41,6 +63,15 @@ class AtlasValidationSummary:
     @property
     def has_mismatches(self) -> bool:
         return self.total_mismatched_rows > 0
+
+
+@dataclass
+class BatchPointParquetConversionSummary:
+    """Summary statistics for a BLTR CSV directory-to-Parquet conversion."""
+
+    discovered_files: int = 0
+    processed_files: int = 0
+    rows_written: int = 0
 
 
 def _empty_string_series(length: int) -> pd.Series:
@@ -88,6 +119,136 @@ def _compare_hemisphere_series(left: pd.Series, right: pd.Series) -> pd.Series:
         _normalize_string_series(left).str.strip().str.lower()
         == _normalize_string_series(right).str.strip().str.lower()
     )
+
+
+def _path_exists_message(path: Path, kind: str) -> str:
+    return f"{kind} not found: {path}"
+
+
+def _escape_duckdb_path(path: Path) -> str:
+    return str(path).replace("\\", "/").replace("'", "''")
+
+
+def _read_standard_point_parquet_schema(parquet_path: str | Path) -> pa.Schema:
+    """Read and lightly validate a standardized point Parquet schema."""
+
+    path = Path(parquet_path)
+    try:
+        schema = pq.read_schema(path)
+    except FileNotFoundError as exc:
+        raise PointImportError(_path_exists_message(path, "Point Parquet file")) from exc
+    except Exception as exc:
+        raise PointImportError(f"Failed to read Point Parquet schema: {path}") from exc
+
+    missing_required = [
+        column for column in REQUIRED_POINT_COLUMNS if column not in schema.names
+    ]
+    if missing_required:
+        columns = ", ".join(missing_required)
+        raise PointImportError(f"Missing required point column(s): {columns}")
+    return schema
+
+
+def point_parquet_has_origin_csv(parquet_path: str | Path) -> bool:
+    """Return whether a point Parquet stores provenance in ``origin_csv``."""
+
+    return "origin_csv" in _read_standard_point_parquet_schema(parquet_path).names
+
+
+def _normalize_origin_csv_value(value: Any) -> str:
+    if pd.isna(value):
+        return POINT_PARQUET_ORIGIN_NOT_RECORDED
+    text = str(value).strip()
+    return text if text else POINT_PARQUET_ORIGIN_NOT_RECORDED
+
+
+def _normalize_point_selection_keys(
+    selections: Iterable[tuple[str, str | None]],
+) -> list[tuple[str, str]]:
+    normalized: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for label, origin_csv in selections:
+        label_text = str(label).strip()
+        if not label_text:
+            continue
+        normalized_key = (label_text, _normalize_origin_csv_value(origin_csv))
+        if normalized_key in seen:
+            continue
+        seen.add(normalized_key)
+        normalized.append(normalized_key)
+    return normalized
+
+
+def _normalize_bltr_header_token(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text or text.startswith("Unnamed:"):
+        return ""
+    return re.sub(r"[^0-9A-Za-z]+", "_", text).strip("_").lower()
+
+
+def _flatten_bltr_columns(columns: pd.Index) -> list[str]:
+    """Flatten the observed BLTR two-row header into canonical column names."""
+
+    current_group = ""
+    flattened: list[str] = []
+    for top_level, sub_level in columns.to_flat_index():
+        top_token = _normalize_bltr_header_token(top_level)
+        sub_token = _normalize_bltr_header_token(sub_level)
+        if top_token:
+            current_group = top_token
+        group = current_group
+
+        if group == "marker":
+            name = "marker"
+        elif group == "experiment":
+            name = "strength" if sub_token == "strength" else f"experiment_{sub_token}"
+        elif group == "channels":
+            name = sub_token
+        elif group == "atlas":
+            name = f"atlas_{sub_token}"
+        elif group == "region":
+            name = f"region_{sub_token}"
+        elif group:
+            name = f"{group}_{sub_token}" if sub_token else group
+        else:
+            name = sub_token
+
+        if not name:
+            raise PointImportError("Failed to flatten BLTR CSV header.")
+        flattened.append(name)
+
+    return flattened
+
+
+def load_bltr_point_csv(csv_path: str | Path) -> pd.DataFrame:
+    """Load a BLTR-format two-row-header CSV into canonical source columns."""
+
+    path = Path(csv_path)
+    try:
+        raw_df = pd.read_csv(path, header=[0, 1])
+    except FileNotFoundError as exc:
+        raise PointImportError(_path_exists_message(path, "CSV file")) from exc
+    except Exception as exc:
+        raise PointImportError(f"Failed to read BLTR CSV file: {path}") from exc
+
+    flattened_columns = _flatten_bltr_columns(raw_df.columns)
+    raw_df.columns = flattened_columns
+
+    missing_columns = sorted(
+        set(BLTR_STANDARD_MAPPING.values()) - set(flattened_columns)
+    )
+    if missing_columns:
+        columns = ", ".join(missing_columns)
+        raise PointImportError(f"BLTR CSV is missing expected column(s): {columns}")
+
+    missing_extra_columns = sorted(set(BLTR_EXTRA_COLUMNS) - set(flattened_columns))
+    if missing_extra_columns:
+        columns = ", ".join(missing_extra_columns)
+        raise PointImportError(f"BLTR CSV is missing expected BLTR column(s): {columns}")
+
+    return raw_df
 
 
 def load_column_mapping(mapping_path: str | Path) -> dict[str, str]:
@@ -243,7 +404,9 @@ def load_raw_point_csv(csv_path: str | Path) -> pd.DataFrame:
     try:
         return pd.read_csv(path)
     except FileNotFoundError as exc:
-        raise PointImportError(f"CSV file not found: {path}") from exc
+        raise PointImportError(_path_exists_message(path, "CSV file")) from exc
+    except Exception as exc:
+        raise PointImportError(f"Failed to read CSV file: {path}") from exc
 
 
 def convert_point_csv_to_parquet(
@@ -261,6 +424,193 @@ def convert_point_csv_to_parquet(
     return standardized
 
 
+def convert_bltr_point_csv_directory_to_parquet(
+    input_dir: str | Path,
+    output_path: str | Path,
+) -> BatchPointParquetConversionSummary:
+    """Convert a directory of BLTR CSV files into one standardized Parquet."""
+
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        raise PointImportError(_path_exists_message(input_path, "Input directory"))
+    if not input_path.is_dir():
+        raise PointImportError(f"Input path must be a directory: {input_path}")
+
+    csv_paths = sorted(path for path in input_path.glob("*.csv") if path.is_file())
+    summary = BatchPointParquetConversionSummary(discovered_files=len(csv_paths))
+    if not csv_paths:
+        raise PointImportError(f"No BLTR CSV files found in directory: {input_path}")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+
+    writer: pq.ParquetWriter | None = None
+    schema: pa.Schema | None = None
+
+    try:
+        for csv_path in csv_paths:
+            raw_df = load_bltr_point_csv(csv_path)
+            standardized = standardize_point_dataframe(raw_df, BLTR_STANDARD_MAPPING)
+            standardized["origin_csv"] = csv_path.name
+
+            table = pa.Table.from_pandas(
+                standardized,
+                schema=schema,
+                preserve_index=False,
+            )
+            if schema is None:
+                schema = table.schema
+                writer = pq.ParquetWriter(
+                    temp_output_path,
+                    schema,
+                    compression="snappy",
+                )
+
+            assert writer is not None
+            writer.write_table(table)
+            summary.processed_files += 1
+            summary.rows_written += len(standardized)
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise
+
+    if writer is None:
+        raise PointImportError("No BLTR CSV rows were written.")
+
+    writer.close()
+    temp_output_path.replace(output_path)
+    return summary
+
+
+def summarize_standard_point_parquet_groups(parquet_path: str | Path) -> pd.DataFrame:
+    """Return a grouped preview of labels, origin CSV, and point counts."""
+
+    path = Path(parquet_path)
+    has_origin_csv = point_parquet_has_origin_csv(path)
+    conn = duckdb.connect()
+    try:
+        path_str = _escape_duckdb_path(path)
+        if has_origin_csv:
+            query = f"""
+                SELECT
+                    TRIM(CAST(label AS VARCHAR)) AS label,
+                    CASE
+                        WHEN TRIM(COALESCE(CAST(origin_csv AS VARCHAR), '')) = ''
+                            THEN ?
+                        ELSE CAST(origin_csv AS VARCHAR)
+                    END AS origin_csv,
+                    COUNT(*) AS point_count
+                FROM read_parquet('{path_str}')
+                GROUP BY 1, 2
+                ORDER BY origin_csv, label
+            """
+            summary = conn.execute(
+                query,
+                [POINT_PARQUET_ORIGIN_NOT_RECORDED],
+            ).fetchdf()
+        else:
+            query = f"""
+                SELECT
+                    TRIM(CAST(label AS VARCHAR)) AS label,
+                    ? AS origin_csv,
+                    COUNT(*) AS point_count
+                FROM read_parquet('{path_str}')
+                GROUP BY 1
+                ORDER BY origin_csv, label
+            """
+            summary = conn.execute(
+                query,
+                [POINT_PARQUET_ORIGIN_NOT_RECORDED],
+            ).fetchdf()
+    except duckdb.Error as exc:
+        raise PointImportError(f"Failed to summarize Point Parquet file: {path}") from exc
+    finally:
+        conn.close()
+
+    if summary.empty:
+        empty = pd.DataFrame(columns=["label", "origin_csv", "point_count"])
+        empty.attrs["has_origin_csv"] = has_origin_csv
+        return empty
+
+    summary["label"] = _normalize_string_series(summary["label"]).str.strip()
+    summary["origin_csv"] = (
+        _normalize_string_series(summary["origin_csv"])
+        .str.strip()
+        .fillna(POINT_PARQUET_ORIGIN_NOT_RECORDED)
+    )
+    summary["point_count"] = (
+        pd.to_numeric(summary["point_count"], errors="raise").astype(int)
+    )
+    summary = summary[["label", "origin_csv", "point_count"]]
+    summary.attrs["has_origin_csv"] = has_origin_csv
+    return summary
+
+
+def load_standard_point_parquet_selection(
+    parquet_path: str | Path,
+    selections: Sequence[tuple[str, str | None]],
+) -> pd.DataFrame:
+    """Load only the selected label/origin rows from a point Parquet file."""
+
+    path = Path(parquet_path)
+    has_origin_csv = point_parquet_has_origin_csv(path)
+    normalized_selections = _normalize_point_selection_keys(selections)
+    if not normalized_selections:
+        columns = [*STANDARD_POINT_COLUMNS]
+        if has_origin_csv:
+            columns.append("origin_csv")
+        return validate_standard_point_dataframe(pd.DataFrame(columns=columns))
+
+    conn = duckdb.connect()
+    try:
+        path_str = _escape_duckdb_path(path)
+        params: list[str] = []
+        if has_origin_csv:
+            clauses: list[str] = []
+            for label, origin_csv in normalized_selections:
+                if origin_csv == POINT_PARQUET_ORIGIN_NOT_RECORDED:
+                    clauses.append(
+                        "("
+                        "TRIM(CAST(label AS VARCHAR)) = ? AND "
+                        "TRIM(COALESCE(CAST(origin_csv AS VARCHAR), '')) = ''"
+                        ")"
+                    )
+                    params.append(label)
+                else:
+                    clauses.append(
+                        "("
+                        "TRIM(CAST(label AS VARCHAR)) = ? AND "
+                        "CAST(origin_csv AS VARCHAR) = ?"
+                        ")"
+                    )
+                    params.extend([label, origin_csv])
+
+            query = (
+                f"SELECT * FROM read_parquet('{path_str}') WHERE "
+                + " OR ".join(clauses)
+            )
+        else:
+            labels = [label for label, _origin_csv in normalized_selections]
+            placeholders = ", ".join(["?"] * len(labels))
+            params = labels
+            query = (
+                f"SELECT * FROM read_parquet('{path_str}') "
+                f"WHERE TRIM(CAST(label AS VARCHAR)) IN ({placeholders})"
+            )
+
+        df = conn.execute(query, params).fetchdf()
+    except duckdb.Error as exc:
+        raise PointImportError(f"Failed to query Point Parquet file: {path}") from exc
+    finally:
+        conn.close()
+
+    return validate_standard_point_dataframe(df)
+
+
 def load_standard_point_parquet(parquet_path: str | Path) -> pd.DataFrame:
     """Load and validate a standardized point Parquet file."""
 
@@ -268,7 +618,7 @@ def load_standard_point_parquet(parquet_path: str | Path) -> pd.DataFrame:
     try:
         df = pd.read_parquet(path)
     except FileNotFoundError as exc:
-        raise PointImportError(f"Point Parquet file not found: {path}") from exc
+        raise PointImportError(_path_exists_message(path, "Point Parquet file")) from exc
     except Exception as exc:
         raise PointImportError(f"Failed to read Point Parquet file: {path}") from exc
     return validate_standard_point_dataframe(df)
@@ -316,6 +666,7 @@ def _world_coords_to_atlas_region_ids(
     if len(valid) > 0:
         region_ids[in_bounds] = annotation[valid[:, 0], valid[:, 1], valid[:, 2]]
     return region_ids
+
 
 def validate_point_metadata_against_atlas(
     df: pd.DataFrame,
@@ -464,30 +815,65 @@ def dataframe_to_point_properties(df: pd.DataFrame) -> dict[str, list[Any]]:
     return properties
 
 
-def build_label_heatmap_volumes(
+def _normalized_groupby_series(df: pd.DataFrame, column: str) -> pd.Series:
+    series = df[column]
+    if column == "origin_csv":
+        normalized = _normalize_string_series(series).str.strip()
+        return normalized.map(_normalize_origin_csv_value).astype("string")
+    if pd.api.types.is_string_dtype(series) or series.dtype == object:
+        return _normalize_string_series(series).str.strip()
+    return series
+
+
+def build_grouped_point_heatmap_volumes(
     df: pd.DataFrame,
     atlas: Any,
-) -> dict[str, np.ndarray]:
-    """Build one dense atlas-space count volume per label."""
+    group_columns: Sequence[str],
+) -> dict[tuple[Any, ...], np.ndarray]:
+    """Build one dense atlas-space count volume per requested group key."""
+
+    if not group_columns:
+        raise ValueError("group_columns must contain at least one column.")
 
     standardized = validate_standard_point_dataframe(df)
+    missing_group_columns = [
+        column for column in group_columns if column not in standardized.columns
+    ]
+    if missing_group_columns:
+        columns = ", ".join(missing_group_columns)
+        raise PointImportError(f"Grouping column(s) not found in dataframe: {columns}")
+
     coords = standardized[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
     voxel_coords = world_coords_xyz_to_atlas_voxels(coords, atlas)
     atlas_shape = np.asarray(atlas.annotation.shape)
     in_bounds = np.all((voxel_coords >= 0) & (voxel_coords < atlas_shape), axis=1)
 
-    volumes: dict[str, np.ndarray] = {}
-    labels = standardized["label"].tolist()
-    for label in dict.fromkeys(labels):
-        label_mask = standardized["label"].eq(label).to_numpy() & in_bounds
+    group_frame = pd.DataFrame(index=standardized.index)
+    for column in group_columns:
+        group_frame[column] = _normalized_groupby_series(standardized, column)
+
+    volumes: dict[tuple[Any, ...], np.ndarray] = {}
+    for raw_key, positions in group_frame.groupby(list(group_columns), sort=False).indices.items():
+        key = raw_key if isinstance(raw_key, tuple) else (raw_key,)
         volume = np.zeros(atlas.annotation.shape, dtype=np.float32)
-        label_voxels = voxel_coords[label_mask]
-        if len(label_voxels) > 0:
+        group_positions = np.asarray(positions, dtype=int)
+        valid_positions = group_positions[in_bounds[group_positions]]
+        if len(valid_positions) > 0:
+            group_voxels = voxel_coords[valid_positions]
             np.add.at(
                 volume,
-                (label_voxels[:, 0], label_voxels[:, 1], label_voxels[:, 2]),
+                (group_voxels[:, 0], group_voxels[:, 1], group_voxels[:, 2]),
                 1.0,
             )
-        volumes[str(label)] = volume
+        volumes[key] = volume
 
     return volumes
+
+
+def build_label_heatmap_volumes(
+    df: pd.DataFrame,
+    atlas: Any,
+) -> dict[str, np.ndarray]:
+    """Build one dense atlas-space count volume per label."""
+    grouped = build_grouped_point_heatmap_volumes(df, atlas, ("label",))
+    return {str(key[0]): volume for key, volume in grouped.items()}

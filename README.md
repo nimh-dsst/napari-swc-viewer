@@ -53,6 +53,8 @@ point Parquet schema:
 - Required columns: `label`, `x`, `y`, `z`
 - Optional columns: `region_name`, `acronym`, `id`, `hemisphere`
 - Additional source columns are preserved in the standardized Parquet
+- BLTR batch conversions also append `origin_csv` so point provenance can be
+  selected at import time
 
 To convert a raw CSV into standardized point Parquet, provide a JSON
 mapping from standard target names to source CSV headers:
@@ -76,12 +78,21 @@ Run the converter from the repository root:
 pixi run python scripts/convert_point_csv.py raw_points.csv mapping.json points.parquet
 ```
 
+For BLTR-format two-row-header CSV directories like [`bltr cases`](bltr%20cases),
+use the batch converter instead:
+
+```bash
+pixi run python scripts/convert_bltr_point_csv_directory.py "bltr cases" bltr_combined.parquet
+```
+
 In the plugin Data tab, use `Import Point Parquet...` to load the standardized
-Parquet. The selected atlas must already be loaded. If optional atlas metadata
-columns are present, the app validates them against the selected atlas,
-warns on mismatches, and imports one heatmap image layer per unique `label`.
-Each heatmap layer is assigned a distinct color so labels are easier to
-differentiate in the viewer.
+Parquet. The selected atlas must already be loaded. Opening a point Parquet now
+populates a preview table with `Label`, `Origin CSV`, and `Points`. Select one
+or more rows and click `Import Selected Heatmaps` to create only those heatmap
+image layers. If optional atlas metadata columns are present, the app validates
+the selected subset against the loaded atlas and warns on mismatches. For older
+point Parquets without `origin_csv`, the table shows `(not recorded)` and still
+imports one heatmap layer per selected `label`.
 
 In the `Tools` tab, eligible native-grid heatmaps can be turned into blurred
 napari `Image` layers. In the `Histogram` tab, those same eligible heatmaps and

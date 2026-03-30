@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +57,48 @@ class BatchParquetConversionSummary:
     midline_files: int = 0
     rows_written: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _BatchWorkerConfig:
+    """Shared worker configuration for chunked conversion."""
+
+    target_hemisphere: Hemisphere | None
+    atlas_name: str
+    coord_axis: int
+    midline: float | None
+    annotate_regions: bool
+    resolution: int
+
+
+@dataclass
+class _FileConversionResult:
+    """Result for one successfully converted SWC file."""
+
+    table: pa.Table
+    flipped_file: bool = False
+    already_target_file: bool = False
+    midline_file: bool = False
+
+
+@dataclass
+class _ChunkConversionResult:
+    """Summary returned from a worker chunk."""
+
+    chunk_index: int
+    processed_files: int = 0
+    failed_files: int = 0
+    flipped_files: int = 0
+    already_target_files: int = 0
+    midline_files: int = 0
+    rows_written: int = 0
+    failures: list[tuple[str, str]] = field(default_factory=list)
+    shard_path: str | None = None
+
+
+_WORKER_CONFIG: _BatchWorkerConfig | None = None
+_WORKER_ANNOTATION_VOLUME: NDArray[np.int32] | None = None
+_WORKER_REGION_LOOKUP: dict[int, dict] | None = None
 
 
 def parse_filename_metadata(filename: str) -> dict[str, str]:
@@ -124,14 +169,23 @@ def swc_data_to_table(
             raise ValueError("region_ids must have one entry per SWC node")
 
         lookup = region_lookup or {}
-        region_names = [
-            lookup.get(int(region_id), {}).get("name", "")
-            for region_id in region_id_values.tolist()
-        ]
-        region_acronyms = [
-            lookup.get(int(region_id), {}).get("acronym", "")
-            for region_id in region_id_values.tolist()
-        ]
+        unique_region_ids, inverse = np.unique(region_id_values, return_inverse=True)
+        region_names_lookup = np.asarray(
+            [
+                lookup.get(int(region_id), {}).get("name", "")
+                for region_id in unique_region_ids.tolist()
+            ],
+            dtype=object,
+        )
+        region_acronyms_lookup = np.asarray(
+            [
+                lookup.get(int(region_id), {}).get("acronym", "")
+                for region_id in unique_region_ids.tolist()
+            ],
+            dtype=object,
+        )
+        region_names = region_names_lookup[inverse].tolist()
+        region_acronyms = region_acronyms_lookup[inverse].tolist()
 
     columns = {
         "file_id": [filename] * n_nodes,
@@ -209,20 +263,6 @@ def swc_to_annotated_rows(
         resolution=resolution,
     ).to_pylist()
 
-
-def _process_single_swc(args: tuple) -> list[dict]:
-    """Worker function for parallel processing. Handles its own Allen SDK setup."""
-    swc_path, resolution, cache_dir = args
-
-    # Each worker loads its own copy of Allen SDK data
-    _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
-    region_lookup = build_region_lookup(structure_tree)
-
-    return swc_to_annotated_rows(
-        swc_path, annotation_volume, structure_tree, region_lookup, resolution
-    )
-
-
 def discover_swc_files(input_path: Path, recursive: bool = True) -> list[Path]:
     """Discover SWC files in a directory.
 
@@ -290,6 +330,33 @@ def _normalize_target_hemisphere(
     return target
 
 
+def _resolve_worker_count(
+    n_workers: int | None,
+    total_files: int,
+    batch_size: int,
+) -> int:
+    """Resolve worker count from explicit or automatic configuration."""
+    if n_workers is None:
+        if total_files <= batch_size:
+            return 1
+        return min(8, os.cpu_count() or 1)
+
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1")
+
+    return n_workers
+
+
+def _open_parquet_writer(output_path: Path) -> pq.ParquetWriter:
+    """Open a Parquet writer using the canonical neuron schema."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return pq.ParquetWriter(
+        output_path,
+        NEURON_SCHEMA,
+        compression="snappy",
+    )
+
+
 def _write_table_batch(
     writer: pq.ParquetWriter | None,
     output_path: Path,
@@ -301,58 +368,207 @@ def _write_table_batch(
 
     table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
     if writer is None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        writer = pq.ParquetWriter(
-            output_path,
-            NEURON_SCHEMA,
-            compression="snappy",
-        )
+        writer = _open_parquet_writer(output_path)
     writer.write_table(table)
     return writer
 
 
-def batch_convert_swc_to_parquet(
-    input_path: Path | str | Iterable[Path | str],
-    output_path: Path | str,
+def _convert_swc_file_to_table(
+    swc_path: Path,
     *,
-    recursive: bool = True,
-    hemisphere: Hemisphere | str | None = None,
-    atlas_name: str = "allen_mouse_10um",
-    coord_axis: int = 2,
-    midline: float | None = None,
-    annotate_regions: bool = False,
-    resolution: int = 25,
-    cache_dir: Path | str | None = None,
-    batch_size: int = 100,
-    progress_callback: Callable[[str, int, int], None] | None = None,
-) -> BatchParquetConversionSummary:
-    """Convert SWC files into one Parquet file with optional alignment."""
-    if batch_size < 1:
-        raise ValueError("batch_size must be at least 1")
+    target_hemisphere: Hemisphere | None,
+    atlas_name: str,
+    coord_axis: int,
+    midline: float | None,
+    annotate_regions: bool,
+    resolution: int,
+    annotation_volume: NDArray[np.int32] | None,
+    region_lookup: dict[int, dict] | None,
+) -> _FileConversionResult:
+    """Parse, align, annotate, and materialize a single SWC file."""
+    swc_data = parse_swc(swc_path)
+    _require_nonempty_swc(swc_data, swc_path)
 
-    output_path = Path(output_path)
-    summary = BatchParquetConversionSummary()
-    swc_files = _resolve_swc_files(input_path, recursive=recursive)
-    summary.discovered_files = len(swc_files)
-    total_files = len(swc_files)
+    flipped_file = False
+    already_target_file = False
+    midline_file = False
 
-    target_hemisphere = _normalize_target_hemisphere(hemisphere)
+    if target_hemisphere is not None:
+        detected = detect_soma_hemisphere(
+            swc_data,
+            atlas_name=atlas_name,
+            midline=midline,
+            coord_axis=coord_axis,
+            validate=False,
+        )
 
-    atlas = None
-    if target_hemisphere is not None and midline is None:
-        from brainglobe_atlasapi import BrainGlobeAtlas
+        if detected == Hemisphere.MIDLINE:
+            midline_file = True
+        elif detected == target_hemisphere:
+            already_target_file = True
+        else:
+            swc_data = flip_swc(
+                swc_data,
+                atlas_name=atlas_name,
+                midline=midline,
+                coord_axis=coord_axis,
+            )
+            flipped_file = True
 
-        atlas = BrainGlobeAtlas(atlas_name)
-        midline = get_atlas_midline(atlas, coord_axis)
-
-    annotation_volume = None
-    region_lookup: dict[int, dict] | None = None
+    region_ids = None
     if annotate_regions:
-        _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
-        region_lookup = build_region_lookup(structure_tree)
+        if annotation_volume is None:
+            raise ValueError("annotation_volume is required when annotate_regions=True")
+        region_ids = np.asarray(
+            get_region_ids_vectorized(
+                swc_data.coords,
+                annotation_volume,
+                resolution,
+            ),
+            dtype=np.int32,
+        )
 
+    table = swc_data_to_table(
+        swc_data,
+        swc_path.name,
+        region_ids=region_ids,
+        region_lookup=region_lookup,
+    )
+    return _FileConversionResult(
+        table=table,
+        flipped_file=flipped_file,
+        already_target_file=already_target_file,
+        midline_file=midline_file,
+    )
+
+
+def _add_file_result_to_summary(
+    summary: BatchParquetConversionSummary,
+    result: _FileConversionResult,
+) -> None:
+    """Update a batch summary from one successful file result."""
+    summary.processed_files += 1
+    summary.rows_written += result.table.num_rows
+    if result.flipped_file:
+        summary.flipped_files += 1
+    if result.already_target_file:
+        summary.already_target_files += 1
+    if result.midline_file:
+        summary.midline_files += 1
+
+
+def _init_batch_worker(
+    config: _BatchWorkerConfig,
+    region_lookup: dict[int, dict] | None,
+    annotation_volume_path: str | None,
+) -> None:
+    """Initialize process-local shared state for chunk workers."""
+    global _WORKER_CONFIG, _WORKER_ANNOTATION_VOLUME, _WORKER_REGION_LOOKUP
+
+    _WORKER_CONFIG = config
+    _WORKER_REGION_LOOKUP = region_lookup
+    _WORKER_ANNOTATION_VOLUME = None
+
+    if annotation_volume_path is not None:
+        _WORKER_ANNOTATION_VOLUME = np.load(annotation_volume_path, mmap_mode="r")
+
+
+def _process_swc_chunk(args: tuple[int, tuple[str, ...], str]) -> _ChunkConversionResult:
+    """Process one chunk of SWC files and write one shard file."""
+    if _WORKER_CONFIG is None:
+        raise RuntimeError("SWC conversion worker was not initialized")
+
+    chunk_index, swc_paths, shard_dir = args
+    result = _ChunkConversionResult(chunk_index=chunk_index)
+    shard_path = Path(shard_dir) / f"chunk_{chunk_index:06d}.parquet"
+    writer: pq.ParquetWriter | None = None
+
+    try:
+        for swc_path_str in swc_paths:
+            swc_path = Path(swc_path_str)
+            try:
+                file_result = _convert_swc_file_to_table(
+                    swc_path,
+                    target_hemisphere=_WORKER_CONFIG.target_hemisphere,
+                    atlas_name=_WORKER_CONFIG.atlas_name,
+                    coord_axis=_WORKER_CONFIG.coord_axis,
+                    midline=_WORKER_CONFIG.midline,
+                    annotate_regions=_WORKER_CONFIG.annotate_regions,
+                    resolution=_WORKER_CONFIG.resolution,
+                    annotation_volume=_WORKER_ANNOTATION_VOLUME,
+                    region_lookup=_WORKER_REGION_LOOKUP,
+                )
+                writer = _write_table_batch(writer, shard_path, [file_result.table])
+                result.processed_files += 1
+                result.rows_written += file_result.table.num_rows
+                if file_result.flipped_file:
+                    result.flipped_files += 1
+                if file_result.already_target_file:
+                    result.already_target_files += 1
+                if file_result.midline_file:
+                    result.midline_files += 1
+            except Exception as exc:
+                result.failed_files += 1
+                result.failures.append((str(swc_path), str(exc)))
+
+        if writer is not None:
+            result.shard_path = str(shard_path)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    return result
+
+
+def _merge_parquet_shards(
+    shard_paths: list[Path],
+    output_path: Path,
+    *,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    total_files: int | None = None,
+) -> None:
+    """Merge shard parquet files into one deterministic output file."""
+    writer: pq.ParquetWriter | None = None
+
+    try:
+        total_shards = len(shard_paths)
+        for shard_index, shard_path in enumerate(shard_paths, start=1):
+            if progress_callback is not None:
+                progress_callback(
+                    f"Finalizing Parquet ({shard_index}/{total_shards} shards)...",
+                    total_files or 0,
+                    total_files or 0,
+                )
+            parquet_file = pq.ParquetFile(shard_path)
+            if writer is None:
+                writer = _open_parquet_writer(output_path)
+            for batch in parquet_file.iter_batches():
+                writer.write_batch(batch)
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def _run_serial_batch_conversion(
+    swc_files: list[Path],
+    output_path: Path,
+    *,
+    target_hemisphere: Hemisphere | None,
+    atlas_name: str,
+    coord_axis: int,
+    midline: float | None,
+    annotate_regions: bool,
+    resolution: int,
+    annotation_volume: NDArray[np.int32] | None,
+    region_lookup: dict[int, dict] | None,
+    batch_size: int,
+    progress_callback: Callable[[str, int, int], None] | None,
+) -> BatchParquetConversionSummary:
+    """Convert SWCs serially while reusing the shared per-file logic."""
+    summary = BatchParquetConversionSummary(discovered_files=len(swc_files))
     writer: pq.ParquetWriter | None = None
     buffered_tables: list[pa.Table] = []
+    total_files = len(swc_files)
 
     try:
         for swc_path in swc_files:
@@ -363,54 +579,20 @@ def batch_convert_swc_to_parquet(
                         summary.processed_files + summary.failed_files,
                         total_files,
                     )
-                swc_data = parse_swc(swc_path)
-                _require_nonempty_swc(swc_data, swc_path)
 
-                if target_hemisphere is not None:
-                    detected = detect_soma_hemisphere(
-                        swc_data,
-                        atlas=atlas,
-                        atlas_name=atlas_name,
-                        midline=midline,
-                        coord_axis=coord_axis,
-                        validate=False,
-                    )
-
-                    if detected == Hemisphere.MIDLINE:
-                        summary.midline_files += 1
-                    elif detected == target_hemisphere:
-                        summary.already_target_files += 1
-                    else:
-                        swc_data = flip_swc(
-                            swc_data,
-                            atlas=atlas,
-                            atlas_name=atlas_name,
-                            midline=midline,
-                            coord_axis=coord_axis,
-                        )
-                        summary.flipped_files += 1
-
-                region_ids = None
-                if annotate_regions:
-                    assert annotation_volume is not None
-                    region_ids = np.asarray(
-                        get_region_ids_vectorized(
-                            swc_data.coords,
-                            annotation_volume,
-                            resolution,
-                        ),
-                        dtype=np.int32,
-                    )
-
-                table = swc_data_to_table(
-                    swc_data,
-                    swc_path.name,
-                    region_ids=region_ids,
+                file_result = _convert_swc_file_to_table(
+                    swc_path,
+                    target_hemisphere=target_hemisphere,
+                    atlas_name=atlas_name,
+                    coord_axis=coord_axis,
+                    midline=midline,
+                    annotate_regions=annotate_regions,
+                    resolution=resolution,
+                    annotation_volume=annotation_volume,
                     region_lookup=region_lookup,
                 )
-                buffered_tables.append(table)
-                summary.processed_files += 1
-                summary.rows_written += table.num_rows
+                _add_file_result_to_summary(summary, file_result)
+                buffered_tables.append(file_result.table)
 
                 if len(buffered_tables) >= batch_size:
                     writer = _write_table_batch(writer, output_path, buffered_tables)
@@ -429,6 +611,195 @@ def batch_convert_swc_to_parquet(
     return summary
 
 
+def _run_parallel_batch_conversion(
+    swc_files: list[Path],
+    output_path: Path,
+    *,
+    worker_count: int,
+    target_hemisphere: Hemisphere | None,
+    atlas_name: str,
+    coord_axis: int,
+    midline: float | None,
+    annotate_regions: bool,
+    resolution: int,
+    annotation_volume: NDArray[np.int32] | None,
+    region_lookup: dict[int, dict] | None,
+    batch_size: int,
+    temp_dir: Path | str | None,
+    progress_callback: Callable[[str, int, int], None] | None,
+) -> BatchParquetConversionSummary:
+    """Convert SWCs in parallel using chunk-local shard files."""
+    summary = BatchParquetConversionSummary(discovered_files=len(swc_files))
+    total_files = len(swc_files)
+
+    if total_files == 0:
+        return summary
+
+    temp_root = Path(temp_dir) if temp_dir is not None else output_path.parent
+    temp_root.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="swc_to_parquet_", dir=temp_root))
+    shard_dir = work_dir / "shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    staged_output_path = work_dir / "merged_output.parquet"
+
+    annotation_volume_path: Path | None = None
+    if annotate_regions:
+        if annotation_volume is None:
+            raise ValueError("annotation_volume is required when annotate_regions=True")
+        annotation_volume_path = work_dir / "annotation_volume.npy"
+        np.save(annotation_volume_path, annotation_volume, allow_pickle=False)
+        annotation_volume = None
+
+    chunks = [
+        tuple(str(path) for path in swc_files[start : start + batch_size])
+        for start in range(0, total_files, batch_size)
+    ]
+    worker_count = min(worker_count, len(chunks))
+    worker_config = _BatchWorkerConfig(
+        target_hemisphere=target_hemisphere,
+        atlas_name=atlas_name,
+        coord_axis=coord_axis,
+        midline=midline,
+        annotate_regions=annotate_regions,
+        resolution=resolution,
+    )
+    chunk_results: dict[int, _ChunkConversionResult] = {}
+    completed_files = 0
+    completed_chunks = 0
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_batch_worker,
+            initargs=(
+                worker_config,
+                region_lookup,
+                str(annotation_volume_path) if annotation_volume_path is not None else None,
+            ),
+        ) as executor:
+            futures = {
+                executor.submit(_process_swc_chunk, (chunk_index, chunk, str(shard_dir))): chunk_index
+                for chunk_index, chunk in enumerate(chunks)
+            }
+
+            for future in as_completed(futures):
+                chunk_index = futures[future]
+                chunk_result = future.result()
+                chunk_results[chunk_index] = chunk_result
+                completed_files += chunk_result.processed_files + chunk_result.failed_files
+                completed_chunks += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        (
+                            f"Processed {completed_files}/{total_files} files "
+                            f"({completed_chunks}/{len(chunks)} chunks)..."
+                        ),
+                        completed_files,
+                        total_files,
+                    )
+
+        shard_paths: list[Path] = []
+        for chunk_index in range(len(chunks)):
+            chunk_result = chunk_results[chunk_index]
+            summary.processed_files += chunk_result.processed_files
+            summary.failed_files += chunk_result.failed_files
+            summary.flipped_files += chunk_result.flipped_files
+            summary.already_target_files += chunk_result.already_target_files
+            summary.midline_files += chunk_result.midline_files
+            summary.rows_written += chunk_result.rows_written
+            summary.failures.extend(chunk_result.failures)
+            if chunk_result.shard_path is not None:
+                shard_paths.append(Path(chunk_result.shard_path))
+
+        if shard_paths:
+            _merge_parquet_shards(
+                shard_paths,
+                staged_output_path,
+                progress_callback=progress_callback,
+                total_files=total_files,
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_output_path.replace(output_path)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return summary
+
+
+def batch_convert_swc_to_parquet(
+    input_path: Path | str | Iterable[Path | str],
+    output_path: Path | str,
+    *,
+    recursive: bool = True,
+    hemisphere: Hemisphere | str | None = None,
+    atlas_name: str = "allen_mouse_10um",
+    coord_axis: int = 2,
+    midline: float | None = None,
+    annotate_regions: bool = False,
+    resolution: int = 25,
+    cache_dir: Path | str | None = None,
+    batch_size: int = 25,
+    n_workers: int | None = None,
+    temp_dir: Path | str | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> BatchParquetConversionSummary:
+    """Convert SWC files into one Parquet file with optional alignment."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
+    output_path = Path(output_path)
+    swc_files = _resolve_swc_files(input_path, recursive=recursive)
+    total_files = len(swc_files)
+
+    target_hemisphere = _normalize_target_hemisphere(hemisphere)
+
+    if target_hemisphere is not None and midline is None:
+        from brainglobe_atlasapi import BrainGlobeAtlas
+
+        atlas = BrainGlobeAtlas(atlas_name)
+        midline = get_atlas_midline(atlas, coord_axis)
+
+    annotation_volume = None
+    region_lookup: dict[int, dict] | None = None
+    if annotate_regions:
+        _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
+        region_lookup = build_region_lookup(structure_tree)
+
+    worker_count = _resolve_worker_count(n_workers, total_files, batch_size)
+    if worker_count <= 1 or total_files == 0:
+        return _run_serial_batch_conversion(
+            swc_files,
+            output_path,
+            target_hemisphere=target_hemisphere,
+            atlas_name=atlas_name,
+            coord_axis=coord_axis,
+            midline=midline,
+            annotate_regions=annotate_regions,
+            resolution=resolution,
+            annotation_volume=annotation_volume,
+            region_lookup=region_lookup,
+            batch_size=batch_size,
+            progress_callback=progress_callback,
+        )
+
+    return _run_parallel_batch_conversion(
+        swc_files,
+        output_path,
+        worker_count=worker_count,
+        target_hemisphere=target_hemisphere,
+        atlas_name=atlas_name,
+        coord_axis=coord_axis,
+        midline=midline,
+        annotate_regions=annotate_regions,
+        resolution=resolution,
+        annotation_volume=annotation_volume,
+        region_lookup=region_lookup,
+        batch_size=batch_size,
+        temp_dir=temp_dir,
+        progress_callback=progress_callback,
+    )
+
+
 def swc_files_to_parquet(
     input_path: Path | str,
     output_path: Path | str,
@@ -436,7 +807,7 @@ def swc_files_to_parquet(
     cache_dir: Path | str | None = None,
     recursive: bool = True,
     n_workers: int = 1,
-    batch_size: int = 100,
+    batch_size: int = 25,
 ) -> int:
     """Convert SWC files to a single annotated Parquet file.
 
@@ -462,82 +833,17 @@ def swc_files_to_parquet(
     int
         Number of SWC files processed.
     """
-    input_path = Path(input_path)
-    output_path = Path(output_path)
-
-    # Discover SWC files
-    swc_files = discover_swc_files(input_path, recursive)
-    if not swc_files:
-        logger.warning("No SWC files found in %s", input_path)
-        return 0
-
-    logger.info("Found %d SWC files to process", len(swc_files))
-
-    # Set up Allen SDK (for serial processing or building lookup)
-    _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
-    region_lookup = build_region_lookup(structure_tree)
-
-    all_rows: list[dict] = []
-    processed = 0
-
-    if n_workers > 1:
-        args_list = [
-            (swc_path, resolution, str(cache_dir) if cache_dir else None)
-            for swc_path in swc_files
-        ]
-
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(_process_single_swc, args): args[0]
-                for args in args_list
-            }
-
-            for future in as_completed(futures):
-                swc_path = futures[future]
-                try:
-                    rows = future.result()
-                    all_rows.extend(rows)
-                    processed += 1
-
-                    if processed % 10 == 0:
-                        logger.info(
-                            "Processed %d/%d files",
-                            processed,
-                            len(swc_files),
-                        )
-
-                except Exception as exc:
-                    logger.error("Error processing %s: %s", swc_path, exc)
-    else:
-        for swc_path in swc_files:
-            try:
-                rows = swc_to_annotated_rows(
-                    swc_path,
-                    annotation_volume,
-                    structure_tree,
-                    region_lookup,
-                    resolution,
-                )
-                all_rows.extend(rows)
-                processed += 1
-
-                if processed % 10 == 0:
-                    logger.info("Processed %d/%d files", processed, len(swc_files))
-
-            except Exception as exc:
-                logger.error("Error processing %s: %s", swc_path, exc)
-
-    if all_rows:
-        table = pa.Table.from_pylist(all_rows, schema=NEURON_SCHEMA)
-        pq.write_table(table, output_path, compression="snappy")
-        logger.info(
-            "Wrote %d rows from %d files to %s",
-            len(all_rows),
-            processed,
-            output_path,
-        )
-
-    return processed
+    summary = batch_convert_swc_to_parquet(
+        input_path,
+        output_path,
+        recursive=recursive,
+        annotate_regions=True,
+        resolution=resolution,
+        cache_dir=cache_dir,
+        batch_size=batch_size,
+        n_workers=n_workers,
+    )
+    return summary.processed_files
 
 
 def append_to_parquet(

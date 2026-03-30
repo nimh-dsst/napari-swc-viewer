@@ -26,14 +26,18 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -53,10 +57,12 @@ from ..auto_center import (
 )
 from ..db import NeuronDatabase
 from ..point_import import (
+    POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
-    build_label_heatmap_volumes,
+    build_grouped_point_heatmap_volumes,
     format_atlas_validation_summary,
-    load_standard_point_parquet,
+    load_standard_point_parquet_selection,
+    summarize_standard_point_parquet_groups,
     validate_point_metadata_against_atlas,
 )
 from .reference_layers import (
@@ -91,6 +97,53 @@ _POINT_HEATMAP_BASE_COLORS = [
 
 _SOMA_SLICE_PROJECTION_POINT_SIZE = 100
 _HISTOGRAM_BIN_COUNT = 256
+_POINT_PREVIEW_LABEL_COLUMN = 0
+_POINT_PREVIEW_ORIGIN_COLUMN = 1
+_POINT_PREVIEW_COUNT_COLUMN = 2
+
+
+class CollapsibleSection(QWidget):
+    """Simple collapsible section for dense tab layouts."""
+
+    def __init__(
+        self,
+        title: str,
+        *,
+        expanded: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._toggle_button = QPushButton()
+        self._toggle_button.setCheckable(True)
+        self._toggle_button.setChecked(expanded)
+        self._toggle_button.setFlat(True)
+        self._toggle_button.setStyleSheet(
+            "text-align: left; font-weight: bold; padding: 4px 0;"
+        )
+        self._toggle_button.toggled.connect(self._set_expanded)
+        layout.addWidget(self._toggle_button)
+
+        self._content_widget = QWidget()
+        self._content_layout = QVBoxLayout(self._content_widget)
+        self._content_layout.setContentsMargins(12, 0, 0, 0)
+        layout.addWidget(self._content_widget)
+
+        self._set_expanded(expanded)
+
+    def content_layout(self) -> QVBoxLayout:
+        """Return the layout used for the section content."""
+        return self._content_layout
+
+    def _set_expanded(self, expanded: bool) -> None:
+        """Show or hide the section content."""
+        prefix = "[-]" if expanded else "[+]"
+        self._toggle_button.setText(f"{prefix} {self._title}")
+        self._content_widget.setVisible(expanded)
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -102,6 +155,19 @@ def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
     hue = (index * 0.618033988749895) % 1.0
     red, green, blue = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
     return (red, green, blue, 1.0)
+
+
+def _point_heatmap_layer_name(
+    label: str,
+    origin_csv: str,
+    *,
+    include_origin: bool,
+) -> str:
+    """Return the viewer layer name for an imported point heatmap."""
+
+    if include_origin:
+        return f"Points Heatmap: {label} [{origin_csv}]"
+    return f"Points Heatmap: {label}"
 
 
 def _layer_metadata(layer) -> dict:
@@ -183,6 +249,9 @@ class NeuronViewerWidget(QWidget):
         self._region_query_source = "Atlas Regions"
         self._mask_bounds_source = "manual"
         self._histogram_line_sync_active = False
+        self._point_parquet_path: str | None = None
+        self._point_parquet_has_origin_csv = False
+        self._point_preview_counts: dict[tuple[str, str], int] = {}
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -255,11 +324,24 @@ class NeuronViewerWidget(QWidget):
 
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
-        layout = QVBoxLayout(parent)
+        parent_layout = QVBoxLayout(parent)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        parent_layout.addWidget(scroll_area)
+
+        content = QWidget()
+        scroll_area.setWidget(content)
+
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # SWC to Parquet conversion
-        convert_group = QGroupBox("Convert SWC to Parquet")
-        convert_layout = QVBoxLayout(convert_group)
+        convert_section = CollapsibleSection(
+            "Convert SWC to Parquet",
+            expanded=False,
+        )
+        convert_layout = convert_section.content_layout()
 
         convert_btn_row = QHBoxLayout()
         convert_dir_btn = QPushButton("From Directory...")
@@ -295,11 +377,11 @@ class NeuronViewerWidget(QWidget):
         self._convert_status_label = QLabel("")
         convert_layout.addWidget(self._convert_status_label)
 
-        layout.addWidget(convert_group)
+        layout.addWidget(convert_section)
 
         # File selection
-        file_group = QGroupBox("SWC Parquet Data")
-        file_layout = QVBoxLayout(file_group)
+        file_section = CollapsibleSection("SWC Parquet Data")
+        file_layout = file_section.content_layout()
 
         file_row = QHBoxLayout()
         self._file_label = QLabel("No file loaded")
@@ -315,13 +397,15 @@ class NeuronViewerWidget(QWidget):
         self._stats_label = QLabel("")
         file_layout.addWidget(self._stats_label)
 
-        layout.addWidget(file_group)
+        layout.addWidget(file_section)
 
         # Atlas selection
-        atlas_group = QGroupBox("Atlas")
-        atlas_layout = QHBoxLayout(atlas_group)
+        atlas_section = CollapsibleSection("Atlas")
+        atlas_layout = atlas_section.content_layout()
 
-        atlas_layout.addWidget(QLabel("Atlas:"))
+        atlas_row = QHBoxLayout()
+
+        atlas_row.addWidget(QLabel("Atlas:"))
         self._atlas_combo = QComboBox()
         self._atlas_combo.addItems(
             [
@@ -331,21 +415,25 @@ class NeuronViewerWidget(QWidget):
             ]
         )
         self._atlas_combo.setCurrentText("allen_mouse_25um")
-        atlas_layout.addWidget(self._atlas_combo)
+        atlas_row.addWidget(self._atlas_combo)
 
         load_atlas_btn = QPushButton("Load Atlas")
         load_atlas_btn.clicked.connect(self._load_atlas)
-        atlas_layout.addWidget(load_atlas_btn)
+        atlas_row.addWidget(load_atlas_btn)
 
-        layout.addWidget(atlas_group)
+        atlas_layout.addLayout(atlas_row)
 
         # Atlas status label
         self._atlas_status_label = QLabel("Atlas: Not loaded")
-        layout.addWidget(self._atlas_status_label)
+        atlas_layout.addWidget(self._atlas_status_label)
+        layout.addWidget(atlas_section)
 
         # Standardized point Parquet import
-        point_group = QGroupBox("Point Parquet Import")
-        point_layout = QVBoxLayout(point_group)
+        point_section = CollapsibleSection(
+            "Point Parquet Import",
+            expanded=False,
+        )
+        point_layout = point_section.content_layout()
 
         point_row = QHBoxLayout()
         self._point_file_label = QLabel("No point parquet imported")
@@ -357,15 +445,50 @@ class NeuronViewerWidget(QWidget):
         point_row.addWidget(import_point_btn)
         point_layout.addLayout(point_row)
 
+        self._point_preview_table = QTableWidget(0, 3)
+        self._point_preview_table.setHorizontalHeaderLabels(
+            ["Label", "Origin CSV", "Points"]
+        )
+        self._point_preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._point_preview_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._point_preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._point_preview_table.verticalHeader().setVisible(False)
+        point_header = self._point_preview_table.horizontalHeader()
+        point_header.setSectionResizeMode(
+            _POINT_PREVIEW_LABEL_COLUMN,
+            QHeaderView.Stretch,
+        )
+        point_header.setSectionResizeMode(
+            _POINT_PREVIEW_ORIGIN_COLUMN,
+            QHeaderView.Stretch,
+        )
+        point_header.setSectionResizeMode(
+            _POINT_PREVIEW_COUNT_COLUMN,
+            QHeaderView.ResizeToContents,
+        )
+        self._point_preview_table.itemSelectionChanged.connect(
+            self._update_point_import_controls
+        )
+        point_layout.addWidget(self._point_preview_table)
+
+        self._import_selected_point_heatmaps_btn = QPushButton(
+            "Import Selected Heatmaps"
+        )
+        self._import_selected_point_heatmaps_btn.setEnabled(False)
+        self._import_selected_point_heatmaps_btn.clicked.connect(
+            self._import_selected_point_heatmaps
+        )
+        point_layout.addWidget(self._import_selected_point_heatmaps_btn)
+
         self._point_import_status_label = QLabel("")
         self._point_import_status_label.setWordWrap(True)
         point_layout.addWidget(self._point_import_status_label)
 
-        layout.addWidget(point_group)
+        layout.addWidget(point_section)
 
         # Selected neurons table
-        neurons_group = QGroupBox("Selected Neurons")
-        neurons_layout = QVBoxLayout(neurons_group)
+        neurons_section = CollapsibleSection("Selected Neurons")
+        neurons_layout = neurons_section.content_layout()
 
         self._neuron_table = NeuronTableWidget()
         self._neuron_table.colors_changed.connect(self._apply_neuron_colors)
@@ -433,7 +556,7 @@ class NeuronViewerWidget(QWidget):
         self._render_status_label = QLabel("")
         neurons_layout.addWidget(self._render_status_label)
 
-        layout.addWidget(neurons_group)
+        layout.addWidget(neurons_section)
         layout.addStretch()
 
     def _setup_regions_tab(self, parent: QWidget) -> None:
@@ -944,9 +1067,86 @@ class NeuronViewerWidget(QWidget):
 
         self._load_point_parquet_file(filepath)
 
+    def _point_preview_key_from_row(self, row: int) -> tuple[str, str] | None:
+        """Return the selected label/origin key for a preview table row."""
+
+        item = self._point_preview_table.item(row, _POINT_PREVIEW_LABEL_COLUMN)
+        if item is None:
+            return None
+
+        key = item.data(Qt.UserRole)
+        if isinstance(key, tuple) and len(key) == 2:
+            return (str(key[0]), str(key[1]))
+
+        label = item.text().strip()
+        origin_item = self._point_preview_table.item(row, _POINT_PREVIEW_ORIGIN_COLUMN)
+        origin_csv = origin_item.text().strip() if origin_item is not None else ""
+        if not label:
+            return None
+        return (label, origin_csv or POINT_PARQUET_ORIGIN_NOT_RECORDED)
+
+    def _selected_point_preview_keys(self) -> list[tuple[str, str]]:
+        """Return the selected label/origin pairs from the preview table."""
+
+        rows = sorted({index.row() for index in self._point_preview_table.selectedIndexes()})
+        selected: list[tuple[str, str]] = []
+        for row in rows:
+            key = self._point_preview_key_from_row(row)
+            if key is not None:
+                selected.append(key)
+        return selected
+
+    def _update_point_import_controls(self) -> None:
+        """Enable or disable point import actions based on current selection."""
+
+        ready = bool(self._point_parquet_path) and bool(self._selected_point_preview_keys())
+        self._import_selected_point_heatmaps_btn.setEnabled(ready)
+
+    def _populate_point_parquet_preview(self, summary_df) -> None:
+        """Populate the point parquet preview table from a grouped summary."""
+
+        self._point_preview_counts.clear()
+        was_blocked = self._point_preview_table.blockSignals(True)
+        try:
+            self._point_preview_table.clearContents()
+            self._point_preview_table.setRowCount(len(summary_df))
+            for row_index, row in enumerate(summary_df.itertuples(index=False)):
+                label = str(row.label)
+                origin_csv = str(row.origin_csv)
+                point_count = int(row.point_count)
+                key = (label, origin_csv)
+                self._point_preview_counts[key] = point_count
+
+                label_item = QTableWidgetItem(label)
+                label_item.setData(Qt.UserRole, key)
+                origin_item = QTableWidgetItem(origin_csv)
+                count_item = QTableWidgetItem(f"{point_count:,}")
+                count_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                count_item.setData(Qt.UserRole, point_count)
+
+                self._point_preview_table.setItem(
+                    row_index,
+                    _POINT_PREVIEW_LABEL_COLUMN,
+                    label_item,
+                )
+                self._point_preview_table.setItem(
+                    row_index,
+                    _POINT_PREVIEW_ORIGIN_COLUMN,
+                    origin_item,
+                )
+                self._point_preview_table.setItem(
+                    row_index,
+                    _POINT_PREVIEW_COUNT_COLUMN,
+                    count_item,
+                )
+        finally:
+            self._point_preview_table.blockSignals(was_blocked)
+
+        self._point_preview_table.clearSelection()
+        self._update_point_import_controls()
+
     def _load_point_parquet_file(self, filepath: str) -> None:
-        """Load standardized point Parquet and add one heatmap layer per label."""
-        from napari.utils.colormaps import Colormap
+        """Load standardized point Parquet metadata into the preview table."""
 
         if self._atlas is None:
             message = "Load an atlas before importing point Parquet."
@@ -955,15 +1155,76 @@ class NeuronViewerWidget(QWidget):
             return
 
         try:
-            points_df = load_standard_point_parquet(filepath)
+            summary_df = summarize_standard_point_parquet_groups(filepath)
         except PointImportError as e:
             logger.error(f"Failed to load point Parquet: {e}")
             self._point_import_status_label.setText(f"Error: {e}")
             return
 
-        if points_df.empty:
-            self._point_file_label.setText(Path(filepath).name)
+        self._point_parquet_path = filepath
+        self._point_parquet_has_origin_csv = bool(
+            summary_df.attrs.get("has_origin_csv", False)
+        )
+        self._point_file_label.setText(Path(filepath).name)
+
+        if summary_df.empty:
+            self._point_preview_counts.clear()
+            self._point_preview_table.clearContents()
+            self._point_preview_table.setRowCount(0)
+            self._update_point_import_controls()
             self._point_import_status_label.setText("No points found in file.")
+            return
+
+        self._populate_point_parquet_preview(summary_df)
+        total_points = int(summary_df["point_count"].sum())
+        self._point_import_status_label.setText(
+            f"Loaded {total_points:,} point(s) across {len(summary_df)} "
+            "label/origin row(s). Select rows and click Import Selected Heatmaps."
+        )
+        logger.info(
+            "Loaded point Parquet preview %s with %d selectable row(s) and %d points",
+            filepath,
+            len(summary_df),
+            total_points,
+        )
+
+    def _import_selected_point_heatmaps(self) -> None:
+        """Create heatmap layers for the selected preview rows."""
+        from napari.utils.colormaps import Colormap
+
+        if self._atlas is None:
+            message = "Load an atlas before importing point Parquet."
+            self._point_import_status_label.setText(message)
+            show_warning(message)
+            return
+
+        if not self._point_parquet_path:
+            self._point_import_status_label.setText(
+                "Load a point Parquet before importing heatmaps."
+            )
+            return
+
+        selected_keys = self._selected_point_preview_keys()
+        if not selected_keys:
+            self._point_import_status_label.setText(
+                "Select at least one label/origin row."
+            )
+            return
+
+        try:
+            points_df = load_standard_point_parquet_selection(
+                self._point_parquet_path,
+                selected_keys,
+            )
+        except PointImportError as e:
+            logger.error(f"Failed to load selected point Parquet rows: {e}")
+            self._point_import_status_label.setText(f"Error: {e}")
+            return
+
+        if points_df.empty:
+            self._point_import_status_label.setText(
+                "No points matched the selected rows."
+            )
             return
 
         validation_summary = validate_point_metadata_against_atlas(
@@ -974,15 +1235,38 @@ class NeuronViewerWidget(QWidget):
             show_warning(format_atlas_validation_summary(validation_summary))
 
         opacity = self._opacity_slider.value() / 100.0
-        label_heatmaps = build_label_heatmap_volumes(points_df, self._atlas)
+        group_columns = (
+            ("label", "origin_csv")
+            if self._point_parquet_has_origin_csv
+            else ("label",)
+        )
+        grouped_heatmaps = build_grouped_point_heatmap_volumes(
+            points_df,
+            self._atlas,
+            group_columns,
+        )
+        columns = list(points_df.columns)
+        created_layers = 0
 
-        for color_idx, (label, volume) in enumerate(label_heatmaps.items()):
-            layer_name = f"Points Heatmap: {label}"
+        for color_idx, (label, origin_csv) in enumerate(selected_keys):
+            group_key = (
+                (label, origin_csv)
+                if self._point_parquet_has_origin_csv
+                else (label,)
+            )
+            volume = grouped_heatmaps.get(group_key)
+            if volume is None:
+                continue
+
+            layer_name = _point_heatmap_layer_name(
+                label,
+                origin_csv,
+                include_origin=self._point_parquet_has_origin_csv,
+            )
             for layer in list(self.viewer.layers):
                 if layer.name == layer_name:
                     self.viewer.layers.remove(layer)
 
-            label_df = points_df.loc[points_df["label"] == label]
             nonzero_voxels = int((volume > 0).sum())
             rgba = _point_heatmap_color(color_idx)
             colormap = Colormap(
@@ -997,11 +1281,12 @@ class NeuronViewerWidget(QWidget):
                 colormap=colormap,
                 opacity=opacity,
                 metadata={
-                    "source_path": filepath,
+                    "source_path": self._point_parquet_path,
                     "label": label,
-                    "point_count": len(label_df),
+                    "origin_csv": origin_csv,
+                    "point_count": self._point_preview_counts.get((label, origin_csv), 0),
                     "nonzero_voxels": nonzero_voxels,
-                    "columns": list(label_df.columns),
+                    "columns": columns,
                     "color": rgba,
                     "heatmap_source": True,
                     "heatmap_native_grid": True,
@@ -1009,11 +1294,11 @@ class NeuronViewerWidget(QWidget):
                     "heatmap_kind": "point_import",
                 },
             )
+            created_layers += 1
 
-        self._point_file_label.setText(Path(filepath).name)
         message = (
-            f"Imported {len(points_df):,} point(s) into {len(label_heatmaps)} "
-            f"heatmap layer(s)."
+            f"Imported {len(points_df):,} selected point(s) into {created_layers} "
+            "heatmap layer(s)."
         )
         if validation_summary.has_mismatches:
             message += (
@@ -1022,9 +1307,9 @@ class NeuronViewerWidget(QWidget):
             )
         self._point_import_status_label.setText(message)
         logger.info(
-            "Imported point Parquet %s with %d labels and %d points",
-            filepath,
-            len(label_heatmaps),
+            "Imported %d selected point heatmaps from %s covering %d points",
+            created_layers,
+            self._point_parquet_path,
             len(points_df),
         )
         self._refresh_heatmap_layer_list()
