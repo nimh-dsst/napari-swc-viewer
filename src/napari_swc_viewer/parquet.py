@@ -101,6 +101,21 @@ _WORKER_ANNOTATION_VOLUME: NDArray[np.int32] | None = None
 _WORKER_REGION_LOOKUP: dict[int, dict] | None = None
 
 
+def _clear_batch_worker_state() -> None:
+    """Release any process-local worker cache that can pin scratch files on Windows."""
+    global _WORKER_CONFIG, _WORKER_ANNOTATION_VOLUME, _WORKER_REGION_LOOKUP
+
+    annotation_volume = _WORKER_ANNOTATION_VOLUME
+    _WORKER_CONFIG = None
+    _WORKER_REGION_LOOKUP = None
+    _WORKER_ANNOTATION_VOLUME = None
+
+    if isinstance(annotation_volume, np.memmap):
+        mmap_handle = getattr(annotation_volume, "_mmap", None)
+        if mmap_handle is not None:
+            mmap_handle.close()
+
+
 def parse_filename_metadata(filename: str) -> dict[str, str]:
     """Extract subject and neuron ID from SWC filename.
 
@@ -465,9 +480,9 @@ def _init_batch_worker(
     """Initialize process-local shared state for chunk workers."""
     global _WORKER_CONFIG, _WORKER_ANNOTATION_VOLUME, _WORKER_REGION_LOOKUP
 
+    _clear_batch_worker_state()
     _WORKER_CONFIG = config
     _WORKER_REGION_LOOKUP = region_lookup
-    _WORKER_ANNOTATION_VOLUME = None
 
     if annotation_volume_path is not None:
         _WORKER_ANNOTATION_VOLUME = np.load(annotation_volume_path, mmap_mode="r")
@@ -539,11 +554,11 @@ def _merge_parquet_shards(
                     total_files or 0,
                     total_files or 0,
                 )
-            parquet_file = pq.ParquetFile(shard_path)
             if writer is None:
                 writer = _open_parquet_writer(output_path)
-            for batch in parquet_file.iter_batches():
-                writer.write_batch(batch)
+            with pq.ParquetFile(shard_path) as parquet_file:
+                for batch in parquet_file.iter_batches():
+                    writer.write_batch(batch)
     finally:
         if writer is not None:
             writer.close()
@@ -730,6 +745,7 @@ def _run_parallel_batch_conversion(
             output_path.parent.mkdir(parents=True, exist_ok=True)
             staged_output_path.replace(output_path)
     finally:
+        _clear_batch_worker_state()
         shutil.rmtree(work_dir, ignore_errors=True)
 
     return summary

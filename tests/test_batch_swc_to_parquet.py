@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
+import napari_swc_viewer.parquet as parquet_module
 from napari_swc_viewer.db import NeuronDatabase
 from napari_swc_viewer.parquet import (
     NEURON_SCHEMA,
@@ -380,6 +381,7 @@ def test_parallel_annotated_output_matches_serial_and_cleans_temp_dir(tmp_path, 
     assert parallel.failed_files == serial.failed_files == 0
     assert parallel.rows_written == serial.rows_written == 6
     assert _read_parquet_rows(parallel_output).equals(_read_parquet_rows(serial_output))
+    assert parquet_module._WORKER_ANNOTATION_VOLUME is None
     assert list(temp_root.iterdir()) == []
 
 
