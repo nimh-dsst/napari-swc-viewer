@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+
 
 class _BoundSignal:
     """Minimal signal object used by widget stubs."""
@@ -229,6 +231,14 @@ class _DummyCanvas(_DummyWidget):
         return None
 
 
+class _DummyColormap:
+    """Minimal napari Colormap stand-in."""
+
+    def __init__(self, colors, name: str) -> None:
+        self.colors = colors
+        self.name = name
+
+
 class _DummyCollapsibleSection(_DummyWidget):
     """Simple collapsible section stub that records constructor args."""
 
@@ -342,6 +352,50 @@ class _DummyViewer:
             events=types.SimpleNamespace(order=_DummyOrderSignal()),
         )
         self.layers = []
+        self.last_image_kwargs: dict[str, object] | None = None
+
+    def add_image(self, data, **kwargs):
+        layer = _DummyImageLayer(data, **kwargs)
+        self.layers.append(layer)
+        self.last_image_kwargs = dict(kwargs)
+        return layer
+
+
+class _DummyImageLayer:
+    """Minimal image layer stand-in for analysis heatmap tests."""
+
+    def __init__(self, data, **kwargs) -> None:
+        self.data = np.asarray(data)
+        self.name = str(kwargs["name"])
+        self.metadata = dict(kwargs.get("metadata", {}))
+        self.contrast_limits = tuple(kwargs.get("contrast_limits", (0.0, 1.0)))
+        self.contrast_limits_range = tuple(
+            kwargs.get("contrast_limits_range", self.contrast_limits)
+        )
+        self.rendering = kwargs.get("rendering")
+        self.blending = kwargs.get("blending")
+        self.opacity = kwargs.get("opacity")
+        self.visible = kwargs.get("visible", True)
+        self.scale = list(kwargs.get("scale", []))
+        self._keep_auto_contrast = False
+        self._slice_input = types.SimpleNamespace(ndisplay=2)
+        self.thumbnail_updates = 0
+        self.slice_updates: list[object] = []
+
+    def _update_thumbnail(self) -> None:
+        self.thumbnail_updates += 1
+
+    def reset_contrast_limits(self, mode=None) -> None:
+        self.contrast_limits = (-1.0, float(mode or -1.0))
+
+    def reset_contrast_limits_range(self, mode=None) -> None:
+        self.contrast_limits_range = (-2.0, float(mode or -2.0))
+
+    def _update_slice_response(self, response) -> object:
+        self.slice_updates.append(response)
+        self.contrast_limits = (4.0, 5.0)
+        self.contrast_limits_range = (4.0, 5.0)
+        return response
 
 
 class _FakeAtlas:
@@ -360,6 +414,15 @@ def _import_analysis_tab_module():
 
     figure_module = types.ModuleType("matplotlib.figure")
     figure_module.Figure = _DummyFigure
+
+    napari_module = types.ModuleType("napari")
+    napari_module.__path__ = []
+    napari_utils_module = types.ModuleType("napari.utils")
+    napari_utils_module.__path__ = []
+    napari_colormaps_module = types.ModuleType("napari.utils.colormaps")
+    napari_colormaps_module.Colormap = _DummyColormap
+    napari_module.utils = napari_utils_module
+    napari_utils_module.colormaps = napari_colormaps_module
 
     qtcore_module = types.ModuleType("qtpy.QtCore")
     qtcore_module.QThread = _DummyThread
@@ -410,6 +473,9 @@ def _import_analysis_tab_module():
         "seaborn": types.ModuleType("seaborn"),
         "matplotlib.backends.backend_qtagg": backend_module,
         "matplotlib.figure": figure_module,
+        "napari": napari_module,
+        "napari.utils": napari_utils_module,
+        "napari.utils.colormaps": napari_colormaps_module,
         "qtpy.QtCore": qtcore_module,
         "qtpy.QtGui": qtgui_module,
         "qtpy.QtWidgets": qtwidgets_module,
@@ -456,6 +522,36 @@ def _make_selector(
     selector.selected = selected
     selector._structure_map = structure_map or {}
     return selector
+
+
+def _install_fake_napari_colormaps():
+    """Install a minimal ``napari.utils.colormaps`` module for one test."""
+    napari_module = types.ModuleType("napari")
+    napari_module.__path__ = []
+    napari_utils_module = types.ModuleType("napari.utils")
+    napari_utils_module.__path__ = []
+    napari_colormaps_module = types.ModuleType("napari.utils.colormaps")
+    napari_colormaps_module.Colormap = _DummyColormap
+    napari_module.utils = napari_utils_module
+    napari_utils_module.colormaps = napari_colormaps_module
+
+    replacements = {
+        "napari": napari_module,
+        "napari.utils": napari_utils_module,
+        "napari.utils.colormaps": napari_colormaps_module,
+    }
+    previous = {name: sys.modules.get(name) for name in replacements}
+    sys.modules.update(replacements)
+    return previous
+
+
+def _restore_modules(previous: dict[str, object | None]) -> None:
+    """Restore modules temporarily replaced during a test."""
+    for name, original in previous.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
 
 
 def test_analysis_region_sections_are_collapsed_by_default():
@@ -609,3 +705,163 @@ def test_update_region_summary_labels_uses_selected_region_and_blank_heatmap():
 
     assert widget._cluster_region_summary_label.text() == "FRP (Frontal pole)"
     assert widget._heat_region_summary_label.text() == "All regions"
+
+
+def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
+    """Analysis heatmaps should be added with explicit full-volume contrast limits."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._viewer = _DummyViewer()
+    widget._progress_bar = _DummyProgressBar()
+    widget._progress_label = _DummyLabel()
+    widget._update_button_states = lambda: None
+    widget._atlas = types.SimpleNamespace(atlas_name="fake_atlas")
+    widget._pending_heatmap_cluster = 1
+    widget._pending_heatmap_region = "CH"
+    widget._pending_heatmap_depth_bin = 3
+    widget._pending_heatmap_depth_axis = 1
+    widget._cluster_label_colors = {1: [0.1, 0.2, 0.3, 1.0]}
+
+    volume = np.zeros((2, 3, 4), dtype=np.float32)
+    volume[1, 2, 3] = 7.0
+
+    previous = _install_fake_napari_colormaps()
+    try:
+        widget._on_heatmap_finished(volume)
+    finally:
+        _restore_modules(previous)
+
+    layer = widget._heatmap_layer
+    assert layer.name == "Cluster 1 CH Heatmap"
+    assert layer.contrast_limits == (0.0, 7.0)
+    assert layer.contrast_limits_range == (0.0, 7.0)
+    assert layer.scale == [1.0, 3.0, 1.0]
+    assert layer.metadata["heatmap_kind"] == "analysis"
+    assert layer.metadata["heatmap_contrast_limits"] == (0.0, 7.0)
+    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
+
+
+def test_analysis_heatmap_workaround_swallows_thumbnail_rank_mismatch():
+    """Known napari thumbnail rank errors should be suppressed for analysis heatmaps."""
+    module = _import_analysis_tab_module()
+
+    class _CrashLayer(_DummyImageLayer):
+        def _update_thumbnail(self) -> None:
+            raise RuntimeError("sequence argument must have length equal to input rank")
+
+    layer = _CrashLayer(
+        np.zeros((2, 2, 2), dtype=np.float32),
+        name="Cluster 1 CH Heatmap",
+        metadata={
+            "heatmap_kind": "analysis",
+            "heatmap_contrast_limits": (0.0, 5.0),
+        },
+        contrast_limits=(0.0, 5.0),
+        contrast_limits_range=(0.0, 5.0),
+    )
+
+    module._install_analysis_heatmap_layer_workarounds(layer)
+
+    layer._update_thumbnail()
+    assert layer._analysis_heatmap_thumbnail_warning_logged is True
+
+
+def test_analysis_heatmap_workaround_resets_to_stored_limits():
+    """Reset hooks should restore stored full-volume contrast limits."""
+    module = _import_analysis_tab_module()
+    layer = _DummyImageLayer(
+        np.zeros((2, 2, 2), dtype=np.float32),
+        name="Cluster 1 CH Heatmap",
+        metadata={
+            "heatmap_kind": "analysis",
+            "heatmap_contrast_limits": (0.0, 9.0),
+        },
+        contrast_limits=(1.0, 2.0),
+        contrast_limits_range=(1.0, 2.0),
+    )
+    layer._slice_input = types.SimpleNamespace(ndisplay=3)
+
+    module._install_analysis_heatmap_layer_workarounds(layer)
+    layer.reset_contrast_limits()
+
+    assert layer.contrast_limits == (0.0, 9.0)
+    assert layer.contrast_limits_range == (0.0, 9.0)
+
+    layer.contrast_limits_range = (3.0, 4.0)
+    layer.reset_contrast_limits_range()
+
+    assert layer.contrast_limits_range == (0.0, 9.0)
+
+
+def test_analysis_heatmap_workaround_keeps_stable_limits_during_slice_updates():
+    """Continuous auto-contrast should not replace stored full-volume heatmap limits."""
+    module = _import_analysis_tab_module()
+    layer = _DummyImageLayer(
+        np.zeros((2, 2, 2), dtype=np.float32),
+        name="Cluster 1 CH Heatmap",
+        metadata={
+            "heatmap_kind": "analysis",
+            "heatmap_contrast_limits": (0.0, 11.0),
+        },
+        contrast_limits=(0.0, 11.0),
+        contrast_limits_range=(0.0, 11.0),
+    )
+    layer._keep_auto_contrast = True
+    layer._slice_input = types.SimpleNamespace(ndisplay=3)
+
+    module._install_analysis_heatmap_layer_workarounds(layer)
+    response = types.SimpleNamespace(
+        slice_input=types.SimpleNamespace(ndisplay=3),
+        payload={"slice": 1},
+    )
+    result = layer._update_slice_response(response)
+
+    assert result is response
+    assert layer.slice_updates == [response]
+    assert layer._keep_auto_contrast is True
+    assert layer.contrast_limits == (0.0, 11.0)
+    assert layer.contrast_limits_range == (0.0, 11.0)
+
+
+def test_analysis_heatmap_workaround_preserves_2d_auto_contrast_behavior():
+    """2D continuous auto-contrast should still use the original napari path."""
+    module = _import_analysis_tab_module()
+    layer = _DummyImageLayer(
+        np.zeros((2, 2, 2), dtype=np.float32),
+        name="Cluster 1 CH Heatmap",
+        metadata={
+            "heatmap_kind": "analysis",
+            "heatmap_contrast_limits": (0.0, 11.0),
+        },
+        contrast_limits=(0.0, 11.0),
+        contrast_limits_range=(0.0, 11.0),
+    )
+    layer._keep_auto_contrast = True
+    layer._slice_input = types.SimpleNamespace(ndisplay=2)
+
+    module._install_analysis_heatmap_layer_workarounds(layer)
+    response = types.SimpleNamespace(
+        slice_input=types.SimpleNamespace(ndisplay=2),
+        payload={"slice": 2},
+    )
+    result = layer._update_slice_response(response)
+
+    assert result is response
+    assert layer.slice_updates == [response]
+    assert layer.contrast_limits == (4.0, 5.0)
+    assert layer.contrast_limits_range == (4.0, 5.0)
+
+    layer.reset_contrast_limits()
+    assert layer.contrast_limits == (-1.0, -1.0)
+
+
+def test_analysis_heatmap_contrast_limits_fallback_for_zero_volume():
+    """All-zero analysis heatmaps should keep the default visible contrast range."""
+    module = _import_analysis_tab_module()
+
+    limits = module._analysis_heatmap_contrast_limits(
+        np.zeros((3, 3, 3), dtype=np.float32)
+    )
+
+    assert limits == (0.0, 1.0)
