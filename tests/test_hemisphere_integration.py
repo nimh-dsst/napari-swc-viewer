@@ -6,7 +6,9 @@ flipped coordinates against known expected results.
 
 import json
 import re
+import socket
 import ssl
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -23,6 +25,7 @@ FLIPPED_DIR = TEST_DATA_DIR / "flipped"
 # BIL API endpoints
 API_BASE = "https://api.brainimagelibrary.org"
 DOWNLOAD_BASE = "https://download.brainimagelibrary.org"
+REQUEST_TIMEOUT_SECONDS = 15
 
 # Known submission UUID for the morphology dataset (from DOI 10.35077/g.73)
 MORPHOLOGY_SUBMISSION_UUID = "0fcde5fdd6f7ccb2"
@@ -30,6 +33,18 @@ MORPHOLOGY_SUBMISSION_UUID = "0fcde5fdd6f7ccb2"
 # Test file to download and compare
 TEST_FILENAME = "1119749665_17545_3134-X21894-Y19320_reg.swc"
 EXPECTED_FLIPPED_FILENAME = "1119749665_17545_3134-X21894-Y19320_reg_right.swc"
+
+
+class BILRequestError(RuntimeError):
+    """Raised when a BIL request cannot be completed reliably."""
+
+
+class BILRequestTimeout(BILRequestError):
+    """Raised when a BIL request exceeds the configured timeout."""
+
+
+class BILRequestUnavailable(BILRequestError):
+    """Raised when a BIL request fails due to network availability issues."""
 
 
 def get_ssl_context():
@@ -40,12 +55,35 @@ def get_ssl_context():
     return ctx
 
 
+def read_url(url: str) -> bytes:
+    """Read a BIL URL with a bounded timeout."""
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(
+            req,
+            context=get_ssl_context(),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            return response.read()
+    except (TimeoutError, socket.timeout) as exc:
+        raise BILRequestTimeout(
+            f"Timed out after {REQUEST_TIMEOUT_SECONDS}s requesting {url}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)) or (
+            reason is not None and "timed out" in str(reason).lower()
+        ):
+            raise BILRequestTimeout(
+                f"Timed out after {REQUEST_TIMEOUT_SECONDS}s requesting {url}"
+            ) from exc
+        raise BILRequestUnavailable(f"Failed to reach {url}: {exc.reason}") from exc
+
+
 def api_get(endpoint: str) -> dict:
     """Make a GET request to the BIL API."""
     url = f"{API_BASE}/{endpoint}"
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, context=get_ssl_context()) as response:
-        return json.loads(response.read().decode())
+    return json.loads(read_url(url).decode())
 
 
 def find_file_url(filename: str) -> str | None:
@@ -91,10 +129,13 @@ def find_file_url(filename: str) -> str | None:
             dir_url = f"{DOWNLOAD_BASE}/{download_path}/"
 
             try:
-                req = urllib.request.Request(dir_url)
-                with urllib.request.urlopen(req, context=get_ssl_context()) as response:
-                    html = response.read().decode()
+                html = read_url(dir_url).decode()
+            except BILRequestError:
+                raise
+            except Exception:
+                continue
 
+            try:
                 # Check if our target file is in this directory
                 if f'href="{filename}"' in html:
                     return f"{DOWNLOAD_BASE}/{download_path}/{filename}"
@@ -107,10 +148,10 @@ def find_file_url(filename: str) -> str | None:
 def download_file(url: str, output_path: Path) -> bool:
     """Download a file from URL to output_path."""
     try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, context=get_ssl_context()) as response:
-            output_path.write_bytes(response.read())
+        output_path.write_bytes(read_url(url))
         return True
+    except BILRequestError:
+        raise
     except Exception:
         return False
 
@@ -127,11 +168,20 @@ def bil_test_file() -> Path:
         return output_path
 
     # Find and download the file
-    url = find_file_url(TEST_FILENAME)
+    try:
+        url = find_file_url(TEST_FILENAME)
+    except BILRequestError as exc:
+        pytest.skip(str(exc))
+
     if url is None:
         pytest.skip(f"Could not find {TEST_FILENAME} in BIL dataset")
 
-    if not download_file(url, output_path):
+    try:
+        downloaded = download_file(url, output_path)
+    except BILRequestError as exc:
+        pytest.skip(str(exc))
+
+    if not downloaded:
         pytest.skip(f"Failed to download {TEST_FILENAME} from BIL")
 
     return output_path

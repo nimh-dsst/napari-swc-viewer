@@ -74,6 +74,7 @@ from .reference_layers import (
     remove_region_segmentation,
 )
 from .analysis_tab import AnalysisTabWidget
+from .collapsible_section import CollapsibleSection
 from .mask_layer_selector import MaskLayerSelectorWidget
 from .neuron_table import NeuronTableWidget
 from .region_selector import RegionSelectorWidget
@@ -100,50 +101,6 @@ _HISTOGRAM_BIN_COUNT = 256
 _POINT_PREVIEW_LABEL_COLUMN = 0
 _POINT_PREVIEW_ORIGIN_COLUMN = 1
 _POINT_PREVIEW_COUNT_COLUMN = 2
-
-
-class CollapsibleSection(QWidget):
-    """Simple collapsible section for dense tab layouts."""
-
-    def __init__(
-        self,
-        title: str,
-        *,
-        expanded: bool = True,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._title = title
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self._toggle_button = QPushButton()
-        self._toggle_button.setCheckable(True)
-        self._toggle_button.setChecked(expanded)
-        self._toggle_button.setFlat(True)
-        self._toggle_button.setStyleSheet(
-            "text-align: left; font-weight: bold; padding: 4px 0;"
-        )
-        self._toggle_button.toggled.connect(self._set_expanded)
-        layout.addWidget(self._toggle_button)
-
-        self._content_widget = QWidget()
-        self._content_layout = QVBoxLayout(self._content_widget)
-        self._content_layout.setContentsMargins(12, 0, 0, 0)
-        layout.addWidget(self._content_widget)
-
-        self._set_expanded(expanded)
-
-    def content_layout(self) -> QVBoxLayout:
-        """Return the layout used for the section content."""
-        return self._content_layout
-
-    def _set_expanded(self, expanded: bool) -> None:
-        """Show or hide the section content."""
-        prefix = "[-]" if expanded else "[+]"
-        self._toggle_button.setText(f"{prefix} {self._title}")
-        self._content_widget.setVisible(expanded)
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
