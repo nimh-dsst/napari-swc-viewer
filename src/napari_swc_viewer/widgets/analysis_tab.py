@@ -11,7 +11,8 @@ Provides UI for:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from types import MethodType
+from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,6 +44,183 @@ if TYPE_CHECKING:
     from ..db import NeuronDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def _analysis_heatmap_contrast_limits(
+    volume: np.ndarray,
+) -> tuple[float, float]:
+    """Return stable full-volume contrast limits for an analysis heatmap."""
+    if volume.size == 0:
+        return (0.0, 1.0)
+
+    upper = float(np.nanmax(volume))
+    if not np.isfinite(upper) or upper <= 0.0:
+        return (0.0, 1.0)
+    return (0.0, upper)
+
+
+def _analysis_heatmap_stored_limits(
+    layer: Any,
+) -> tuple[float, float] | None:
+    """Return stored contrast limits from analysis heatmap metadata."""
+    metadata = getattr(layer, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+
+    raw_limits = metadata.get("heatmap_contrast_limits")
+    if raw_limits is None:
+        return None
+
+    try:
+        values = np.asarray(raw_limits, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+
+    if values.size < 2:
+        return None
+
+    lower = float(values[0])
+    upper = float(values[1])
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+        return None
+    return (lower, upper)
+
+
+def _apply_analysis_heatmap_contrast_limits(
+    layer: Any,
+    limits: tuple[float, float],
+) -> None:
+    """Apply stored full-volume contrast limits to an analysis heatmap layer."""
+    keep_auto = bool(getattr(layer, "_keep_auto_contrast", False))
+    if keep_auto:
+        layer._keep_auto_contrast = False
+    try:
+        layer.contrast_limits_range = limits
+        layer.contrast_limits = limits
+    finally:
+        layer._keep_auto_contrast = keep_auto
+
+
+def _is_thumbnail_rank_mismatch_error(error: RuntimeError) -> bool:
+    """Return whether napari thumbnail generation hit the known rank bug."""
+    return "sequence argument must have length equal to input rank" in str(error)
+
+
+def _analysis_heatmap_ndisplay(layer: Any, response: Any | None = None) -> int | None:
+    """Return the current display dimensionality for a heatmap layer."""
+    slice_input = getattr(response, "slice_input", None)
+    ndisplay = getattr(slice_input, "ndisplay", None)
+    if isinstance(ndisplay, int):
+        return ndisplay
+
+    slice_input = getattr(layer, "_slice_input", None)
+    ndisplay = getattr(slice_input, "ndisplay", None)
+    if isinstance(ndisplay, int):
+        return ndisplay
+    return None
+
+
+def _analysis_heatmap_requires_stable_limits(
+    layer: Any, response: Any | None = None
+) -> bool:
+    """Return whether the 3D napari workaround should be active."""
+    return _analysis_heatmap_ndisplay(layer, response) == 3
+
+
+def _install_analysis_heatmap_layer_workarounds(layer: Any) -> None:
+    """Install stable contrast behavior on one analysis heatmap layer."""
+    metadata = getattr(layer, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    if metadata.get("heatmap_kind") != "analysis":
+        return
+    if getattr(layer, "_analysis_heatmap_workarounds_installed", False):
+        return
+
+    original_update_thumbnail = getattr(layer, "_update_thumbnail", None)
+    if callable(original_update_thumbnail):
+
+        def _safe_update_thumbnail(self) -> None:
+            try:
+                original_update_thumbnail()
+            except RuntimeError as error:
+                if not _is_thumbnail_rank_mismatch_error(error):
+                    raise
+                if not getattr(
+                    self, "_analysis_heatmap_thumbnail_warning_logged", False
+                ):
+                    logger.warning(
+                        "Suppressed napari thumbnail update failure for "
+                        "analysis heatmap '%s': %s",
+                        getattr(self, "name", "<unnamed>"),
+                        error,
+                    )
+                    self._analysis_heatmap_thumbnail_warning_logged = True
+
+        layer._update_thumbnail = MethodType(_safe_update_thumbnail, layer)
+
+    original_reset_contrast_limits = getattr(layer, "reset_contrast_limits", None)
+    if callable(original_reset_contrast_limits):
+
+        def _stable_reset_contrast_limits(self, mode=None) -> None:
+            if not _analysis_heatmap_requires_stable_limits(self):
+                original_reset_contrast_limits(mode)
+                return
+            limits = _analysis_heatmap_stored_limits(self)
+            if limits is None:
+                original_reset_contrast_limits(mode)
+                return
+            _apply_analysis_heatmap_contrast_limits(self, limits)
+
+        layer.reset_contrast_limits = MethodType(
+            _stable_reset_contrast_limits, layer
+        )
+
+    original_reset_contrast_limits_range = getattr(
+        layer, "reset_contrast_limits_range", None
+    )
+    if callable(original_reset_contrast_limits_range):
+
+        def _stable_reset_contrast_limits_range(self, mode=None) -> None:
+            if not _analysis_heatmap_requires_stable_limits(self):
+                original_reset_contrast_limits_range(mode)
+                return
+            limits = _analysis_heatmap_stored_limits(self)
+            if limits is None:
+                original_reset_contrast_limits_range(mode)
+                return
+            self.contrast_limits_range = limits
+
+        layer.reset_contrast_limits_range = MethodType(
+            _stable_reset_contrast_limits_range, layer
+        )
+
+    original_update_slice_response = getattr(layer, "_update_slice_response", None)
+    if callable(original_update_slice_response):
+
+        def _stable_update_slice_response(self, response) -> Any:
+            keep_auto = bool(getattr(self, "_keep_auto_contrast", False))
+            if not keep_auto or not _analysis_heatmap_requires_stable_limits(
+                self, response
+            ):
+                return original_update_slice_response(response)
+
+            self._keep_auto_contrast = False
+            try:
+                result = original_update_slice_response(response)
+            finally:
+                self._keep_auto_contrast = True
+
+            limits = _analysis_heatmap_stored_limits(self)
+            if limits is not None:
+                _apply_analysis_heatmap_contrast_limits(self, limits)
+            return result
+
+        layer._update_slice_response = MethodType(
+            _stable_update_slice_response, layer
+        )
+
+    layer._analysis_heatmap_workarounds_installed = True
 
 
 class AnalysisTabWidget(QWidget):
@@ -746,6 +924,7 @@ class AnalysisTabWidget(QWidget):
         self._progress_label.setText(
             f"{layer_name}: {(volume > 0).sum():,} non-zero voxels"
         )
+        contrast_limits = _analysis_heatmap_contrast_limits(volume)
 
         # Remove existing layer with the same name
         for layer in list(self._viewer.layers):
@@ -755,6 +934,18 @@ class AnalysisTabWidget(QWidget):
         # Set scale so the binned depth axis stays spatially aligned
         scale = [1.0, 1.0, 1.0]
         scale[self._pending_heatmap_depth_axis] = float(self._pending_heatmap_depth_bin)
+        metadata = {
+            "heatmap_source": True,
+            "heatmap_native_grid": self._pending_heatmap_depth_bin == 1,
+            "atlas_name": getattr(self._atlas, "atlas_name", None),
+            "heatmap_kind": "analysis",
+            "heatmap_region": region,
+            "heatmap_cluster": cluster_label,
+            "depth_bin_factor": self._pending_heatmap_depth_bin,
+            "depth_axis": self._pending_heatmap_depth_axis,
+            "heatmap_contrast_limits": contrast_limits,
+            "heatmap_autocontrast_policy": "stable_full_volume",
+        }
 
         self._heatmap_layer = self._viewer.add_image(
             volume,
@@ -765,17 +956,10 @@ class AnalysisTabWidget(QWidget):
             opacity=0.7,
             visible=True,
             scale=scale,
-            metadata={
-                "heatmap_source": True,
-                "heatmap_native_grid": self._pending_heatmap_depth_bin == 1,
-                "atlas_name": getattr(self._atlas, "atlas_name", None),
-                "heatmap_kind": "analysis",
-                "heatmap_region": region,
-                "heatmap_cluster": cluster_label,
-                "depth_bin_factor": self._pending_heatmap_depth_bin,
-                "depth_axis": self._pending_heatmap_depth_axis,
-            },
+            contrast_limits=contrast_limits,
+            metadata=metadata,
         )
+        _install_analysis_heatmap_layer_workarounds(self._heatmap_layer)
 
     def _on_error(self, message: str) -> None:
         """Handle worker errors."""
