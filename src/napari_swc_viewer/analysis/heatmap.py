@@ -24,7 +24,7 @@ def build_node_counts_volume(
     conn: duckdb.DuckDBPyConnection,
     parquet_path: str,
     atlas: BrainGlobeAtlas,
-    region_acronym: str | None = None,
+    region_ids: list[int] | None = None,
     file_ids: list[str] | None = None,
     depth_bin_factor: int = 1,
     depth_axis: int = 0,
@@ -42,8 +42,8 @@ def build_node_counts_volume(
         Path to parquet file containing neuron node data.
     atlas : BrainGlobeAtlas
         Atlas for volume shape and resolution.
-    region_acronym : str, optional
-        Filter to nodes in this region only.
+    region_ids : list[int], optional
+        Filter to nodes whose annotation region ID is in this list.
     file_ids : list[str], optional
         Filter to specific neurons.
     depth_bin_factor : int
@@ -74,9 +74,10 @@ def build_node_counts_volume(
     # Build WHERE clauses
     where_clauses = []
     params = []
-    if region_acronym is not None:
-        where_clauses.append("region_acronym = ?")
-        params.append(region_acronym)
+    if region_ids:
+        placeholders = ", ".join(["?"] * len(region_ids))
+        where_clauses.append(f"region_id IN ({placeholders})")
+        params.extend(int(region_id) for region_id in region_ids)
     if file_ids is not None and len(file_ids) > 0:
         placeholders = ", ".join(["?"] * len(file_ids))
         where_clauses.append(f"file_id IN ({placeholders})")

@@ -18,12 +18,11 @@ import numpy as np
 import seaborn as sns
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from qtpy.QtCore import QThread, Qt, Signal
+from qtpy.QtCore import QThread, Signal
 from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QProgressBar,
@@ -32,6 +31,9 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .collapsible_section import CollapsibleSection
+from .region_selector import RegionSelectorWidget
 
 if TYPE_CHECKING:
     import napari
@@ -73,7 +75,7 @@ class AnalysisTabWidget(QWidget):
         self._pending_heatmap_depth_axis: int = 0
         self._last_heatmap_file_ids: list[str] | None = None
         self._slice_projector = None
-        self._available_regions: list[str] = []
+        self._dataset_region_ids: set[int] = set()
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -87,17 +89,35 @@ class AnalysisTabWidget(QWidget):
         self._update_button_states()
 
     def refresh_available_regions_from_database(self) -> None:
-        """Populate analysis-region dropdowns from the loaded neuron parquet."""
+        """Cache dataset region IDs and refresh analysis selectors."""
         if self._db is None:
-            self.set_available_regions([])
+            self._dataset_region_ids = set()
+            self._refresh_analysis_region_selectors()
             return
 
         regions_df = self._db.get_unique_regions()
-        self.set_available_regions(regions_df["region_acronym"].tolist())
+        normalized_ids: set[int] = set()
+        region_values = regions_df["region_id"] if "region_id" in regions_df else []
+        for region_id in list(region_values):
+            if region_id is None:
+                continue
+            if isinstance(region_id, (float, np.floating)) and np.isnan(region_id):
+                continue
+
+            try:
+                value = int(region_id)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                normalized_ids.add(value)
+
+        self._dataset_region_ids = normalized_ids
+        self._refresh_analysis_region_selectors()
 
     def set_atlas(self, atlas: BrainGlobeAtlas) -> None:
         """Set the atlas instance."""
         self._atlas = atlas
+        self._refresh_analysis_region_selectors()
         self._update_button_states()
         self._update_voxel_depth_label()
 
@@ -122,8 +142,11 @@ class AnalysisTabWidget(QWidget):
         layout = QVBoxLayout(self)
 
         # --- Clustering group ---
-        corr_group = QGroupBox("Clustering")
-        corr_layout = QVBoxLayout(corr_group)
+        self._clustering_section = CollapsibleSection(
+            "Clustering",
+            expanded=True,
+        )
+        corr_layout = self._clustering_section.content_layout()
 
         # Clustering method
         method_type_row = QHBoxLayout()
@@ -151,10 +174,25 @@ class AnalysisTabWidget(QWidget):
         # Target region
         region_row = QHBoxLayout()
         region_row.addWidget(QLabel("Target region:"))
-        self._region_combo = QComboBox()
-        self._region_combo.setEditable(True)
-        region_row.addWidget(self._region_combo)
+        self._cluster_region_summary_label = QLabel("None selected")
+        region_row.addWidget(self._cluster_region_summary_label)
         corr_layout.addLayout(region_row)
+
+        self._cluster_region_section = CollapsibleSection(
+            "Select Target Region",
+            expanded=False,
+        )
+        cluster_region_layout = self._cluster_region_section.content_layout()
+        self._cluster_region_selector = RegionSelectorWidget(
+            single_select=True,
+            show_include_children=False,
+            force_include_children=True,
+        )
+        self._cluster_region_selector.selection_changed.connect(
+            self._on_cluster_region_selection_changed
+        )
+        cluster_region_layout.addWidget(self._cluster_region_selector)
+        corr_layout.addWidget(self._cluster_region_section)
 
         # Dilation fraction
         dilation_row = QHBoxLayout()
@@ -219,21 +257,39 @@ class AnalysisTabWidget(QWidget):
         self._color_by_cluster_btn.clicked.connect(self._color_neurons_by_cluster)
         corr_layout.addWidget(self._color_by_cluster_btn)
 
-        layout.addWidget(corr_group)
+        layout.addWidget(self._clustering_section)
 
         # Set initial visibility
         self._on_clustering_method_changed(self._clustering_method_combo.currentText())
 
         # --- Node Count Heatmap group ---
-        heat_group = QGroupBox("Node Count Heatmap")
-        heat_layout = QVBoxLayout(heat_group)
+        self._heatmap_section = CollapsibleSection(
+            "Node Count Heatmap",
+            expanded=True,
+        )
+        heat_layout = self._heatmap_section.content_layout()
 
         heat_region_row = QHBoxLayout()
         heat_region_row.addWidget(QLabel("Region filter:"))
-        self._heat_region_combo = QComboBox()
-        self._heat_region_combo.setEditable(True)
-        heat_region_row.addWidget(self._heat_region_combo)
+        self._heat_region_summary_label = QLabel("All regions")
+        heat_region_row.addWidget(self._heat_region_summary_label)
         heat_layout.addLayout(heat_region_row)
+
+        self._heat_region_section = CollapsibleSection(
+            "Select Heatmap Region",
+            expanded=False,
+        )
+        heat_region_selector_layout = self._heat_region_section.content_layout()
+        self._heat_region_selector = RegionSelectorWidget(
+            single_select=True,
+            show_include_children=False,
+            force_include_children=True,
+        )
+        self._heat_region_selector.selection_changed.connect(
+            self._on_heat_region_selection_changed
+        )
+        heat_region_selector_layout.addWidget(self._heat_region_selector)
+        heat_layout.addWidget(self._heat_region_section)
 
         # Cluster filter
         cluster_filter_row = QHBoxLayout()
@@ -265,78 +321,159 @@ class AnalysisTabWidget(QWidget):
         self._run_heat_btn.clicked.connect(self._run_heatmap_pipeline)
         heat_layout.addWidget(self._run_heat_btn)
 
-        layout.addWidget(heat_group)
+        layout.addWidget(self._heatmap_section)
 
         # --- Progress bar ---
+        self._progress_section = CollapsibleSection(
+            "Progress",
+            expanded=True,
+        )
+        progress_layout = self._progress_section.content_layout()
         self._progress_label = QLabel("")
-        layout.addWidget(self._progress_label)
+        progress_layout.addWidget(self._progress_label)
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
-        layout.addWidget(self._progress_bar)
+        progress_layout.addWidget(self._progress_bar)
+        layout.addWidget(self._progress_section)
 
         # --- Matplotlib canvas for clustermap ---
+        self._clustermap_section = CollapsibleSection(
+            "Clustermap",
+            expanded=False,
+        )
+        clustermap_layout = self._clustermap_section.content_layout()
         self._figure = Figure(figsize=(6, 6))
         self._canvas = FigureCanvasQTAgg(self._figure)
         self._canvas.setMinimumHeight(400)
-        layout.addWidget(self._canvas)
+        clustermap_layout.addWidget(self._canvas)
+        layout.addWidget(self._clustermap_section)
 
         layout.addStretch()
-        self.set_available_regions([])
+        self._refresh_analysis_region_selectors()
 
-    def _set_region_combo_items(
+    def _format_selected_region_text(
         self,
-        combo: QComboBox,
-        items: list[str],
+        selector: RegionSelectorWidget | None,
         *,
-        allow_blank: bool,
-    ) -> None:
-        """Replace combo options while preserving the current value when possible."""
-        current = combo.currentText().strip()
-        entries = [""] if allow_blank else []
-        entries.extend(items)
+        empty_text: str,
+    ) -> str:
+        """Return a compact summary string for a selector's current region."""
+        if selector is None:
+            return empty_text
 
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItems(entries)
+        selected = selector.get_single_selected_region()
+        if selected is None:
+            return empty_text
 
-        if current and current in entries:
-            combo.setCurrentText(current)
-        elif allow_blank:
-            combo.setCurrentText("")
-        elif entries:
-            combo.setCurrentText(entries[0])
-        else:
-            combo.setEditText("")
+        struct_id, acronym = selected
+        struct = selector._structure_map.get(struct_id, {})
+        name = str(struct.get("name", "")).strip()
+        if name and name != acronym:
+            return f"{acronym} ({name})"
+        return acronym
 
-        combo.blockSignals(False)
-
-    def set_available_regions(self, regions: list[str]) -> None:
-        """Limit analysis region dropdowns to the supplied acronyms."""
-        normalized_regions: set[str] = set()
-        for region in regions:
-            if region is None:
-                continue
-            if isinstance(region, (float, np.floating)) and np.isnan(region):
-                continue
-
-            text = str(region).strip()
-            if not text:
-                continue
-
-            normalized_regions.add(text)
-
-        normalized = sorted(normalized_regions)
-        self._available_regions = normalized
-        self._set_region_combo_items(
-            self._region_combo,
-            normalized,
-            allow_blank=False,
+    def _update_region_summary_labels(self) -> None:
+        """Refresh the visible region summary labels for Analysis workflows."""
+        self._cluster_region_summary_label.setText(
+            self._format_selected_region_text(
+                getattr(self, "_cluster_region_selector", None),
+                empty_text="None selected",
+            )
         )
-        self._set_region_combo_items(
-            self._heat_region_combo,
-            normalized,
-            allow_blank=True,
+        self._heat_region_summary_label.setText(
+            self._format_selected_region_text(
+                getattr(self, "_heat_region_selector", None),
+                empty_text="All regions",
+            )
         )
+
+    def _analysis_allowed_structure_ids(self) -> set[int]:
+        """Return dataset-backed visible structure IDs for Analysis selectors."""
+        if self._atlas is None or not self._dataset_region_ids:
+            return set()
+
+        allowed_ids: set[int] = set()
+        for region_id in self._dataset_region_ids:
+            struct = self._atlas.structures.get(int(region_id))
+            if struct is None:
+                continue
+            allowed_ids.add(int(region_id))
+            for path_id in struct.get("structure_id_path", []) or []:
+                try:
+                    allowed_ids.add(int(path_id))
+                except (TypeError, ValueError):
+                    continue
+        return allowed_ids
+
+    def _refresh_analysis_region_selectors(self) -> None:
+        """Rebuild Analysis region selectors from atlas hierarchy and dataset IDs."""
+        cluster_selector = getattr(self, "_cluster_region_selector", None)
+        heat_selector = getattr(self, "_heat_region_selector", None)
+        if cluster_selector is None or heat_selector is None:
+            return
+
+        selectors = (cluster_selector, heat_selector)
+        previous_ids = []
+        for selector in selectors:
+            selected = selector.get_single_selected_region()
+            previous_ids.append(selected[0] if selected is not None else None)
+
+        if self._atlas is None or not self._dataset_region_ids:
+            for selector in selectors:
+                selector.clear()
+            self._update_region_summary_labels()
+            return
+
+        allowed_ids = self._analysis_allowed_structure_ids()
+        for selector, previous_id in zip(selectors, previous_ids):
+            selector.set_allowed_structure_ids(allowed_ids)
+            selector.set_atlas(self._atlas)
+            selector.select_region_by_id(
+                previous_id if previous_id in allowed_ids else None
+            )
+
+        self._update_region_summary_labels()
+
+    def _selected_region(self, selector: RegionSelectorWidget | None) -> tuple[int, str] | None:
+        """Return the single selected region for a selector, if any."""
+        if selector is None:
+            return None
+        return selector.get_single_selected_region()
+
+    def _selected_cluster_region(self) -> tuple[int, str] | None:
+        """Return the currently selected clustering region."""
+        return self._selected_region(getattr(self, "_cluster_region_selector", None))
+
+    def _selected_heat_region(self) -> tuple[int, str] | None:
+        """Return the currently selected heatmap region."""
+        return self._selected_region(getattr(self, "_heat_region_selector", None))
+
+    def _represented_region_ids_for_selection(self, region_id: int) -> list[int]:
+        """Return represented dataset region IDs inside a selected atlas region."""
+        if self._atlas is None or not self._dataset_region_ids:
+            return []
+
+        selected_region_id = int(region_id)
+        represented_ids: list[int] = []
+        for candidate_id in sorted(self._dataset_region_ids):
+            struct = self._atlas.structures.get(int(candidate_id))
+            if struct is None:
+                continue
+            try:
+                path_ids = [int(path_id) for path_id in struct.get("structure_id_path", []) or []]
+            except (TypeError, ValueError):
+                continue
+            if selected_region_id in path_ids:
+                represented_ids.append(int(candidate_id))
+        return represented_ids
+
+    def _on_cluster_region_selection_changed(self, _acronyms: list[str]) -> None:
+        """Keep the clustering region summary in sync with tree selection."""
+        self._update_region_summary_labels()
+
+    def _on_heat_region_selection_changed(self, _acronyms: list[str]) -> None:
+        """Keep the heatmap region summary in sync with tree selection."""
+        self._update_region_summary_labels()
 
     def _on_clustering_method_changed(self, text: str) -> None:
         """Show/hide UI rows based on the selected clustering method."""
@@ -381,10 +518,11 @@ class AnalysisTabWidget(QWidget):
         if self._worker_thread is not None and self._worker_thread.isRunning():
             return
 
-        region = self._region_combo.currentText().strip()
-        if not region:
-            self._progress_label.setText("Please enter a target region acronym")
+        selected = self._selected_cluster_region()
+        if selected is None:
+            self._progress_label.setText("Select a target region.")
             return
+        _region_id, region = selected
 
         dilation = self._dilation_spin.value() / 100.0
         clustering_method = self._clustering_method_combo.currentText()
@@ -474,7 +612,18 @@ class AnalysisTabWidget(QWidget):
 
         from ..workers import HeatmapWorker
 
-        region = self._heat_region_combo.currentText().strip() or None
+        selected_region = self._selected_heat_region()
+        region = selected_region[1] if selected_region is not None else None
+        region_ids = (
+            self._represented_region_ids_for_selection(selected_region[0])
+            if selected_region is not None
+            else None
+        )
+        if selected_region is not None and not region_ids:
+            self._progress_label.setText(
+                "Selected region has no represented dataset regions."
+            )
+            return
         self._pending_heatmap_region = region
 
         # Determine cluster filter
@@ -503,7 +652,7 @@ class AnalysisTabWidget(QWidget):
         worker = HeatmapWorker(
             parquet_path=self._parquet_path,
             atlas=self._atlas,
-            region_acronym=region,
+            region_ids=region_ids,
             file_ids=file_ids,
             depth_bin_factor=depth_bin_factor,
             depth_axis=depth_axis,

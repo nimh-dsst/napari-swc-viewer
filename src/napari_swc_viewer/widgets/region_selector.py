@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
@@ -50,14 +50,29 @@ class RegionSelectorWidget(QWidget):
     def __init__(
         self,
         atlas: BrainGlobeAtlas | None = None,
+        *,
+        single_select: bool = False,
+        allowed_structure_ids: set[int] | None = None,
+        show_include_children: bool = True,
+        force_include_children: bool = False,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self._atlas = atlas
         self._structure_map: dict[int, dict] = {}
         self._items_by_id: dict[int, QTreeWidgetItem] = {}
+        self._single_select = bool(single_select)
+        self._allowed_structure_ids = (
+            {int(struct_id) for struct_id in allowed_structure_ids}
+            if allowed_structure_ids is not None
+            else None
+        )
+        self._show_include_children = bool(show_include_children)
+        self._force_include_children = bool(force_include_children)
+        self._selection_change_depth = 0
 
         self._setup_ui()
+        self._apply_include_children_visibility()
 
         if atlas is not None:
             self.set_atlas(atlas)
@@ -102,6 +117,17 @@ class RegionSelectorWidget(QWidget):
         self._include_children_cb.stateChanged.connect(self._emit_selection_changed)
         layout.addWidget(self._include_children_cb)
 
+    def _apply_include_children_visibility(self) -> None:
+        """Update include-children checkbox visibility and enabled state."""
+        if not hasattr(self, "_include_children_cb"):
+            return
+
+        visible = self._show_include_children and not self._force_include_children
+        self._include_children_cb.setVisible(visible)
+        self._include_children_cb.setEnabled(not self._force_include_children)
+        if self._force_include_children:
+            self._include_children_cb.setChecked(True)
+
     def set_atlas(self, atlas: BrainGlobeAtlas) -> None:
         """Set the atlas and populate the tree.
 
@@ -112,6 +138,47 @@ class RegionSelectorWidget(QWidget):
         """
         self._atlas = atlas
         self._populate_tree()
+
+    def clear(self) -> None:
+        """Clear the current tree contents and selection state."""
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        self._tree.blockSignals(False)
+        self._items_by_id.clear()
+        self._structure_map.clear()
+        self._update_selection_label()
+
+    def set_single_select(self, enabled: bool) -> None:
+        """Configure whether only one checked region is allowed."""
+        self._single_select = bool(enabled)
+
+    def set_allowed_structure_ids(self, structure_ids: set[int] | None) -> None:
+        """Restrict the visible atlas tree to the supplied structure IDs."""
+        self._allowed_structure_ids = (
+            {int(struct_id) for struct_id in structure_ids}
+            if structure_ids is not None
+            else None
+        )
+        if self._atlas is not None:
+            self._populate_tree()
+
+    def set_include_children_controls(
+        self,
+        *,
+        show_include_children: bool | None = None,
+        force_include_children: bool | None = None,
+    ) -> None:
+        """Update include-children checkbox behavior."""
+        if show_include_children is not None:
+            self._show_include_children = bool(show_include_children)
+        if force_include_children is not None:
+            self._force_include_children = bool(force_include_children)
+        self._apply_include_children_visibility()
+
+    def _is_structure_allowed(self, struct_id: int) -> bool:
+        """Return whether a structure should be shown in the tree."""
+        allowed = self._allowed_structure_ids
+        return allowed is None or int(struct_id) in allowed
 
     def _populate_tree(self) -> None:
         """Populate the tree with the atlas structure hierarchy."""
@@ -131,8 +198,10 @@ class RegionSelectorWidget(QWidget):
         # Find root structures (those without a parent in our map)
         root_ids = set()
         for struct_id, struct in self._structure_map.items():
+            if not self._is_structure_allowed(struct_id):
+                continue
             parent_id = _get_parent_structure_id(struct)
-            if parent_id is None or parent_id not in self._structure_map:
+            if parent_id is None or not self._is_structure_allowed(parent_id):
                 root_ids.add(struct_id)
 
         # Build tree recursively from roots
@@ -140,6 +209,7 @@ class RegionSelectorWidget(QWidget):
             self._add_structure_to_tree(root_id, None)
 
         self._tree.blockSignals(False)
+        self._update_selection_label()
 
     def _add_structure_to_tree(
         self,
@@ -161,7 +231,7 @@ class RegionSelectorWidget(QWidget):
             The created tree item.
         """
         struct = self._structure_map.get(struct_id)
-        if struct is None:
+        if struct is None or not self._is_structure_allowed(struct_id):
             return None
 
         name = struct.get("name", f"Region {struct_id}")
@@ -208,6 +278,20 @@ class RegionSelectorWidget(QWidget):
         """Handle item check state changes."""
         if column != 0:
             return
+
+        if self._selection_change_depth > 0:
+            return
+
+        if self._single_select and item.checkState(0) == Qt.Checked:
+            self._selection_change_depth += 1
+            self._tree.blockSignals(True)
+            try:
+                for other_item in self._items_by_id.values():
+                    if other_item is not item:
+                        other_item.setCheckState(0, Qt.Unchecked)
+            finally:
+                self._tree.blockSignals(False)
+                self._selection_change_depth -= 1
 
         # Update selection count and emit signal
         self._update_selection_label()
@@ -287,6 +371,8 @@ class RegionSelectorWidget(QWidget):
 
     def include_children_enabled(self) -> bool:
         """Return whether descendant regions should be included in queries."""
+        if getattr(self, "_force_include_children", False):
+            return True
         return self._include_children_cb.isChecked()
 
     def get_query_acronyms(self) -> list[str]:
@@ -382,6 +468,39 @@ class RegionSelectorWidget(QWidget):
             collect_checked(self._tree.topLevelItem(i))
 
         return sorted(selected_ids)
+
+    def get_single_selected_region(self) -> tuple[int, str] | None:
+        """Return the single directly selected region as ``(id, acronym)``."""
+        selected_ids = self.get_selected_ids(include_children=False)
+        if not selected_ids:
+            return None
+
+        struct_id = int(selected_ids[0])
+        struct = self._structure_map.get(struct_id)
+        if struct is None:
+            return None
+
+        acronym = str(struct.get("acronym", "")).strip()
+        if not acronym:
+            return None
+        return struct_id, acronym
+
+    def select_region_by_id(self, struct_id: int | None) -> None:
+        """Programmatically select one region by structure ID."""
+        self._tree.blockSignals(True)
+        try:
+            for current_id, item in self._items_by_id.items():
+                state = (
+                    Qt.Checked
+                    if struct_id is not None and current_id == struct_id
+                    else Qt.Unchecked
+                )
+                item.setCheckState(0, state)
+        finally:
+            self._tree.blockSignals(False)
+
+        self._update_selection_label()
+        self._emit_selection_changed()
 
     def select_regions(self, acronyms: list[str]) -> None:
         """Programmatically select regions by acronym.
