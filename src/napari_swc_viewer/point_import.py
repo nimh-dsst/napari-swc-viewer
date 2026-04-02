@@ -252,13 +252,13 @@ def _align_table_to_schema(table: pa.Table, target_schema: pa.Schema) -> pa.Tabl
     return table.replace_schema_metadata(target_schema.metadata)
 
 
-def _rewrite_point_parquet_with_appended_tables(
+def _write_point_parquet_with_appended_tables(
     existing_tables: Iterable[pa.Table],
     append_tables: Iterable[pa.Table],
     output_path: Path,
     target_schema: pa.Schema,
-) -> None:
-    """Rewrite a point Parquet with appended tables via a temp file."""
+) -> Path:
+    """Write appended point Parquet data to a temp file and return its path."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
@@ -283,7 +283,7 @@ def _rewrite_point_parquet_with_appended_tables(
     else:
         writer.close()
 
-    temp_output_path.replace(output_path)
+    return temp_output_path
 
 
 def _normalize_origin_csv_value(value: Any) -> str:
@@ -730,31 +730,41 @@ def append_point_csv_to_parquet(
     standardized = _ensure_origin_csv_provenance(standardized, csv_path.name)
     target_schema = _validate_append_schema_compatibility(standardized, target_schema)
     existing_parquet = pq.ParquetFile(parquet_path)
-    append_table = pa.Table.from_pandas(
-        standardized,
-        schema=target_schema,
-        preserve_index=False,
-    )
-
-    legacy_row_groups: list[pa.Table] = []
-    for row_group_index in range(existing_parquet.num_row_groups):
-        row_group_table = existing_parquet.read_row_group(row_group_index)
-        legacy_row_groups.append(
-            _table_with_origin_csv(
-                row_group_table,
-                POINT_PARQUET_ORIGIN_NOT_RECORDED,
-            )
+    temp_output_path: Path | None = None
+    try:
+        append_table = pa.Table.from_pandas(
+            standardized,
+            schema=target_schema,
+            preserve_index=False,
         )
 
-    _rewrite_point_parquet_with_appended_tables(
-        existing_tables=legacy_row_groups,
-        append_tables=[append_table],
-        output_path=output_path,
-        target_schema=target_schema,
-    )
+        legacy_row_groups: list[pa.Table] = []
+        for row_group_index in range(existing_parquet.num_row_groups):
+            row_group_table = existing_parquet.read_row_group(row_group_index)
+            legacy_row_groups.append(
+                _table_with_origin_csv(
+                    row_group_table,
+                    POINT_PARQUET_ORIGIN_NOT_RECORDED,
+                )
+            )
+
+        temp_output_path = _write_point_parquet_with_appended_tables(
+            existing_tables=legacy_row_groups,
+            append_tables=[append_table],
+            output_path=output_path,
+            target_schema=target_schema,
+        )
+        total_rows = int(existing_parquet.metadata.num_rows + len(standardized))
+    finally:
+        existing_parquet.close()
+
+    if temp_output_path is None:
+        raise PointImportError("Failed to write appended point Parquet.")
+
+    temp_output_path.replace(output_path)
     return PointParquetAppendSummary(
         appended_rows=len(standardized),
-        total_rows=int(existing_parquet.metadata.num_rows + len(standardized)),
+        total_rows=total_rows,
     )
 
 
@@ -777,23 +787,35 @@ def append_point_parquet_to_parquet(
 
     existing_parquet = pq.ParquetFile(parquet_path)
     input_parquet = pq.ParquetFile(input_parquet_path)
-    existing_tables = (
-        existing_parquet.read_row_group(row_group_index)
-        for row_group_index in range(existing_parquet.num_row_groups)
-    )
-    append_tables = [
-        input_parquet.read_row_group(row_group_index)
-        for row_group_index in range(input_parquet.num_row_groups)
-    ]
-    _rewrite_point_parquet_with_appended_tables(
-        existing_tables=existing_tables,
-        append_tables=append_tables,
-        output_path=output_path,
-        target_schema=target_schema,
-    )
+    temp_output_path: Path | None = None
+    try:
+        existing_tables = (
+            existing_parquet.read_row_group(row_group_index)
+            for row_group_index in range(existing_parquet.num_row_groups)
+        )
+        append_tables = [
+            input_parquet.read_row_group(row_group_index)
+            for row_group_index in range(input_parquet.num_row_groups)
+        ]
+        temp_output_path = _write_point_parquet_with_appended_tables(
+            existing_tables=existing_tables,
+            append_tables=append_tables,
+            output_path=output_path,
+            target_schema=target_schema,
+        )
+        appended_rows = int(input_parquet.metadata.num_rows)
+        total_rows = int(existing_parquet.metadata.num_rows + input_parquet.metadata.num_rows)
+    finally:
+        input_parquet.close()
+        existing_parquet.close()
+
+    if temp_output_path is None:
+        raise PointImportError("Failed to write appended point Parquet.")
+
+    temp_output_path.replace(output_path)
     return PointParquetAppendSummary(
-        appended_rows=int(input_parquet.metadata.num_rows),
-        total_rows=int(existing_parquet.metadata.num_rows + input_parquet.metadata.num_rows),
+        appended_rows=appended_rows,
+        total_rows=total_rows,
     )
 
 

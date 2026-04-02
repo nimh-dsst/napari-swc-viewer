@@ -776,6 +776,137 @@ def test_append_point_parquet_to_parquet_casts_equivalent_utf8_types(
     assert schema.field("origin_csv").type == pa.string()
 
 
+def test_append_point_csv_to_parquet_closes_source_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    append_csv_path = tmp_path / "append.csv"
+    mapping_path = tmp_path / "mapping.json"
+    parquet_path = tmp_path / "points.parquet"
+
+    pd.DataFrame(
+        {
+            "label": pd.Series(["A"], dtype="string"),
+            "x": [1.0],
+            "y": [2.0],
+            "z": [3.0],
+            **_typed_optional_point_columns(),
+            "origin_csv": pd.Series(["existing.csv"], dtype="string"),
+        }
+    ).to_parquet(parquet_path, index=False)
+    _write_point_csv(
+        append_csv_path,
+        [
+            {
+                "marker": "B",
+                "atlas_x": 4.0,
+                "atlas_y": 5.0,
+                "atlas_z": 6.0,
+            }
+        ],
+    )
+    _write_point_mapping(mapping_path)
+
+    original_parquet_file = point_import.pq.ParquetFile
+    tracked_files: list[TrackingParquetFile] = []
+
+    class TrackingParquetFile:
+        def __init__(self, *args, **kwargs) -> None:
+            self._delegate = original_parquet_file(*args, **kwargs)
+            self.closed = False
+            tracked_files.append(self)
+
+        def close(self) -> None:
+            self._delegate.close()
+            self.closed = True
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+    original_replace = Path.replace
+
+    def guarded_replace(self: Path, target: str | Path) -> Path:
+        if any(not tracked_file.closed for tracked_file in tracked_files):
+            raise PermissionError("simulated windows file lock")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(point_import.pq, "ParquetFile", TrackingParquetFile)
+    monkeypatch.setattr(Path, "replace", guarded_replace)
+
+    summary = append_point_csv_to_parquet(
+        append_csv_path,
+        mapping_path,
+        parquet_path,
+    )
+
+    loaded = pd.read_parquet(parquet_path)
+
+    assert summary.appended_rows == 1
+    assert loaded["origin_csv"].tolist() == ["existing.csv", "append.csv"]
+
+
+def test_append_point_parquet_to_parquet_closes_sources_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parquet_path = tmp_path / "points.parquet"
+    input_parquet_path = tmp_path / "points_in.parquet"
+
+    pd.DataFrame(
+        {
+            "label": pd.Series(["A"], dtype="string"),
+            "x": [1.0],
+            "y": [2.0],
+            "z": [3.0],
+            **_typed_optional_point_columns(),
+            "origin_csv": pd.Series(["first.csv"], dtype="string"),
+        }
+    ).to_parquet(parquet_path, index=False)
+    pd.DataFrame(
+        {
+            "label": pd.Series(["B"], dtype="string"),
+            "x": [4.0],
+            "y": [5.0],
+            "z": [6.0],
+            **_typed_optional_point_columns(),
+            "origin_csv": pd.Series(["second.csv"], dtype="string"),
+        }
+    ).to_parquet(input_parquet_path, index=False)
+
+    original_parquet_file = point_import.pq.ParquetFile
+    tracked_files: list[TrackingParquetFile] = []
+
+    class TrackingParquetFile:
+        def __init__(self, *args, **kwargs) -> None:
+            self._delegate = original_parquet_file(*args, **kwargs)
+            self.closed = False
+            tracked_files.append(self)
+
+        def close(self) -> None:
+            self._delegate.close()
+            self.closed = True
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+    original_replace = Path.replace
+
+    def guarded_replace(self: Path, target: str | Path) -> Path:
+        if any(not tracked_file.closed for tracked_file in tracked_files):
+            raise PermissionError("simulated windows file lock")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(point_import.pq, "ParquetFile", TrackingParquetFile)
+    monkeypatch.setattr(Path, "replace", guarded_replace)
+
+    summary = append_point_parquet_to_parquet(input_parquet_path, parquet_path)
+
+    loaded = pd.read_parquet(parquet_path)
+
+    assert summary.appended_rows == 1
+    assert loaded["origin_csv"].tolist() == ["first.csv", "second.csv"]
+
+
 def test_append_point_file_to_parquet_routes_parquet_input(
     tmp_path: Path,
 ) -> None:
