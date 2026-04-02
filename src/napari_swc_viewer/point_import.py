@@ -179,6 +179,26 @@ def _validate_append_schema_compatibility(
     return _validate_point_schema_compatibility(incoming_schema, target_schema)
 
 
+def _is_utf8_arrow_type(data_type: pa.DataType) -> bool:
+    """Return whether an Arrow type stores UTF-8 text values."""
+
+    if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
+        return True
+    is_string_view = getattr(pa.types, "is_string_view", None)
+    return bool(is_string_view is not None and is_string_view(data_type))
+
+
+def _point_field_types_are_compatible(
+    incoming_type: pa.DataType,
+    target_type: pa.DataType,
+) -> bool:
+    """Return whether two Arrow field types are append-compatible."""
+
+    return incoming_type == target_type or (
+        _is_utf8_arrow_type(incoming_type) and _is_utf8_arrow_type(target_type)
+    )
+
+
 def _validate_point_schema_compatibility(
     incoming_schema: pa.Schema,
     target_schema: pa.Schema,
@@ -210,7 +230,10 @@ def _validate_point_schema_compatibility(
         )
 
     for incoming_field, target_field in zip(incoming_schema, target_schema):
-        if incoming_field.type != target_field.type:
+        if not _point_field_types_are_compatible(
+            incoming_field.type,
+            target_field.type,
+        ):
             raise PointImportError(
                 "Point Parquet schema mismatch: "
                 f"column '{target_field.name}' has type {incoming_field.type} "
@@ -218,6 +241,15 @@ def _validate_point_schema_compatibility(
             )
 
     return target_schema
+
+
+def _align_table_to_schema(table: pa.Table, target_schema: pa.Schema) -> pa.Table:
+    """Return a table aligned to the target schema, preserving schema metadata."""
+
+    target_without_metadata = target_schema.remove_metadata()
+    if table.schema.remove_metadata() != target_without_metadata:
+        table = table.cast(target_without_metadata)
+    return table.replace_schema_metadata(target_schema.metadata)
 
 
 def _rewrite_point_parquet_with_appended_tables(
@@ -239,9 +271,9 @@ def _rewrite_point_parquet_with_appended_tables(
             compression="snappy",
         )
         for row_group_table in existing_tables:
-            writer.write_table(row_group_table.replace_schema_metadata(target_schema.metadata))
+            writer.write_table(_align_table_to_schema(row_group_table, target_schema))
         for append_table in append_tables:
-            writer.write_table(append_table.replace_schema_metadata(target_schema.metadata))
+            writer.write_table(_align_table_to_schema(append_table, target_schema))
     except Exception:
         if writer is not None:
             writer.close()

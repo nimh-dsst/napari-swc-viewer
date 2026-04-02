@@ -9,10 +9,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import napari_swc_viewer.point_import as point_import
 from napari_swc_viewer.point_import import (
     append_point_file_to_parquet,
     append_point_parquet_to_parquet,
@@ -542,6 +545,61 @@ def test_append_point_csv_to_parquet_upgrades_legacy_parquet_with_origin_csv(
     ]
 
 
+def test_append_point_csv_to_parquet_accepts_large_string_origin_csv_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    append_csv_path = tmp_path / "append.csv"
+    mapping_path = tmp_path / "mapping.json"
+    parquet_path = tmp_path / "points.parquet"
+
+    pd.DataFrame(
+        {
+            "label": ["A"],
+            "x": [10.0],
+            "y": [20.0],
+            "z": [30.0],
+            **_typed_optional_point_columns(),
+        }
+    ).to_parquet(parquet_path, index=False)
+    _write_point_csv(
+        append_csv_path,
+        [
+            {
+                "marker": "B",
+                "atlas_x": 40.0,
+                "atlas_y": 50.0,
+                "atlas_z": 60.0,
+            }
+        ],
+    )
+    _write_point_mapping(mapping_path)
+
+    legacy_schema = pq.read_schema(parquet_path).remove_metadata()
+    incoming_schema = pa.schema([*legacy_schema, pa.field("origin_csv", pa.large_string())])
+    monkeypatch.setattr(
+        point_import,
+        "_dataframe_arrow_schema",
+        lambda _df: incoming_schema,
+    )
+
+    summary = append_point_csv_to_parquet(
+        append_csv_path,
+        mapping_path,
+        parquet_path,
+    )
+
+    loaded = pd.read_parquet(parquet_path)
+
+    assert summary.appended_rows == 1
+    assert summary.total_rows == 2
+    assert loaded["label"].tolist() == ["A", "B"]
+    assert loaded["origin_csv"].tolist() == [
+        POINT_PARQUET_ORIGIN_NOT_RECORDED,
+        "append.csv",
+    ]
+
+
 def test_append_point_csv_to_parquet_injects_origin_csv_when_present(
     tmp_path: Path,
 ) -> None:
@@ -665,6 +723,57 @@ def test_append_point_parquet_to_parquet_rejects_extra_columns(
 
     with pytest.raises(PointImportError, match="extra column\\(s\\): score"):
         append_point_parquet_to_parquet(input_parquet_path, parquet_path)
+
+
+def test_append_point_parquet_to_parquet_casts_equivalent_utf8_types(
+    tmp_path: Path,
+) -> None:
+    parquet_path = tmp_path / "points.parquet"
+    input_parquet_path = tmp_path / "points_in.parquet"
+
+    pq.write_table(
+        pa.table(
+            {
+                "label": pa.array(["A"], type=pa.string()),
+                "x": pa.array([1.0], type=pa.float64()),
+                "y": pa.array([2.0], type=pa.float64()),
+                "z": pa.array([3.0], type=pa.float64()),
+                "region_name": pa.array([None], type=pa.string()),
+                "acronym": pa.array([None], type=pa.string()),
+                "id": pa.array([None], type=pa.int64()),
+                "hemisphere": pa.array([None], type=pa.string()),
+                "origin_csv": pa.array(["first.csv"], type=pa.string()),
+            }
+        ),
+        parquet_path,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "label": pa.array(["B"], type=pa.large_string()),
+                "x": pa.array([4.0], type=pa.float64()),
+                "y": pa.array([5.0], type=pa.float64()),
+                "z": pa.array([6.0], type=pa.float64()),
+                "region_name": pa.array([None], type=pa.large_string()),
+                "acronym": pa.array([None], type=pa.large_string()),
+                "id": pa.array([None], type=pa.int64()),
+                "hemisphere": pa.array([None], type=pa.large_string()),
+                "origin_csv": pa.array(["second.csv"], type=pa.large_string()),
+            }
+        ),
+        input_parquet_path,
+    )
+
+    summary = append_point_parquet_to_parquet(input_parquet_path, parquet_path)
+
+    loaded = pd.read_parquet(parquet_path)
+    schema = pq.read_schema(parquet_path).remove_metadata()
+
+    assert summary.appended_rows == 1
+    assert summary.total_rows == 2
+    assert loaded["label"].tolist() == ["A", "B"]
+    assert loaded["origin_csv"].tolist() == ["first.csv", "second.csv"]
+    assert schema.field("origin_csv").type == pa.string()
 
 
 def test_append_point_file_to_parquet_routes_parquet_input(
