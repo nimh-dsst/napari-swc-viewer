@@ -10,6 +10,7 @@ from pathlib import Path
 from napari_swc_viewer.point_import import (
     OPTIONAL_POINT_COLUMNS,
     REQUIRED_POINT_COLUMNS,
+    append_point_csv_to_parquet,
     convert_point_csv_to_parquet,
 )
 
@@ -46,7 +47,12 @@ Example:
     parser.add_argument(
         "output_parquet",
         type=Path,
-        help="Output standardized Parquet path",
+        help="Output standardized Parquet path, or existing Parquet path with --append",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append rows into an existing standardized point Parquet instead of creating a new one",
     )
     return parser.parse_args(args)
 
@@ -56,19 +62,32 @@ def main(args: list[str] | None = None) -> int:
 
     parsed = parse_args(args)
     try:
-        standardized = convert_point_csv_to_parquet(
-            parsed.input_csv,
-            parsed.mapping_json,
-            parsed.output_parquet,
-        )
+        if parsed.append:
+            summary = append_point_csv_to_parquet(
+                parsed.input_csv,
+                parsed.mapping_json,
+                parsed.output_parquet,
+            )
+        else:
+            standardized = convert_point_csv_to_parquet(
+                parsed.input_csv,
+                parsed.mapping_json,
+                parsed.output_parquet,
+            )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print(
-        f"Wrote {len(standardized):,} standardized point rows to "
-        f"{parsed.output_parquet}"
-    )
+    if parsed.append:
+        print(
+            f"Appended {summary.appended_rows:,} standardized point rows to "
+            f"{parsed.output_parquet} ({summary.total_rows:,} total)"
+        )
+    else:
+        print(
+            f"Wrote {len(standardized):,} standardized point rows to "
+            f"{parsed.output_parquet}"
+        )
     return 0
 
 

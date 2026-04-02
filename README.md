@@ -78,6 +78,13 @@ Run the converter from the repository root:
 pixi run python scripts/convert_point_csv.py raw_points.csv mapping.json points.parquet
 ```
 
+To append another raw CSV into an existing standardized point Parquet with the
+same schema, use `--append`:
+
+```bash
+pixi run python scripts/convert_point_csv.py --append new_points.csv mapping.json points.parquet
+```
+
 For BLTR-format two-row-header CSV directories like [`bltr cases`](bltr%20cases),
 use the batch converter instead:
 
@@ -85,14 +92,29 @@ use the batch converter instead:
 pixi run python scripts/convert_bltr_point_csv_directory.py "bltr cases" bltr_combined.parquet
 ```
 
-In the plugin Data tab, use `Import Point Parquet...` to load the standardized
-Parquet. The selected atlas must already be loaded. Opening a point Parquet now
-populates a preview table with `Label`, `Origin CSV`, and `Points`. Select one
-or more rows and click `Import Selected Heatmaps` to create only those heatmap
-image layers. If optional atlas metadata columns are present, the app validates
-the selected subset against the loaded atlas and warns on mismatches. For older
-point Parquets without `origin_csv`, the table shows `(not recorded)` and still
-imports one heatmap layer per selected `label`.
+In the plugin Data tab, use `Create From Directory...` or `Create From File(s)...`
+to build a new point Parquet from CSV inputs. Point CSV conversions record
+provenance in `origin_csv`, including single-file conversions. The conversion flow first tries known header
+formats automatically (`label/x/y/z/...` standardized headers or BLTR two-row
+headers) and only asks for a mapping JSON if the CSVs cannot be inferred from
+headers. Use `Open Point Parquet...` to preview an existing standardized
+Parquet, and `Append Point file` to add either a raw CSV or another
+standardized point Parquet onto an existing point Parquet and save the combined
+result as a new Parquet file. If the input is CSV, the flow auto-detects
+standard headers first and only asks for mapping JSON if needed. If the input
+is Parquet, its ordered columns and Arrow types must exactly match the target
+Parquet schema. If a point Parquet is already loaded in the preview, the append
+flow uses that file as the source by default and goes straight to a save-as
+destination. When appending CSV onto an older point Parquet that predates
+`origin_csv`, the output is upgraded to include the column and legacy rows are
+marked as `(not recorded)`. Opening a point Parquet populates a preview table
+with `Label`, `Origin CSV`, and `Points`.
+Select one or more rows and click `Import Selected Heatmaps` to create only
+those heatmap image layers. The selected atlas is only required for heatmap
+import and atlas validation. If optional atlas metadata columns are present,
+the app validates the selected subset against the loaded atlas and warns on
+mismatches. For older point Parquets without `origin_csv`, the table shows
+`(not recorded)` and still imports one heatmap layer per selected `label`.
 
 In the `Tools` tab, eligible native-grid heatmaps can be turned into blurred
 napari `Image` layers. In the `Histogram` tab, those same eligible heatmaps and

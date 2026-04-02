@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import duckdb
 import numpy as np
@@ -67,11 +67,19 @@ class AtlasValidationSummary:
 
 @dataclass
 class BatchPointParquetConversionSummary:
-    """Summary statistics for a BLTR CSV directory-to-Parquet conversion."""
+    """Summary statistics for converting one or more point CSV files to Parquet."""
 
     discovered_files: int = 0
     processed_files: int = 0
     rows_written: int = 0
+
+
+@dataclass(frozen=True)
+class PointParquetAppendSummary:
+    """Summary statistics for appending rows into an existing point Parquet."""
+
+    appended_rows: int
+    total_rows: int
 
 
 def _empty_string_series(length: int) -> pd.Series:
@@ -155,11 +163,140 @@ def point_parquet_has_origin_csv(parquet_path: str | Path) -> bool:
     return "origin_csv" in _read_standard_point_parquet_schema(parquet_path).names
 
 
+def _dataframe_arrow_schema(df: pd.DataFrame) -> pa.Schema:
+    """Return an Arrow schema for a dataframe without pandas metadata."""
+
+    return pa.Table.from_pandas(df, preserve_index=False).schema.remove_metadata()
+
+
+def _validate_append_schema_compatibility(
+    incoming_df: pd.DataFrame,
+    target_schema: pa.Schema,
+) -> pa.Schema:
+    """Validate strict append compatibility against an existing schema."""
+
+    incoming_schema = _dataframe_arrow_schema(incoming_df)
+    return _validate_point_schema_compatibility(incoming_schema, target_schema)
+
+
+def _validate_point_schema_compatibility(
+    incoming_schema: pa.Schema,
+    target_schema: pa.Schema,
+) -> pa.Schema:
+    """Validate strict append compatibility between two Arrow schemas."""
+
+    target_schema = target_schema.remove_metadata()
+    incoming_schema = incoming_schema.remove_metadata()
+    incoming_names = list(incoming_schema.names)
+    target_names = list(target_schema.names)
+
+    if incoming_names != target_names:
+        missing_columns = [name for name in target_names if name not in incoming_names]
+        if missing_columns:
+            columns = ", ".join(missing_columns)
+            raise PointImportError(
+                f"Point Parquet schema mismatch: missing column(s): {columns}"
+            )
+
+        extra_columns = [name for name in incoming_names if name not in target_names]
+        if extra_columns:
+            columns = ", ".join(extra_columns)
+            raise PointImportError(
+                f"Point Parquet schema mismatch: extra column(s): {columns}"
+            )
+
+        raise PointImportError(
+            "Point Parquet schema mismatch: column order does not match existing file."
+        )
+
+    for incoming_field, target_field in zip(incoming_schema, target_schema):
+        if incoming_field.type != target_field.type:
+            raise PointImportError(
+                "Point Parquet schema mismatch: "
+                f"column '{target_field.name}' has type {incoming_field.type} "
+                f"but existing file uses {target_field.type}."
+            )
+
+    return target_schema
+
+
+def _rewrite_point_parquet_with_appended_tables(
+    existing_tables: Iterable[pa.Table],
+    append_tables: Iterable[pa.Table],
+    output_path: Path,
+    target_schema: pa.Schema,
+) -> None:
+    """Rewrite a point Parquet with appended tables via a temp file."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    writer: pq.ParquetWriter | None = None
+
+    try:
+        writer = pq.ParquetWriter(
+            temp_output_path,
+            target_schema,
+            compression="snappy",
+        )
+        for row_group_table in existing_tables:
+            writer.write_table(row_group_table.replace_schema_metadata(target_schema.metadata))
+        for append_table in append_tables:
+            writer.write_table(append_table.replace_schema_metadata(target_schema.metadata))
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise
+    else:
+        writer.close()
+
+    temp_output_path.replace(output_path)
+
+
 def _normalize_origin_csv_value(value: Any) -> str:
     if pd.isna(value):
         return POINT_PARQUET_ORIGIN_NOT_RECORDED
     text = str(value).strip()
     return text if text else POINT_PARQUET_ORIGIN_NOT_RECORDED
+
+
+def _ensure_origin_csv_provenance(
+    df: pd.DataFrame,
+    default_origin_csv: str,
+) -> pd.DataFrame:
+    """Return a dataframe with a normalized ``origin_csv`` provenance column."""
+
+    normalized = df.copy()
+    default_values = pd.Series(
+        pd.array([default_origin_csv] * len(normalized), dtype="string")
+    )
+
+    if "origin_csv" not in normalized.columns:
+        normalized["origin_csv"] = default_values
+        return normalized
+
+    existing = _normalize_string_series(normalized["origin_csv"]).str.strip()
+    missing_origin = existing.isna() | existing.eq("")
+    normalized["origin_csv"] = existing.where(~missing_origin, default_values)
+    return normalized
+
+
+def _schema_with_origin_csv(schema: pa.Schema) -> pa.Schema:
+    """Return a schema that includes ``origin_csv`` as the final string field."""
+
+    if "origin_csv" in schema.names:
+        return schema
+    return pa.schema([*schema, pa.field("origin_csv", pa.string())], metadata=schema.metadata)
+
+
+def _table_with_origin_csv(table: pa.Table, origin_csv: str) -> pa.Table:
+    """Return a table with ``origin_csv`` appended when it is missing."""
+
+    if "origin_csv" in table.column_names:
+        return table
+    origin_values = pa.array([origin_csv] * table.num_rows, type=pa.string())
+    return table.append_column("origin_csv", origin_values)
 
 
 def _normalize_point_selection_keys(
@@ -227,7 +364,7 @@ def load_bltr_point_csv(csv_path: str | Path) -> pd.DataFrame:
 
     path = Path(csv_path)
     try:
-        raw_df = pd.read_csv(path, header=[0, 1])
+        raw_df = pd.read_csv(path, header=[0, 1], low_memory=False)
     except FileNotFoundError as exc:
         raise PointImportError(_path_exists_message(path, "CSV file")) from exc
     except Exception as exc:
@@ -402,11 +539,41 @@ def load_raw_point_csv(csv_path: str | Path) -> pd.DataFrame:
 
     path = Path(csv_path)
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path, low_memory=False)
     except FileNotFoundError as exc:
         raise PointImportError(_path_exists_message(path, "CSV file")) from exc
     except Exception as exc:
         raise PointImportError(f"Failed to read CSV file: {path}") from exc
+
+
+def load_and_standardize_point_csv(
+    csv_path: str | Path,
+    mapping_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """Load and standardize a point CSV via mapping or known header formats."""
+
+    if mapping_path is not None:
+        raw_df = load_raw_point_csv(csv_path)
+        mapping = load_column_mapping(mapping_path)
+        return standardize_point_dataframe(raw_df, mapping), "mapping JSON"
+
+    try:
+        raw_df = load_raw_point_csv(csv_path)
+        return validate_standard_point_dataframe(raw_df), "standardized headers"
+    except PointImportError:
+        pass
+
+    try:
+        raw_df = load_bltr_point_csv(csv_path)
+        return (
+            standardize_point_dataframe(raw_df, BLTR_STANDARD_MAPPING),
+            "BLTR headers",
+        )
+    except PointImportError as exc:
+        raise PointImportError(
+            "Could not infer point CSV columns from headers. "
+            "Provide a mapping JSON."
+        ) from exc
 
 
 def convert_point_csv_to_parquet(
@@ -416,12 +583,217 @@ def convert_point_csv_to_parquet(
 ) -> pd.DataFrame:
     """Convert a raw point CSV plus mapping JSON into standardized Parquet."""
 
-    raw_df = load_raw_point_csv(csv_path)
-    mapping = load_column_mapping(mapping_path)
-    standardized = standardize_point_dataframe(raw_df, mapping)
+    standardized, _source = load_and_standardize_point_csv(csv_path, mapping_path)
+    standardized = _ensure_origin_csv_provenance(standardized, Path(csv_path).name)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     standardized.to_parquet(output_path, index=False)
     return standardized
+
+
+def _load_point_csv_for_batch_conversion(
+    csv_path: str | Path,
+    mapping_path: str | Path | None,
+) -> pd.DataFrame:
+    """Load one point CSV for batch conversion, falling back to mapping if needed."""
+
+    try:
+        standardized, _source = load_and_standardize_point_csv(csv_path)
+        return standardized
+    except PointImportError:
+        if mapping_path is None:
+            raise
+    standardized, _source = load_and_standardize_point_csv(csv_path, mapping_path)
+    return standardized
+
+
+def convert_point_csv_files_to_parquet(
+    csv_paths: Sequence[str | Path],
+    output_path: str | Path,
+    mapping_path: str | Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> BatchPointParquetConversionSummary:
+    """Convert one or more point CSV files into a standardized Parquet."""
+
+    normalized_paths = [Path(path) for path in csv_paths]
+    if not normalized_paths:
+        raise PointImportError("No point CSV files were provided.")
+
+    summary = BatchPointParquetConversionSummary(discovered_files=len(normalized_paths))
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+
+    writer: pq.ParquetWriter | None = None
+    schema: pa.Schema | None = None
+    try:
+        for current, csv_path in enumerate(normalized_paths, start=1):
+            if progress_callback is not None:
+                progress_callback(
+                    f"Processing point CSV {current}/{len(normalized_paths)}: {csv_path.name}",
+                    current - 1,
+                    len(normalized_paths),
+                )
+
+            standardized = _load_point_csv_for_batch_conversion(csv_path, mapping_path)
+            standardized = _ensure_origin_csv_provenance(standardized, csv_path.name)
+
+            if schema is None:
+                table = pa.Table.from_pandas(
+                    standardized,
+                    preserve_index=False,
+                )
+                schema = table.schema
+                writer = pq.ParquetWriter(
+                    temp_output_path,
+                    schema,
+                    compression="snappy",
+                )
+            else:
+                schema = _validate_append_schema_compatibility(standardized, schema)
+                table = pa.Table.from_pandas(
+                    standardized,
+                    schema=schema,
+                    preserve_index=False,
+                )
+
+            assert writer is not None
+            writer.write_table(table.replace_schema_metadata(schema.metadata))
+            summary.processed_files += 1
+            summary.rows_written += len(standardized)
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise
+
+    if writer is None:
+        raise PointImportError("No point CSV rows were written.")
+
+    writer.close()
+    temp_output_path.replace(output_path)
+    if progress_callback is not None:
+        progress_callback(
+            f"Finalized point Parquet: {output_path.name}",
+            len(normalized_paths),
+            len(normalized_paths),
+        )
+    return summary
+
+
+def append_point_csv_to_parquet(
+    csv_path: str | Path,
+    mapping_path: str | Path | None,
+    parquet_path: str | Path,
+    output_path: str | Path | None = None,
+) -> PointParquetAppendSummary:
+    """Append a raw point CSV into a point Parquet and write the result."""
+
+    csv_path = Path(csv_path)
+    parquet_path = Path(parquet_path)
+    output_path = Path(output_path) if output_path is not None else parquet_path
+    target_schema = _schema_with_origin_csv(_read_standard_point_parquet_schema(parquet_path))
+
+    standardized, _source = load_and_standardize_point_csv(csv_path, mapping_path)
+    standardized = _ensure_origin_csv_provenance(standardized, csv_path.name)
+    target_schema = _validate_append_schema_compatibility(standardized, target_schema)
+    existing_parquet = pq.ParquetFile(parquet_path)
+    append_table = pa.Table.from_pandas(
+        standardized,
+        schema=target_schema,
+        preserve_index=False,
+    )
+
+    legacy_row_groups: list[pa.Table] = []
+    for row_group_index in range(existing_parquet.num_row_groups):
+        row_group_table = existing_parquet.read_row_group(row_group_index)
+        legacy_row_groups.append(
+            _table_with_origin_csv(
+                row_group_table,
+                POINT_PARQUET_ORIGIN_NOT_RECORDED,
+            )
+        )
+
+    _rewrite_point_parquet_with_appended_tables(
+        existing_tables=legacy_row_groups,
+        append_tables=[append_table],
+        output_path=output_path,
+        target_schema=target_schema,
+    )
+    return PointParquetAppendSummary(
+        appended_rows=len(standardized),
+        total_rows=int(existing_parquet.metadata.num_rows + len(standardized)),
+    )
+
+
+def append_point_parquet_to_parquet(
+    input_parquet_path: str | Path,
+    parquet_path: str | Path,
+    output_path: str | Path | None = None,
+) -> PointParquetAppendSummary:
+    """Append one standardized point Parquet into another with exact schema matching."""
+
+    input_parquet_path = Path(input_parquet_path)
+    parquet_path = Path(parquet_path)
+    if input_parquet_path.resolve() == parquet_path.resolve():
+        raise PointImportError("Input point Parquet must differ from the target file.")
+
+    output_path = Path(output_path) if output_path is not None else parquet_path
+    target_schema = _read_standard_point_parquet_schema(parquet_path)
+    input_schema = _read_standard_point_parquet_schema(input_parquet_path)
+    target_schema = _validate_point_schema_compatibility(input_schema, target_schema)
+
+    existing_parquet = pq.ParquetFile(parquet_path)
+    input_parquet = pq.ParquetFile(input_parquet_path)
+    existing_tables = (
+        existing_parquet.read_row_group(row_group_index)
+        for row_group_index in range(existing_parquet.num_row_groups)
+    )
+    append_tables = [
+        input_parquet.read_row_group(row_group_index)
+        for row_group_index in range(input_parquet.num_row_groups)
+    ]
+    _rewrite_point_parquet_with_appended_tables(
+        existing_tables=existing_tables,
+        append_tables=append_tables,
+        output_path=output_path,
+        target_schema=target_schema,
+    )
+    return PointParquetAppendSummary(
+        appended_rows=int(input_parquet.metadata.num_rows),
+        total_rows=int(existing_parquet.metadata.num_rows + input_parquet.metadata.num_rows),
+    )
+
+
+def append_point_file_to_parquet(
+    input_path: str | Path,
+    parquet_path: str | Path,
+    output_path: str | Path | None = None,
+    mapping_path: str | Path | None = None,
+) -> PointParquetAppendSummary:
+    """Append a point CSV or point Parquet into an existing point Parquet."""
+
+    input_path = Path(input_path)
+    suffix = input_path.suffix.lower()
+    if suffix == ".csv":
+        return append_point_csv_to_parquet(
+            input_path,
+            mapping_path,
+            parquet_path,
+            output_path,
+        )
+    if suffix == ".parquet":
+        if mapping_path is not None:
+            raise PointImportError("Mapping JSON is only supported when appending CSV input.")
+        return append_point_parquet_to_parquet(
+            input_path,
+            parquet_path,
+            output_path,
+        )
+
+    raise PointImportError(
+        f"Unsupported point input file type: {input_path.suffix or '(none)'}"
+    )
 
 
 def convert_bltr_point_csv_directory_to_parquet(
