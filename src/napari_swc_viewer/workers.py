@@ -89,6 +89,91 @@ class ConvertWorker(QObject):
             self.error.emit(str(e))
 
 
+class AppendPointFileWorker(QObject):
+    """Append a point CSV or point Parquet into an existing point Parquet."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(str, object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        input_path: str,
+        mapping_path: str | None,
+        parquet_path: str,
+        output_path: str | None = None,
+    ):
+        super().__init__()
+        self._input_path = Path(input_path)
+        self._mapping_path = Path(mapping_path) if mapping_path is not None else None
+        self._parquet_path = Path(parquet_path)
+        self._output_path = (
+            Path(output_path) if output_path is not None else self._parquet_path
+        )
+
+    def run(self) -> None:
+        """Execute the append pipeline."""
+        try:
+            from .point_import import append_point_file_to_parquet
+
+            if self._input_path.suffix.lower() == ".parquet":
+                self.progress.emit("Validating point Parquet schemas...", 1, 3)
+            else:
+                self.progress.emit("Validating point CSV and target Parquet...", 1, 3)
+            summary = append_point_file_to_parquet(
+                self._input_path,
+                self._parquet_path,
+                self._output_path,
+                self._mapping_path,
+            )
+            self.progress.emit("Refreshing saved point Parquet...", 2, 3)
+            self.progress.emit("Done", 3, 3)
+            self.finished.emit(str(self._output_path), summary)
+
+        except Exception as e:
+            logger.exception("Point file append failed")
+            self.error.emit(str(e))
+
+
+AppendPointCSVWorker = AppendPointFileWorker
+
+
+class ConvertPointCSVWorker(QObject):
+    """Convert one or more point CSV files into a point Parquet in the background."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(str, object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        csv_paths: list[str],
+        output_path: str,
+        mapping_path: str | None = None,
+    ):
+        super().__init__()
+        self._csv_paths = [Path(path) for path in csv_paths]
+        self._output_path = Path(output_path)
+        self._mapping_path = Path(mapping_path) if mapping_path is not None else None
+
+    def run(self) -> None:
+        """Execute the point-CSV conversion pipeline."""
+        try:
+            from .point_import import convert_point_csv_files_to_parquet
+
+            summary = convert_point_csv_files_to_parquet(
+                self._csv_paths,
+                self._output_path,
+                self._mapping_path,
+                progress_callback=self.progress.emit,
+            )
+            self.finished.emit(str(self._output_path), summary)
+
+        except Exception as e:
+            logger.exception("Point CSV conversion failed")
+            self.error.emit(str(e))
+
+
 class CorrelationWorker(QObject):
     """Compute the full correlation + clustering pipeline in background.
 

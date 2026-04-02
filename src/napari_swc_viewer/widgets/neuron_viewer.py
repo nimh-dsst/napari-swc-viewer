@@ -61,6 +61,7 @@ from ..point_import import (
     PointImportError,
     build_grouped_point_heatmap_volumes,
     format_atlas_validation_summary,
+    load_and_standardize_point_csv,
     load_standard_point_parquet_selection,
     summarize_standard_point_parquet_groups,
     validate_point_metadata_against_atlas,
@@ -222,6 +223,10 @@ class NeuronViewerWidget(QWidget):
         # Conversion worker state
         self._convert_thread: QThread | None = None
         self._convert_worker = None
+        self._point_convert_thread: QThread | None = None
+        self._point_convert_worker = None
+        self._point_append_thread: QThread | None = None
+        self._point_append_worker = None
 
         self._setup_ui()
         self._connect_layer_events()
@@ -392,14 +397,32 @@ class NeuronViewerWidget(QWidget):
         )
         point_layout = point_section.content_layout()
 
+        point_create_row = QHBoxLayout()
+        self._create_point_from_directory_btn = QPushButton("Create From Directory...")
+        self._create_point_from_directory_btn.clicked.connect(
+            self._convert_point_csv_from_directory
+        )
+        point_create_row.addWidget(self._create_point_from_directory_btn)
+
+        self._create_point_from_files_btn = QPushButton("Create From File(s)...")
+        self._create_point_from_files_btn.clicked.connect(
+            self._convert_point_csv_from_files
+        )
+        point_create_row.addWidget(self._create_point_from_files_btn)
+        point_layout.addLayout(point_create_row)
+
         point_row = QHBoxLayout()
         self._point_file_label = QLabel("No point parquet imported")
         self._point_file_label.setWordWrap(True)
         point_row.addWidget(self._point_file_label)
 
-        import_point_btn = QPushButton("Import Point Parquet...")
-        import_point_btn.clicked.connect(self._import_point_parquet)
-        point_row.addWidget(import_point_btn)
+        self._open_point_parquet_btn = QPushButton("Open Point Parquet...")
+        self._open_point_parquet_btn.clicked.connect(self._open_point_parquet)
+        point_row.addWidget(self._open_point_parquet_btn)
+
+        self._append_point_file_btn = QPushButton("Append Point file")
+        self._append_point_file_btn.clicked.connect(self._append_point_file)
+        point_row.addWidget(self._append_point_file_btn)
         point_layout.addLayout(point_row)
 
         self._point_preview_table = QTableWidget(0, 3)
@@ -436,6 +459,10 @@ class NeuronViewerWidget(QWidget):
             self._import_selected_point_heatmaps
         )
         point_layout.addWidget(self._import_selected_point_heatmaps_btn)
+
+        self._point_append_progress = QProgressBar()
+        self._point_append_progress.setVisible(False)
+        point_layout.addWidget(self._point_append_progress)
 
         self._point_import_status_label = QLabel("")
         self._point_import_status_label.setWordWrap(True)
@@ -1004,15 +1031,17 @@ class NeuronViewerWidget(QWidget):
             self._refresh_heatmap_layer_list()
             self._refresh_histogram_layer_list()
             self._refresh_mask_layer_options()
+            self._update_point_import_controls()
             logger.info(f"Loaded atlas: {atlas_name}")
 
         except Exception as e:
             logger.error(f"Failed to load atlas: {e}")
             self._atlas_status_label.setText(f"Atlas: Error - {e}")
             self._update_mask_sigma_units_label()
+            self._update_point_import_controls()
 
-    def _import_point_parquet(self) -> None:
-        """Open file dialog and import standardized point Parquet."""
+    def _open_point_parquet(self) -> None:
+        """Open file dialog and preview a standardized point Parquet."""
         filepath, _ = QFileDialog.getOpenFileName(
             self,
             "Open Point Parquet File",
@@ -1023,6 +1052,207 @@ class NeuronViewerWidget(QWidget):
             return
 
         self._load_point_parquet_file(filepath)
+
+    def _append_point_file(self) -> None:
+        """Prompt for a point CSV or point Parquet and save a combined Parquet."""
+
+        input_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Point File to Append",
+            "",
+            "Point Files (*.csv *.parquet);;CSV Files (*.csv);;Parquet Files (*.parquet);;All Files (*)",
+        )
+        if not input_path:
+            return
+
+        input_suffix = Path(input_path).suffix.lower()
+        mapping_path: str | None = None
+        if input_suffix == ".csv":
+            try:
+                _standardized, source_description = load_and_standardize_point_csv(input_path)
+            except PointImportError:
+                mapping_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select Mapping JSON",
+                    "",
+                    "JSON Files (*.json);;All Files (*)",
+                )
+                if not mapping_path:
+                    return
+            else:
+                self._point_import_status_label.setText(
+                    f"Detected {source_description} in {Path(input_path).name}; "
+                    "no mapping JSON needed."
+                )
+        elif input_suffix == ".parquet":
+            self._point_import_status_label.setText(
+                f"Selected point Parquet {Path(input_path).name}; "
+                "it must exactly match the target schema."
+            )
+        else:
+            self._point_import_status_label.setText(
+                "Select a point CSV or point Parquet file to append."
+            )
+            return
+
+        parquet_path = self._select_point_parquet_source_for_append()
+        if parquet_path is None:
+            return
+
+        if (
+            input_suffix == ".parquet"
+            and Path(input_path).resolve() == Path(parquet_path).resolve()
+        ):
+            self._point_import_status_label.setText(
+                "Choose a different point Parquet to append than the target file."
+            )
+            return
+
+        default_output_name = (
+            f"{Path(parquet_path).stem}_with_{Path(input_path).stem}.parquet"
+        )
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save New Point Parquet File",
+            str(Path(parquet_path).with_name(default_output_name)),
+            "Parquet Files (*.parquet);;All Files (*)",
+        )
+        if not output_path:
+            return
+
+        if Path(output_path).resolve() == Path(parquet_path).resolve():
+            self._point_import_status_label.setText(
+                "Choose a new output Parquet path instead of overwriting the source file."
+            )
+            return
+
+        self._start_point_file_append(
+            input_path,
+            mapping_path,
+            parquet_path,
+            output_path,
+        )
+
+    def _select_point_parquet_source_for_append(self) -> str | None:
+        """Return the loaded point Parquet when available, otherwise prompt for one."""
+
+        if self._point_parquet_path:
+            loaded_path = Path(self._point_parquet_path)
+            if loaded_path.exists():
+                self._point_import_status_label.setText(
+                    f"Using loaded point Parquet {loaded_path.name} as the append source. "
+                    "Choose where to save the combined file."
+                )
+                return str(loaded_path)
+
+            self._point_import_status_label.setText(
+                f"Loaded point Parquet {loaded_path.name} is no longer available. "
+                "Select a source Parquet file."
+            )
+
+        parquet_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Existing Point Parquet File",
+            "",
+            "Parquet Files (*.parquet);;All Files (*)",
+        )
+        return parquet_path or None
+
+    def _convert_point_csv_from_directory(self) -> None:
+        """Create a point Parquet from all top-level CSV files in a directory."""
+
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory of Point CSV Files",
+        )
+        if not directory:
+            return
+
+        csv_paths = sorted(
+            str(path)
+            for path in Path(directory).glob("*.csv")
+            if path.is_file()
+        )
+        if not csv_paths:
+            self._point_import_status_label.setText("No CSV files found in directory.")
+            return
+
+        default_name = f"{Path(directory).name}_points.parquet"
+        self._prompt_point_csv_output_and_convert(csv_paths, default_name)
+
+    def _convert_point_csv_from_files(self) -> None:
+        """Create a point Parquet from one or more selected CSV files."""
+
+        csv_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Point CSV Files",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not csv_paths:
+            return
+
+        default_name = (
+            f"{Path(csv_paths[0]).stem}.parquet"
+            if len(csv_paths) == 1
+            else "points.parquet"
+        )
+        self._prompt_point_csv_output_and_convert(csv_paths, default_name)
+
+    def _prompt_point_csv_output_and_convert(
+        self,
+        csv_paths: list[str],
+        default_name: str,
+    ) -> None:
+        """Ask for mapping if needed, then ask for output path and start conversion."""
+
+        mapping_path = self._select_point_csv_mapping_if_needed(csv_paths)
+        if mapping_path is False:
+            return
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Point Parquet File",
+            default_name,
+            "Parquet Files (*.parquet)",
+        )
+        if not output_path:
+            return
+
+        self._start_point_csv_conversion(
+            csv_paths,
+            output_path,
+            mapping_path if isinstance(mapping_path, str) else None,
+        )
+
+    def _select_point_csv_mapping_if_needed(
+        self,
+        csv_paths: list[str],
+    ) -> str | bool | None:
+        """Return a mapping path if autodetect fails for any selected CSV."""
+
+        for csv_path in csv_paths:
+            try:
+                _standardized, _source = load_and_standardize_point_csv(csv_path)
+            except PointImportError:
+                mapping_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select Mapping JSON",
+                    "",
+                    "JSON Files (*.json);;All Files (*)",
+                )
+                return mapping_path if mapping_path else False
+
+        if len(csv_paths) == 1:
+            self._point_import_status_label.setText(
+                f"Detected point CSV headers in {Path(csv_paths[0]).name}; "
+                "no mapping JSON needed."
+            )
+        else:
+            self._point_import_status_label.setText(
+                "Detected point CSV headers automatically; no mapping JSON needed."
+            )
+        return None
 
     def _point_preview_key_from_row(self, row: int) -> tuple[str, str] | None:
         """Return the selected label/origin key for a preview table row."""
@@ -1056,8 +1286,29 @@ class NeuronViewerWidget(QWidget):
     def _update_point_import_controls(self) -> None:
         """Enable or disable point import actions based on current selection."""
 
-        ready = bool(self._point_parquet_path) and bool(self._selected_point_preview_keys())
+        operation_running = self._point_operation_running()
+        ready = (
+            bool(self._point_parquet_path)
+            and bool(self._selected_point_preview_keys())
+            and self._atlas is not None
+            and not operation_running
+        )
         self._import_selected_point_heatmaps_btn.setEnabled(ready)
+        self._open_point_parquet_btn.setEnabled(not operation_running)
+        self._append_point_file_btn.setEnabled(not operation_running)
+        self._create_point_from_directory_btn.setEnabled(not operation_running)
+        self._create_point_from_files_btn.setEnabled(not operation_running)
+
+    def _point_operation_running(self) -> bool:
+        """Return whether a point conversion or append worker is currently active."""
+
+        return bool(
+            (self._point_append_thread is not None and self._point_append_thread.isRunning())
+            or (
+                self._point_convert_thread is not None
+                and self._point_convert_thread.isRunning()
+            )
+        )
 
     def _populate_point_parquet_preview(self, summary_df) -> None:
         """Populate the point parquet preview table from a grouped summary."""
@@ -1102,14 +1353,13 @@ class NeuronViewerWidget(QWidget):
         self._point_preview_table.clearSelection()
         self._update_point_import_controls()
 
-    def _load_point_parquet_file(self, filepath: str) -> None:
+    def _load_point_parquet_file(
+        self,
+        filepath: str,
+        *,
+        success_message: str | None = None,
+    ) -> None:
         """Load standardized point Parquet metadata into the preview table."""
-
-        if self._atlas is None:
-            message = "Load an atlas before importing point Parquet."
-            self._point_import_status_label.setText(message)
-            show_warning(message)
-            return
 
         try:
             summary_df = summarize_standard_point_parquet_groups(filepath)
@@ -1134,16 +1384,194 @@ class NeuronViewerWidget(QWidget):
 
         self._populate_point_parquet_preview(summary_df)
         total_points = int(summary_df["point_count"].sum())
-        self._point_import_status_label.setText(
-            f"Loaded {total_points:,} point(s) across {len(summary_df)} "
-            "label/origin row(s). Select rows and click Import Selected Heatmaps."
-        )
+        if success_message is None:
+            action_message = "Select rows and click Import Selected Heatmaps."
+            if self._atlas is None:
+                action_message = "Load an atlas to enable Import Selected Heatmaps."
+            success_message = (
+                f"Loaded {total_points:,} point(s) across {len(summary_df)} "
+                f"label/origin row(s). {action_message}"
+            )
+        self._point_import_status_label.setText(success_message)
         logger.info(
             "Loaded point Parquet preview %s with %d selectable row(s) and %d points",
             filepath,
             len(summary_df),
             total_points,
         )
+
+    def _start_point_file_append(
+        self,
+        input_path: str,
+        mapping_path: str | None,
+        parquet_path: str,
+        output_path: str,
+    ) -> None:
+        """Launch the background point-file append worker."""
+
+        from ..workers import AppendPointFileWorker
+
+        self._point_append_progress.setVisible(True)
+        self._point_append_progress.setRange(0, 0)
+        self._point_import_status_label.setText(
+            f"Saving {Path(output_path).name} from {Path(parquet_path).name} + {Path(input_path).name}..."
+        )
+
+        thread = QThread()
+        worker = AppendPointFileWorker(
+            input_path,
+            mapping_path,
+            parquet_path,
+            output_path,
+        )
+        self._point_append_thread = thread
+        self._point_append_worker = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_point_append_progress)
+        worker.finished.connect(self._on_point_append_finished)
+        worker.error.connect(self._on_point_append_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._cleanup_point_append_thread(thread, worker)
+        )
+
+        self._update_point_import_controls()
+        thread.start()
+
+    def _start_point_csv_conversion(
+        self,
+        csv_paths: list[str],
+        output_path: str,
+        mapping_path: str | None,
+    ) -> None:
+        """Launch the background point-CSV conversion worker."""
+
+        from ..workers import ConvertPointCSVWorker
+
+        self._point_append_progress.setVisible(True)
+        self._point_append_progress.setRange(0, max(1, len(csv_paths)))
+        self._point_append_progress.setValue(0)
+        self._point_import_status_label.setText(
+            f"Creating {Path(output_path).name} from {len(csv_paths)} point CSV file(s)..."
+        )
+
+        thread = QThread()
+        worker = ConvertPointCSVWorker(
+            csv_paths,
+            output_path,
+            mapping_path,
+        )
+        self._point_convert_thread = thread
+        self._point_convert_worker = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_point_convert_progress)
+        worker.finished.connect(self._on_point_convert_finished)
+        worker.error.connect(self._on_point_convert_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._cleanup_point_convert_thread(thread, worker)
+        )
+
+        self._update_point_import_controls()
+        thread.start()
+
+    def _on_point_convert_progress(self, message: str, current: int, total: int) -> None:
+        """Handle point-CSV conversion progress updates."""
+
+        self._point_append_progress.setRange(0, max(1, total))
+        self._point_append_progress.setValue(current)
+        self._point_import_status_label.setText(message)
+
+    def _on_point_convert_finished(self, parquet_path: str, summary: object) -> None:
+        """Handle point-CSV conversion completion."""
+
+        self._point_append_progress.setVisible(False)
+        self._point_append_progress.setRange(0, 1)
+        self._point_append_progress.setValue(0)
+        message = (
+            f"Created {Path(parquet_path).name} from {summary.processed_files} CSV "
+            f"file(s) with {summary.rows_written:,} point(s)."
+        )
+        self._load_point_parquet_file(parquet_path, success_message=message)
+        self._update_point_import_controls()
+        logger.info(
+            "Created point parquet %s from %d CSV file(s) with %d point(s)",
+            parquet_path,
+            summary.processed_files,
+            summary.rows_written,
+        )
+
+    def _on_point_convert_error(self, error_msg: str) -> None:
+        """Handle point-CSV conversion failure."""
+
+        self._point_append_progress.setVisible(False)
+        self._point_append_progress.setRange(0, 1)
+        self._point_append_progress.setValue(0)
+        self._point_import_status_label.setText(f"Error: {error_msg}")
+        self._update_point_import_controls()
+        logger.error(f"Point CSV conversion failed: {error_msg}")
+
+    def _on_point_append_progress(self, message: str, _current: int, _total: int) -> None:
+        """Handle point-file append progress updates."""
+
+        self._point_import_status_label.setText(message)
+
+    def _on_point_append_finished(self, parquet_path: str, summary: object) -> None:
+        """Handle point-file append completion."""
+
+        self._point_append_progress.setVisible(False)
+        self._point_append_progress.setRange(0, 1)
+        self._point_append_progress.setValue(0)
+        message = (
+            f"Saved {Path(parquet_path).name} with {summary.appended_rows:,} "
+            f"added point(s) ({summary.total_rows:,} total)."
+        )
+        self._load_point_parquet_file(parquet_path, success_message=message)
+        self._update_point_import_controls()
+        logger.info(
+            "Saved point parquet %s with %d added point(s) (%d total)",
+            parquet_path,
+            summary.appended_rows,
+            summary.total_rows,
+        )
+
+    def _on_point_append_error(self, error_msg: str) -> None:
+        """Handle point-file append failure."""
+
+        self._point_append_progress.setVisible(False)
+        self._point_append_progress.setRange(0, 1)
+        self._point_append_progress.setValue(0)
+        self._point_import_status_label.setText(f"Error: {error_msg}")
+        self._update_point_import_controls()
+        logger.error(f"Point CSV append failed: {error_msg}")
+
+    def _cleanup_point_convert_thread(self, thread: QThread, worker: object) -> None:
+        """Release point conversion worker objects after the thread stops."""
+
+        if self._point_convert_thread is thread:
+            self._point_convert_thread = None
+        if self._point_convert_worker is worker:
+            self._point_convert_worker = None
+        self._update_point_import_controls()
+
+    def _cleanup_point_append_thread(self, thread: QThread, worker: object) -> None:
+        """Release point append worker objects after the thread stops."""
+
+        if self._point_append_thread is thread:
+            self._point_append_thread = None
+        if self._point_append_worker is worker:
+            self._point_append_worker = None
+        self._update_point_import_controls()
 
     def _import_selected_point_heatmaps(self) -> None:
         """Create heatmap layers for the selected preview rows."""
