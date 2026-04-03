@@ -37,6 +37,18 @@ pixi run napari
 
 When napari is open, launch the widget from the Plugins menu and choose **Neuron Viewer**.
 
+To enable debug-level plugin logging for large clustering runs:
+
+```bash
+NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
+```
+
+Optional custom log file:
+
+```bash
+NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
+```
+
 ## Quick validation commands
 
 Run from the repository root:
@@ -174,6 +186,7 @@ In the table you can:
 Buttons:
 
 - `Add Selected`: add currently selected neurons to the scene while keeping neurons already added.
+- `Add Soma Only`: add currently selected neurons to the scene as soma-only, reusing the shared soma layers without full trace geometry.
 - `Remove Selected`: remove only currently selected neurons from the scene.
 - `Clear All`: remove all neuron layers.
 - Centering mode (`Same` | `Auto`): `Same` keeps the current depth slice after add/remove. `Auto` auto-centers once on first add/remove in the widget session.
@@ -191,6 +204,8 @@ Controls:
 Rendering behavior:
 
 - Batch rendering is used (single layers for performance): `Neuron Lines` (`Shapes`), `Neuron Points` (`Points`), and `Soma Labels` (`Points`, labeled by `neuron_id`)
+- `Add Selected` contributes to the full-trace layers based on the current Visualization render mode, while `Add Soma Only` contributes only to the shared soma layers
+- Mixed scenes are supported: some neurons can remain full traces while others are rendered soma-only at the same time
 - In 2D mode, line/point layers are auto-hidden to keep navigation responsive
 - Optional `Neuron Slice Projection` (vectors layer) shows line segments near current slice
 - Optional `Soma Slice Projection` (points layer) shows raw soma/body nodes (`type = 1`) near the current slice using the same shared slice thickness
@@ -236,7 +251,7 @@ Common controls:
 Run:
 
 1. Click `Run Clustering`
-2. Inspect clustermap output
+2. Optional: expand `Clustermap` and click `Build Dendrogram` to render the dendrogram and cluster map
 3. Click `Color Neurons by Cluster` to recolor rendered neuron layers
 
 ### Node Count Heatmap

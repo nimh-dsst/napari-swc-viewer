@@ -128,6 +128,7 @@ def _import_region_selector_module():
     qtwidgets_module = types.ModuleType("qtpy.QtWidgets")
     for name, value in {
         "QCheckBox": _DummyQtObject,
+        "QHeaderView": types.SimpleNamespace(Stretch=1, ResizeToContents=2),
         "QHBoxLayout": _DummyQtObject,
         "QLabel": _DummyQtObject,
         "QLineEdit": _DummyQtObject,

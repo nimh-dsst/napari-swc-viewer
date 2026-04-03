@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from qtpy.QtCore import Signal
 from qtpy.QtWidgets import QPushButton, QVBoxLayout, QWidget
 
 
 class CollapsibleSection(QWidget):
     """Simple collapsible section for dense tab layouts."""
+
+    expanded_changed = Signal(bool)
 
     def __init__(
         self,
@@ -47,3 +50,4 @@ class CollapsibleSection(QWidget):
         prefix = "[-]" if expanded else "[+]"
         self._toggle_button.setText(f"{prefix} {self._title}")
         self._content_widget.setVisible(expanded)
+        self.expanded_changed.emit(bool(expanded))

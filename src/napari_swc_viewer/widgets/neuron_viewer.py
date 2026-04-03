@@ -56,6 +56,7 @@ from ..auto_center import (
     depth_axis_from_not_displayed,
 )
 from ..db import NeuronDatabase
+from ..logging_utils import configure_debug_logging
 from ..point_import import (
     POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
@@ -102,6 +103,8 @@ _HISTOGRAM_BIN_COUNT = 256
 _POINT_PREVIEW_LABEL_COLUMN = 0
 _POINT_PREVIEW_ORIGIN_COLUMN = 1
 _POINT_PREVIEW_COUNT_COLUMN = 2
+_SCENE_RENDER_MODE_FULL = "full"
+_SCENE_RENDER_MODE_SOMA = "soma"
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -196,6 +199,9 @@ class NeuronViewerWidget(QWidget):
 
     def __init__(self, napari_viewer: napari.Viewer):
         super().__init__()
+        log_path = configure_debug_logging()
+        if log_path is not None:
+            logger.debug("Debug logging enabled for NeuronViewerWidget: %s", log_path)
         self.viewer = napari_viewer
         self._db: NeuronDatabase | None = None
         self._atlas: BrainGlobeAtlas | None = None
@@ -210,6 +216,7 @@ class NeuronViewerWidget(QWidget):
         self._point_parquet_path: str | None = None
         self._point_parquet_has_origin_csv = False
         self._point_preview_counts: dict[tuple[str, str], int] = {}
+        self._scene_render_modes: dict[object, str] = {}
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -513,6 +520,10 @@ class NeuronViewerWidget(QWidget):
         self._render_btn.clicked.connect(self._render_selected_neurons)
         neuron_btn_row.addWidget(self._render_btn)
 
+        self._render_soma_only_btn = QPushButton("Add Soma Only")
+        self._render_soma_only_btn.clicked.connect(self._render_selected_soma_only)
+        neuron_btn_row.addWidget(self._render_soma_only_btn)
+
         self._remove_selected_btn = QPushButton("Remove Selected")
         self._remove_selected_btn.clicked.connect(self._remove_selected_neurons)
         neuron_btn_row.addWidget(self._remove_selected_btn)
@@ -545,7 +556,17 @@ class NeuronViewerWidget(QWidget):
 
     def _setup_regions_tab(self, parent: QWidget) -> None:
         """Set up the region selection tab."""
-        layout = QVBoxLayout(parent)
+        parent_layout = QVBoxLayout(parent)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        parent_layout.addWidget(scroll_area)
+
+        content = QWidget()
+        scroll_area.setWidget(content)
+
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("Query source:"))
@@ -604,6 +625,7 @@ class NeuronViewerWidget(QWidget):
         self._regions_status_label = QLabel("")
         self._regions_status_label.setWordWrap(True)
         layout.addWidget(self._regions_status_label)
+        layout.addStretch()
         self._on_region_query_source_changed(self._region_query_source_combo.currentText())
 
     def _setup_tools_tab(self, parent: QWidget) -> None:
@@ -676,8 +698,11 @@ class NeuronViewerWidget(QWidget):
         layout = QVBoxLayout(parent)
         self._histogram_pg = pg
 
-        sources_group = QGroupBox("Histogram Sources")
-        sources_layout = QVBoxLayout(sources_group)
+        self._histogram_sources_section = CollapsibleSection(
+            "Histogram Sources",
+            expanded=True,
+        )
+        sources_layout = self._histogram_sources_section.content_layout()
         self._histogram_layer_list = QListWidget()
         self._histogram_layer_list.setSelectionMode(
             QAbstractItemView.ExtendedSelection
@@ -689,10 +714,13 @@ class NeuronViewerWidget(QWidget):
         self._histogram_hint_label = QLabel("")
         self._histogram_hint_label.setWordWrap(True)
         sources_layout.addWidget(self._histogram_hint_label)
-        layout.addWidget(sources_group)
+        layout.addWidget(self._histogram_sources_section)
 
-        plot_group = QGroupBox("Intensity Histogram")
-        plot_layout = QVBoxLayout(plot_group)
+        self._histogram_plot_section = CollapsibleSection(
+            "Intensity Histogram",
+            expanded=True,
+        )
+        plot_layout = self._histogram_plot_section.content_layout()
 
         self._histogram_include_zero_cb = QCheckBox("Include zero-valued background")
         self._histogram_include_zero_cb.setChecked(False)
@@ -736,10 +764,13 @@ class NeuronViewerWidget(QWidget):
         )
         plot_layout.addWidget(self._histogram_plot_widget)
 
-        layout.addWidget(plot_group)
+        layout.addWidget(self._histogram_plot_section)
 
-        mask_group = QGroupBox("Mask Creation")
-        mask_layout = QVBoxLayout(mask_group)
+        self._histogram_mask_section = CollapsibleSection(
+            "Mask Creation",
+            expanded=False,
+        )
+        mask_layout = self._histogram_mask_section.content_layout()
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Create mode:"))
@@ -796,7 +827,7 @@ class NeuronViewerWidget(QWidget):
         self._create_mask_btn.clicked.connect(self._create_masks_from_heatmaps)
         mask_layout.addWidget(self._create_mask_btn)
 
-        layout.addWidget(mask_group)
+        layout.addWidget(self._histogram_mask_section)
 
         self._histogram_status_label = QLabel("")
         self._histogram_status_label.setWordWrap(True)
@@ -2668,8 +2699,16 @@ class NeuronViewerWidget(QWidget):
     def _query_neurons(self) -> None:
         """Dispatch Regions-tab queries by the selected source type."""
         if self._region_query_source == "Mask Layer":
+            self._regions_status_label.setText(
+                "Searching selected mask layers. Please wait..."
+            )
+            QApplication.processEvents()
             self._query_neurons_by_mask()
         else:
+            self._regions_status_label.setText(
+                "Searching selected atlas regions. Please wait..."
+            )
+            QApplication.processEvents()
             self._query_neurons_by_region()
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
@@ -2705,6 +2744,7 @@ class NeuronViewerWidget(QWidget):
 
         except Exception as e:
             logger.error(f"Query failed: {e}")
+            self._regions_status_label.setText(f"Region query failed: {e}")
 
     def _query_neurons_by_mask(self) -> None:
         """Query neurons using a generated mask layer."""
@@ -2750,7 +2790,7 @@ class NeuronViewerWidget(QWidget):
             for _, row in result.iterrows()
         ]
         self._neuron_table.populate(neurons)
-        self._neuron_table.set_added_file_ids(set())
+        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
         self._refresh_cluster_filter_controls()
 
     def _selected_cluster_from_filter(self) -> int | None:
@@ -2826,19 +2866,38 @@ class NeuronViewerWidget(QWidget):
         )
 
     def _render_selected_neurons(self) -> None:
-        """Add selected neurons to the scene without removing existing neurons."""
+        """Render selected neurons with full trace geometry."""
+        self._render_selected_with_mode(_SCENE_RENDER_MODE_FULL)
+
+    def _render_selected_soma_only(self) -> None:
+        """Render selected neurons using the shared soma-only layers."""
+        self._render_selected_with_mode(_SCENE_RENDER_MODE_SOMA)
+
+    def _render_selected_with_mode(self, render_mode: str) -> None:
+        """Apply a scene render mode to the selected neurons and rebuild."""
         selected_file_ids = self._neuron_table.get_selected_file_ids()
         if not selected_file_ids:
             return
 
-        current_file_ids = self._current_scene_file_ids()
-        new_file_ids = [fid for fid in selected_file_ids if fid not in current_file_ids]
-        if not new_file_ids:
-            self._render_status_label.setText("All selected neurons are already in the scene.")
+        changed = False
+        for file_id in selected_file_ids:
+            if self._scene_render_modes.get(file_id) == render_mode:
+                continue
+            self._scene_render_modes[file_id] = render_mode
+            changed = True
+
+        if not changed:
+            mode_label = (
+                "full traces"
+                if render_mode == _SCENE_RENDER_MODE_FULL
+                else "soma only"
+            )
+            self._render_status_label.setText(
+                f"All selected neurons are already in the scene as {mode_label}."
+            )
             return
 
-        target_file_ids = sorted(current_file_ids.union(new_file_ids), key=str)
-        self._render_file_ids(target_file_ids)
+        self._render_scene()
 
     def _remove_selected_neurons(self) -> None:
         """Remove selected neurons from the scene while leaving others in place."""
@@ -2857,27 +2916,36 @@ class NeuronViewerWidget(QWidget):
             )
             return
 
-        remaining_file_ids = sorted(current_file_ids - removed_file_ids, key=str)
-        if not remaining_file_ids:
+        for file_id in removed_file_ids:
+            self._scene_render_modes.pop(file_id, None)
+
+        if not self._scene_render_modes:
             depth_state = self._capture_depth_state()
             self._clear_neuron_layers()
             self._restore_depth_state(depth_state)
             self._render_status_label.setText("Cleared all neurons from the scene.")
             return
 
-        self._render_file_ids(remaining_file_ids)
+        self._render_scene()
 
-    def _render_file_ids(self, file_ids: list[object]) -> None:
-        """Render exactly ``file_ids`` by rebuilding all neuron scene layers."""
-        if not file_ids or self._db is None:
+    def _render_scene(self) -> None:
+        """Rebuild the neuron scene from the current per-neuron render modes."""
+        if not self._scene_render_modes or self._db is None:
             return
 
+        scene_render_modes = dict(self._scene_render_modes)
+        file_ids = sorted(scene_render_modes, key=str)
+        full_file_ids = [
+            fid for fid in file_ids
+            if scene_render_modes.get(fid) == _SCENE_RENDER_MODE_FULL
+        ]
         n = len(file_ids)
         depth_state = self._capture_depth_state()
         use_auto_centering = self._use_auto_centering()
 
         # Show progress UI
         self._render_btn.setEnabled(False)
+        self._render_soma_only_btn.setEnabled(False)
         self._remove_selected_btn.setEnabled(False)
         self._render_progress.setRange(0, n)
         self._render_progress.setValue(0)
@@ -2886,13 +2954,17 @@ class NeuronViewerWidget(QWidget):
         QApplication.processEvents()
 
         # Clear existing neuron layers
-        self._clear_neuron_layers()
+        self._clear_neuron_layers(reset_render_state=False)
 
         render_mode = self._render_mode_combo.currentText()
         opacity = self._opacity_slider.value() / 100.0
 
         # Read per-neuron colors from the table
         neuron_colors = [self._neuron_table.get_color(fid) for fid in file_ids]
+        color_map = {
+            fid: color
+            for fid, color in zip(file_ids, neuron_colors)
+        }
 
         # Scale to match atlas mesh (coordinates are in microns)
         scale = None
@@ -2903,9 +2975,9 @@ class NeuronViewerWidget(QWidget):
         points_df = None
 
         # --- Lines ---
-        if render_mode in ("Lines", "Both"):
+        if full_file_ids and render_mode in ("Lines", "Both"):
             # Single batch query for all neurons
-            line_data = self._db.get_neuron_lines_batch(file_ids)
+            line_data = self._db.get_neuron_lines_batch(full_file_ids)
 
             self._render_status_label.setText(f"Building line segments for {n} neurons...")
             QApplication.processEvents()
@@ -2916,9 +2988,10 @@ class NeuronViewerWidget(QWidget):
             rendered_file_ids = []
             segments_per_neuron = []
 
-            for i, (file_id, color) in enumerate(zip(file_ids, neuron_colors)):
+            for i, file_id in enumerate(full_file_ids):
                 if file_id not in line_data:
                     continue
+                color = color_map[file_id]
                 coords, edges = line_data[file_id]
                 if len(edges) == 0:
                     continue
@@ -2972,13 +3045,13 @@ class NeuronViewerWidget(QWidget):
             self._slice_projector.add_neuron_data_batch(projector_batch)
 
         # --- Points ---
-        if render_mode in ("Points", "Both"):
+        if full_file_ids and render_mode in ("Points", "Both"):
             self._render_status_label.setText("Querying point data...")
             self._render_progress.setRange(0, 0)  # indeterminate
             QApplication.processEvents()
 
             # Single batch query for all neurons
-            points_df = self._db.get_neurons_for_rendering(file_ids)
+            points_df = self._db.get_neurons_for_rendering(full_file_ids)
 
             if not points_df.empty:
                 self._render_status_label.setText(
@@ -3003,7 +3076,6 @@ class NeuronViewerWidget(QWidget):
                     )
                 else:
                     # Per-point color based on which neuron each point belongs to
-                    color_map = dict(zip(file_ids, neuron_colors))
                     colors = np.array(
                         [
                             color_map.get(fid, [0.5, 0.5, 0.5, 1.0])[:4]
@@ -3032,7 +3104,7 @@ class NeuronViewerWidget(QWidget):
             soma_coords = soma_df[["x", "y", "z"]].values
             soma_fids = soma_df["file_id"].values.tolist()
             soma_colors = np.array(
-                [self._neuron_table.get_color(fid)[:4] for fid in soma_fids]
+                [color_map.get(fid, [0.5, 0.5, 0.5, 1.0])[:4] for fid in soma_fids]
             )
             # Use neuron_id for the label text (shorter than file_id)
             labels = soma_df["neuron_id"].astype(str).values.tolist()
@@ -3097,6 +3169,7 @@ class NeuronViewerWidget(QWidget):
         self._render_progress.setVisible(False)
         self._render_status_label.setText(f"Rendered {n} neurons.")
         self._render_btn.setEnabled(True)
+        self._render_soma_only_btn.setEnabled(True)
         self._remove_selected_btn.setEnabled(True)
 
     def _use_auto_centering(self) -> bool:
@@ -3135,21 +3208,8 @@ class NeuronViewerWidget(QWidget):
             logger.debug("Failed to restore depth slice position.", exc_info=True)
 
     def _current_scene_file_ids(self) -> set[object]:
-        """Collect neuron file IDs currently represented by scene layers."""
-        file_ids: set[object] = set()
-        for layer in self._current_neuron_layers:
-            meta = layer.metadata or {}
-            for fid in meta.get("file_ids", []):
-                try:
-                    file_ids.add(fid)
-                except TypeError:
-                    file_ids.add(str(fid))
-            for fid in meta.get("file_ids_per_point", []):
-                try:
-                    file_ids.add(fid)
-                except TypeError:
-                    file_ids.add(str(fid))
-        return file_ids
+        """Collect neuron file IDs currently tracked in the scene state."""
+        return set(self._scene_render_modes.keys())
 
     def _build_soma_projection_batch(
         self,
@@ -3162,23 +3222,26 @@ class NeuronViewerWidget(QWidget):
         if points_df is not None and not points_df.empty and "type" in points_df:
             soma_points_df = points_df[points_df["type"] == 1]
 
-        if soma_points_df is None or soma_points_df.empty:
-            if self._db is None:
-                return {}
-            soma_points_df = self._db.get_soma_points(file_ids)
-
-        if soma_points_df.empty:
-            return {}
-
         color_map = {
             fid: tuple(color[:4])
             for fid, color in zip(file_ids, neuron_colors)
         }
         default_color = (0.5, 0.5, 0.5, 1.0)
         batch = {}
-        for file_id, group in soma_points_df.groupby("file_id", sort=True):
-            coords = group[["x", "y", "z"]].values.astype(np.float64)
-            batch[file_id] = (coords, color_map.get(file_id, default_color))
+
+        if soma_points_df is not None and not soma_points_df.empty:
+            for file_id, group in soma_points_df.groupby("file_id", sort=True):
+                coords = group[["x", "y", "z"]].values.astype(np.float64)
+                batch[file_id] = (coords, color_map.get(file_id, default_color))
+
+        missing_file_ids = [fid for fid in file_ids if fid not in batch]
+        if missing_file_ids and self._db is not None:
+            missing_soma_points_df = self._db.get_soma_points(missing_file_ids)
+            if not missing_soma_points_df.empty:
+                for file_id, group in missing_soma_points_df.groupby("file_id", sort=True):
+                    coords = group[["x", "y", "z"]].values.astype(np.float64)
+                    batch[file_id] = (coords, color_map.get(file_id, default_color))
+
         return batch
 
     def _soma_projection_active_in_2d(self) -> bool:
@@ -3372,14 +3435,7 @@ class NeuronViewerWidget(QWidget):
             self._highlighted_file_ids = None
             return
 
-        # Get the set of rendered file_ids from layer metadata
-        rendered_ids: set[str] = set()
-        for layer in self._current_neuron_layers:
-            meta = layer.metadata or {}
-            rendered_ids.update(meta.get("file_ids", []))
-            for fid in meta.get("file_ids_per_point", []):
-                rendered_ids.add(fid)
-
+        rendered_ids = self._current_scene_file_ids()
         selected = set(selected_file_ids) & rendered_ids
         if not selected or selected == rendered_ids:
             # Nothing selected or everything selected → clear highlight
@@ -3419,8 +3475,8 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.update_colors(color_map)
         self._refresh_cluster_filter_controls()
 
-    def _clear_neuron_layers(self) -> None:
-        """Remove all current neuron layers."""
+    def _clear_neuron_layers(self, reset_render_state: bool = True) -> None:
+        """Remove all current neuron layers and optionally reset scene state."""
         for layer in self._current_neuron_layers:
             try:
                 self.viewer.layers.remove(layer)
@@ -3428,11 +3484,13 @@ class NeuronViewerWidget(QWidget):
                 pass  # Layer already removed
 
         self._current_neuron_layers.clear()
+        if reset_render_state:
+            self._scene_render_modes.clear()
 
         # Clear slice projector data
         self._slice_projector.clear()
         self._soma_slice_projector.clear()
-        self._neuron_table.set_added_file_ids(set())
+        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
 
     def _toggle_template(self, state: int) -> None:
         """Toggle the template layer visibility."""

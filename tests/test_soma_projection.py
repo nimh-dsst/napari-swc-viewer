@@ -14,6 +14,9 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 _PATCHED_MODULE_NAMES = [
+    "napari",
+    "napari.utils",
+    "napari.utils.notifications",
     "qtpy",
     "qtpy.QtCore",
     "qtpy.QtWidgets",
@@ -32,8 +35,33 @@ _ORIGINAL_MODULES = {
 
 
 class _DummyAnalysisSignal:
+    def __init__(self) -> None:
+        self._callbacks: list = []
+
     def connect(self, *_args, **_kwargs) -> None:
-        return None
+        if _args:
+            self._callbacks.append(_args[0])
+
+    def emit(self, *args, **kwargs) -> None:
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
+
+
+class _Signal:
+    """Minimal descriptor stand-in for ``qtpy.QtCore.Signal``."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self._storage_name = ""
+
+    def __set_name__(self, _owner, name: str) -> None:
+        self._storage_name = f"__signal_{name}"
+
+    def __get__(self, instance, _owner):
+        if instance is None:
+            return self
+        if self._storage_name not in instance.__dict__:
+            instance.__dict__[self._storage_name] = _DummyAnalysisSignal()
+        return instance.__dict__[self._storage_name]
 
 
 class _FakeAnalysisTabWidget:
@@ -89,6 +117,7 @@ fake_qtcore = types.ModuleType("qtpy.QtCore")
 fake_qtcore.Qt = _FakeQt
 fake_qtcore.QThread = _FakeWidget
 fake_qtcore.QTimer = _FakeQTimer
+fake_qtcore.Signal = _Signal
 sys.modules["qtpy.QtCore"] = fake_qtcore
 
 fake_qtwidgets = types.ModuleType("qtpy.QtWidgets")
@@ -123,6 +152,19 @@ fake_qtpy = types.ModuleType("qtpy")
 fake_qtpy.QtCore = fake_qtcore
 fake_qtpy.QtWidgets = fake_qtwidgets
 sys.modules["qtpy"] = fake_qtpy
+
+fake_napari_notifications = types.ModuleType("napari.utils.notifications")
+fake_napari_notifications.show_info = lambda *args, **kwargs: None
+fake_napari_notifications.show_warning = lambda *args, **kwargs: None
+sys.modules["napari.utils.notifications"] = fake_napari_notifications
+
+fake_napari_utils = types.ModuleType("napari.utils")
+fake_napari_utils.notifications = fake_napari_notifications
+sys.modules["napari.utils"] = fake_napari_utils
+
+fake_napari = types.ModuleType("napari")
+fake_napari.utils = fake_napari_utils
+sys.modules["napari"] = fake_napari
 
 fake_analysis_module = types.ModuleType("napari_swc_viewer.widgets.analysis_tab")
 fake_analysis_module.AnalysisTabWidget = _FakeAnalysisTabWidget
@@ -254,6 +296,18 @@ class _DummyPointsLayer:
         self.refresh_count += 1
 
 
+class _DummyShapesLayer:
+    def __init__(self, data: np.ndarray, **kwargs) -> None:
+        self.data = np.asarray(data, dtype=float)
+        self.name = kwargs["name"]
+        self.scale = kwargs.get("scale")
+        self.metadata = kwargs.get("metadata", {})
+        self.opacity = kwargs.get("opacity", 1.0)
+        self.visible = True
+        self.edge_color = kwargs.get("edge_color")
+        self.edge_width = kwargs.get("edge_width")
+
+
 class _DummyViewer:
     def __init__(
         self,
@@ -274,6 +328,11 @@ class _DummyViewer:
         self.layers.append(layer)
         return layer
 
+    def add_shapes(self, data: np.ndarray, **kwargs) -> _DummyShapesLayer:
+        layer = _DummyShapesLayer(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
 
 class _DummyCheckBox:
     def __init__(self, checked: bool) -> None:
@@ -281,6 +340,9 @@ class _DummyCheckBox:
 
     def isChecked(self) -> bool:
         return self._checked
+
+    def setChecked(self, checked: bool) -> None:
+        self._checked = checked
 
 
 class _DummyComboBox:
@@ -294,9 +356,45 @@ class _DummyComboBox:
 class _DummyLabel:
     def __init__(self) -> None:
         self.visible = None
+        self.text = ""
 
     def setVisible(self, value: bool) -> None:
         self.visible = value
+
+    def setText(self, value: str) -> None:
+        self.text = value
+
+
+class _DummyButton:
+    def __init__(self) -> None:
+        self.enabled = True
+
+    def setEnabled(self, value: bool) -> None:
+        self.enabled = value
+
+
+class _DummyProgressBar:
+    def __init__(self) -> None:
+        self.visible = False
+        self.range = (0, 0)
+        self.value = 0
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        self.range = (minimum, maximum)
+
+    def setValue(self, value: int) -> None:
+        self.value = value
+
+    def setVisible(self, value: bool) -> None:
+        self.visible = value
+
+
+class _DummyValueControl:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def value(self):
+        return self._value
 
 
 def _make_soma_projector(
@@ -336,6 +434,25 @@ def _bind_projection_helpers(widget) -> None:
     )
     widget._sync_soma_projection_overlay_state = types.MethodType(
         NeuronViewerWidget._sync_soma_projection_overlay_state,
+        widget,
+    )
+
+
+def _bind_scene_helpers(widget) -> None:
+    widget._current_scene_file_ids = types.MethodType(
+        NeuronViewerWidget._current_scene_file_ids,
+        widget,
+    )
+    widget._build_soma_projection_batch = types.MethodType(
+        NeuronViewerWidget._build_soma_projection_batch,
+        widget,
+    )
+    widget._clear_neuron_layers = types.MethodType(
+        NeuronViewerWidget._clear_neuron_layers,
+        widget,
+    )
+    widget._render_selected_with_mode = types.MethodType(
+        NeuronViewerWidget._render_selected_with_mode,
         widget,
     )
 
@@ -471,6 +588,181 @@ def test_build_soma_projection_batch_queries_db_for_lines_only_rendering() -> No
     assert batch["n2"][1] == (0.0, 1.0, 0.0, 1.0)
 
 
+def test_build_soma_projection_batch_queries_only_missing_soma_only_ids() -> None:
+    points_df = pd.DataFrame(
+        {
+            "file_id": ["n1", "n1"],
+            "type": [1, 2],
+            "x": [1.0, 2.0],
+            "y": [3.0, 4.0],
+            "z": [5.0, 6.0],
+        }
+    )
+    soma_df = pd.DataFrame(
+        {
+            "file_id": ["n2"],
+            "neuron_id": ["N2"],
+            "x": [7.0],
+            "y": [8.0],
+            "z": [9.0],
+        }
+    )
+    widget = types.SimpleNamespace(_db=MagicMock())
+    widget._db.get_soma_points.return_value = soma_df
+
+    batch = NeuronViewerWidget._build_soma_projection_batch(
+        widget,
+        file_ids=["n1", "n2"],
+        neuron_colors=[[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
+        points_df=points_df,
+    )
+
+    widget._db.get_soma_points.assert_called_once_with(["n2"])
+    np.testing.assert_allclose(batch["n1"][0], np.array([[1.0, 3.0, 5.0]]))
+    np.testing.assert_allclose(batch["n2"][0], np.array([[7.0, 8.0, 9.0]]))
+    assert batch["n2"][1] == (0.0, 1.0, 0.0, 1.0)
+
+
+def test_render_selected_soma_only_rebuilds_scene_with_soma_mode() -> None:
+    widget = types.SimpleNamespace(
+        _scene_render_modes={"n1": "full"},
+        _neuron_table=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _render_scene=MagicMock(),
+    )
+    widget._neuron_table.get_selected_file_ids.return_value = ["n1", "n2"]
+    _bind_scene_helpers(widget)
+
+    NeuronViewerWidget._render_selected_soma_only(widget)
+
+    assert widget._scene_render_modes == {"n1": "soma", "n2": "soma"}
+    widget._render_scene.assert_called_once_with()
+
+
+def test_render_selected_neurons_switches_soma_only_back_to_full() -> None:
+    widget = types.SimpleNamespace(
+        _scene_render_modes={"n1": "soma"},
+        _neuron_table=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _render_scene=MagicMock(),
+    )
+    widget._neuron_table.get_selected_file_ids.return_value = ["n1"]
+    _bind_scene_helpers(widget)
+
+    NeuronViewerWidget._render_selected_neurons(widget)
+
+    assert widget._scene_render_modes == {"n1": "full"}
+    widget._render_scene.assert_called_once_with()
+
+
+def test_remove_selected_neurons_preserves_remaining_render_modes() -> None:
+    widget = types.SimpleNamespace(
+        _scene_render_modes={"n1": "full", "n2": "soma"},
+        _neuron_table=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _render_scene=MagicMock(),
+        _capture_depth_state=MagicMock(return_value=None),
+        _restore_depth_state=MagicMock(),
+        _clear_neuron_layers=MagicMock(),
+    )
+    widget._neuron_table.get_selected_file_ids.return_value = ["n1"]
+    widget._current_scene_file_ids = types.MethodType(
+        NeuronViewerWidget._current_scene_file_ids,
+        widget,
+    )
+
+    NeuronViewerWidget._remove_selected_neurons(widget)
+
+    assert widget._scene_render_modes == {"n2": "soma"}
+    widget._render_scene.assert_called_once_with()
+    widget._clear_neuron_layers.assert_not_called()
+
+
+def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    widget = types.SimpleNamespace(
+        _scene_render_modes={"n1": "full", "n2": "soma"},
+        _db=MagicMock(),
+        viewer=viewer,
+        _render_btn=_DummyButton(),
+        _render_soma_only_btn=_DummyButton(),
+        _remove_selected_btn=_DummyButton(),
+        _render_progress=_DummyProgressBar(),
+        _render_status_label=_DummyLabel(),
+        _render_mode_combo=_DummyComboBox("Both"),
+        _opacity_slider=_DummyValueControl(100),
+        _point_size_spin=_DummyValueControl(5),
+        _line_width_spin=_DummyValueControl(4),
+        _color_by_type_cb=_DummyCheckBox(False),
+        _show_slice_projection_cb=_DummyCheckBox(False),
+        _neuron_table=types.SimpleNamespace(
+            get_color=lambda fid: [1.0, 0.0, 0.0, 1.0],
+            set_added_file_ids=MagicMock(),
+        ),
+        _atlas=None,
+        _slice_projector=MagicMock(),
+        _soma_slice_projector=MagicMock(),
+        _analysis_tab=MagicMock(),
+        _current_neuron_layers=[],
+        _capture_depth_state=MagicMock(return_value=None),
+        _restore_depth_state=MagicMock(),
+        _maybe_auto_center_slice=MagicMock(return_value=False),
+        _use_auto_centering=lambda: False,
+        _apply_layer_visibility=MagicMock(),
+        _last_soma_selection=set(),
+        _on_soma_selected=MagicMock(),
+    )
+    _bind_scene_helpers(widget)
+
+    widget._db.get_neuron_lines_batch.return_value = {
+        "n1": (
+            np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=float),
+            np.array([[0, 1]], dtype=np.int32),
+        )
+    }
+    widget._db.get_neurons_for_rendering.return_value = pd.DataFrame(
+        {
+            "file_id": ["n1", "n1"],
+            "type": [1, 2],
+            "x": [1.0, 2.0],
+            "y": [3.0, 4.0],
+            "z": [5.0, 6.0],
+        }
+    )
+    widget._db.get_soma_locations.return_value = pd.DataFrame(
+        {
+            "file_id": ["n1", "n2"],
+            "neuron_id": ["N1", "N2"],
+            "x": [1.0, 7.0],
+            "y": [3.0, 8.0],
+            "z": [5.0, 9.0],
+        }
+    )
+    widget._db.get_soma_points.return_value = pd.DataFrame(
+        {
+            "file_id": ["n2"],
+            "neuron_id": ["N2"],
+            "x": [7.0],
+            "y": [8.0],
+            "z": [9.0],
+        }
+    )
+
+    NeuronViewerWidget._render_scene(widget)
+
+    widget._db.get_neuron_lines_batch.assert_called_once_with(["n1"])
+    widget._db.get_neurons_for_rendering.assert_called_once_with(["n1"])
+    widget._db.get_soma_locations.assert_called_once_with(["n1", "n2"])
+    widget._db.get_soma_points.assert_called_once_with(["n2"])
+    widget._slice_projector.add_neuron_data_batch.assert_called_once()
+    widget._soma_slice_projector.add_soma_data_batch.assert_called_once()
+    assert {layer.name for layer in widget._current_neuron_layers} == {
+        "Neuron Lines",
+        "Neuron Points",
+        "Soma Labels",
+    }
+
+
 def test_apply_layer_visibility_hides_duplicate_soma_markers_in_2d_points_mode() -> None:
     viewer = _DummyViewer(ndisplay=2)
     neuron_points = _DummyPointsLayer(
@@ -599,3 +891,46 @@ def test_on_soma_selected_uses_metadata_file_ids_for_projected_layer() -> None:
     NeuronViewerWidget._on_soma_selected(widget, event)
 
     table.select_file_ids.assert_called_once_with(["n1", "n3"])
+
+
+@pytest.mark.parametrize(
+    ("query_source", "expected_message", "handler_name"),
+    [
+        (
+            "Atlas Regions",
+            "Searching selected atlas regions. Please wait...",
+            "_query_neurons_by_region",
+        ),
+        (
+            "Mask Layer",
+            "Searching selected mask layers. Please wait...",
+            "_query_neurons_by_mask",
+        ),
+    ],
+)
+def test_query_neurons_sets_wait_message_before_dispatch(
+    query_source: str,
+    expected_message: str,
+    handler_name: str,
+) -> None:
+    observed: dict[str, str] = {}
+
+    widget = types.SimpleNamespace(
+        _region_query_source=query_source,
+        _regions_status_label=_DummyLabel(),
+    )
+
+    def _record_status() -> None:
+        observed["status"] = widget._regions_status_label.text
+
+    setattr(widget, handler_name, _record_status)
+    other_handler = (
+        "_query_neurons_by_mask"
+        if handler_name == "_query_neurons_by_region"
+        else "_query_neurons_by_region"
+    )
+    setattr(widget, other_handler, MagicMock())
+
+    NeuronViewerWidget._query_neurons(widget)
+
+    assert observed["status"] == expected_message

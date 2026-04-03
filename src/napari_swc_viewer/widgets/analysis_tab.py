@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from types import MethodType
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
@@ -19,7 +20,7 @@ import numpy as np
 import seaborn as sns
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from qtpy.QtCore import QThread, Signal
+from qtpy.QtCore import QThread, QTimer, Signal
 from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
     QComboBox,
@@ -28,6 +29,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -254,6 +256,8 @@ class AnalysisTabWidget(QWidget):
         self._last_heatmap_file_ids: list[str] | None = None
         self._slice_projector = None
         self._dataset_region_ids: set[int] = set()
+        self._clustermap_rendered = False
+        self._clustermap_refresh_pending = False
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -310,6 +314,9 @@ class AnalysisTabWidget(QWidget):
         self._run_corr_btn.setEnabled(ready and not busy)
         self._run_heat_btn.setEnabled(ready and not busy)
         self._color_by_cluster_btn.setEnabled(self._last_cluster_result is not None)
+        self._build_clustermap_btn.setEnabled(
+            self._last_cluster_result is not None and not busy
+        )
 
     def _on_thread_finished(self) -> None:
         """Clear worker references after the thread has stopped."""
@@ -317,7 +324,17 @@ class AnalysisTabWidget(QWidget):
         self._current_worker = None
 
     def _setup_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        parent_layout = QVBoxLayout(self)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        parent_layout.addWidget(scroll_area)
+
+        content = QWidget()
+        scroll_area.setWidget(content)
+
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # --- Clustering group ---
         self._clustering_section = CollapsibleSection(
@@ -519,7 +536,18 @@ class AnalysisTabWidget(QWidget):
             "Clustermap",
             expanded=False,
         )
+        self._clustermap_section.expanded_changed.connect(
+            self._on_clustermap_section_expanded_changed
+        )
         clustermap_layout = self._clustermap_section.content_layout()
+        self._clustermap_status_label = QLabel(
+            "Run clustering, then click 'Build Dendrogram' to render the cluster map."
+        )
+        clustermap_layout.addWidget(self._clustermap_status_label)
+        self._build_clustermap_btn = QPushButton("Build Dendrogram")
+        self._build_clustermap_btn.setEnabled(False)
+        self._build_clustermap_btn.clicked.connect(self._build_clustermap_on_demand)
+        clustermap_layout.addWidget(self._build_clustermap_btn)
         self._figure = Figure(figsize=(6, 6))
         self._canvas = FigureCanvasQTAgg(self._figure)
         self._canvas.setMinimumHeight(400)
@@ -777,6 +805,10 @@ class AnalysisTabWidget(QWidget):
         self._progress_bar.setRange(0, 0)  # indeterminate
         self._run_corr_btn.setEnabled(False)
         self._run_heat_btn.setEnabled(False)
+        self._build_clustermap_btn.setEnabled(False)
+        self._clustermap_status_label.setText(
+            "Clustering in progress. Build the dendrogram after results are ready."
+        )
 
         thread.start()
 
@@ -867,8 +899,22 @@ class AnalysisTabWidget(QWidget):
 
     def _on_correlation_finished(self, result: ClusterResult) -> None:
         """Handle completed correlation pipeline."""
+        finish_start = perf_counter()
+        logger.debug(
+            "_on_correlation_finished start: neurons=%d distance_shape=%s distance_dtype=%s distance_nbytes=%s",
+            len(result.neuron_ids),
+            getattr(result.distance_matrix, "shape", None),
+            getattr(result.distance_matrix, "dtype", None),
+            getattr(result.distance_matrix, "nbytes", None),
+        )
         self._last_cluster_result = result
+        color_map_start = perf_counter()
         self._build_cluster_color_map()
+        logger.debug(
+            "_on_correlation_finished color map built: elapsed=%.3fs actual_clusters=%d",
+            perf_counter() - color_map_start,
+            self._actual_n_clusters,
+        )
         self._progress_bar.setVisible(False)
 
         requested_k = self._n_clusters_spin.value()
@@ -883,15 +929,22 @@ class AnalysisTabWidget(QWidget):
             f"Clustering complete: {len(result.neuron_ids)} neurons, "
             f"{cluster_msg}"
         )
+        self._clustermap_status_label.setText(
+            "Clustering complete. Click 'Build Dendrogram' to render the cluster map."
+        )
         self._update_button_states()
         self._update_cluster_filter_combo()
-
-        # Draw clustermap
-        self._draw_clustermap(result)
+        logger.debug(
+            "_on_correlation_finished worker result ready; clustermap render deferred until button click"
+        )
 
         # Notify the neuron table of cluster assignments and colors
         if self._cluster_color_map is not None:
             self.cluster_colors_updated.emit(result, self._cluster_color_map)
+        logger.debug(
+            "_on_correlation_finished complete: total_elapsed=%.3fs",
+            perf_counter() - finish_start,
+        )
 
     def _on_heatmap_finished(self, volume: np.ndarray) -> None:
         """Handle completed heatmap pipeline."""
@@ -968,8 +1021,134 @@ class AnalysisTabWidget(QWidget):
         self._update_button_states()
         logger.error(f"Analysis pipeline error: {message}")
 
+    def _attach_clustermap_figure(self, figure: Figure) -> None:
+        """Attach a matplotlib figure to the persistent embedded canvas."""
+        logger.debug(
+            "_attach_clustermap_figure start: figure_id=%s canvas_id=%s",
+            id(figure),
+            id(self._canvas),
+        )
+        figure.set_canvas(self._canvas)
+        self._figure = figure
+        self._canvas.figure = figure
+        update_geometry = getattr(self._canvas, "updateGeometry", None)
+        if callable(update_geometry):
+            update_geometry()
+        logger.debug("_attach_clustermap_figure complete")
+
+    def _clustermap_canvas_pixel_size(self) -> tuple[int, int] | None:
+        """Return the current canvas size in pixels, if available."""
+        width = height = None
+
+        width_method = getattr(self._canvas, "width", None)
+        if callable(width_method):
+            try:
+                width = int(width_method())
+            except (TypeError, ValueError):
+                width = None
+
+        height_method = getattr(self._canvas, "height", None)
+        if callable(height_method):
+            try:
+                height = int(height_method())
+            except (TypeError, ValueError):
+                height = None
+
+        if width is None or height is None:
+            size_attr = getattr(self._canvas, "size", None)
+            size_obj = size_attr() if callable(size_attr) else size_attr
+            if size_obj is not None:
+                if width is None:
+                    width_getter = getattr(size_obj, "width", None)
+                    if callable(width_getter):
+                        width = int(width_getter())
+                if height is None:
+                    height_getter = getattr(size_obj, "height", None)
+                    if callable(height_getter):
+                        height = int(height_getter())
+
+        if width is None or height is None or width <= 0 or height <= 0:
+            return None
+        return (width, height)
+
+    def _refresh_clustermap_layout(self) -> None:
+        """Resize and redraw the clustermap using the canvas's current geometry."""
+        if not getattr(self, "_clustermap_rendered", False):
+            logger.debug("_refresh_clustermap_layout skipped: no rendered clustermap")
+            return
+
+        size = self._clustermap_canvas_pixel_size()
+        if size is None:
+            logger.debug(
+                "_refresh_clustermap_layout skipped: canvas size unavailable"
+            )
+            return
+
+        width_px, height_px = size
+        dpi_getter = getattr(self._figure, "get_dpi", None)
+        dpi = float(dpi_getter()) if callable(dpi_getter) else float(
+            getattr(self._figure, "dpi", 100.0) or 100.0
+        )
+        width_in = max(width_px, 1) / dpi
+        height_in = max(height_px, 1) / dpi
+        self._figure.set_size_inches(width_in, height_in, forward=False)
+
+        for widget in (
+            getattr(self, "_clustermap_section", None),
+            getattr(self, "_canvas", None),
+        ):
+            if widget is None:
+                continue
+            update_geometry = getattr(widget, "updateGeometry", None)
+            if callable(update_geometry):
+                update_geometry()
+
+        logger.debug(
+            "_refresh_clustermap_layout resized figure: width_px=%d height_px=%d dpi=%.3f",
+            width_px,
+            height_px,
+            dpi,
+        )
+        draw_idle = getattr(self._canvas, "draw_idle", None)
+        if callable(draw_idle):
+            draw_idle()
+
+        canvas_start = perf_counter()
+        self._canvas.draw()
+        logger.debug(
+            "_refresh_clustermap_layout canvas draw complete: elapsed=%.3fs",
+            perf_counter() - canvas_start,
+        )
+
+    def _run_scheduled_clustermap_layout_refresh(self) -> None:
+        """Clear the pending flag and perform the deferred layout refresh."""
+        self._clustermap_refresh_pending = False
+        self._refresh_clustermap_layout()
+
+    def _schedule_clustermap_layout_refresh(self) -> None:
+        """Queue a layout-aware clustermap redraw on the next Qt event cycle."""
+        if getattr(self, "_clustermap_refresh_pending", False):
+            logger.debug(
+                "_schedule_clustermap_layout_refresh skipped: refresh already pending"
+            )
+            return
+        self._clustermap_refresh_pending = True
+        logger.debug("_schedule_clustermap_layout_refresh queued")
+        QTimer.singleShot(0, self._run_scheduled_clustermap_layout_refresh)
+
+    def _on_clustermap_section_expanded_changed(self, expanded: bool) -> None:
+        """Refresh clustermap layout when the section becomes visible again."""
+        logger.debug(
+            "_on_clustermap_section_expanded_changed: expanded=%s rendered=%s",
+            expanded,
+            getattr(self, "_clustermap_rendered", False),
+        )
+        if expanded and getattr(self, "_clustermap_rendered", False):
+            self._schedule_clustermap_layout_refresh()
+
     def _draw_clustermap(self, result: ClusterResult) -> None:
         """Draw a seaborn clustermap into the embedded canvas."""
+        draw_start = perf_counter()
         self._figure.clear()
 
         # Build per-neuron cluster color strip for row_colors / col_colors
@@ -982,6 +1161,14 @@ class AnalysisTabWidget(QWidget):
 
         # Use seaborn clustermap with precomputed linkage
         try:
+            logger.debug(
+                "_draw_clustermap start: distance_shape=%s distance_dtype=%s distance_nbytes=%s linkage_shape=%s",
+                getattr(result.distance_matrix, "shape", None),
+                getattr(result.distance_matrix, "dtype", None),
+                getattr(result.distance_matrix, "nbytes", None),
+                getattr(result.linkage_matrix, "shape", None),
+            )
+            seaborn_start = perf_counter()
             g = sns.clustermap(
                 result.distance_matrix,
                 row_linkage=result.linkage_matrix,
@@ -994,16 +1181,28 @@ class AnalysisTabWidget(QWidget):
                 xticklabels=False,
                 yticklabels=False,
             )
+            logger.debug(
+                "_draw_clustermap seaborn.clustermap complete: elapsed=%.3fs",
+                perf_counter() - seaborn_start,
+            )
 
             # Copy the clustermap figure content to our embedded canvas figure
             # seaborn.clustermap creates its own figure, so we replace ours
             old_fig = self._figure
-            self._figure = g.fig
-            self._canvas.figure = self._figure
-            self._canvas.draw()
+            self._attach_clustermap_figure(g.fig)
+            self._clustermap_rendered = True
+            logger.debug("_draw_clustermap canvas figure swapped")
+            self._schedule_clustermap_layout_refresh()
+            logger.debug(
+                "_draw_clustermap layout refresh scheduled after figure swap"
+            )
 
             # Close the reference to the old figure
             plt.close(old_fig)
+            logger.debug(
+                "_draw_clustermap closed previous figure; total_elapsed=%.3fs",
+                perf_counter() - draw_start,
+            )
 
         except Exception as e:
             logger.exception("Failed to draw clustermap")
@@ -1014,7 +1213,39 @@ class AnalysisTabWidget(QWidget):
                 ha="center", va="center",
                 transform=ax.transAxes,
             )
-            self._canvas.draw()
+            self._clustermap_rendered = True
+            self._schedule_clustermap_layout_refresh()
+
+    def _build_clustermap_on_demand(self) -> None:
+        """Render the cached clustering result into the clustermap canvas."""
+        result = self._last_cluster_result
+        if result is None:
+            self._clustermap_status_label.setText(
+                "Run clustering before building the dendrogram."
+            )
+            return
+
+        logger.debug(
+            "_build_clustermap_on_demand start: neurons=%d distance_shape=%s",
+            len(result.neuron_ids),
+            getattr(result.distance_matrix, "shape", None),
+        )
+        self._build_clustermap_btn.setEnabled(False)
+        self._clustermap_status_label.setText(
+            f"Rendering dendrogram for {len(result.neuron_ids)} neurons..."
+        )
+        draw_start = perf_counter()
+        try:
+            self._draw_clustermap(result)
+            self._clustermap_status_label.setText(
+                f"Dendrogram ready for {len(result.neuron_ids)} neurons."
+            )
+        finally:
+            self._update_button_states()
+        logger.debug(
+            "_build_clustermap_on_demand complete: elapsed=%.3fs",
+            perf_counter() - draw_start,
+        )
 
     def _build_cluster_color_map(self) -> None:
         """Build and cache the neuron_id -> RGBA color mapping from cluster results.
@@ -1028,6 +1259,7 @@ class AnalysisTabWidget(QWidget):
             self._cluster_color_map = None
             return
 
+        start = perf_counter()
         result = self._last_cluster_result
         unique_labels = np.unique(result.labels)
         n_clusters = int(len(unique_labels))
@@ -1080,6 +1312,10 @@ class AnalysisTabWidget(QWidget):
         logger.info(
             f"Built cluster color map: {len(color_map)} neurons, "
             f"{n_clusters} clusters"
+        )
+        logger.debug(
+            "_build_cluster_color_map complete: elapsed=%.3fs",
+            perf_counter() - start,
         )
 
     def _update_cluster_filter_combo(self) -> None:
