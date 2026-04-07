@@ -160,3 +160,7 @@ flipped_coordinate = 2 × midline - original_coordinate
 ```
 
 This operation is vectorized using NumPy for efficient processing of large SWC files (10,000+ nodes).
+
+## Third Party Attribution
+
+This repository contains modified code derived from [napari swc editor](https://github.com/LaboratoryOpticsBiosciences/napari-swc-editor) by Clément Caporal.
