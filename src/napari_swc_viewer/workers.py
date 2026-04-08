@@ -18,9 +18,48 @@ from qtpy.QtCore import QObject, Signal
 if TYPE_CHECKING:
     from brainglobe_atlasapi import BrainGlobeAtlas
 
-    from .analysis.clustering import ClusterResult
+    from .analysis.clustering import ClusterRegionSelection, ClusterResult
 
 logger = logging.getLogger(__name__)
+
+
+def _attach_cluster_run_metadata(
+    result,
+    *,
+    atlas,
+    parquet_path: str,
+    region_selection,
+    analysis_method: str,
+    clustering_algorithm: str,
+    distance_metric: str,
+    clustering_linkage: str | None,
+    dendrogram_linkage: str | None,
+    dilation_fraction: float,
+    requested_cluster_count: int | None,
+    dbscan_eps: float | None = None,
+    dbscan_min_samples: int | None = None,
+):
+    """Populate the cluster result with reproducibility metadata."""
+    from .analysis.clustering import ClusterRunMetadata
+
+    result.metadata = ClusterRunMetadata.from_region_selection(
+        region_selection=region_selection,
+        analysis_method=analysis_method,
+        clustering_algorithm=clustering_algorithm,
+        distance_metric=distance_metric,
+        clustering_linkage=clustering_linkage,
+        dendrogram_linkage=dendrogram_linkage,
+        dilation_fraction=dilation_fraction,
+        requested_cluster_count=requested_cluster_count,
+        actual_cluster_count=len(np.unique(result.labels)),
+        dbscan_eps=dbscan_eps,
+        dbscan_min_samples=dbscan_min_samples,
+        atlas_name=getattr(atlas, "atlas_name", None),
+        atlas_resolution_um=tuple(float(value) for value in getattr(atlas, "resolution", ()) or ()),
+        source_parquet_path=str(Path(parquet_path)),
+        dendrogram_leaf_order=[int(value) for value in result.reorder_indices.tolist()],
+    )
+    return result
 
 
 class ConvertWorker(QObject):
@@ -203,7 +242,7 @@ class CorrelationWorker(QObject):
         self,
         parquet_path: str,
         atlas: BrainGlobeAtlas,
-        region_acronym: str,
+        region_selection: ClusterRegionSelection,
         dilation_fraction: float = 0.2,
         linkage_method: str = "average",
         n_clusters: int = 5,
@@ -211,7 +250,7 @@ class CorrelationWorker(QObject):
         super().__init__()
         self._parquet_path = parquet_path
         self._atlas = atlas
-        self._region_acronym = region_acronym
+        self._region_selection = region_selection
         self._dilation_fraction = dilation_fraction
         self._linkage_method = linkage_method
         self._n_clusters = n_clusters
@@ -226,13 +265,13 @@ class CorrelationWorker(QObject):
                 compute_pearson_correlation_matrix,
                 correlation_long_to_matrix,
             )
-            from .analysis.mask import get_expanded_region_voxel_ids
+            from .analysis.mask import get_expanded_region_voxel_ids_for_regions
 
             total = 5
             self.progress.emit("Extracting and dilating region mask...", 1, total)
-            voxel_id_map = get_expanded_region_voxel_ids(
+            voxel_id_map = get_expanded_region_voxel_ids_for_regions(
                 self._atlas,
-                self._region_acronym,
+                self._region_selection.selected_region_acronyms,
                 self._dilation_fraction,
             )
 
@@ -258,6 +297,19 @@ class CorrelationWorker(QObject):
                 list(mat_df.columns),
                 method=self._linkage_method,
                 n_clusters=self._n_clusters,
+            )
+            _attach_cluster_run_metadata(
+                result,
+                atlas=self._atlas,
+                parquet_path=self._parquet_path,
+                region_selection=self._region_selection,
+                analysis_method="voxel_correlation",
+                clustering_algorithm="hierarchical",
+                distance_metric="one_minus_pearson_r",
+                clustering_linkage=self._linkage_method,
+                dendrogram_linkage=self._linkage_method,
+                dilation_fraction=self._dilation_fraction,
+                requested_cluster_count=self._n_clusters,
             )
 
             self.progress.emit("Done", 5, total)
@@ -295,7 +347,7 @@ class SomaClusterWorker(QObject):
         self,
         parquet_path: str,
         atlas: BrainGlobeAtlas,
-        region_acronym: str,
+        region_selection: ClusterRegionSelection,
         dilation_fraction: float = 0.2,
         algorithm: str = "hierarchical",
         linkage_method: str = "ward",
@@ -306,7 +358,7 @@ class SomaClusterWorker(QObject):
         super().__init__()
         self._parquet_path = parquet_path
         self._atlas = atlas
-        self._region_acronym = region_acronym
+        self._region_selection = region_selection
         self._dilation_fraction = dilation_fraction
         self._algorithm = algorithm
         self._linkage_method = linkage_method
@@ -324,7 +376,7 @@ class SomaClusterWorker(QObject):
                 cluster_somas_hierarchical,
                 cluster_somas_kmeans,
             )
-            from .analysis.mask import get_expanded_region_voxel_ids
+            from .analysis.mask import get_expanded_region_voxel_ids_for_regions
 
             total = 4
             run_start = perf_counter()
@@ -344,8 +396,9 @@ class SomaClusterWorker(QObject):
             self.progress.emit("Extracting and dilating region mask...", 1, total)
             mask_start = perf_counter()
             voxel_id_map = get_expanded_region_voxel_ids(
+            voxel_id_map = get_expanded_region_voxel_ids_for_regions(
                 self._atlas,
-                self._region_acronym,
+                self._region_selection.selected_region_acronyms,
                 self._dilation_fraction,
             )
             logger.debug(
@@ -409,7 +462,8 @@ class SomaClusterWorker(QObject):
 
             logger.info(
                 f"Soma filtering: {len(coords)} total somas, "
-                f"{len(filtered_ids)} in region '{self._region_acronym}'"
+                f"{len(filtered_ids)} in region(s) "
+                f"'{', '.join(self._region_selection.selected_region_acronyms)}'"
             )
             logger.debug(
                 "SomaClusterWorker filtering complete: total=%d in_bounds=%d in_region=%d filtered_shape=%s filtered_dtype=%s elapsed=%.3fs",
@@ -424,7 +478,8 @@ class SomaClusterWorker(QObject):
             if len(filtered_ids) < 2:
                 self.error.emit(
                     f"Only {len(filtered_ids)} soma(s) found in "
-                    f"'{self._region_acronym}' — need at least 2 for clustering."
+                    f"'{', '.join(self._region_selection.selected_region_acronyms)}' "
+                    "— need at least 2 for clustering."
                 )
                 return
 
@@ -437,26 +492,44 @@ class SomaClusterWorker(QObject):
                     method=self._linkage_method,
                     n_clusters=self._n_clusters,
                 )
+                clustering_linkage = self._linkage_method
+                dendrogram_linkage = self._linkage_method
+                requested_cluster_count = self._n_clusters
             elif self._algorithm == "kmeans":
                 result = cluster_somas_kmeans(
                     filtered_coords, filtered_ids,
                     n_clusters=self._n_clusters,
                 )
+                clustering_linkage = None
+                dendrogram_linkage = "average"
+                requested_cluster_count = self._n_clusters
             elif self._algorithm == "dbscan":
                 result = cluster_somas_dbscan(
                     filtered_coords, filtered_ids,
                     eps=self._eps,
                     min_samples=self._min_samples,
                 )
+                clustering_linkage = None
+                dendrogram_linkage = "average"
+                requested_cluster_count = None
             else:
                 self.error.emit(f"Unknown algorithm: {self._algorithm}")
                 return
-            logger.debug(
-                "SomaClusterWorker clustering complete: algorithm=%s elapsed=%.3fs labels_shape=%s linkage_shape=%s",
-                self._algorithm,
-                perf_counter() - cluster_start,
-                getattr(result.labels, "shape", None),
-                getattr(result.linkage_matrix, "shape", None),
+
+            _attach_cluster_run_metadata(
+                result,
+                atlas=self._atlas,
+                parquet_path=self._parquet_path,
+                region_selection=self._region_selection,
+                analysis_method="soma_location",
+                clustering_algorithm=self._algorithm,
+                distance_metric="euclidean_um",
+                clustering_linkage=clustering_linkage,
+                dendrogram_linkage=dendrogram_linkage,
+                dilation_fraction=self._dilation_fraction,
+                requested_cluster_count=requested_cluster_count,
+                dbscan_eps=self._eps if self._algorithm == "dbscan" else None,
+                dbscan_min_samples=self._min_samples if self._algorithm == "dbscan" else None,
             )
 
             self.progress.emit("Done", 4, total)
@@ -533,4 +606,76 @@ class HeatmapWorker(QObject):
 
         except Exception as e:
             logger.exception("Heatmap pipeline failed")
+            self.error.emit(str(e))
+
+
+class AnalysisExportWorker(QObject):
+    """Export analysis outputs that benefit from background execution."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        export_kind: str,
+        output_path: str,
+        cluster_result: ClusterResult,
+        cluster_color_map: dict[str, list[float]] | None = None,
+        *,
+        figure_title: str = "",
+        x_label: str = "",
+        y_label: str = "",
+    ):
+        super().__init__()
+        self._export_kind = str(export_kind)
+        self._output_path = Path(output_path)
+        self._cluster_result = cluster_result
+        self._cluster_color_map = cluster_color_map or {}
+        self._figure_title = figure_title
+        self._x_label = x_label
+        self._y_label = y_label
+
+    def run(self) -> None:
+        """Execute one analysis export."""
+        try:
+            from .analysis.export import (
+                export_cluster_workbook,
+                export_distance_workbook,
+                export_extended_parquet,
+            )
+
+            if self._export_kind == "cluster_workbook":
+                export_cluster_workbook(
+                    self._output_path,
+                    self._cluster_result,
+                    self._cluster_color_map,
+                    figure_title=self._figure_title,
+                    x_label=self._x_label,
+                    y_label=self._y_label,
+                    progress_callback=self.progress.emit,
+                )
+            elif self._export_kind == "distance_workbook":
+                export_distance_workbook(
+                    self._output_path,
+                    self._cluster_result,
+                    self._cluster_color_map,
+                    figure_title=self._figure_title,
+                    x_label=self._x_label,
+                    y_label=self._y_label,
+                    progress_callback=self.progress.emit,
+                )
+            elif self._export_kind == "extended_parquet":
+                export_extended_parquet(
+                    self._output_path,
+                    self._cluster_result,
+                    progress_callback=self.progress.emit,
+                )
+            else:
+                raise ValueError(f"Unknown analysis export kind: {self._export_kind}")
+
+            self.finished.emit(str(self._output_path))
+
+        except Exception as e:
+            logger.exception("Analysis export failed")
             self.error.emit(str(e))

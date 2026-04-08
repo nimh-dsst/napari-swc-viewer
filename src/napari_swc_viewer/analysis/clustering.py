@@ -11,8 +11,8 @@ k-means, and DBSCAN algorithms.
 from __future__ import annotations
 
 import logging
-from time import perf_counter
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -26,15 +26,142 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _format_nbytes(num_bytes: int) -> str:
-    """Return a compact human-readable size string."""
-    if num_bytes < 1024:
-        return f"{num_bytes} B"
-    if num_bytes < 1024**2:
-        return f"{num_bytes / 1024:.2f} KiB"
-    if num_bytes < 1024**3:
-        return f"{num_bytes / (1024**2):.2f} MiB"
-    return f"{num_bytes / (1024**3):.2f} GiB"
+@dataclass(frozen=True)
+class ClusterRegionSelection:
+    """Direct region selections and represented dataset descendants."""
+
+    selected_region_ids: list[int] = field(default_factory=list)
+    selected_region_acronyms: list[str] = field(default_factory=list)
+    represented_region_ids: list[int] = field(default_factory=list)
+    represented_region_acronyms: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe mapping for export metadata."""
+        return {
+            "selected_region_ids": [
+                int(value) for value in self.selected_region_ids
+            ],
+            "selected_region_acronyms": [
+                str(value) for value in self.selected_region_acronyms
+            ],
+            "represented_region_ids": [
+                int(value) for value in self.represented_region_ids
+            ],
+            "represented_region_acronyms": [
+                str(value) for value in self.represented_region_acronyms
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class ClusterRunMetadata:
+    """Parameters and provenance required to reproduce a clustering run."""
+
+    analysis_method: str
+    clustering_algorithm: str
+    distance_metric: str
+    clustering_linkage: str | None
+    dendrogram_linkage: str | None
+    selected_region_ids: list[int] = field(default_factory=list)
+    selected_region_acronyms: list[str] = field(default_factory=list)
+    represented_region_ids: list[int] = field(default_factory=list)
+    represented_region_acronyms: list[str] = field(default_factory=list)
+    dilation_fraction: float = 0.0
+    requested_cluster_count: int | None = None
+    actual_cluster_count: int = 0
+    dbscan_eps: float | None = None
+    dbscan_min_samples: int | None = None
+    atlas_name: str | None = None
+    atlas_resolution_um: tuple[float, ...] = ()
+    source_parquet_path: str | None = None
+    dendrogram_leaf_order: list[int] = field(default_factory=list)
+
+    @classmethod
+    def from_region_selection(
+        cls,
+        *,
+        region_selection: ClusterRegionSelection,
+        analysis_method: str,
+        clustering_algorithm: str,
+        distance_metric: str,
+        clustering_linkage: str | None,
+        dendrogram_linkage: str | None,
+        dilation_fraction: float,
+        requested_cluster_count: int | None,
+        actual_cluster_count: int,
+        dbscan_eps: float | None,
+        dbscan_min_samples: int | None,
+        atlas_name: str | None,
+        atlas_resolution_um: tuple[float, ...],
+        source_parquet_path: str | None,
+        dendrogram_leaf_order: list[int],
+    ) -> "ClusterRunMetadata":
+        """Build metadata from a worker-region selection payload."""
+        return cls(
+            analysis_method=analysis_method,
+            clustering_algorithm=clustering_algorithm,
+            distance_metric=distance_metric,
+            clustering_linkage=clustering_linkage,
+            dendrogram_linkage=dendrogram_linkage,
+            selected_region_ids=list(region_selection.selected_region_ids),
+            selected_region_acronyms=list(
+                region_selection.selected_region_acronyms
+            ),
+            represented_region_ids=list(
+                region_selection.represented_region_ids
+            ),
+            represented_region_acronyms=list(
+                region_selection.represented_region_acronyms
+            ),
+            dilation_fraction=float(dilation_fraction),
+            requested_cluster_count=requested_cluster_count,
+            actual_cluster_count=int(actual_cluster_count),
+            dbscan_eps=dbscan_eps,
+            dbscan_min_samples=dbscan_min_samples,
+            atlas_name=atlas_name,
+            atlas_resolution_um=tuple(
+                float(value) for value in atlas_resolution_um
+            ),
+            source_parquet_path=source_parquet_path,
+            dendrogram_leaf_order=[
+                int(value) for value in dendrogram_leaf_order
+            ],
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe mapping for workbook/parquet exports."""
+        return {
+            "analysis_method": self.analysis_method,
+            "clustering_algorithm": self.clustering_algorithm,
+            "distance_metric": self.distance_metric,
+            "clustering_linkage": self.clustering_linkage,
+            "dendrogram_linkage": self.dendrogram_linkage,
+            "selected_region_ids": [
+                int(value) for value in self.selected_region_ids
+            ],
+            "selected_region_acronyms": [
+                str(value) for value in self.selected_region_acronyms
+            ],
+            "represented_region_ids": [
+                int(value) for value in self.represented_region_ids
+            ],
+            "represented_region_acronyms": [
+                str(value) for value in self.represented_region_acronyms
+            ],
+            "dilation_fraction": float(self.dilation_fraction),
+            "requested_cluster_count": self.requested_cluster_count,
+            "actual_cluster_count": int(self.actual_cluster_count),
+            "dbscan_eps": self.dbscan_eps,
+            "dbscan_min_samples": self.dbscan_min_samples,
+            "atlas_name": self.atlas_name,
+            "atlas_resolution_um": [
+                float(value) for value in self.atlas_resolution_um
+            ],
+            "source_parquet_path": self.source_parquet_path,
+            "dendrogram_leaf_order": [
+                int(value) for value in self.dendrogram_leaf_order
+            ],
+        }
 
 
 @dataclass
@@ -46,7 +173,24 @@ class ClusterResult:
     linkage_matrix: NDArray[np.float64]
     neuron_ids: list[str]
     reorder_indices: NDArray[np.intp]
-    labels: NDArray[np.int32] = field(default_factory=lambda: np.array([], dtype=np.int32))
+    labels: NDArray[np.int32] = field(
+        default_factory=lambda: np.array([], dtype=np.int32)
+    )
+    metadata: ClusterRunMetadata | None = None
+
+    def neuron_ids_in_leaf_order(self) -> list[str]:
+        """Return neuron IDs in dendrogram leaf order."""
+        return [
+            self.neuron_ids[int(index)]
+            for index in self.reorder_indices.tolist()
+        ]
+
+    def labels_in_leaf_order(self) -> list[int]:
+        """Return cluster labels in dendrogram leaf order."""
+        return [
+            int(self.labels[int(index)])
+            for index in self.reorder_indices.tolist()
+        ]
 
 
 def compute_linkage(
@@ -85,7 +229,9 @@ def compute_linkage(
         squareform_elapsed,
     )
     linkage_start = perf_counter()
-    logger.debug("compute_linkage calling scipy.linkage with method=%s", method)
+    logger.debug(
+        "compute_linkage calling scipy.linkage with method=%s", method
+    )
     result = linkage(condensed, method=method)
     linkage_elapsed = perf_counter() - linkage_start
     logger.debug(
@@ -189,7 +335,9 @@ def extract_clusters(
     NDArray[np.int32]
         Cluster label for each sample (1-indexed).
     """
-    return fcluster(linkage_matrix, t=n_clusters, criterion="maxclust").astype(np.int32)
+    return fcluster(linkage_matrix, t=n_clusters, criterion="maxclust").astype(
+        np.int32
+    )
 
 
 def cophenetic_spearman(
@@ -236,9 +384,14 @@ def compare_partitions(
         List of (k, ARI, NMI) tuples.
     """
     try:
-        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+        from sklearn.metrics import (
+            adjusted_rand_score,
+            normalized_mutual_info_score,
+        )
     except ImportError:
-        logger.warning("scikit-learn not installed; skipping partition comparison")
+        logger.warning(
+            "scikit-learn not installed; skipping partition comparison"
+        )
         return []
 
     results = []
@@ -272,23 +425,22 @@ def _euclidean_distance_matrix(
     NDArray[np.float32]
         (N, N) symmetric distance matrix with zero diagonal.
     """
-    logger.debug(
-        "Building Euclidean distance matrix: coords shape=%s dtype=%s nbytes=%s",
-        coords.shape,
-        coords.dtype,
-        _format_nbytes(int(coords.nbytes)),
-    )
-    start = perf_counter()
-    dist = squareform(pdist(coords, metric="euclidean")).astype(np.float32)
-    elapsed = perf_counter() - start
-    logger.debug(
-        "Built Euclidean distance matrix: shape=%s dtype=%s nbytes=%s elapsed=%.3fs",
-        dist.shape,
-        dist.dtype,
-        _format_nbytes(int(dist.nbytes)),
-        elapsed,
-    )
-    return dist
+    return squareform(pdist(coords, metric="euclidean")).astype(np.float32)
+
+
+def _euclidean_condensed_distances(
+    coords: NDArray[np.float64],
+) -> NDArray[np.float32]:
+    """Compute condensed pairwise Euclidean distances from 3-D coordinates."""
+    return pdist(coords, metric="euclidean").astype(np.float32, copy=False)
+
+
+def compute_linkage_from_condensed(
+    condensed_distances: NDArray[np.floating],
+    method: str = "average",
+) -> NDArray[np.float64]:
+    """Compute linkage directly from a condensed distance vector."""
+    return linkage(np.asarray(condensed_distances), method=method)
 
 
 def cluster_somas_hierarchical(
@@ -314,32 +466,8 @@ def cluster_somas_hierarchical(
     -------
     ClusterResult
     """
-    total_start = perf_counter()
-    logger.debug(
-        "cluster_somas_hierarchical start: neurons=%d coords shape=%s dtype=%s method=%s n_clusters=%d",
-        len(neuron_ids),
-        coords.shape,
-        coords.dtype,
-        method,
-        n_clusters,
-    )
-    distance_start = perf_counter()
-    dist = _euclidean_distance_matrix(coords)
-    distance_elapsed = perf_counter() - distance_start
-    logger.debug(
-        "cluster_somas_hierarchical distance build complete: elapsed=%.3fs distance_nbytes=%s",
-        distance_elapsed,
-        _format_nbytes(int(dist.nbytes)),
-    )
-    linkage_start = perf_counter()
-    Z = compute_linkage(dist, method=method)
-    linkage_elapsed = perf_counter() - linkage_start
-    logger.debug(
-        "cluster_somas_hierarchical linkage complete: elapsed=%.3fs linkage_nbytes=%s",
-        linkage_elapsed,
-        _format_nbytes(int(Z.nbytes)),
-    )
-    fcluster_start = perf_counter()
+    condensed = _euclidean_condensed_distances(coords)
+    Z = compute_linkage_from_condensed(condensed, method=method)
     labels = fcluster(Z, t=n_clusters, criterion="maxclust").astype(np.int32)
     fcluster_elapsed = perf_counter() - fcluster_start
     logger.debug(
@@ -350,13 +478,7 @@ def cluster_somas_hierarchical(
     )
     reorder_start = perf_counter()
     reorder = leaves_list(Z)
-    reorder_elapsed = perf_counter() - reorder_start
-    logger.debug(
-        "cluster_somas_hierarchical leaves_list complete: elapsed=%.3fs reorder shape=%s dtype=%s",
-        reorder_elapsed,
-        reorder.shape,
-        reorder.dtype,
-    )
+    dist = squareform(condensed, checks=False).astype(np.float32, copy=False)
 
     actual_k = int(len(np.unique(labels)))
     logger.info(
@@ -403,13 +525,16 @@ def cluster_somas_kmeans(
     """
     from sklearn.cluster import KMeans
 
-    dist = _euclidean_distance_matrix(coords)
+    condensed = _euclidean_condensed_distances(coords)
     # Linkage is computed for clustermap dendrogram visualisation only
-    Z = compute_linkage(dist, method="average")
+    Z = compute_linkage_from_condensed(condensed, method="average")
     reorder = leaves_list(Z)
+    dist = squareform(condensed, checks=False).astype(np.float32, copy=False)
 
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = km.fit_predict(coords).astype(np.int32) + 1  # 1-indexed like fcluster
+    labels = (
+        km.fit_predict(coords).astype(np.int32) + 1
+    )  # 1-indexed like fcluster
 
     actual_k = int(len(np.unique(labels)))
     logger.info(
@@ -455,10 +580,11 @@ def cluster_somas_dbscan(
     """
     from sklearn.cluster import DBSCAN
 
-    dist = _euclidean_distance_matrix(coords)
+    condensed = _euclidean_condensed_distances(coords)
     # Linkage is computed for clustermap dendrogram visualisation only
-    Z = compute_linkage(dist, method="average")
+    Z = compute_linkage_from_condensed(condensed, method="average")
     reorder = leaves_list(Z)
+    dist = squareform(condensed, checks=False).astype(np.float32, copy=False)
 
     db = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
     raw_labels = db.fit_predict(dist)

@@ -12,6 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from napari_swc_viewer.analysis.mask import (
     build_binary_mask_from_heatmap,
     build_binary_mask_from_threshold_range,
+    get_expanded_region_voxel_ids_for_regions,
+    get_regions_mask,
     merge_heatmap_volumes,
     otsu_threshold_positive,
     smooth_heatmap_volume,
@@ -25,6 +27,17 @@ class FakeAtlas:
         self.resolution = (25.0, 25.0, 25.0)
         self.atlas_name = "fake_atlas"
         self.structures = {}
+
+
+class _UnionMaskAtlas:
+    """Atlas-like object with explicit per-acronym masks."""
+
+    def __init__(self, masks: dict[str, np.ndarray]) -> None:
+        self._masks = {key: np.asarray(value, dtype=np.uint8) for key, value in masks.items()}
+        self.resolution = (25.0, 25.0, 25.0)
+
+    def get_structure_mask(self, acronym: str) -> np.ndarray:
+        return self._masks[str(acronym)]
 
 
 def test_smooth_heatmap_volume_sigma_zero_returns_copy() -> None:
@@ -48,6 +61,55 @@ def test_merge_heatmap_volumes_sums_inputs() -> None:
 
     assert float(merged[1, 1, 1]) == 5.0
     assert float(merged[2, 1, 1]) == 1.0
+
+
+def test_get_regions_mask_unions_selected_region_masks() -> None:
+    atlas = _UnionMaskAtlas(
+        {
+            "R1": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+            "R2": np.array([[[0, 0], [1, 0]]], dtype=np.uint8),
+        }
+    )
+
+    mask = get_regions_mask(atlas, ["R1", "R2"])
+
+    assert mask.dtype == np.bool_
+    assert int(mask.sum()) == 2
+    assert bool(mask[0, 0, 0])
+    assert bool(mask[0, 1, 0])
+
+
+def test_get_expanded_region_voxel_ids_for_regions_dilates_after_union(monkeypatch) -> None:
+    atlas = _UnionMaskAtlas(
+        {
+            "R1": np.array([[[1, 0], [0, 0]]], dtype=np.uint8),
+            "R2": np.array([[[0, 1], [0, 0]]], dtype=np.uint8),
+        }
+    )
+    seen: dict[str, object] = {}
+
+    def fake_dilate(mask, increase_fraction, voxel_spacing_um):
+        seen["mask"] = np.asarray(mask, dtype=bool).copy()
+        seen["increase_fraction"] = float(increase_fraction)
+        seen["voxel_spacing_um"] = tuple(float(value) for value in voxel_spacing_um)
+        return np.asarray(mask, dtype=bool)
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.dilate_mask_to_volume_increase",
+        fake_dilate,
+    )
+
+    id_map = get_expanded_region_voxel_ids_for_regions(
+        atlas,
+        ["R1", "R2"],
+        increase_fraction=0.2,
+    )
+
+    expected_union = np.array([[[True, True], [False, False]]], dtype=bool)
+    assert np.array_equal(seen["mask"], expected_union)
+    assert seen["increase_fraction"] == 0.2
+    assert seen["voxel_spacing_um"] == (25.0, 25.0, 25.0)
+    assert sorted(id_map[id_map >= 0].tolist()) == [0, 1]
 
 
 def test_otsu_threshold_positive_ignores_zero_background() -> None:

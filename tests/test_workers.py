@@ -7,6 +7,10 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
+from napari_swc_viewer.analysis.clustering import ClusterRegionSelection, ClusterResult
 from napari_swc_viewer.point_import import PointParquetAppendSummary
 from napari_swc_viewer.parquet import BatchParquetConversionSummary
 
@@ -56,12 +60,59 @@ def _import_workers_module():
     qtcore_module.QObject = _QObject
     qtcore_module.Signal = _Signal
     qtpy_module.QtCore = qtcore_module
+    previous_qtpy = sys.modules.get("qtpy")
+    previous_qtcore = sys.modules.get("qtpy.QtCore")
+    previous_workers = sys.modules.get("napari_swc_viewer.workers")
 
-    sys.modules["qtpy"] = qtpy_module
-    sys.modules["qtpy.QtCore"] = qtcore_module
-    sys.modules.pop("napari_swc_viewer.workers", None)
+    try:
+        sys.modules["qtpy"] = qtpy_module
+        sys.modules["qtpy.QtCore"] = qtcore_module
+        sys.modules.pop("napari_swc_viewer.workers", None)
+        return importlib.import_module("napari_swc_viewer.workers")
+    finally:
+        if previous_workers is None:
+            sys.modules.pop("napari_swc_viewer.workers", None)
+        else:
+            sys.modules["napari_swc_viewer.workers"] = previous_workers
 
-    return importlib.import_module("napari_swc_viewer.workers")
+        if previous_qtpy is None:
+            sys.modules.pop("qtpy", None)
+        else:
+            sys.modules["qtpy"] = previous_qtpy
+
+        if previous_qtcore is None:
+            sys.modules.pop("qtpy.QtCore", None)
+        else:
+            sys.modules["qtpy.QtCore"] = previous_qtcore
+
+
+def _make_cluster_result(neuron_ids: list[str], labels: list[int]) -> ClusterResult:
+    """Build a small cluster result fixture."""
+    n_neurons = len(neuron_ids)
+    return ClusterResult(
+        correlation_matrix=np.eye(n_neurons, dtype=np.float32),
+        distance_matrix=np.eye(n_neurons, dtype=np.float32),
+        linkage_matrix=np.zeros((max(n_neurons - 1, 1), 4), dtype=np.float64),
+        neuron_ids=list(neuron_ids),
+        reorder_indices=np.arange(n_neurons - 1, -1, -1, dtype=np.intp),
+        labels=np.asarray(labels, dtype=np.int32),
+    )
+
+
+class _FakeDuckConnection:
+    """Very small DuckDB connection stub used for worker tests."""
+
+    def __init__(self, dataframe: pd.DataFrame | None = None):
+        self._dataframe = dataframe if dataframe is not None else pd.DataFrame()
+
+    def execute(self, _query):
+        return self
+
+    def fetchdf(self):
+        return self._dataframe
+
+    def close(self) -> None:
+        return None
 
 
 def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_path):
@@ -137,6 +188,253 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
     assert not errors
     assert finished[0][0] == str(output_path)
     assert finished[0][1].flipped_files == 1
+
+
+def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeypatch):
+    """CorrelationWorker should union selected regions and persist run metadata."""
+    workers = _import_workers_module()
+    CorrelationWorker = workers.CorrelationWorker
+    calls: dict[str, object] = {}
+
+    def fake_get_expanded_region_voxel_ids_for_regions(atlas, acronyms, increase_fraction):
+        calls["atlas"] = atlas
+        calls["acronyms"] = list(acronyms)
+        calls["increase_fraction"] = float(increase_fraction)
+        return np.zeros((2, 2, 2), dtype=np.int32)
+
+    def fake_compute_pearson_correlation_matrix(conn, parquet_path, voxel_id_map, resolution):
+        calls["parquet_path"] = parquet_path
+        calls["voxel_id_map_shape"] = voxel_id_map.shape
+        calls["resolution"] = resolution
+        return pd.DataFrame({"swc_id_1": [], "swc_id_2": [], "r": []})
+
+    def fake_correlation_long_to_matrix(_corr_df):
+        return pd.DataFrame([[1.0, 0.4], [0.4, 1.0]], columns=["n1", "n2"]), np.array(
+            [[1.0, 0.4], [0.4, 1.0]],
+            dtype=np.float32,
+        )
+
+    def fake_compute_clustermap_data(mat, neuron_ids, method, n_clusters):
+        calls["linkage_method"] = method
+        calls["n_clusters"] = n_clusters
+        assert list(neuron_ids) == ["n1", "n2"]
+        return _make_cluster_result(["n1", "n2"], [1, 2])
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        fake_get_expanded_region_voxel_ids_for_regions,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.correlation.compute_pearson_correlation_matrix",
+        fake_compute_pearson_correlation_matrix,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.correlation.correlation_long_to_matrix",
+        fake_correlation_long_to_matrix,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.compute_clustermap_data",
+        fake_compute_clustermap_data,
+    )
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection())
+
+    atlas = types.SimpleNamespace(
+        resolution=(25.0, 25.0, 25.0),
+        atlas_name="fake_atlas",
+    )
+    region_selection = ClusterRegionSelection(
+        selected_region_ids=[184, 500],
+        selected_region_acronyms=["FRP", "CP"],
+        represented_region_ids=[68, 500],
+        represented_region_acronyms=["FRP1", "CP"],
+    )
+    worker = CorrelationWorker(
+        parquet_path="neurons.parquet",
+        atlas=atlas,
+        region_selection=region_selection,
+        dilation_fraction=0.3,
+        linkage_method="average",
+        n_clusters=4,
+    )
+
+    finished: list[ClusterResult] = []
+    errors: list[str] = []
+    worker.finished.connect(lambda result: finished.append(result))
+    worker.error.connect(lambda message: errors.append(message))
+
+    worker.run()
+
+    assert not errors
+    assert calls["acronyms"] == ["FRP", "CP"]
+    assert calls["increase_fraction"] == 0.3
+    assert calls["voxel_id_map_shape"] == (2, 2, 2)
+    assert calls["resolution"] == 25.0
+    metadata = finished[0].metadata
+    assert metadata is not None
+    assert metadata.analysis_method == "voxel_correlation"
+    assert metadata.clustering_algorithm == "hierarchical"
+    assert metadata.distance_metric == "one_minus_pearson_r"
+    assert metadata.clustering_linkage == "average"
+    assert metadata.dendrogram_linkage == "average"
+    assert metadata.selected_region_ids == [184, 500]
+    assert metadata.represented_region_acronyms == ["FRP1", "CP"]
+    assert metadata.requested_cluster_count == 4
+    assert metadata.actual_cluster_count == 2
+    assert metadata.atlas_name == "fake_atlas"
+    assert metadata.dendrogram_leaf_order == [1, 0]
+
+
+def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
+    """Hierarchical soma clustering should record the chosen linkage for clustering and dendrograms."""
+    workers = _import_workers_module()
+    SomaClusterWorker = workers.SomaClusterWorker
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
+        lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(neuron_ids, [1, 2]),
+    )
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
+        pd.DataFrame(
+            {
+                "file_id": ["n1", "n2"],
+                "x": [0.0, 25.0],
+                "y": [0.0, 25.0],
+                "z": [0.0, 25.0],
+            }
+        )
+    ))
+
+    worker = SomaClusterWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        region_selection=ClusterRegionSelection(
+            selected_region_ids=[184],
+            selected_region_acronyms=["FRP"],
+            represented_region_ids=[68],
+            represented_region_acronyms=["FRP1"],
+        ),
+        dilation_fraction=0.2,
+        algorithm="hierarchical",
+        linkage_method="ward",
+        n_clusters=3,
+    )
+    finished: list[ClusterResult] = []
+    worker.finished.connect(lambda result: finished.append(result))
+
+    worker.run()
+
+    metadata = finished[0].metadata
+    assert metadata is not None
+    assert metadata.clustering_algorithm == "hierarchical"
+    assert metadata.clustering_linkage == "ward"
+    assert metadata.dendrogram_linkage == "ward"
+    assert metadata.requested_cluster_count == 3
+    assert metadata.distance_metric == "euclidean_um"
+
+
+def test_soma_cluster_worker_kmeans_uses_synthesized_dendrogram_linkage(monkeypatch):
+    """K-means soma clustering should keep clustering linkage empty and dendrogram linkage synthetic."""
+    workers = _import_workers_module()
+    SomaClusterWorker = workers.SomaClusterWorker
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.cluster_somas_kmeans",
+        lambda coords, neuron_ids, n_clusters: _make_cluster_result(neuron_ids, [1, 1]),
+    )
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
+        pd.DataFrame(
+            {
+                "file_id": ["n1", "n2"],
+                "x": [0.0, 25.0],
+                "y": [0.0, 25.0],
+                "z": [0.0, 25.0],
+            }
+        )
+    ))
+
+    worker = SomaClusterWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        region_selection=ClusterRegionSelection(
+            selected_region_ids=[184, 500],
+            selected_region_acronyms=["FRP", "CP"],
+            represented_region_ids=[68, 500],
+            represented_region_acronyms=["FRP1", "CP"],
+        ),
+        algorithm="kmeans",
+        n_clusters=2,
+    )
+    finished: list[ClusterResult] = []
+    worker.finished.connect(lambda result: finished.append(result))
+
+    worker.run()
+
+    metadata = finished[0].metadata
+    assert metadata is not None
+    assert metadata.clustering_algorithm == "kmeans"
+    assert metadata.clustering_linkage is None
+    assert metadata.dendrogram_linkage == "average"
+    assert metadata.requested_cluster_count == 2
+
+
+def test_soma_cluster_worker_dbscan_records_dbscan_parameters(monkeypatch):
+    """DBSCAN soma clustering should keep clustering linkage empty and persist DBSCAN params."""
+    workers = _import_workers_module()
+    SomaClusterWorker = workers.SomaClusterWorker
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.cluster_somas_dbscan",
+        lambda coords, neuron_ids, eps, min_samples: _make_cluster_result(neuron_ids, [1, 2]),
+    )
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
+        pd.DataFrame(
+            {
+                "file_id": ["n1", "n2"],
+                "x": [0.0, 25.0],
+                "y": [0.0, 25.0],
+                "z": [0.0, 25.0],
+            }
+        )
+    ))
+
+    worker = SomaClusterWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        region_selection=ClusterRegionSelection(
+            selected_region_ids=[184],
+            selected_region_acronyms=["FRP"],
+            represented_region_ids=[68],
+            represented_region_acronyms=["FRP1"],
+        ),
+        algorithm="dbscan",
+        eps=150.0,
+        min_samples=7,
+    )
+    finished: list[ClusterResult] = []
+    worker.finished.connect(lambda result: finished.append(result))
+
+    worker.run()
+
+    metadata = finished[0].metadata
+    assert metadata is not None
+    assert metadata.clustering_algorithm == "dbscan"
+    assert metadata.clustering_linkage is None
+    assert metadata.dendrogram_linkage == "average"
+    assert metadata.requested_cluster_count is None
+    assert metadata.dbscan_eps == 150.0
+    assert metadata.dbscan_min_samples == 7
 
 
 def test_append_point_file_worker_routes_csv_to_append_helper(monkeypatch, tmp_path):

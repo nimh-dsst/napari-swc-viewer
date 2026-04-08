@@ -162,6 +162,26 @@ def get_region_mask(atlas: BrainGlobeAtlas, acronym: str) -> NDArray[np.bool_]:
     return mask
 
 
+def get_regions_mask(
+    atlas: BrainGlobeAtlas,
+    acronyms: list[str],
+) -> NDArray[np.bool_]:
+    """Return the voxelwise union of one or more selected atlas regions."""
+    selected = [str(acronym).strip() for acronym in acronyms if str(acronym).strip()]
+    if not selected:
+        raise ValueError("At least one region acronym is required.")
+
+    masks = [get_region_mask(atlas, acronym) for acronym in selected]
+    combined = np.logical_or.reduce(masks)
+    logger.info(
+        "Combined %d region mask(s): %s -> %,d voxels",
+        len(selected),
+        ", ".join(selected),
+        int(combined.sum()),
+    )
+    return combined
+
+
 def dilate_mask_to_volume_increase(
     mask: NDArray[np.bool_],
     increase_fraction: float = 0.20,
@@ -266,6 +286,36 @@ def dilate_mask_to_volume_increase(
     return new_mask
 
 
+def get_expanded_region_voxel_ids_for_regions(
+    atlas: BrainGlobeAtlas,
+    acronyms: list[str],
+    increase_fraction: float = 0.2,
+) -> NDArray[np.int32]:
+    """Create a voxel ID map for the union of selected regions."""
+    mask = get_regions_mask(atlas, acronyms)
+    resolution = tuple(float(r) for r in atlas.resolution)
+
+    if increase_fraction > 0:
+        exp_mask = dilate_mask_to_volume_increase(
+            mask,
+            increase_fraction=increase_fraction,
+            voxel_spacing_um=resolution,
+        )
+    else:
+        exp_mask = mask
+
+    id_map = np.full(exp_mask.shape, -1, dtype=np.int32)
+    id_map[exp_mask] = np.arange(exp_mask.sum(), dtype=np.int32)
+
+    logger.info(
+        "Voxel ID map for %s (+%.0f%%): %,d voxels with IDs",
+        ", ".join(str(acronym) for acronym in acronyms),
+        increase_fraction * 100.0,
+        int(exp_mask.sum()),
+    )
+    return id_map
+
+
 def get_expanded_region_voxel_ids(
     atlas: BrainGlobeAtlas,
     acronym: str,
@@ -291,23 +341,8 @@ def get_expanded_region_voxel_ids(
         3D array where expanded-region voxels have sequential IDs (0, 1, 2, ...)
         and voxels outside the expanded region have value -1.
     """
-    mask = get_region_mask(atlas, acronym)
-    resolution = tuple(float(r) for r in atlas.resolution)
-
-    if increase_fraction > 0:
-        exp_mask = dilate_mask_to_volume_increase(
-            mask,
-            increase_fraction=increase_fraction,
-            voxel_spacing_um=resolution,
-        )
-    else:
-        exp_mask = mask
-
-    id_map = np.full(exp_mask.shape, -1, dtype=np.int32)
-    id_map[exp_mask] = np.arange(exp_mask.sum(), dtype=np.int32)
-
-    logger.info(
-        f"Voxel ID map for '{acronym}' (+{increase_fraction*100:.0f}%): "
-        f"{exp_mask.sum():,} voxels with IDs"
+    return get_expanded_region_voxel_ids_for_regions(
+        atlas,
+        [acronym],
+        increase_fraction=increase_fraction,
     )
-    return id_map
