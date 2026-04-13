@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -97,7 +98,10 @@ class RegionSelectorWidget(QWidget):
         # Tree widget
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Region", "Acronym"])
-        self._tree.setColumnWidth(0, 250)
+        header = self._tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self._tree)
 

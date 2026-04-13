@@ -31,6 +31,18 @@ pixi run napari
 
 This command will automatically build the package (if needed) before launching napari.
 
+To enable plugin debug logging for clustering diagnostics:
+
+```bash
+NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
+```
+
+To write the debug trace to a custom file:
+
+```bash
+NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
+```
+
 ### Running Tests
 
 To run the test suite:

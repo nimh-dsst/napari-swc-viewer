@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
+
+from napari_swc_viewer.analysis.clustering import ClusterResult
 
 
 class _BoundSignal:
@@ -47,6 +51,7 @@ class _DummyWidget:
     def __init__(self, *_args, **_kwargs) -> None:
         self._enabled = True
         self._visible = True
+        self.geometry_updates = 0
 
     def setEnabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
@@ -56,6 +61,9 @@ class _DummyWidget:
 
     def setVisible(self, visible: bool) -> None:
         self._visible = bool(visible)
+
+    def updateGeometry(self) -> None:
+        self.geometry_updates += 1
 
 
 class _DummyLayout:
@@ -94,9 +102,13 @@ class _DummyLabel(_DummyWidget):
 class _DummyButton(_DummyWidget):
     """Small QPushButton stand-in."""
 
-    def __init__(self, *_args, **_kwargs) -> None:
+    def __init__(self, text: str = "", *_args, **_kwargs) -> None:
         super().__init__()
+        self._text = text
         self.clicked = _BoundSignal()
+
+    def text(self) -> str:
+        return self._text
 
 
 class _DummyCombo(_DummyWidget):
@@ -210,11 +222,44 @@ class _DummyProgressBar(_DummyWidget):
         return None
 
 
+class _DummyScrollArea(_DummyWidget):
+    """Small scroll-area stand-in."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        super().__init__()
+        self.widget_resizable = False
+        self.widget = None
+
+    def setWidgetResizable(self, resizable: bool) -> None:
+        self.widget_resizable = bool(resizable)
+
+    def setWidget(self, widget) -> None:
+        self.widget = widget
+
+
 class _DummyFigure:
     """Minimal figure stand-in."""
 
     def __init__(self, *_args, **_kwargs) -> None:
-        return None
+        self.cleared = 0
+        self.canvas = None
+        self.dpi = 100.0
+        self.size_inches: tuple[float, float] | None = None
+
+    def clear(self) -> None:
+        self.cleared += 1
+
+    def add_subplot(self, *_args, **_kwargs):
+        return types.SimpleNamespace(text=lambda *a, **k: None)
+
+    def set_canvas(self, canvas) -> None:
+        self.canvas = canvas
+
+    def get_dpi(self) -> float:
+        return self.dpi
+
+    def set_size_inches(self, width: float, height: float, forward: bool = True) -> None:
+        self.size_inches = (float(width), float(height), bool(forward))
 
 
 class _DummyCanvas(_DummyWidget):
@@ -223,12 +268,23 @@ class _DummyCanvas(_DummyWidget):
     def __init__(self, figure, *_args, **_kwargs) -> None:
         super().__init__()
         self.figure = figure
+        self._width = 600
+        self._height = 400
 
     def setMinimumHeight(self, *_args) -> None:
         return None
 
     def draw(self) -> None:
         return None
+
+    def draw_idle(self) -> None:
+        return None
+
+    def width(self) -> int:
+        return self._width
+
+    def height(self) -> int:
+        return self._height
 
 
 class _DummyColormap:
@@ -248,11 +304,16 @@ class _DummyCollapsibleSection(_DummyWidget):
         super().__init__(parent)
         self.title = title
         self.expanded = expanded
+        self.expanded_changed = _BoundSignal()
         self._layout = _DummyLayout()
         self.__class__.instances.append(self)
 
     def content_layout(self) -> _DummyLayout:
         return self._layout
+
+    def emit_expanded(self, expanded: bool) -> None:
+        self.expanded = bool(expanded)
+        self.expanded_changed.emit(bool(expanded))
 
 
 class _DummyRegionSelector(_DummyWidget):
@@ -334,6 +395,14 @@ class _DummyThread:
 
     def deleteLater(self) -> None:
         return None
+
+
+class _DummyQTimer:
+    """Minimal QTimer stand-in with immediate singleShot execution."""
+
+    @staticmethod
+    def singleShot(_interval: int, callback) -> None:
+        callback()
 
 
 class _DummyOrderSignal:
@@ -426,6 +495,7 @@ def _import_analysis_tab_module():
 
     qtcore_module = types.ModuleType("qtpy.QtCore")
     qtcore_module.QThread = _DummyThread
+    qtcore_module.QTimer = _DummyQTimer
     qtcore_module.Signal = _Signal
 
     qtgui_module = types.ModuleType("qtpy.QtGui")
@@ -442,6 +512,7 @@ def _import_analysis_tab_module():
         "QLabel": _DummyLabel,
         "QProgressBar": _DummyProgressBar,
         "QPushButton": _DummyButton,
+        "QScrollArea": _DummyScrollArea,
         "QSpinBox": _DummySpinBox,
         "QVBoxLayout": _DummyLayout,
         "QWidget": _DummyWidget,
@@ -559,7 +630,7 @@ def test_analysis_region_sections_are_collapsed_by_default():
     _DummyCollapsibleSection.instances = []
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
 
-    AnalysisTabWidget(_DummyViewer())
+    widget = AnalysisTabWidget(_DummyViewer())
 
     titles = [section.title for section in _DummyCollapsibleSection.instances]
     expanded = [section.expanded for section in _DummyCollapsibleSection.instances]
@@ -573,6 +644,9 @@ def test_analysis_region_sections_are_collapsed_by_default():
         "Clustermap",
     ]
     assert expanded == [True, False, True, False, True, False]
+    assert widget._build_clustermap_btn.text() == "Build Dendrogram"
+    assert widget._build_clustermap_btn.isEnabled() is False
+    assert "Run clustering" in widget._clustermap_status_label.text()
 
 
 def test_analysis_allowed_structure_ids_include_dataset_regions_and_ancestors():
@@ -865,3 +939,138 @@ def test_analysis_heatmap_contrast_limits_fallback_for_zero_volume():
     )
 
     assert limits == (0.0, 1.0)
+
+
+def test_draw_clustermap_emits_debug_logs(caplog):
+    """Clustermap drawing should log seaborn and canvas timing phases."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._clustermap_rendered = False
+    widget._clustermap_refresh_pending = False
+    widget._clustermap_section = _DummyCollapsibleSection("Clustermap", expanded=True)
+    widget._figure = _DummyFigure()
+    widget._canvas = _DummyCanvas(widget._figure)
+    widget._canvas.draw = MagicMock()
+    widget._canvas.draw_idle = MagicMock()
+    widget._cluster_color_map = {
+        "n1": [0.1, 0.2, 0.3, 1.0],
+        "n2": [0.2, 0.3, 0.4, 1.0],
+    }
+    closed: list[object] = []
+    module.plt.close = lambda fig: closed.append(fig)
+    new_figure = _DummyFigure()
+    module.sns.clustermap = lambda *args, **kwargs: types.SimpleNamespace(fig=new_figure)
+    result = ClusterResult(
+        correlation_matrix=np.eye(2, dtype=np.float32),
+        distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+        linkage_matrix=np.array([[0.0, 1.0, 1.0, 2.0]], dtype=np.float64),
+        neuron_ids=["n1", "n2"],
+        reorder_indices=np.array([0, 1], dtype=np.intp),
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"):
+        widget._draw_clustermap(result)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("_draw_clustermap start" in message for message in messages)
+    assert any("seaborn.clustermap complete" in message for message in messages)
+    assert any("_attach_clustermap_figure complete" in message for message in messages)
+    assert any("_schedule_clustermap_layout_refresh queued" in message for message in messages)
+    assert any("_refresh_clustermap_layout canvas draw complete" in message for message in messages)
+    widget._canvas.draw.assert_called_once_with()
+    widget._canvas.draw_idle.assert_called_once_with()
+    assert widget._figure is new_figure
+    assert new_figure.canvas is widget._canvas
+    assert new_figure.size_inches == (6.0, 4.0, False)
+    assert len(closed) == 1
+
+
+def test_refresh_clustermap_on_section_expand_when_rendered() -> None:
+    """Re-expanding the clustermap section should queue a layout refresh."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._clustermap_rendered = True
+    widget._schedule_clustermap_layout_refresh = MagicMock()
+
+    widget._on_clustermap_section_expanded_changed(True)
+
+    widget._schedule_clustermap_layout_refresh.assert_called_once_with()
+
+
+def test_build_clustermap_on_demand_draws_cached_result_and_logs(caplog):
+    """Opt-in dendrogram rendering should draw only when the button handler runs."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._build_clustermap_btn = _DummyButton("Build Dendrogram")
+    widget._clustermap_status_label = _DummyLabel()
+    widget._update_button_states = MagicMock()
+    widget._draw_clustermap = MagicMock()
+    result = ClusterResult(
+        correlation_matrix=np.eye(2, dtype=np.float32),
+        distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+        linkage_matrix=np.array([[0.0, 1.0, 1.0, 2.0]], dtype=np.float64),
+        neuron_ids=["n1", "n2"],
+        reorder_indices=np.array([0, 1], dtype=np.intp),
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+    widget._last_cluster_result = result
+
+    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"):
+        widget._build_clustermap_on_demand()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("_build_clustermap_on_demand start" in message for message in messages)
+    assert any("_build_clustermap_on_demand complete" in message for message in messages)
+    widget._draw_clustermap.assert_called_once_with(result)
+    widget._update_button_states.assert_called_once_with()
+    assert widget._clustermap_status_label.text() == "Dendrogram ready for 2 neurons."
+
+
+def test_on_correlation_finished_emits_debug_logs(caplog):
+    """UI completion handler should defer dendrogram rendering until a button click."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._last_cluster_result = None
+    widget._cluster_color_map = {"n1": [0.1, 0.2, 0.3, 1.0]}
+    widget._actual_n_clusters = 2
+    widget._n_clusters_spin = types.SimpleNamespace(value=lambda: 5)
+    widget._progress_bar = _DummyProgressBar()
+    widget._progress_label = _DummyLabel()
+    widget._clustermap_status_label = _DummyLabel()
+    widget._build_clustermap_btn = _DummyButton("Build Dendrogram")
+    widget._update_button_states = MagicMock()
+    widget._update_cluster_filter_combo = lambda: None
+    widget._build_cluster_color_map = MagicMock()
+    widget._draw_clustermap = MagicMock()
+    emitted: list[tuple[object, dict[str, list[float]]]] = []
+    widget.cluster_colors_updated = types.SimpleNamespace(
+        emit=lambda result, color_map: emitted.append((result, color_map))
+    )
+    result = ClusterResult(
+        correlation_matrix=np.eye(2, dtype=np.float32),
+        distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+        linkage_matrix=np.array([[0.0, 1.0, 1.0, 2.0]], dtype=np.float64),
+        neuron_ids=["n1", "n2"],
+        reorder_indices=np.array([0, 1], dtype=np.intp),
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"):
+        widget._on_correlation_finished(result)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("_on_correlation_finished start" in message for message in messages)
+    assert any("color map built" in message for message in messages)
+    assert any("clustermap render deferred until button click" in message for message in messages)
+    widget._build_cluster_color_map.assert_called_once_with()
+    widget._update_button_states.assert_called_once_with()
+    widget._draw_clustermap.assert_not_called()
+    assert emitted == [(result, {"n1": [0.1, 0.2, 0.3, 1.0]})]
+    assert widget._clustermap_status_label.text() == (
+        "Clustering complete. Click 'Build Dendrogram' to render the cluster map."
+    )

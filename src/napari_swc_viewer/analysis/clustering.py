@@ -11,6 +11,7 @@ k-means, and DBSCAN algorithms.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,17 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
+
+
+def _format_nbytes(num_bytes: int) -> str:
+    """Return a compact human-readable size string."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024**2:
+        return f"{num_bytes / 1024:.2f} KiB"
+    if num_bytes < 1024**3:
+        return f"{num_bytes / (1024**2):.2f} MiB"
+    return f"{num_bytes / (1024**3):.2f} GiB"
 
 
 @dataclass
@@ -55,8 +67,35 @@ def compute_linkage(
     NDArray[np.float64]
         Scipy linkage matrix.
     """
+    logger.debug(
+        "compute_linkage start: method=%s, distance_matrix shape=%s dtype=%s nbytes=%s",
+        method,
+        distance_matrix.shape,
+        distance_matrix.dtype,
+        _format_nbytes(int(distance_matrix.nbytes)),
+    )
+    squareform_start = perf_counter()
     condensed = squareform(distance_matrix, checks=False)
-    return linkage(condensed, method=method)
+    squareform_elapsed = perf_counter() - squareform_start
+    logger.debug(
+        "compute_linkage squareform complete: condensed shape=%s dtype=%s nbytes=%s elapsed=%.3fs",
+        condensed.shape,
+        condensed.dtype,
+        _format_nbytes(int(condensed.nbytes)),
+        squareform_elapsed,
+    )
+    linkage_start = perf_counter()
+    logger.debug("compute_linkage calling scipy.linkage with method=%s", method)
+    result = linkage(condensed, method=method)
+    linkage_elapsed = perf_counter() - linkage_start
+    logger.debug(
+        "compute_linkage linkage complete: linkage shape=%s dtype=%s nbytes=%s elapsed=%.3fs",
+        result.shape,
+        result.dtype,
+        _format_nbytes(int(result.nbytes)),
+        linkage_elapsed,
+    )
+    return result
 
 
 def compute_clustermap_data(
@@ -233,7 +272,23 @@ def _euclidean_distance_matrix(
     NDArray[np.float32]
         (N, N) symmetric distance matrix with zero diagonal.
     """
-    return squareform(pdist(coords, metric="euclidean")).astype(np.float32)
+    logger.debug(
+        "Building Euclidean distance matrix: coords shape=%s dtype=%s nbytes=%s",
+        coords.shape,
+        coords.dtype,
+        _format_nbytes(int(coords.nbytes)),
+    )
+    start = perf_counter()
+    dist = squareform(pdist(coords, metric="euclidean")).astype(np.float32)
+    elapsed = perf_counter() - start
+    logger.debug(
+        "Built Euclidean distance matrix: shape=%s dtype=%s nbytes=%s elapsed=%.3fs",
+        dist.shape,
+        dist.dtype,
+        _format_nbytes(int(dist.nbytes)),
+        elapsed,
+    )
+    return dist
 
 
 def cluster_somas_hierarchical(
@@ -259,15 +314,59 @@ def cluster_somas_hierarchical(
     -------
     ClusterResult
     """
+    total_start = perf_counter()
+    logger.debug(
+        "cluster_somas_hierarchical start: neurons=%d coords shape=%s dtype=%s method=%s n_clusters=%d",
+        len(neuron_ids),
+        coords.shape,
+        coords.dtype,
+        method,
+        n_clusters,
+    )
+    distance_start = perf_counter()
     dist = _euclidean_distance_matrix(coords)
+    distance_elapsed = perf_counter() - distance_start
+    logger.debug(
+        "cluster_somas_hierarchical distance build complete: elapsed=%.3fs distance_nbytes=%s",
+        distance_elapsed,
+        _format_nbytes(int(dist.nbytes)),
+    )
+    linkage_start = perf_counter()
     Z = compute_linkage(dist, method=method)
+    linkage_elapsed = perf_counter() - linkage_start
+    logger.debug(
+        "cluster_somas_hierarchical linkage complete: elapsed=%.3fs linkage_nbytes=%s",
+        linkage_elapsed,
+        _format_nbytes(int(Z.nbytes)),
+    )
+    fcluster_start = perf_counter()
     labels = fcluster(Z, t=n_clusters, criterion="maxclust").astype(np.int32)
+    fcluster_elapsed = perf_counter() - fcluster_start
+    logger.debug(
+        "cluster_somas_hierarchical fcluster complete: elapsed=%.3fs labels shape=%s dtype=%s",
+        fcluster_elapsed,
+        labels.shape,
+        labels.dtype,
+    )
+    reorder_start = perf_counter()
     reorder = leaves_list(Z)
+    reorder_elapsed = perf_counter() - reorder_start
+    logger.debug(
+        "cluster_somas_hierarchical leaves_list complete: elapsed=%.3fs reorder shape=%s dtype=%s",
+        reorder_elapsed,
+        reorder.shape,
+        reorder.dtype,
+    )
 
     actual_k = int(len(np.unique(labels)))
     logger.info(
         f"Soma hierarchical clustering: {len(neuron_ids)} neurons, "
         f"{actual_k} clusters, method={method}"
+    )
+    logger.debug(
+        "cluster_somas_hierarchical complete: total_elapsed=%.3fs cluster_sizes=%s",
+        perf_counter() - total_start,
+        dict(zip(*np.unique(labels, return_counts=True))),
     )
 
     return ClusterResult(

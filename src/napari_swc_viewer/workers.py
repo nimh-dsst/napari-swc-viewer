@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -326,18 +327,39 @@ class SomaClusterWorker(QObject):
             from .analysis.mask import get_expanded_region_voxel_ids
 
             total = 4
+            run_start = perf_counter()
+            resolution = float(self._atlas.resolution[0])
+            logger.debug(
+                "SomaClusterWorker start: algorithm=%s linkage=%s n_clusters=%d eps=%s min_samples=%d region=%s dilation_fraction=%.3f resolution=%.3f parquet=%s",
+                self._algorithm,
+                self._linkage_method,
+                self._n_clusters,
+                self._eps,
+                self._min_samples,
+                self._region_acronym,
+                self._dilation_fraction,
+                resolution,
+                self._parquet_path,
+            )
             self.progress.emit("Extracting and dilating region mask...", 1, total)
+            mask_start = perf_counter()
             voxel_id_map = get_expanded_region_voxel_ids(
                 self._atlas,
                 self._region_acronym,
                 self._dilation_fraction,
             )
+            logger.debug(
+                "SomaClusterWorker mask ready: shape=%s dtype=%s elapsed=%.3fs",
+                voxel_id_map.shape,
+                voxel_id_map.dtype,
+                perf_counter() - mask_start,
+            )
 
             self.progress.emit("Querying soma locations...", 2, total)
-            resolution = float(self._atlas.resolution[0])
             parquet_escaped = str(self._parquet_path).replace("\\", "/")
             Z, Y, X = voxel_id_map.shape
 
+            query_start = perf_counter()
             conn = duckdb.connect()
             try:
                 # Query soma locations (type=1) grouped by file
@@ -352,12 +374,19 @@ class SomaClusterWorker(QObject):
                 """).fetchdf()
             finally:
                 conn.close()
+            logger.debug(
+                "SomaClusterWorker soma query complete: rows=%d columns=%s elapsed=%.3fs",
+                len(soma_df),
+                list(soma_df.columns),
+                perf_counter() - query_start,
+            )
 
             if soma_df.empty:
                 self.error.emit("No soma nodes found in the dataset.")
                 return
 
             # Convert soma coordinates to voxel indices and filter to region
+            filter_start = perf_counter()
             coords = soma_df[["x", "y", "z"]].values
             # Axis mapping matches correlation.py: x->zi, y->yi, z->xi
             zi = np.floor(coords[:, 0] / resolution).astype(int)
@@ -382,6 +411,15 @@ class SomaClusterWorker(QObject):
                 f"Soma filtering: {len(coords)} total somas, "
                 f"{len(filtered_ids)} in region '{self._region_acronym}'"
             )
+            logger.debug(
+                "SomaClusterWorker filtering complete: total=%d in_bounds=%d in_region=%d filtered_shape=%s filtered_dtype=%s elapsed=%.3fs",
+                len(coords),
+                int(in_bounds.sum()),
+                int(in_region.sum()),
+                filtered_coords.shape,
+                filtered_coords.dtype,
+                perf_counter() - filter_start,
+            )
 
             if len(filtered_ids) < 2:
                 self.error.emit(
@@ -391,6 +429,7 @@ class SomaClusterWorker(QObject):
                 return
 
             self.progress.emit(f"Clustering {len(filtered_ids)} somas ({self._algorithm})...", 3, total)
+            cluster_start = perf_counter()
 
             if self._algorithm == "hierarchical":
                 result = cluster_somas_hierarchical(
@@ -412,8 +451,20 @@ class SomaClusterWorker(QObject):
             else:
                 self.error.emit(f"Unknown algorithm: {self._algorithm}")
                 return
+            logger.debug(
+                "SomaClusterWorker clustering complete: algorithm=%s elapsed=%.3fs labels_shape=%s linkage_shape=%s",
+                self._algorithm,
+                perf_counter() - cluster_start,
+                getattr(result.labels, "shape", None),
+                getattr(result.linkage_matrix, "shape", None),
+            )
 
             self.progress.emit("Done", 4, total)
+            logger.debug(
+                "SomaClusterWorker finished: total_elapsed=%.3fs neuron_count=%d",
+                perf_counter() - run_start,
+                len(result.neuron_ids),
+            )
             self.finished.emit(result)
 
         except Exception as e:
