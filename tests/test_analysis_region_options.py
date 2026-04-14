@@ -745,6 +745,15 @@ def test_analysis_tab_wraps_content_in_scroll_area():
     assert widget._scroll_area.widget is widget._scroll_content
 
 
+def test_analysis_tab_exposes_bulk_cluster_heatmap_button():
+    """Analysis tab should expose a dedicated bulk cluster-heatmap action."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert widget._add_all_cluster_heatmaps_btn._text == "Add All Cluster Heatmaps"
+    assert not widget._add_all_cluster_heatmaps_btn.isEnabled()
+
+
 def test_analysis_allowed_structure_ids_include_dataset_regions_and_ancestors():
     """Dataset-backed Analysis trees should expose represented leaves plus ancestors."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
@@ -1046,6 +1055,21 @@ def test_update_button_states_enables_export_controls_after_clustering():
     assert widget._save_dendrogram_btn.isEnabled()
 
 
+def test_update_button_states_enables_bulk_heatmap_button_with_cluster_options():
+    """Bulk heatmap action should enable only when concrete cluster entries exist."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._last_cluster_result = object()
+    widget._heat_cluster_combo.addItem("Cluster 1")
+    widget._heat_cluster_combo.setItemData(1, 1)
+
+    widget._update_button_states()
+
+    assert widget._add_all_cluster_heatmaps_btn.isEnabled()
+
+
 def test_update_button_states_disables_export_controls_without_result():
     """Export controls should stay disabled until clustering has completed."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
@@ -1061,6 +1085,7 @@ def test_update_button_states_disables_export_controls_without_result():
     assert not widget._save_distance_workbook_btn.isEnabled()
     assert not widget._save_extended_parquet_btn.isEnabled()
     assert not widget._save_dendrogram_btn.isEnabled()
+    assert not widget._add_all_cluster_heatmaps_btn.isEnabled()
 
 
 def test_on_correlation_finished_leaves_clustermap_unrendered():
@@ -1156,13 +1181,21 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     widget._viewer = _DummyViewer()
     widget._progress_bar = _DummyProgressBar()
     widget._progress_label = _DummyLabel()
-    widget._update_button_states = lambda: None
     widget._atlas = types.SimpleNamespace(atlas_name="fake_atlas")
-    widget._pending_heatmap_cluster = 1
-    widget._pending_heatmap_region = "CH"
-    widget._pending_heatmap_depth_bin = 3
-    widget._pending_heatmap_depth_axis = 1
+    widget._completed_heatmap_requests = []
+    widget._active_heatmap_total = 1
+    widget._active_heatmap_index = 1
+    widget._heatmap_batch_mode = False
     widget._cluster_label_colors = {1: [0.1, 0.2, 0.3, 1.0]}
+    widget._current_heatmap_request = module._HeatmapRequest(
+        selected_region_id=567,
+        selected_region_acronym="CH",
+        region_ids=(567, 568),
+        cluster_label=1,
+        file_ids=("n1", "n2"),
+        depth_bin_factor=3,
+        depth_axis=1,
+    )
 
     volume = np.zeros((2, 3, 4), dtype=np.float32)
     volume[1, 2, 3] = 7.0
@@ -1180,9 +1213,156 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.scale == [1.0, 3.0, 1.0]
     assert layer.metadata["heatmap_kind"] == "analysis"
     assert layer.metadata["heatmap_contrast_limits"] == (0.0, 7.0)
+    assert layer.metadata["heatmap_selected_region_id"] == 567
+    assert layer.metadata["heatmap_selected_region_acronym"] == "CH"
+    assert layer.metadata["heatmap_region_ids"] == [567, 568]
     assert (
         layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
     )
+
+
+def test_all_cluster_heatmap_requests_excludes_all_neurons_entry():
+    """Bulk heatmap request generation should include only concrete clusters."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._heat_cluster_combo = _DummyCombo()
+    widget._heat_cluster_combo.addItem("All neurons")
+    widget._heat_cluster_combo.addItem("Cluster 1")
+    widget._heat_cluster_combo.setItemData(1, 1)
+    widget._heat_cluster_combo.addItem("Cluster 2")
+    widget._heat_cluster_combo.setItemData(2, 2)
+    widget._last_cluster_result = types.SimpleNamespace(
+        neuron_ids=["n1", "n2", "n3"],
+        labels=np.array([1, 2, 2], dtype=np.int32),
+    )
+    widget._depth_bin_spin = _DummySpinBox()
+    widget._depth_bin_spin.setValue(4)
+    widget._current_depth_axis = lambda: 2
+    widget._selected_heat_region = lambda: None
+    widget._progress_label = _DummyLabel()
+
+    requests = widget._all_cluster_heatmap_requests()
+
+    assert [request.cluster_label for request in requests] == [1, 2]
+    assert [request.file_ids for request in requests] == [("n1",), ("n2", "n3")]
+    assert all(request.depth_bin_factor == 4 for request in requests)
+    assert all(request.depth_axis == 2 for request in requests)
+
+
+def test_bulk_heatmap_queue_advances_and_summarizes_completion():
+    """Queued cluster heatmaps should advance one-by-one and finish with a summary."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    request1 = module._HeatmapRequest(
+        selected_region_id=10,
+        selected_region_acronym="CH",
+        region_ids=(10,),
+        cluster_label=1,
+        file_ids=("n1",),
+        depth_bin_factor=2,
+        depth_axis=1,
+    )
+    request2 = module._HeatmapRequest(
+        selected_region_id=10,
+        selected_region_acronym="CH",
+        region_ids=(10,),
+        cluster_label=2,
+        file_ids=("n2",),
+        depth_bin_factor=2,
+        depth_axis=1,
+    )
+
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._viewer = _DummyViewer()
+    widget._atlas = types.SimpleNamespace(atlas_name="fake_atlas")
+    widget._progress_bar = _DummyProgressBar()
+    widget._progress_label = _DummyLabel()
+    widget._cluster_label_colors = {
+        1: [0.1, 0.2, 0.3, 1.0],
+        2: [0.6, 0.5, 0.4, 1.0],
+    }
+    widget._completed_heatmap_requests = []
+    widget._pending_heatmap_requests = [request2]
+    widget._current_heatmap_request = request1
+    widget._active_heatmap_total = 2
+    widget._active_heatmap_index = 1
+    widget._heatmap_batch_mode = True
+    widget._on_thread_finished = lambda: None
+    widget._update_button_states = lambda: None
+    started: list[str] = []
+    widget._start_next_heatmap_request = lambda: started.append("next")
+
+    volume1 = np.zeros((2, 2, 2), dtype=np.float32)
+    volume1[0, 1, 1] = 3.0
+    volume2 = np.zeros((2, 2, 2), dtype=np.float32)
+    volume2[1, 0, 1] = 5.0
+
+    previous = _install_fake_napari_colormaps()
+    try:
+        widget._on_heatmap_finished(volume1)
+        widget._on_heatmap_thread_finished()
+        widget._current_heatmap_request = request2
+        widget._pending_heatmap_requests = []
+        widget._active_heatmap_index = 2
+        widget._on_heatmap_finished(volume2)
+        widget._on_heatmap_thread_finished()
+    finally:
+        _restore_modules(previous)
+
+    assert started == ["next"]
+    assert [layer.name for layer in widget._viewer.layers] == [
+        "Cluster 1 CH Heatmap",
+        "Cluster 2 CH Heatmap",
+    ]
+    assert widget._viewer.layers[0].metadata["heatmap_cluster"] == 1
+    assert widget._viewer.layers[1].metadata["heatmap_cluster"] == 2
+    assert widget._progress_label.text() == "Added 2 cluster heatmaps to scene"
+    assert widget._last_heatmap_requests == [request1, request2]
+
+
+def test_dims_order_rebuilds_tracked_heatmap_request_set():
+    """Dims-order changes should reuse the last built heatmap requests."""
+    module = _import_analysis_tab_module()
+    AnalysisTabWidget = module.AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._db = object()
+    widget._atlas = object()
+    widget._worker_thread = None
+    widget._current_depth_axis = lambda: 2
+    widget._last_heatmap_requests = [
+        module._HeatmapRequest(
+            selected_region_id=10,
+            selected_region_acronym="CH",
+            region_ids=(10,),
+            cluster_label=5,
+            file_ids=("n5",),
+            depth_bin_factor=3,
+            depth_axis=0,
+        ),
+        module._HeatmapRequest(
+            selected_region_id=None,
+            selected_region_acronym=None,
+            region_ids=None,
+            cluster_label=None,
+            file_ids=None,
+            depth_bin_factor=1,
+            depth_axis=1,
+        ),
+    ]
+    calls: list[tuple[list[object], bool]] = []
+    widget._start_heatmap_requests = (
+        lambda requests, batch_mode: calls.append((requests, batch_mode))
+    )
+
+    widget._on_dims_order_changed()
+
+    assert len(calls) == 1
+    requests, batch_mode = calls[0]
+    assert batch_mode is True
+    assert [request.cluster_label for request in requests] == [5, None]
+    assert [request.file_ids for request in requests] == [("n5",), None]
+    assert [request.depth_axis for request in requests] == [2, 2]
 
 
 def test_analysis_heatmap_workaround_swallows_thumbnail_rank_mismatch():
