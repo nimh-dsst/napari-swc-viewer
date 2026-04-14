@@ -308,9 +308,13 @@ class NeuronTableWidget(QWidget):
         if row is None:
             return
 
+        self._update_color_swatch_for_row(row, entry.color)
+
+    def _update_color_swatch_for_row(self, row: int, color: list[float]) -> None:
+        """Update the color swatch button for one known table row."""
         btn = self._table.cellWidget(row, COL_COLOR)
         if btn is not None:
-            self._apply_color_style(btn, entry.color)
+            self._apply_color_style(btn, color)
 
     # --- Public API ---
 
@@ -473,24 +477,40 @@ class NeuronTableWidget(QWidget):
         # Emit once after all rows are selected
         self.selection_changed.emit(self.get_selected_file_ids())
 
-    def update_colors(self, color_map: dict[str, list[float]]) -> None:
+    def update_colors(
+        self,
+        color_map: dict[str, list[float]],
+        *,
+        emit_signal: bool = True,
+    ) -> None:
         """Batch-update neuron colors from a color map.
 
-        Emits a single ``colors_changed`` signal at the end.
+        Emits a single ``colors_changed`` signal at the end when requested.
 
         Parameters
         ----------
         color_map : dict[str, list[float]]
             Mapping of file_id to RGBA color.
         """
+        row_map = self._file_id_to_row_map()
+        sorting_enabled = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
         changed = {}
-        for file_id, rgba in color_map.items():
-            entry = self._entries.get(file_id)
-            if entry is None:
-                continue
-            entry.color = list(rgba)
-            self._update_color_swatch(file_id)
-            changed[file_id] = list(rgba)
+        try:
+            for file_id, rgba in color_map.items():
+                entry = self._entries.get(file_id)
+                if entry is None:
+                    continue
+                new_color = list(rgba)
+                if list(entry.color) == new_color:
+                    continue
+                entry.color = new_color
+                row = row_map.get(file_id)
+                if row is not None:
+                    self._update_color_swatch_for_row(row, entry.color)
+                changed[file_id] = list(entry.color)
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
 
-        if changed:
+        if emit_signal and changed:
             self.colors_changed.emit(changed)

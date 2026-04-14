@@ -3138,9 +3138,6 @@ class NeuronViewerWidget(QWidget):
         self._soma_slice_projector.point_size = _SOMA_SLICE_PROJECTION_POINT_SIZE
         self._soma_slice_projector.add_soma_data_batch(soma_projection_batch)
 
-        # Re-apply cluster colors if a clustering result exists
-        self._analysis_tab.apply_cluster_colors()
-
         # Hide neuron layers if currently in 2D mode (the ndisplay event
         # only fires on *changes*, so layers added while already in 2D
         # would otherwise stay visible).
@@ -3472,7 +3469,7 @@ class NeuronViewerWidget(QWidget):
     def _on_cluster_colors_updated(self, result, color_map: dict) -> None:
         """Handle cluster color updates from the analysis tab."""
         self._neuron_table.update_cluster_assignments(result)
-        self._neuron_table.update_colors(color_map)
+        self._neuron_table.update_colors(color_map, emit_signal=False)
         self._refresh_cluster_filter_controls()
 
     def _clear_neuron_layers(self, reset_render_state: bool = True) -> None:

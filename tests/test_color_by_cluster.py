@@ -95,8 +95,8 @@ class TestColorByClusterLines:
         np.testing.assert_array_almost_equal(color_array[2], expected_default)
         np.testing.assert_array_almost_equal(color_array[4], expected_default)
 
-    def test_no_lines_layer_reports_zero(self):
-        """No crash when no Neuron Lines layer exists."""
+    def test_no_lines_layer_reports_table_cluster_updates(self):
+        """Status text should still report clustered neurons when no layers are rendered."""
         from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
@@ -112,9 +112,10 @@ class TestColorByClusterLines:
 
         widget._color_neurons_by_cluster()
 
-        widget._progress_label.setText.assert_called_once()
+        assert widget._progress_label.setText.call_count >= 1
         msg = widget._progress_label.setText.call_args[0][0]
-        assert "0/0 neurons" in msg
+        assert "table 2 clustered neurons" in msg
+        assert "rendered" not in msg
 
 
 class TestCustomColorsSmallClusters:

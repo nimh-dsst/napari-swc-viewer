@@ -107,8 +107,19 @@ class _DummyButton(_DummyWidget):
         self._text = text
         self.clicked = _BoundSignal()
 
+
+class _DummyLineEdit(_DummyWidget):
+    """Small QLineEdit stand-in."""
+
+    def __init__(self, text: str = "", *_args, **_kwargs) -> None:
+        super().__init__()
+        self._text = text
+
     def text(self) -> str:
         return self._text
+
+    def setText(self, text: str) -> None:
+        self._text = str(text)
 
 
 class _DummyCombo(_DummyWidget):
@@ -244,7 +255,8 @@ class _DummyFigure:
         self.cleared = 0
         self.canvas = None
         self.dpi = 100.0
-        self.size_inches: tuple[float, float] | None = None
+        self.size_inches: tuple[float, float] | None = (6.0, 6.0)
+        self.set_size_inches_calls = 0
 
     def clear(self) -> None:
         self.cleared += 1
@@ -258,7 +270,13 @@ class _DummyFigure:
     def get_dpi(self) -> float:
         return self.dpi
 
-    def set_size_inches(self, width: float, height: float, forward: bool = True) -> None:
+    def get_size_inches(self):
+        return self.size_inches
+
+    def set_size_inches(
+        self, width: float, height: float, forward: bool = True
+    ) -> None:
+        self.set_size_inches_calls += 1
         self.size_inches = (float(width), float(height), bool(forward))
 
 
@@ -270,21 +288,40 @@ class _DummyCanvas(_DummyWidget):
         self.figure = figure
         self._width = 600
         self._height = 400
+        self.device_pixel_ratio = 1.0
+        self._physical_width: int | None = None
+        self._physical_height: int | None = None
 
     def setMinimumHeight(self, *_args) -> None:
         return None
 
+    def get_width_height(self, *, physical: bool = False):
+        if physical:
+            if self._physical_width is not None and self._physical_height is not None:
+                return (self._physical_width, self._physical_height)
+            return (
+                int(round(self._width * float(self.device_pixel_ratio))),
+                int(round(self._height * float(self.device_pixel_ratio))),
+            )
+        return (self._width, self._height)
+
     def draw(self) -> None:
         return None
 
-    def draw_idle(self) -> None:
-        return None
 
-    def width(self) -> int:
-        return self._width
+class _DummyScrollArea(_DummyWidget):
+    """Minimal QScrollArea stand-in."""
 
-    def height(self) -> int:
-        return self._height
+    def __init__(self, *_args, **_kwargs) -> None:
+        super().__init__()
+        self.widget_resizable = False
+        self.widget = None
+
+    def setWidgetResizable(self, enabled: bool) -> None:
+        self.widget_resizable = bool(enabled)
+
+    def setWidget(self, widget) -> None:
+        self.widget = widget
 
 
 class _DummyColormap:
@@ -300,7 +337,9 @@ class _DummyCollapsibleSection(_DummyWidget):
 
     instances: list["_DummyCollapsibleSection"] = []
 
-    def __init__(self, title: str, *, expanded: bool = True, parent=None) -> None:
+    def __init__(
+        self, title: str, *, expanded: bool = True, parent=None
+    ) -> None:
         super().__init__(parent)
         self.title = title
         self.expanded = expanded
@@ -325,14 +364,34 @@ class _DummyRegionSelector(_DummyWidget):
         self.allowed_ids: set[int] | None = None
         self.atlas = None
         self.selected: tuple[int, str] | None = None
+        self.selected_ids: list[int] = []
         self._structure_map: dict[int, dict] = {}
         self.clear_calls = 0
 
     def get_single_selected_region(self) -> tuple[int, str] | None:
+        if self.selected is not None:
+            return self.selected
+        if self.selected_ids:
+            struct_id = int(self.selected_ids[0])
+            struct = self._structure_map.get(struct_id, {})
+            acronym = str(struct.get("acronym", f"R{struct_id}"))
+            return (struct_id, acronym)
         return self.selected
 
-    def set_allowed_structure_ids(self, structure_ids: set[int] | None) -> None:
-        self.allowed_ids = None if structure_ids is None else set(structure_ids)
+    def get_selected_ids(self, include_children: bool = True) -> list[int]:
+        _ = include_children
+        if self.selected_ids:
+            return list(self.selected_ids)
+        if self.selected is not None:
+            return [int(self.selected[0])]
+        return []
+
+    def set_allowed_structure_ids(
+        self, structure_ids: set[int] | None
+    ) -> None:
+        self.allowed_ids = (
+            None if structure_ids is None else set(structure_ids)
+        )
 
     def set_atlas(self, atlas) -> None:
         self.atlas = atlas
@@ -341,15 +400,35 @@ class _DummyRegionSelector(_DummyWidget):
     def select_region_by_id(self, region_id: int | None) -> None:
         if region_id is None:
             self.selected = None
+            self.selected_ids = []
             return
         struct = self._structure_map.get(region_id, {})
         acronym = str(struct.get("acronym", f"R{region_id}"))
         self.selected = (int(region_id), acronym)
+        self.selected_ids = [int(region_id)]
+
+    def select_regions(self, acronyms: list[str]) -> None:
+        selected_ids = [
+            int(struct_id)
+            for struct_id, struct in self._structure_map.items()
+            if struct.get("acronym") in set(acronyms)
+        ]
+        self.selected_ids = selected_ids
+        self.selected = self.get_single_selected_region()
 
     def clear(self) -> None:
         self.clear_calls += 1
         self.selected = None
+        self.selected_ids = []
         self._structure_map = {}
+
+
+class _DummyFileDialog:
+    """Minimal QFileDialog stand-in."""
+
+    @staticmethod
+    def getSaveFileName(*_args, **_kwargs):
+        return ("", "")
 
 
 class _DummyQColor:
@@ -507,11 +586,14 @@ def _import_analysis_tab_module():
     for name, value in {
         "QComboBox": _DummyCombo,
         "QDoubleSpinBox": _DummySpinBox,
+        "QFileDialog": _DummyFileDialog,
         "QGroupBox": _DummyWidget,
         "QHBoxLayout": _DummyLayout,
         "QLabel": _DummyLabel,
+        "QLineEdit": _DummyLineEdit,
         "QProgressBar": _DummyProgressBar,
         "QPushButton": _DummyButton,
+        "QScrollArea": _DummyScrollArea,
         "QScrollArea": _DummyScrollArea,
         "QSpinBox": _DummySpinBox,
         "QVBoxLayout": _DummyLayout,
@@ -588,9 +670,13 @@ def _import_analysis_tab_module():
 def _make_selector(
     selected: tuple[int, str] | None = None,
     structure_map: dict[int, dict] | None = None,
+    selected_ids: list[int] | None = None,
 ):
     selector = _DummyRegionSelector()
     selector.selected = selected
+    selector.selected_ids = list(
+        selected_ids or ([] if selected is None else [selected[0]])
+    )
     selector._structure_map = structure_map or {}
     return selector
 
@@ -633,7 +719,9 @@ def test_analysis_region_sections_are_collapsed_by_default():
     widget = AnalysisTabWidget(_DummyViewer())
 
     titles = [section.title for section in _DummyCollapsibleSection.instances]
-    expanded = [section.expanded for section in _DummyCollapsibleSection.instances]
+    expanded = [
+        section.expanded for section in _DummyCollapsibleSection.instances
+    ]
 
     assert titles == [
         "Clustering",
@@ -642,11 +730,19 @@ def test_analysis_region_sections_are_collapsed_by_default():
         "Select Heatmap Region",
         "Progress",
         "Clustermap",
+        "Export Results",
     ]
-    assert expanded == [True, False, True, False, True, False]
-    assert widget._build_clustermap_btn.text() == "Build Dendrogram"
-    assert widget._build_clustermap_btn.isEnabled() is False
-    assert "Run clustering" in widget._clustermap_status_label.text()
+    assert expanded == [True, False, True, False, True, False, False]
+
+
+def test_analysis_tab_wraps_content_in_scroll_area():
+    """Analysis tab should use a scroll area so the dock can stay bounded."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert isinstance(widget._scroll_area, _DummyScrollArea)
+    assert widget._scroll_area.widget_resizable is True
+    assert widget._scroll_area.widget is widget._scroll_content
 
 
 def test_analysis_allowed_structure_ids_include_dataset_regions_and_ancestors():
@@ -655,10 +751,30 @@ def test_analysis_allowed_structure_ids_include_dataset_regions_and_ancestors():
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
     widget._atlas = _FakeAtlas(
         {
-            997: {"id": 997, "acronym": "root", "name": "root", "structure_id_path": [997]},
-            315: {"id": 315, "acronym": "ISO", "name": "Isocortex", "structure_id_path": [997, 315]},
-            184: {"id": 184, "acronym": "FRP", "name": "Frontal pole", "structure_id_path": [997, 315, 184]},
-            68: {"id": 68, "acronym": "FRP1", "name": "FRP1", "structure_id_path": [997, 315, 184, 68]},
+            997: {
+                "id": 997,
+                "acronym": "root",
+                "name": "root",
+                "structure_id_path": [997],
+            },
+            315: {
+                "id": 315,
+                "acronym": "ISO",
+                "name": "Isocortex",
+                "structure_id_path": [997, 315],
+            },
+            184: {
+                "id": 184,
+                "acronym": "FRP",
+                "name": "Frontal pole",
+                "structure_id_path": [997, 315, 184],
+            },
+            68: {
+                "id": 68,
+                "acronym": "FRP1",
+                "name": "FRP1",
+                "structure_id_path": [997, 315, 184, 68],
+            },
         }
     )
     widget._dataset_region_ids = {68}
@@ -695,10 +811,30 @@ def test_refresh_analysis_region_selectors_populates_both_selectors_from_dataset
     widget._heat_region_summary_label = _DummyLabel()
     widget._atlas = _FakeAtlas(
         {
-            997: {"id": 997, "acronym": "root", "name": "root", "structure_id_path": [997]},
-            315: {"id": 315, "acronym": "ISO", "name": "Isocortex", "structure_id_path": [997, 315]},
-            184: {"id": 184, "acronym": "FRP", "name": "Frontal pole", "structure_id_path": [997, 315, 184]},
-            68: {"id": 68, "acronym": "FRP1", "name": "FRP1", "structure_id_path": [997, 315, 184, 68]},
+            997: {
+                "id": 997,
+                "acronym": "root",
+                "name": "root",
+                "structure_id_path": [997],
+            },
+            315: {
+                "id": 315,
+                "acronym": "ISO",
+                "name": "Isocortex",
+                "structure_id_path": [997, 315],
+            },
+            184: {
+                "id": 184,
+                "acronym": "FRP",
+                "name": "Frontal pole",
+                "structure_id_path": [997, 315, 184],
+            },
+            68: {
+                "id": 68,
+                "acronym": "FRP1",
+                "name": "FRP1",
+                "structure_id_path": [997, 315, 184, 68],
+            },
         }
     )
     widget._dataset_region_ids = {68}
@@ -731,9 +867,24 @@ def test_refresh_analysis_region_selectors_preserves_independent_selections():
     widget._heat_region_summary_label = _DummyLabel()
     widget._atlas = _FakeAtlas(
         {
-            997: {"id": 997, "acronym": "root", "name": "root", "structure_id_path": [997]},
-            184: {"id": 184, "acronym": "FRP", "name": "Frontal pole", "structure_id_path": [997, 184]},
-            500: {"id": 500, "acronym": "CP", "name": "Caudoputamen", "structure_id_path": [997, 500]},
+            997: {
+                "id": 997,
+                "acronym": "root",
+                "name": "root",
+                "structure_id_path": [997],
+            },
+            184: {
+                "id": 184,
+                "acronym": "FRP",
+                "name": "Frontal pole",
+                "structure_id_path": [997, 184],
+            },
+            500: {
+                "id": 500,
+                "acronym": "CP",
+                "name": "Caudoputamen",
+                "structure_id_path": [997, 500],
+            },
         }
     )
     widget._dataset_region_ids = {184, 500}
@@ -744,17 +895,90 @@ def test_refresh_analysis_region_selectors_preserves_independent_selections():
     assert widget._selected_heat_region() == (500, "CP")
 
 
+def test_refresh_analysis_region_selectors_preserves_multiple_cluster_selections():
+    """Clustering selector should retain multiple direct selections after refresh."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    cluster_selector = _make_selector(
+        structure_map={
+            184: {"acronym": "FRP"},
+            500: {"acronym": "CP"},
+        },
+        selected_ids=[184, 500],
+    )
+    heat_selector = _make_selector(
+        selected=(500, "CP"), structure_map={500: {"acronym": "CP"}}
+    )
+
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._cluster_region_selector = cluster_selector
+    widget._heat_region_selector = heat_selector
+    widget._cluster_region_summary_label = _DummyLabel()
+    widget._heat_region_summary_label = _DummyLabel()
+    widget._atlas = _FakeAtlas(
+        {
+            997: {
+                "id": 997,
+                "acronym": "root",
+                "name": "root",
+                "structure_id_path": [997],
+            },
+            184: {
+                "id": 184,
+                "acronym": "FRP",
+                "name": "Frontal pole",
+                "structure_id_path": [997, 184],
+            },
+            500: {
+                "id": 500,
+                "acronym": "CP",
+                "name": "Caudoputamen",
+                "structure_id_path": [997, 500],
+            },
+        }
+    )
+    widget._dataset_region_ids = {184, 500}
+
+    widget._refresh_analysis_region_selectors()
+
+    assert widget._selected_cluster_regions() == [(184, "FRP"), (500, "CP")]
+
+
 def test_represented_region_ids_for_selection_expands_parent_to_dataset_descendants():
     """Parent selection for heatmaps should expand to represented descendant region IDs."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
     widget._atlas = _FakeAtlas(
         {
-            997: {"id": 997, "acronym": "root", "name": "root", "structure_id_path": [997]},
-            184: {"id": 184, "acronym": "FRP", "name": "Frontal pole", "structure_id_path": [997, 184]},
-            68: {"id": 68, "acronym": "FRP1", "name": "FRP1", "structure_id_path": [997, 184, 68]},
-            667: {"id": 667, "acronym": "FRP2/3", "name": "FRP2/3", "structure_id_path": [997, 184, 667]},
-            500: {"id": 500, "acronym": "CP", "name": "Caudoputamen", "structure_id_path": [997, 500]},
+            997: {
+                "id": 997,
+                "acronym": "root",
+                "name": "root",
+                "structure_id_path": [997],
+            },
+            184: {
+                "id": 184,
+                "acronym": "FRP",
+                "name": "Frontal pole",
+                "structure_id_path": [997, 184],
+            },
+            68: {
+                "id": 68,
+                "acronym": "FRP1",
+                "name": "FRP1",
+                "structure_id_path": [997, 184, 68],
+            },
+            667: {
+                "id": 667,
+                "acronym": "FRP2/3",
+                "name": "FRP2/3",
+                "structure_id_path": [997, 184, 667],
+            },
+            500: {
+                "id": 500,
+                "acronym": "CP",
+                "name": "Caudoputamen",
+                "structure_id_path": [997, 500],
+            },
         }
     )
     widget._dataset_region_ids = {68, 667, 500}
@@ -779,6 +1003,149 @@ def test_update_region_summary_labels_uses_selected_region_and_blank_heatmap():
 
     assert widget._cluster_region_summary_label.text() == "FRP (Frontal pole)"
     assert widget._heat_region_summary_label.text() == "All regions"
+
+
+def test_update_region_summary_labels_compacts_multiple_cluster_regions():
+    """Cluster summary should compact long direct-selection lists."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._cluster_region_selector = _make_selector(
+        selected_ids=[184, 500, 315],
+        structure_map={
+            184: {"name": "Frontal pole", "acronym": "FRP"},
+            500: {"name": "Caudoputamen", "acronym": "CP"},
+            315: {"name": "Isocortex", "acronym": "ISO"},
+        },
+    )
+    widget._heat_region_selector = _make_selector(selected=None)
+    widget._cluster_region_summary_label = _DummyLabel()
+    widget._heat_region_summary_label = _DummyLabel()
+
+    widget._update_region_summary_labels()
+
+    assert (
+        widget._cluster_region_summary_label.text()
+        == "FRP (Frontal pole), CP (Caudoputamen) +1 more"
+    )
+
+
+def test_update_button_states_enables_export_controls_after_clustering():
+    """Export controls should enable only when a clustering result exists and the UI is idle."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._last_cluster_result = object()
+
+    widget._update_button_states()
+
+    assert widget._render_clustermap_btn.isEnabled()
+    assert widget._save_cluster_workbook_btn.isEnabled()
+    assert widget._save_distance_workbook_btn.isEnabled()
+    assert widget._save_extended_parquet_btn.isEnabled()
+    assert widget._save_dendrogram_btn.isEnabled()
+
+
+def test_update_button_states_disables_export_controls_without_result():
+    """Export controls should stay disabled until clustering has completed."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._last_cluster_result = None
+
+    widget._update_button_states()
+
+    assert not widget._render_clustermap_btn.isEnabled()
+    assert not widget._save_cluster_workbook_btn.isEnabled()
+    assert not widget._save_distance_workbook_btn.isEnabled()
+    assert not widget._save_extended_parquet_btn.isEnabled()
+    assert not widget._save_dendrogram_btn.isEnabled()
+
+
+def test_on_correlation_finished_leaves_clustermap_unrendered():
+    """Clustering completion should not auto-render the dendrogram preview."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._n_clusters_spin = _DummySpinBox()
+    widget._n_clusters_spin.setValue(2)
+    widget._progress_bar = _DummyProgressBar()
+    widget._progress_label = _DummyLabel()
+    widget._update_button_states = lambda: None
+    widget._update_cluster_filter_combo = lambda: None
+    placeholder_messages: list[str] = []
+    widget._show_clustermap_message = lambda message: (
+        placeholder_messages.append(message)
+    )
+    draw_calls: list[object] = []
+    widget._draw_clustermap = lambda result: draw_calls.append(result)
+    emitted: list[tuple[object, dict]] = []
+    widget.cluster_colors_updated.connect(
+        lambda result, color_map: emitted.append((result, color_map))
+    )
+
+    result = types.SimpleNamespace(
+        neuron_ids=["n1", "n2"],
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+
+    widget._on_correlation_finished(result)
+
+    assert widget._last_cluster_result is result
+    assert draw_calls == []
+    assert emitted == []
+    assert placeholder_messages == [
+        "Clustering complete. Click Render Dendrogram to view."
+    ]
+
+
+def test_render_clustermap_requires_button_press():
+    """Render button handler should draw only when a result is available."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    result = types.SimpleNamespace()
+    widget._last_cluster_result = result
+    draw_calls: list[object] = []
+    widget._draw_clustermap = lambda cluster_result: draw_calls.append(
+        cluster_result
+    )
+
+    widget._render_clustermap_requested()
+
+    assert draw_calls == [result]
+
+
+def test_color_neurons_by_cluster_emits_updates_only_on_button_press():
+    """Explicit cluster-color application should drive table updates and its own message."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._viewer = _DummyViewer()
+    widget._slice_projector = None
+    widget._progress_bar = _DummyProgressBar()
+    widget._progress_label = _DummyLabel()
+    widget._last_cluster_result = types.SimpleNamespace(
+        neuron_ids=["n1", "n2"]
+    )
+    widget._cluster_color_map = {
+        "n1": [0.12, 0.47, 0.71, 1.0],
+        "n2": [0.84, 0.15, 0.16, 1.0],
+    }
+    widget._actual_n_clusters = 2
+    emitted: list[tuple[object, dict]] = []
+    widget.cluster_colors_updated.connect(
+        lambda result, color_map: emitted.append((result, color_map))
+    )
+    widget._flush_progress_updates = lambda: None
+
+    widget._color_neurons_by_cluster()
+
+    assert emitted == [
+        (widget._last_cluster_result, widget._cluster_color_map)
+    ]
+    assert (
+        widget._progress_label.text()
+        == "Applied cluster colors: table 2 clustered neurons (2 clusters)"
+    )
 
 
 def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
@@ -813,7 +1180,9 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.scale == [1.0, 3.0, 1.0]
     assert layer.metadata["heatmap_kind"] == "analysis"
     assert layer.metadata["heatmap_contrast_limits"] == (0.0, 7.0)
-    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
+    assert (
+        layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
+    )
 
 
 def test_analysis_heatmap_workaround_swallows_thumbnail_rank_mismatch():
@@ -822,7 +1191,9 @@ def test_analysis_heatmap_workaround_swallows_thumbnail_rank_mismatch():
 
     class _CrashLayer(_DummyImageLayer):
         def _update_thumbnail(self) -> None:
-            raise RuntimeError("sequence argument must have length equal to input rank")
+            raise RuntimeError(
+                "sequence argument must have length equal to input rank"
+            )
 
     layer = _CrashLayer(
         np.zeros((2, 2, 2), dtype=np.float32),
@@ -942,14 +1313,16 @@ def test_analysis_heatmap_contrast_limits_fallback_for_zero_volume():
 
 
 def test_draw_clustermap_emits_debug_logs(caplog):
-    """Clustermap drawing should log seaborn and canvas timing phases."""
+    """Clustermap drawing should use backend-managed figure size once."""
     module = _import_analysis_tab_module()
     AnalysisTabWidget = module.AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
     widget._clustermap_rendered = False
-    widget._clustermap_refresh_pending = False
-    widget._clustermap_section = _DummyCollapsibleSection("Clustermap", expanded=True)
+    widget._clustermap_section = _DummyCollapsibleSection(
+        "Clustermap", expanded=True
+    )
     widget._figure = _DummyFigure()
+    widget._figure.size_inches = (5.0, 3.0)
     widget._canvas = _DummyCanvas(widget._figure)
     widget._canvas.draw = MagicMock()
     widget._canvas.draw_idle = MagicMock()
@@ -957,10 +1330,17 @@ def test_draw_clustermap_emits_debug_logs(caplog):
         "n1": [0.1, 0.2, 0.3, 1.0],
         "n2": [0.2, 0.3, 0.4, 1.0],
     }
-    closed: list[object] = []
-    module.plt.close = lambda fig: closed.append(fig)
-    new_figure = _DummyFigure()
-    module.sns.clustermap = lambda *args, **kwargs: types.SimpleNamespace(fig=new_figure)
+    populate_calls: list[tuple[object, object, object, tuple[float, float], int]] = []
+
+    def _fake_populate(
+        figure, result, cluster_color_map, *, figsize, dpi
+    ):
+        populate_calls.append(
+            (figure, result, cluster_color_map, tuple(figsize), int(dpi))
+        )
+        return figure
+
+    module._populate_embedded_clustermap_figure = _fake_populate
     result = ClusterResult(
         correlation_matrix=np.eye(2, dtype=np.float32),
         distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
@@ -970,34 +1350,85 @@ def test_draw_clustermap_emits_debug_logs(caplog):
         labels=np.array([1, 2], dtype=np.int32),
     )
 
-    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"):
+    with caplog.at_level(
+        logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"
+    ):
         widget._draw_clustermap(result)
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("_draw_clustermap start" in message for message in messages)
-    assert any("seaborn.clustermap complete" in message for message in messages)
-    assert any("_attach_clustermap_figure complete" in message for message in messages)
-    assert any("_schedule_clustermap_layout_refresh queued" in message for message in messages)
-    assert any("_refresh_clustermap_layout canvas draw complete" in message for message in messages)
+    assert any(
+        "populate_clustermap_figure complete" in message
+        for message in messages
+    )
+    assert any(
+        "_draw_clustermap canvas draw complete" in message
+        for message in messages
+    )
+    assert populate_calls == [
+        (
+            widget._figure,
+            result,
+            widget._cluster_color_map,
+            (5.0, 3.0),
+            100,
+        )
+    ]
     widget._canvas.draw.assert_called_once_with()
-    widget._canvas.draw_idle.assert_called_once_with()
-    assert widget._figure is new_figure
-    assert new_figure.canvas is widget._canvas
-    assert new_figure.size_inches == (6.0, 4.0, False)
-    assert len(closed) == 1
+    widget._canvas.draw_idle.assert_not_called()
+    assert widget._figure.canvas is None
+    assert widget._figure.size_inches == (5.0, 3.0)
+    assert widget._figure.set_size_inches_calls == 0
 
 
-def test_refresh_clustermap_on_section_expand_when_rendered() -> None:
-    """Re-expanding the clustermap section should queue a layout refresh."""
+def test_draw_clustermap_uses_physical_canvas_size_when_figure_size_unavailable():
+    """Preview sizing should fall back to physical canvas pixels on HiDPI displays."""
     module = _import_analysis_tab_module()
     AnalysisTabWidget = module.AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
-    widget._clustermap_rendered = True
-    widget._schedule_clustermap_layout_refresh = MagicMock()
+    widget._clustermap_rendered = False
+    widget._figure = _DummyFigure()
+    widget._figure.size_inches = None
+    widget._canvas = _DummyCanvas(widget._figure)
+    widget._canvas._width = 600
+    widget._canvas._height = 400
+    widget._canvas._physical_width = 1200
+    widget._canvas._physical_height = 800
+    widget._canvas.draw = MagicMock()
+    widget._cluster_color_map = None
+    populate_calls: list[tuple[object, object, object, tuple[float, float], int]] = []
 
-    widget._on_clustermap_section_expanded_changed(True)
+    def _fake_populate(
+        figure, result, cluster_color_map, *, figsize, dpi
+    ):
+        populate_calls.append(
+            (figure, result, cluster_color_map, tuple(figsize), int(dpi))
+        )
+        return figure
 
-    widget._schedule_clustermap_layout_refresh.assert_called_once_with()
+    module._populate_embedded_clustermap_figure = _fake_populate
+    result = ClusterResult(
+        correlation_matrix=np.eye(2, dtype=np.float32),
+        distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+        linkage_matrix=np.array([[0.0, 1.0, 1.0, 2.0]], dtype=np.float64),
+        neuron_ids=["n1", "n2"],
+        reorder_indices=np.array([0, 1], dtype=np.intp),
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+
+    widget._draw_clustermap(result)
+
+    assert populate_calls == [
+        (
+            widget._figure,
+            result,
+            None,
+            (12.0, 8.0),
+            100,
+        )
+    ]
+    widget._canvas.draw.assert_called_once_with()
+    assert widget._figure.set_size_inches_calls == 0
 
 
 def test_build_clustermap_on_demand_draws_cached_result_and_logs(caplog):
@@ -1019,15 +1450,25 @@ def test_build_clustermap_on_demand_draws_cached_result_and_logs(caplog):
     )
     widget._last_cluster_result = result
 
-    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"):
+    with caplog.at_level(
+        logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"
+    ):
         widget._build_clustermap_on_demand()
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any("_build_clustermap_on_demand start" in message for message in messages)
-    assert any("_build_clustermap_on_demand complete" in message for message in messages)
+    assert any(
+        "_build_clustermap_on_demand start" in message for message in messages
+    )
+    assert any(
+        "_build_clustermap_on_demand complete" in message
+        for message in messages
+    )
     widget._draw_clustermap.assert_called_once_with(result)
     widget._update_button_states.assert_called_once_with()
-    assert widget._clustermap_status_label.text() == "Dendrogram ready for 2 neurons."
+    assert (
+        widget._clustermap_status_label.text()
+        == "Dendrogram ready for 2 neurons."
+    )
 
 
 def test_on_correlation_finished_emits_debug_logs(caplog):
@@ -1060,13 +1501,20 @@ def test_on_correlation_finished_emits_debug_logs(caplog):
         labels=np.array([1, 2], dtype=np.int32),
     )
 
-    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"):
+    with caplog.at_level(
+        logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"
+    ):
         widget._on_correlation_finished(result)
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any("_on_correlation_finished start" in message for message in messages)
+    assert any(
+        "_on_correlation_finished start" in message for message in messages
+    )
     assert any("color map built" in message for message in messages)
-    assert any("clustermap render deferred until button click" in message for message in messages)
+    assert any(
+        "clustermap render deferred until button click" in message
+        for message in messages
+    )
     widget._build_cluster_color_map.assert_called_once_with()
     widget._update_button_states.assert_called_once_with()
     widget._draw_clustermap.assert_not_called()

@@ -30,6 +30,7 @@ dependencies = [
     "pyarrow>=14.0",
     "duckdb>=0.9",
     "pandas>=2.0",
+    "xlsxwriter>=3.2",
     "qtpy>=2.0",
     "pyqtgraph>=0.13",
     "scikit-learn>=1.2",
@@ -39,6 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 testing = [
+    "openpyxl>=3.1",
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
