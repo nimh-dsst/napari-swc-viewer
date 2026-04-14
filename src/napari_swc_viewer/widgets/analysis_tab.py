@@ -11,6 +11,7 @@ Provides UI for:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from types import MethodType
@@ -48,6 +49,19 @@ if TYPE_CHECKING:
     from ..db import NeuronDatabase
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _HeatmapRequest:
+    """Immutable specification for one analysis heatmap build."""
+
+    selected_region_id: int | None
+    selected_region_acronym: str | None
+    region_ids: tuple[int, ...] | None
+    cluster_label: int | None
+    file_ids: tuple[str, ...] | None
+    depth_bin_factor: int
+    depth_axis: int
 
 
 def _analysis_heatmap_contrast_limits(
@@ -280,15 +294,13 @@ class AnalysisTabWidget(QWidget):
         self._cluster_color_map: dict[str, list[float]] | None = None
         self._actual_n_clusters: int = 0
         self._heatmap_layer = None
-        self._pending_heatmap_cluster: int | None = (
-            None  # cluster label for in-flight heatmap
-        )
-        self._pending_heatmap_region: str | None = (
-            None  # region acronym for in-flight heatmap
-        )
-        self._pending_heatmap_depth_bin: int = 1
-        self._pending_heatmap_depth_axis: int = 0
-        self._last_heatmap_file_ids: list[str] | None = None
+        self._current_heatmap_request: _HeatmapRequest | None = None
+        self._pending_heatmap_requests: list[_HeatmapRequest] = []
+        self._completed_heatmap_requests: list[_HeatmapRequest] = []
+        self._last_heatmap_requests: list[_HeatmapRequest] = []
+        self._active_heatmap_total: int = 0
+        self._active_heatmap_index: int = 0
+        self._heatmap_batch_mode: bool = False
         self._slice_projector = None
         self._dataset_region_ids: set[int] = set()
         self._clustermap_rendered = False
@@ -353,6 +365,17 @@ class AnalysisTabWidget(QWidget):
         )
         self._run_corr_btn.setEnabled(ready and not busy)
         self._run_heat_btn.setEnabled(ready and not busy)
+        has_cluster_heatmap_options = (
+            ready
+            and not busy
+            and self._last_cluster_result is not None
+            and getattr(self, "_heat_cluster_combo", None) is not None
+            and self._heat_cluster_combo.count() > 1
+        )
+        if hasattr(self, "_add_all_cluster_heatmaps_btn"):
+            self._add_all_cluster_heatmaps_btn.setEnabled(
+                has_cluster_heatmap_options
+            )
         analysis_ready = self._last_cluster_result is not None and not busy
         self._color_by_cluster_btn.setEnabled(analysis_ready)
         if hasattr(self, "_render_clustermap_btn"):
@@ -572,10 +595,21 @@ class AnalysisTabWidget(QWidget):
         self._voxel_depth_label = QLabel("Voxel depth: — μm")
         heat_layout.addWidget(self._voxel_depth_label)
 
+        heat_action_row = QHBoxLayout()
         self._run_heat_btn = QPushButton("Build Heatmap Volume")
         self._run_heat_btn.setEnabled(False)
         self._run_heat_btn.clicked.connect(self._run_heatmap_pipeline)
-        heat_layout.addWidget(self._run_heat_btn)
+        heat_action_row.addWidget(self._run_heat_btn)
+
+        self._add_all_cluster_heatmaps_btn = QPushButton(
+            "Add All Cluster Heatmaps"
+        )
+        self._add_all_cluster_heatmaps_btn.setEnabled(False)
+        self._add_all_cluster_heatmaps_btn.clicked.connect(
+            self._run_all_cluster_heatmaps
+        )
+        heat_action_row.addWidget(self._add_all_cluster_heatmaps_btn)
+        heat_layout.addLayout(heat_action_row)
 
         layout.addWidget(self._heatmap_section)
 
@@ -1057,70 +1091,223 @@ class AnalysisTabWidget(QWidget):
         if self._worker_thread is not None and self._worker_thread.isRunning():
             return
 
-        from ..workers import HeatmapWorker
+        request = self._selected_heatmap_request()
+        if request is None:
+            return
 
+        self._start_heatmap_requests([request], batch_mode=False)
+
+    def _run_all_cluster_heatmaps(self) -> None:
+        """Queue heatmaps for every cluster shown in the dropdown."""
+        if self._db is None or self._atlas is None:
+            return
+
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            return
+
+        requests = self._all_cluster_heatmap_requests()
+        if not requests:
+            self._progress_label.setText(
+                "Run clustering before adding cluster heatmaps."
+            )
+            return
+
+        self._start_heatmap_requests(requests, batch_mode=True)
+
+    def _current_heatmap_region_filter(
+        self,
+    ) -> tuple[int | None, str | None, tuple[int, ...] | None] | None:
+        """Return the current region filter for heatmap creation."""
         selected_region = self._selected_heat_region()
-        region = selected_region[1] if selected_region is not None else None
-        region_ids = (
-            self._represented_region_ids_for_selection(selected_region[0])
-            if selected_region is not None
-            else None
+        if selected_region is None:
+            return (None, None, None)
+
+        region_id, acronym = selected_region
+        represented_ids = tuple(
+            self._represented_region_ids_for_selection(region_id)
         )
-        if selected_region is not None and not region_ids:
+        if not represented_ids:
             self._progress_label.setText(
                 "Selected region has no represented dataset regions."
             )
-            return
-        self._pending_heatmap_region = region
+            return None
+        return (int(region_id), acronym, represented_ids)
 
-        # Determine cluster filter
+    def _cluster_file_ids(self, cluster_label: int) -> tuple[str, ...]:
+        """Return neuron IDs assigned to one cluster label."""
+        result = self._last_cluster_result
+        if result is None:
+            return ()
+
+        mask = np.asarray(result.labels) == int(cluster_label)
+        return tuple(
+            str(neuron_id)
+            for neuron_id, matched in zip(result.neuron_ids, mask)
+            if matched
+        )
+
+    def _build_heatmap_request(
+        self,
+        cluster_label: int | None,
+        *,
+        depth_axis: int | None = None,
+        depth_bin_factor: int | None = None,
+    ) -> _HeatmapRequest | None:
+        """Build one heatmap request from current UI state."""
+        region_filter = self._current_heatmap_region_filter()
+        if region_filter is None:
+            return None
+
+        selected_region_id, selected_region_acronym, region_ids = region_filter
+        request_cluster = (
+            None if cluster_label is None else int(cluster_label)
+        )
         file_ids = None
-        cluster_idx = self._heat_cluster_combo.currentIndex()
-        if cluster_idx > 0:  # 0 = "All neurons"
-            cluster_label = self._heat_cluster_combo.itemData(cluster_idx)
-            self._pending_heatmap_cluster = cluster_label
-            result = self._last_cluster_result
-            if result is not None:
-                mask = result.labels == cluster_label
-                file_ids = [
-                    nid for nid, m in zip(result.neuron_ids, mask) if m
-                ]
-        else:
-            self._pending_heatmap_cluster = None
+        if request_cluster is not None:
+            file_ids = self._cluster_file_ids(request_cluster)
+            if not file_ids:
+                self._progress_label.setText(
+                    f"No neurons found for cluster {request_cluster}."
+                )
+                return None
 
-        # Determine depth axis from napari dims
+        resolved_depth_axis = (
+            self._current_depth_axis()
+            if depth_axis is None
+            else int(depth_axis)
+        )
+        resolved_depth_bin = (
+            self._depth_bin_spin.value()
+            if depth_bin_factor is None
+            else int(depth_bin_factor)
+        )
+
+        return _HeatmapRequest(
+            selected_region_id=selected_region_id,
+            selected_region_acronym=selected_region_acronym,
+            region_ids=region_ids,
+            cluster_label=request_cluster,
+            file_ids=file_ids,
+            depth_bin_factor=resolved_depth_bin,
+            depth_axis=resolved_depth_axis,
+        )
+
+    def _selected_heatmap_request(self) -> _HeatmapRequest | None:
+        """Return the heatmap request for the current dropdown selection."""
+        cluster_label = None
+        cluster_idx = self._heat_cluster_combo.currentIndex()
+        if cluster_idx > 0:
+            cluster_label = self._heat_cluster_combo.itemData(cluster_idx)
+        return self._build_heatmap_request(cluster_label)
+
+    def _all_cluster_heatmap_labels(self) -> list[int]:
+        """Return all concrete cluster labels shown in the heatmap dropdown."""
+        labels: list[int] = []
+        seen: set[int] = set()
+        combo = getattr(self, "_heat_cluster_combo", None)
+        if combo is not None:
+            for index in range(1, combo.count()):
+                label = combo.itemData(index)
+                if label is None:
+                    continue
+                value = int(label)
+                if value in seen:
+                    continue
+                seen.add(value)
+                labels.append(value)
+        if labels:
+            return labels
+
+        result = self._last_cluster_result
+        if result is None:
+            return []
+        return [int(label) for label in sorted(np.unique(result.labels).tolist())]
+
+    def _all_cluster_heatmap_requests(self) -> list[_HeatmapRequest]:
+        """Return heatmap requests for every cluster-specific option."""
         depth_axis = self._current_depth_axis()
         depth_bin_factor = self._depth_bin_spin.value()
+        requests: list[_HeatmapRequest] = []
+        for cluster_label in self._all_cluster_heatmap_labels():
+            request = self._build_heatmap_request(
+                cluster_label,
+                depth_axis=depth_axis,
+                depth_bin_factor=depth_bin_factor,
+            )
+            if request is not None:
+                requests.append(request)
+        return requests
 
-        self._pending_heatmap_depth_bin = depth_bin_factor
-        self._pending_heatmap_depth_axis = depth_axis
-        self._last_heatmap_file_ids = file_ids
+    def _start_heatmap_requests(
+        self,
+        requests: list[_HeatmapRequest],
+        *,
+        batch_mode: bool,
+    ) -> None:
+        """Start one or more heatmap requests in sequence."""
+        if not requests:
+            return
+
+        self._pending_heatmap_requests = list(requests)
+        self._completed_heatmap_requests = []
+        self._current_heatmap_request = None
+        self._active_heatmap_total = len(requests)
+        self._active_heatmap_index = 0
+        self._heatmap_batch_mode = bool(batch_mode)
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, 0)
+        self._update_button_states()
+        self._start_next_heatmap_request()
+
+    def _start_next_heatmap_request(self) -> None:
+        """Start the next queued heatmap request."""
+        if not self._pending_heatmap_requests:
+            return
+
+        from ..workers import HeatmapWorker
+
+        request = self._pending_heatmap_requests.pop(0)
+        self._current_heatmap_request = request
+        self._active_heatmap_index = len(self._completed_heatmap_requests) + 1
 
         worker = HeatmapWorker(
             parquet_path=self._parquet_path,
             atlas=self._atlas,
-            region_ids=region_ids,
-            file_ids=file_ids,
-            depth_bin_factor=depth_bin_factor,
-            depth_axis=depth_axis,
+            region_ids=(
+                list(request.region_ids)
+                if request.region_ids is not None
+                else None
+            ),
+            file_ids=(
+                list(request.file_ids) if request.file_ids is not None else None
+            ),
+            depth_bin_factor=request.depth_bin_factor,
+            depth_axis=request.depth_axis,
         )
 
         thread = QThread()
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_progress)
+        worker.progress.connect(self._on_heatmap_progress)
         worker.finished.connect(self._on_heatmap_finished)
         worker.finished.connect(thread.quit)
-        worker.error.connect(self._on_error)
+        worker.error.connect(self._on_heatmap_error)
         worker.error.connect(thread.quit)
-        thread.finished.connect(self._on_thread_finished)
-        thread.finished.connect(self._update_button_states)
+        thread.finished.connect(self._on_heatmap_thread_finished)
         thread.finished.connect(thread.deleteLater)
 
         self._worker_thread = thread
         self._current_worker = worker
 
+        if self._heatmap_batch_mode:
+            self._progress_label.setText(
+                f"Building heatmap {self._active_heatmap_index}/"
+                f"{self._active_heatmap_total}: "
+                f"{self._heatmap_layer_name(request)}"
+            )
+        else:
+            self._progress_label.setText("Building heatmap volume...")
         self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, 0)
         self._update_button_states()
@@ -1132,6 +1319,30 @@ class AnalysisTabWidget(QWidget):
         self._progress_label.setText(f"Step {current}/{total}: {step_name}")
         self._progress_bar.setRange(0, total)
         self._progress_bar.setValue(current)
+
+    def _on_heatmap_progress(
+        self,
+        step_name: str,
+        current: int,
+        total: int,
+    ) -> None:
+        """Handle progress updates for queued heatmap builds."""
+        request = self._current_heatmap_request
+        if not self._heatmap_batch_mode or request is None:
+            self._on_progress(step_name, current, total)
+            return
+
+        overall_total = max(int(total) * self._active_heatmap_total, 1)
+        overall_current = (
+            (self._active_heatmap_index - 1) * int(total)
+        ) + int(current)
+        self._progress_label.setText(
+            f"Heatmap {self._active_heatmap_index}/"
+            f"{self._active_heatmap_total}: "
+            f"{self._heatmap_layer_name(request)} - {step_name}"
+        )
+        self._progress_bar.setRange(0, overall_total)
+        self._progress_bar.setValue(overall_current)
 
     def _on_correlation_finished(self, result: ClusterResult) -> None:
         """Handle completed correlation pipeline."""
@@ -1172,8 +1383,8 @@ class AnalysisTabWidget(QWidget):
         clustermap_status = getattr(self, "_clustermap_status_label", None)
         if clustermap_status is not None:
             clustermap_status.setText(clustermap_message)
-        self._update_button_states()
         self._update_cluster_filter_combo()
+        self._update_button_states()
         show_placeholder = "_show_clustermap_message" in self.__dict__ or (
             hasattr(self, "_figure") and hasattr(self, "_canvas")
         )
@@ -1201,61 +1412,86 @@ class AnalysisTabWidget(QWidget):
 
     def _on_heatmap_finished(self, volume: np.ndarray) -> None:
         """Handle completed heatmap pipeline."""
-        from napari.utils.colormaps import Colormap
+        request = self._current_heatmap_request
+        if request is None:
+            return
 
-        self._progress_bar.setVisible(False)
-        self._update_button_states()
+        layer = self._add_analysis_heatmap_layer(volume, request)
+        self._completed_heatmap_requests.append(request)
+        self._heatmap_layer = layer
 
-        cluster_label = self._pending_heatmap_cluster
-        region = self._pending_heatmap_region
-        self._pending_heatmap_cluster = None
-        self._pending_heatmap_region = None
-
-        region_part = f" {region}" if region else ""
-
-        if cluster_label is not None:
-            # Cluster-specific heatmap with derived colormap
-            rgba = self._cluster_label_colors.get(
-                cluster_label, [0.5, 0.5, 0.5, 1.0]
+        if self._heatmap_batch_mode:
+            self._progress_label.setText(
+                f"Added {self._heatmap_layer_name(request)} "
+                f"({self._active_heatmap_index}/"
+                f"{self._active_heatmap_total})"
             )
-            layer_name = f"Cluster {cluster_label}{region_part} Heatmap"
-            colormap = Colormap(
-                colors=[[0, 0, 0, 0], [rgba[0], rgba[1], rgba[2], 1.0]],
-                name=f"cluster_{cluster_label}",
-            )
-        else:
-            layer_name = f"Node Count{region_part} Heatmap"
-            colormap = "hot"
+            return
 
         self._progress_label.setText(
-            f"{layer_name}: {(volume > 0).sum():,} non-zero voxels"
+            f"{layer.name}: {(volume > 0).sum():,} non-zero voxels"
         )
+
+    def _heatmap_layer_name(self, request: _HeatmapRequest) -> str:
+        """Return the napari layer name for one heatmap request."""
+        region_part = (
+            f" {request.selected_region_acronym}"
+            if request.selected_region_acronym
+            else ""
+        )
+        if request.cluster_label is None:
+            return f"Node Count{region_part} Heatmap"
+        return f"Cluster {request.cluster_label}{region_part} Heatmap"
+
+    def _add_analysis_heatmap_layer(
+        self,
+        volume: np.ndarray,
+        request: _HeatmapRequest,
+    ):
+        """Add or replace one analysis heatmap layer."""
+        from napari.utils.colormaps import Colormap
+
+        layer_name = self._heatmap_layer_name(request)
         contrast_limits = _analysis_heatmap_contrast_limits(volume)
 
-        # Remove existing layer with the same name
+        if request.cluster_label is not None:
+            rgba = getattr(self, "_cluster_label_colors", {}).get(
+                request.cluster_label, [0.5, 0.5, 0.5, 1.0]
+            )
+            colormap = Colormap(
+                colors=[[0, 0, 0, 0], [rgba[0], rgba[1], rgba[2], 1.0]],
+                name=f"cluster_{request.cluster_label}",
+            )
+        else:
+            colormap = "hot"
+
         for layer in list(self._viewer.layers):
             if layer.name == layer_name:
                 self._viewer.layers.remove(layer)
 
-        # Set scale so the binned depth axis stays spatially aligned
         scale = [1.0, 1.0, 1.0]
-        scale[self._pending_heatmap_depth_axis] = float(
-            self._pending_heatmap_depth_bin
-        )
+        scale[request.depth_axis] = float(request.depth_bin_factor)
         metadata = {
             "heatmap_source": True,
-            "heatmap_native_grid": self._pending_heatmap_depth_bin == 1,
+            "heatmap_native_grid": request.depth_bin_factor == 1,
             "atlas_name": getattr(self._atlas, "atlas_name", None),
             "heatmap_kind": "analysis",
-            "heatmap_region": region,
-            "heatmap_cluster": cluster_label,
-            "depth_bin_factor": self._pending_heatmap_depth_bin,
-            "depth_axis": self._pending_heatmap_depth_axis,
+            "heatmap_region": request.selected_region_acronym,
+            "heatmap_selected_region_id": request.selected_region_id,
+            "heatmap_selected_region_acronym": request.selected_region_acronym,
+            "heatmap_region_ids": (
+                list(request.region_ids)
+                if request.region_ids is not None
+                else None
+            ),
+            "heatmap_cluster": request.cluster_label,
+            "depth_bin_factor": request.depth_bin_factor,
+            "depth_axis": request.depth_axis,
             "heatmap_contrast_limits": contrast_limits,
             "heatmap_autocontrast_policy": "stable_full_volume",
         }
 
-        self._heatmap_layer = self._viewer.add_image(
+        layer = self._viewer.add_image(
             volume,
             name=layer_name,
             colormap=colormap,
@@ -1267,7 +1503,50 @@ class AnalysisTabWidget(QWidget):
             contrast_limits=contrast_limits,
             metadata=metadata,
         )
-        _install_analysis_heatmap_layer_workarounds(self._heatmap_layer)
+        _install_analysis_heatmap_layer_workarounds(layer)
+        return layer
+
+    def _on_heatmap_thread_finished(self) -> None:
+        """Advance the heatmap queue or finalize the completed run."""
+        self._on_thread_finished()
+
+        if self._pending_heatmap_requests:
+            self._start_next_heatmap_request()
+            return
+
+        if self._completed_heatmap_requests:
+            self._last_heatmap_requests = list(
+                self._completed_heatmap_requests
+            )
+
+        completed_count = len(self._completed_heatmap_requests)
+        batch_mode = self._heatmap_batch_mode
+        self._current_heatmap_request = None
+        self._completed_heatmap_requests = []
+        self._active_heatmap_total = 0
+        self._active_heatmap_index = 0
+        self._heatmap_batch_mode = False
+        self._progress_bar.setVisible(False)
+        if batch_mode and completed_count > 0:
+            suffix = "" if completed_count == 1 else "s"
+            self._progress_label.setText(
+                f"Added {completed_count} cluster heatmap{suffix} to scene"
+            )
+        self._update_button_states()
+
+    def _on_heatmap_error(self, message: str) -> None:
+        """Handle a heatmap worker failure and stop any remaining queue."""
+        if self._completed_heatmap_requests:
+            self._last_heatmap_requests = list(
+                self._completed_heatmap_requests
+            )
+        self._pending_heatmap_requests = []
+        self._current_heatmap_request = None
+        self._completed_heatmap_requests = []
+        self._active_heatmap_total = 0
+        self._active_heatmap_index = 0
+        self._heatmap_batch_mode = False
+        self._on_error(message)
 
     def _on_error(self, message: str) -> None:
         """Handle worker errors."""
@@ -1795,13 +2074,20 @@ class AnalysisTabWidget(QWidget):
 
     def _on_dims_order_changed(self, event=None) -> None:
         """Rebuild heatmap when the user reorders axes in napari."""
-        if self._heatmap_layer is None:
+        if not self._last_heatmap_requests:
             return
         if self._worker_thread is not None and self._worker_thread.isRunning():
             return
         if self._db is None or self._atlas is None:
             return
-        self._run_heatmap_pipeline()
+        updated_requests = [
+            replace(request, depth_axis=self._current_depth_axis())
+            for request in self._last_heatmap_requests
+        ]
+        self._start_heatmap_requests(
+            updated_requests,
+            batch_mode=len(updated_requests) > 1,
+        )
 
     def apply_cluster_colors(self) -> None:
         """Apply cached cluster colors to currently rendered neuron layers.
