@@ -26,6 +26,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _format_nbytes(num_bytes: int) -> str:
+    """Return a compact human-readable size string."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024**2:
+        return f"{num_bytes / 1024:.2f} KiB"
+    if num_bytes < 1024**3:
+        return f"{num_bytes / (1024**2):.2f} MiB"
+    return f"{num_bytes / (1024**3):.2f} GiB"
+
+
 @dataclass(frozen=True)
 class ClusterRegionSelection:
     """Direct region selections and represented dataset descendants."""
@@ -466,8 +477,37 @@ def cluster_somas_hierarchical(
     -------
     ClusterResult
     """
+    total_start = perf_counter()
+    logger.debug(
+        "cluster_somas_hierarchical start: neurons=%d coords shape=%s dtype=%s method=%s n_clusters=%d",
+        len(neuron_ids),
+        coords.shape,
+        coords.dtype,
+        method,
+        n_clusters,
+    )
+    distance_start = perf_counter()
     condensed = _euclidean_condensed_distances(coords)
+    dist = squareform(condensed, checks=False).astype(np.float32, copy=False)
+    logger.debug(
+        "Built Euclidean distance matrix for %d soma coordinates",
+        len(neuron_ids),
+    )
+    distance_elapsed = perf_counter() - distance_start
+    logger.debug(
+        "cluster_somas_hierarchical distance build complete: elapsed=%.3fs distance_nbytes=%s",
+        distance_elapsed,
+        _format_nbytes(int(dist.nbytes)),
+    )
+    linkage_start = perf_counter()
     Z = compute_linkage_from_condensed(condensed, method=method)
+    linkage_elapsed = perf_counter() - linkage_start
+    logger.debug(
+        "cluster_somas_hierarchical linkage complete: elapsed=%.3fs linkage_nbytes=%s",
+        linkage_elapsed,
+        _format_nbytes(int(Z.nbytes)),
+    )
+    fcluster_start = perf_counter()
     labels = fcluster(Z, t=n_clusters, criterion="maxclust").astype(np.int32)
     fcluster_elapsed = perf_counter() - fcluster_start
     logger.debug(
@@ -478,7 +518,13 @@ def cluster_somas_hierarchical(
     )
     reorder_start = perf_counter()
     reorder = leaves_list(Z)
-    dist = squareform(condensed, checks=False).astype(np.float32, copy=False)
+    reorder_elapsed = perf_counter() - reorder_start
+    logger.debug(
+        "cluster_somas_hierarchical leaves_list complete: elapsed=%.3fs reorder shape=%s dtype=%s",
+        reorder_elapsed,
+        reorder.shape,
+        reorder.dtype,
+    )
 
     actual_k = int(len(np.unique(labels)))
     logger.info(

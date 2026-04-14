@@ -154,18 +154,26 @@ class AppendPointFileWorker(QObject):
     def run(self) -> None:
         """Execute the append pipeline."""
         try:
-            from .point_import import append_point_file_to_parquet
+            from .point_import import (
+                append_point_csv_to_parquet,
+                append_point_parquet_to_parquet,
+            )
 
             if self._input_path.suffix.lower() == ".parquet":
                 self.progress.emit("Validating point Parquet schemas...", 1, 3)
+                summary = append_point_parquet_to_parquet(
+                    self._input_path,
+                    self._parquet_path,
+                    self._output_path,
+                )
             else:
                 self.progress.emit("Validating point CSV and target Parquet...", 1, 3)
-            summary = append_point_file_to_parquet(
-                self._input_path,
-                self._parquet_path,
-                self._output_path,
-                self._mapping_path,
-            )
+                summary = append_point_csv_to_parquet(
+                    self._input_path,
+                    self._mapping_path,
+                    self._parquet_path,
+                    self._output_path,
+                )
             self.progress.emit("Refreshing saved point Parquet...", 2, 3)
             self.progress.emit("Done", 3, 3)
             self.finished.emit(str(self._output_path), summary)
@@ -388,14 +396,13 @@ class SomaClusterWorker(QObject):
                 self._n_clusters,
                 self._eps,
                 self._min_samples,
-                self._region_acronym,
+                ",".join(self._region_selection.selected_region_acronyms),
                 self._dilation_fraction,
                 resolution,
                 self._parquet_path,
             )
             self.progress.emit("Extracting and dilating region mask...", 1, total)
             mask_start = perf_counter()
-            voxel_id_map = get_expanded_region_voxel_ids(
             voxel_id_map = get_expanded_region_voxel_ids_for_regions(
                 self._atlas,
                 self._region_selection.selected_region_acronyms,
