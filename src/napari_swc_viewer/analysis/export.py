@@ -179,6 +179,34 @@ def build_clustermap_figure(
 ):
     """Build the clustermap figure used in the widget and image export."""
     figure = plt.Figure(figsize=figsize)
+    populate_clustermap_figure(
+        figure,
+        result,
+        cluster_color_map,
+        title=title,
+        x_label=x_label,
+        y_label=y_label,
+        figsize=figsize,
+        max_render_size=max_render_size,
+        dpi=dpi,
+    )
+    return figure
+
+
+def populate_clustermap_figure(
+    figure,
+    result: ClusterResult,
+    cluster_color_map: Mapping[str, Sequence[float]] | None = None,
+    *,
+    title: str = "",
+    x_label: str = "",
+    y_label: str = "",
+    figsize: tuple[float, float] = (6.0, 6.0),
+    max_render_size: int | None = None,
+    dpi: int | None = None,
+):
+    """Populate one existing figure with the clustermap layout."""
+    figure.clear()
     grid = GridSpec(
         3,
         4,

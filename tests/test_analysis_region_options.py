@@ -255,7 +255,8 @@ class _DummyFigure:
         self.cleared = 0
         self.canvas = None
         self.dpi = 100.0
-        self.size_inches: tuple[float, float] | None = None
+        self.size_inches: tuple[float, float] | None = (6.0, 6.0)
+        self.set_size_inches_calls = 0
 
     def clear(self) -> None:
         self.cleared += 1
@@ -269,9 +270,13 @@ class _DummyFigure:
     def get_dpi(self) -> float:
         return self.dpi
 
+    def get_size_inches(self):
+        return self.size_inches
+
     def set_size_inches(
         self, width: float, height: float, forward: bool = True
     ) -> None:
+        self.set_size_inches_calls += 1
         self.size_inches = (float(width), float(height), bool(forward))
 
 
@@ -283,9 +288,22 @@ class _DummyCanvas(_DummyWidget):
         self.figure = figure
         self._width = 600
         self._height = 400
+        self.device_pixel_ratio = 1.0
+        self._physical_width: int | None = None
+        self._physical_height: int | None = None
 
     def setMinimumHeight(self, *_args) -> None:
         return None
+
+    def get_width_height(self, *, physical: bool = False):
+        if physical:
+            if self._physical_width is not None and self._physical_height is not None:
+                return (self._physical_width, self._physical_height)
+            return (
+                int(round(self._width * float(self.device_pixel_ratio))),
+                int(round(self._height * float(self.device_pixel_ratio))),
+            )
+        return (self._width, self._height)
 
     def draw(self) -> None:
         return None
@@ -1295,16 +1313,16 @@ def test_analysis_heatmap_contrast_limits_fallback_for_zero_volume():
 
 
 def test_draw_clustermap_emits_debug_logs(caplog):
-    """Clustermap drawing should log seaborn and canvas timing phases."""
+    """Clustermap drawing should use backend-managed figure size once."""
     module = _import_analysis_tab_module()
     AnalysisTabWidget = module.AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
     widget._clustermap_rendered = False
-    widget._clustermap_refresh_pending = False
     widget._clustermap_section = _DummyCollapsibleSection(
         "Clustermap", expanded=True
     )
     widget._figure = _DummyFigure()
+    widget._figure.size_inches = (5.0, 3.0)
     widget._canvas = _DummyCanvas(widget._figure)
     widget._canvas.draw = MagicMock()
     widget._canvas.draw_idle = MagicMock()
@@ -1312,12 +1330,17 @@ def test_draw_clustermap_emits_debug_logs(caplog):
         "n1": [0.1, 0.2, 0.3, 1.0],
         "n2": [0.2, 0.3, 0.4, 1.0],
     }
-    closed: list[object] = []
-    module.plt.close = lambda fig: closed.append(fig)
-    new_figure = _DummyFigure()
-    module.sns.clustermap = lambda *args, **kwargs: types.SimpleNamespace(
-        fig=new_figure
-    )
+    populate_calls: list[tuple[object, object, object, tuple[float, float], int]] = []
+
+    def _fake_populate(
+        figure, result, cluster_color_map, *, figsize, dpi
+    ):
+        populate_calls.append(
+            (figure, result, cluster_color_map, tuple(figsize), int(dpi))
+        )
+        return figure
+
+    module._populate_embedded_clustermap_figure = _fake_populate
     result = ClusterResult(
         correlation_matrix=np.eye(2, dtype=np.float32),
         distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
@@ -1335,38 +1358,77 @@ def test_draw_clustermap_emits_debug_logs(caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert any("_draw_clustermap start" in message for message in messages)
     assert any(
-        "seaborn.clustermap complete" in message for message in messages
-    )
-    assert any(
-        "_attach_clustermap_figure complete" in message for message in messages
-    )
-    assert any(
-        "_schedule_clustermap_layout_refresh queued" in message
+        "populate_clustermap_figure complete" in message
         for message in messages
     )
     assert any(
-        "_refresh_clustermap_layout canvas draw complete" in message
+        "_draw_clustermap canvas draw complete" in message
         for message in messages
     )
+    assert populate_calls == [
+        (
+            widget._figure,
+            result,
+            widget._cluster_color_map,
+            (5.0, 3.0),
+            100,
+        )
+    ]
     widget._canvas.draw.assert_called_once_with()
-    widget._canvas.draw_idle.assert_called_once_with()
-    assert widget._figure is new_figure
-    assert new_figure.canvas is widget._canvas
-    assert new_figure.size_inches == (6.0, 4.0, False)
-    assert len(closed) == 1
+    widget._canvas.draw_idle.assert_not_called()
+    assert widget._figure.canvas is None
+    assert widget._figure.size_inches == (5.0, 3.0)
+    assert widget._figure.set_size_inches_calls == 0
 
 
-def test_refresh_clustermap_on_section_expand_when_rendered() -> None:
-    """Re-expanding the clustermap section should queue a layout refresh."""
+def test_draw_clustermap_uses_physical_canvas_size_when_figure_size_unavailable():
+    """Preview sizing should fall back to physical canvas pixels on HiDPI displays."""
     module = _import_analysis_tab_module()
     AnalysisTabWidget = module.AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
-    widget._clustermap_rendered = True
-    widget._schedule_clustermap_layout_refresh = MagicMock()
+    widget._clustermap_rendered = False
+    widget._figure = _DummyFigure()
+    widget._figure.size_inches = None
+    widget._canvas = _DummyCanvas(widget._figure)
+    widget._canvas._width = 600
+    widget._canvas._height = 400
+    widget._canvas._physical_width = 1200
+    widget._canvas._physical_height = 800
+    widget._canvas.draw = MagicMock()
+    widget._cluster_color_map = None
+    populate_calls: list[tuple[object, object, object, tuple[float, float], int]] = []
 
-    widget._on_clustermap_section_expanded_changed(True)
+    def _fake_populate(
+        figure, result, cluster_color_map, *, figsize, dpi
+    ):
+        populate_calls.append(
+            (figure, result, cluster_color_map, tuple(figsize), int(dpi))
+        )
+        return figure
 
-    widget._schedule_clustermap_layout_refresh.assert_called_once_with()
+    module._populate_embedded_clustermap_figure = _fake_populate
+    result = ClusterResult(
+        correlation_matrix=np.eye(2, dtype=np.float32),
+        distance_matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+        linkage_matrix=np.array([[0.0, 1.0, 1.0, 2.0]], dtype=np.float64),
+        neuron_ids=["n1", "n2"],
+        reorder_indices=np.array([0, 1], dtype=np.intp),
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+
+    widget._draw_clustermap(result)
+
+    assert populate_calls == [
+        (
+            widget._figure,
+            result,
+            None,
+            (12.0, 8.0),
+            100,
+        )
+    ]
+    widget._canvas.draw.assert_called_once_with()
+    assert widget._figure.set_size_inches_calls == 0
 
 
 def test_build_clustermap_on_demand_draws_cached_result_and_logs(caplog):

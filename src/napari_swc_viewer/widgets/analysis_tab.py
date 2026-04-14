@@ -18,10 +18,9 @@ from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from qtpy.QtCore import QThread, QTimer, Signal
+from qtpy.QtCore import QThread, Signal
 from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
     QComboBox,
@@ -62,6 +61,26 @@ def _analysis_heatmap_contrast_limits(
     if not np.isfinite(upper) or upper <= 0.0:
         return (0.0, 1.0)
     return (0.0, upper)
+
+
+def _populate_embedded_clustermap_figure(
+    figure: Figure,
+    result: ClusterResult,
+    cluster_color_map: dict[str, list[float]] | None = None,
+    *,
+    figsize: tuple[float, float] = (6.0, 6.0),
+    dpi: int | None = None,
+) -> Figure:
+    """Populate the persistent dendrogram preview figure used by the tab."""
+    from ..analysis.export import populate_clustermap_figure
+
+    return populate_clustermap_figure(
+        figure,
+        result,
+        cluster_color_map,
+        figsize=figsize,
+        dpi=dpi,
+    )
 
 
 def _analysis_heatmap_stored_limits(
@@ -273,7 +292,6 @@ class AnalysisTabWidget(QWidget):
         self._slice_projector = None
         self._dataset_region_ids: set[int] = set()
         self._clustermap_rendered = False
-        self._clustermap_refresh_pending = False
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -578,9 +596,6 @@ class AnalysisTabWidget(QWidget):
         self._clustermap_section = CollapsibleSection(
             "Clustermap",
             expanded=False,
-        )
-        self._clustermap_section.expanded_changed.connect(
-            self._on_clustermap_section_expanded_changed
         )
         clustermap_layout = self._clustermap_section.content_layout()
         self._clustermap_status_label = QLabel(
@@ -1302,23 +1317,8 @@ class AnalysisTabWidget(QWidget):
                     axis_off()
         self._canvas.draw()
 
-    def _attach_clustermap_figure(self, figure: Figure) -> None:
-        """Attach a matplotlib figure to the persistent embedded canvas."""
-        logger.debug(
-            "_attach_clustermap_figure start: figure_id=%s canvas_id=%s",
-            id(figure),
-            id(self._canvas),
-        )
-        figure.set_canvas(self._canvas)
-        self._figure = figure
-        self._canvas.figure = figure
-        update_geometry = getattr(self._canvas, "updateGeometry", None)
-        if callable(update_geometry):
-            update_geometry()
-        logger.debug("_attach_clustermap_figure complete")
-
-    def _clustermap_canvas_pixel_size(self) -> tuple[int, int] | None:
-        """Return the current canvas size in pixels, if available."""
+    def _clustermap_canvas_logical_pixel_size(self) -> tuple[int, int] | None:
+        """Return the current canvas size in logical Qt pixels, if available."""
         width = height = None
 
         width_method = getattr(self._canvas, "width", None)
@@ -1363,132 +1363,129 @@ class AnalysisTabWidget(QWidget):
             return None
         return (width, height)
 
-    def _refresh_clustermap_layout(self) -> None:
-        """Resize and redraw the clustermap using the canvas's current geometry."""
-        if not getattr(self, "_clustermap_rendered", False):
-            logger.debug(
-                "_refresh_clustermap_layout skipped: no rendered clustermap"
-            )
-            return
+    def _clustermap_canvas_physical_pixel_size(
+        self,
+    ) -> tuple[int, int] | None:
+        """Return the current canvas size in physical pixels, if available."""
+        get_width_height = getattr(self._canvas, "get_width_height", None)
+        if callable(get_width_height):
+            try:
+                width, height = get_width_height(physical=True)
+            except TypeError:
+                width = height = None
+            else:
+                try:
+                    width = int(width)
+                    height = int(height)
+                except (TypeError, ValueError):
+                    width = height = None
+                if width > 0 and height > 0:
+                    return (width, height)
 
-        size = self._clustermap_canvas_pixel_size()
+        logical_size = self._clustermap_canvas_logical_pixel_size()
+        if logical_size is None:
+            return None
+
+        device_pixel_ratio = getattr(self._canvas, "device_pixel_ratio", 1.0)
+        if callable(device_pixel_ratio):
+            try:
+                ratio = float(device_pixel_ratio())
+            except (TypeError, ValueError):
+                ratio = 1.0
+        else:
+            try:
+                ratio = float(device_pixel_ratio)
+            except (TypeError, ValueError):
+                ratio = 1.0
+
+        if not np.isfinite(ratio) or ratio <= 0.0:
+            ratio = 1.0
+
+        width, height = logical_size
+        physical_width = int(round(width * ratio))
+        physical_height = int(round(height * ratio))
+        if physical_width <= 0 or physical_height <= 0:
+            return None
+        return (physical_width, physical_height)
+
+    def _clustermap_preview_figsize(
+        self, dpi: float
+    ) -> tuple[float, float] | None:
+        """Return the preview figure size using backend-owned geometry."""
+        get_size_inches = getattr(self._figure, "get_size_inches", None)
+        if callable(get_size_inches):
+            try:
+                size_values = np.asarray(get_size_inches(), dtype=float).reshape(
+                    -1
+                )
+            except (TypeError, ValueError):
+                size_values = np.array([], dtype=float)
+            if size_values.size >= 2:
+                width_in = float(size_values[0])
+                height_in = float(size_values[1])
+                if (
+                    np.isfinite(width_in)
+                    and np.isfinite(height_in)
+                    and width_in > 0.0
+                    and height_in > 0.0
+                ):
+                    return (width_in, height_in)
+
+        size = self._clustermap_canvas_physical_pixel_size()
         if size is None:
-            logger.debug(
-                "_refresh_clustermap_layout skipped: canvas size unavailable"
-            )
-            return
+            return None
 
         width_px, height_px = size
-        dpi_getter = getattr(self._figure, "get_dpi", None)
-        dpi = float(dpi_getter()) if callable(dpi_getter) else float(
-            getattr(self._figure, "dpi", 100.0) or 100.0
-        )
-        width_in = max(width_px, 1) / dpi
-        height_in = max(height_px, 1) / dpi
-        self._figure.set_size_inches(width_in, height_in, forward=False)
-
-        for widget in (
-            getattr(self, "_clustermap_section", None),
-            getattr(self, "_canvas", None),
-        ):
-            if widget is None:
-                continue
-            update_geometry = getattr(widget, "updateGeometry", None)
-            if callable(update_geometry):
-                update_geometry()
-
-        logger.debug(
-            "_refresh_clustermap_layout resized figure: width_px=%d height_px=%d dpi=%.3f",
-            width_px,
-            height_px,
-            dpi,
-        )
-        draw_idle = getattr(self._canvas, "draw_idle", None)
-        if callable(draw_idle):
-            draw_idle()
-
-        canvas_start = perf_counter()
-        self._canvas.draw()
-        logger.debug(
-            "_refresh_clustermap_layout canvas draw complete: elapsed=%.3fs",
-            perf_counter() - canvas_start,
-        )
-
-    def _run_scheduled_clustermap_layout_refresh(self) -> None:
-        """Clear the pending flag and perform the deferred layout refresh."""
-        self._clustermap_refresh_pending = False
-        self._refresh_clustermap_layout()
-
-    def _schedule_clustermap_layout_refresh(self) -> None:
-        """Queue a layout-aware clustermap redraw on the next Qt event cycle."""
-        if getattr(self, "_clustermap_refresh_pending", False):
-            logger.debug(
-                "_schedule_clustermap_layout_refresh skipped: refresh already pending"
-            )
-            return
-        self._clustermap_refresh_pending = True
-        logger.debug("_schedule_clustermap_layout_refresh queued")
-        QTimer.singleShot(0, self._run_scheduled_clustermap_layout_refresh)
-
-    def _on_clustermap_section_expanded_changed(self, expanded: bool) -> None:
-        """Refresh clustermap layout when the section becomes visible again."""
-        logger.debug(
-            "_on_clustermap_section_expanded_changed: expanded=%s rendered=%s",
-            expanded,
-            getattr(self, "_clustermap_rendered", False),
-        )
-        if expanded and getattr(self, "_clustermap_rendered", False):
-            self._schedule_clustermap_layout_refresh()
+        if not np.isfinite(dpi) or dpi <= 0.0:
+            return None
+        return (max(width_px, 1) / dpi, max(height_px, 1) / dpi)
 
     def _draw_clustermap(self, result: ClusterResult) -> None:
-        """Draw a seaborn clustermap into the embedded canvas."""
+        """Draw the clustermap preview into the embedded canvas."""
         draw_start = perf_counter()
         self._figure.clear()
 
-        cluster_colors = None
-        if self._cluster_color_map is not None:
-            cluster_colors = [
-                self._cluster_color_map.get(nid, [0.5, 0.5, 0.5, 1.0])[:3]
-                for nid in result.neuron_ids
-            ]
-
         try:
+            dpi_getter = getattr(self._figure, "get_dpi", None)
+            dpi = float(dpi_getter()) if callable(dpi_getter) else float(
+                getattr(self._figure, "dpi", 100.0) or 100.0
+            )
+            figsize = self._clustermap_preview_figsize(dpi)
+            physical_size = self._clustermap_canvas_physical_pixel_size()
+            if figsize is None:
+                figsize = (6.0, 6.0)
             logger.debug(
-                "_draw_clustermap start: distance_shape=%s distance_dtype=%s distance_nbytes=%s linkage_shape=%s",
+                "_draw_clustermap start: distance_shape=%s distance_dtype=%s distance_nbytes=%s linkage_shape=%s physical_canvas_size=%s figsize=%s dpi=%.3f",
                 getattr(result.distance_matrix, "shape", None),
                 getattr(result.distance_matrix, "dtype", None),
                 getattr(result.distance_matrix, "nbytes", None),
                 getattr(result.linkage_matrix, "shape", None),
+                physical_size,
+                figsize,
+                dpi,
             )
-            seaborn_start = perf_counter()
-            g = sns.clustermap(
-                result.distance_matrix,
-                row_linkage=result.linkage_matrix,
-                col_linkage=result.linkage_matrix,
-                row_colors=cluster_colors,
-                col_colors=cluster_colors,
-                cmap="coolwarm",
-                center=0,
-                figsize=(6, 6),
-                xticklabels=False,
-                yticklabels=False,
+            figure_start = perf_counter()
+            _populate_embedded_clustermap_figure(
+                self._figure,
+                result,
+                self._cluster_color_map,
+                figsize=figsize,
+                dpi=int(round(dpi)),
             )
             logger.debug(
-                "_draw_clustermap seaborn.clustermap complete: elapsed=%.3fs",
-                perf_counter() - seaborn_start,
+                "_draw_clustermap populate_clustermap_figure complete: elapsed=%.3fs",
+                perf_counter() - figure_start,
             )
 
-            old_fig = self._figure
-            self._attach_clustermap_figure(g.fig)
             self._clustermap_rendered = True
-            logger.debug("_draw_clustermap canvas figure swapped")
-            self._schedule_clustermap_layout_refresh()
+            canvas_start = perf_counter()
+            self._canvas.draw()
             logger.debug(
-                "_draw_clustermap layout refresh scheduled after figure swap"
+                "_draw_clustermap canvas draw complete: elapsed=%.3fs",
+                perf_counter() - canvas_start,
             )
-            plt.close(old_fig)
             logger.debug(
-                "_draw_clustermap closed previous figure; total_elapsed=%.3fs",
+                "_draw_clustermap complete: total_elapsed=%.3fs",
                 perf_counter() - draw_start,
             )
 
@@ -1504,7 +1501,7 @@ class AnalysisTabWidget(QWidget):
                 transform=ax.transAxes,
             )
             self._clustermap_rendered = True
-            self._schedule_clustermap_layout_refresh()
+            self._canvas.draw()
 
     def _build_clustermap_on_demand(self) -> None:
         """Render the cached clustering result into the clustermap canvas."""
