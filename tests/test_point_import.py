@@ -1719,6 +1719,23 @@ def test_convert_bltr_point_csv_directory_script(tmp_path: Path) -> None:
 
 
 @pytest.mark.skip(reason="Qt runtime is unavailable in the current test sandbox.")
+def test_widget_selected_neuron_controls_show_updated_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    NeuronViewerWidget = _import_neuron_viewer_widget()
+    monkeypatch.setattr(NeuronViewerWidget, "_toggle_template", lambda self, state: None)
+
+    viewer = _DummyViewer()
+    widget = NeuronViewerWidget(viewer)
+
+    assert widget._render_btn.text() == "Add Full Neurons"
+    assert widget._selected_neurons_hint_label.text() == (
+        "Only Neurons highlighted in the above table will be added to scene. "
+        "Use cmd+A or ctrl+A to select all."
+    )
+
+
+@pytest.mark.skip(reason="Qt runtime is unavailable in the current test sandbox.")
 def test_widget_point_parquet_preview_loads_without_atlas(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

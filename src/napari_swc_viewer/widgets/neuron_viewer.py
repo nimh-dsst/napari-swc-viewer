@@ -515,8 +515,15 @@ class NeuronViewerWidget(QWidget):
 
         neurons_layout.addLayout(cluster_row)
 
+        self._selected_neurons_hint_label = QLabel(
+            "Only Neurons highlighted in the above table will be added to "
+            "scene. Use cmd+A or ctrl+A to select all."
+        )
+        self._selected_neurons_hint_label.setWordWrap(True)
+        neurons_layout.addWidget(self._selected_neurons_hint_label)
+
         neuron_btn_row = QHBoxLayout()
-        self._render_btn = QPushButton("Add Selected")
+        self._render_btn = QPushButton("Add Full Neurons")
         self._render_btn.clicked.connect(self._render_selected_neurons)
         neuron_btn_row.addWidget(self._render_btn)
 
