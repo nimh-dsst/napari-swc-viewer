@@ -57,6 +57,14 @@ To run tests with coverage:
 pixi run test-cov
 ```
 
+### Test Data Attribution
+
+`tests/test_hemisphere_integration.py` uses a vendored SWC test fixture from the
+Brain Image Library. The committed fixture files live under
+`tests/data/hemisphere/`.
+
+Source dataset DOI: https://doi.org/10.35077/g.73
+
 ## Standard Point Parquet Workflow
 
 This repo now supports atlas-registered point datasets via a standardized

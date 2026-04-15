@@ -1,199 +1,37 @@
-"""Integration tests for hemisphere flipping using real BIL data.
+"""Integration tests for hemisphere flipping using vendored BIL data."""
 
-These tests download SWC files from the Brain Image Library and compare
-flipped coordinates against known expected results.
-"""
-
-import json
-import re
-import socket
-import ssl
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from napari_swc_viewer.hemisphere import flip_swc
+from napari_swc_viewer.hemisphere import Hemisphere, detect_soma_hemisphere, flip_swc
 from napari_swc_viewer.swc import parse_swc
 
-# Test data directories
-TEST_DATA_DIR = Path(__file__).parent.parent / "test_data"
-FLIPPED_DIR = TEST_DATA_DIR / "flipped"
-
-# BIL API endpoints
-API_BASE = "https://api.brainimagelibrary.org"
-DOWNLOAD_BASE = "https://download.brainimagelibrary.org"
-REQUEST_TIMEOUT_SECONDS = 15
-
-# Known submission UUID for the morphology dataset (from DOI 10.35077/g.73)
-MORPHOLOGY_SUBMISSION_UUID = "0fcde5fdd6f7ccb2"
-
-# Test file to download and compare
+FIXTURE_DIR = Path(__file__).parent / "data" / "hemisphere"
+ALLEN_MOUSE_10UM_MIDLINE = 5695.0
 TEST_FILENAME = "1119749665_17545_3134-X21894-Y19320_reg.swc"
 EXPECTED_FLIPPED_FILENAME = "1119749665_17545_3134-X21894-Y19320_reg_right.swc"
 
 
-class BILRequestError(RuntimeError):
-    """Raised when a BIL request cannot be completed reliably."""
-
-
-class BILRequestTimeout(BILRequestError):
-    """Raised when a BIL request exceeds the configured timeout."""
-
-
-class BILRequestUnavailable(BILRequestError):
-    """Raised when a BIL request fails due to network availability issues."""
-
-
-def get_ssl_context():
-    """Create SSL context that doesn't verify certificates (BIL API requirement)."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-def read_url(url: str) -> bytes:
-    """Read a BIL URL with a bounded timeout."""
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(
-            req,
-            context=get_ssl_context(),
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            return response.read()
-    except (TimeoutError, socket.timeout) as exc:
-        raise BILRequestTimeout(
-            f"Timed out after {REQUEST_TIMEOUT_SECONDS}s requesting {url}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, (TimeoutError, socket.timeout)) or (
-            reason is not None and "timed out" in str(reason).lower()
-        ):
-            raise BILRequestTimeout(
-                f"Timed out after {REQUEST_TIMEOUT_SECONDS}s requesting {url}"
-            ) from exc
-        raise BILRequestUnavailable(f"Failed to reach {url}: {exc.reason}") from exc
-
-
-def api_get(endpoint: str) -> dict:
-    """Make a GET request to the BIL API."""
-    url = f"{API_BASE}/{endpoint}"
-    return json.loads(read_url(url).decode())
-
-
-def find_file_url(filename: str) -> str | None:
-    """Find the download URL for a specific file in the BIL dataset.
-
-    Parameters
-    ----------
-    filename : str
-        The filename to search for.
-
-    Returns
-    -------
-    str or None
-        The full download URL if found, None otherwise.
-    """
-    # Query for bildids in the dataset
-    result = api_get(f"query/submission?submission_uuid={MORPHOLOGY_SUBMISSION_UUID}")
-
-    if result.get("success") != "true":
-        return None
-
-    bildids = result.get("bildids", [])
-
-    for bildid in bildids:
-        retrieve_result = api_get(f"retrieve?bildid={bildid}")
-
-        if retrieve_result.get("success") != "true":
-            continue
-
-        for entry in retrieve_result.get("retjson", []):
-            dataset = entry.get("Dataset", [{}])[0]
-            bildirectory = dataset.get("bildirectory", "")
-
-            if not bildirectory:
-                continue
-
-            # Convert bildirectory to download URL path
-            match = re.match(r"/bil/data/(.+)", bildirectory)
-            if not match:
-                continue
-
-            download_path = match.group(1)
-            dir_url = f"{DOWNLOAD_BASE}/{download_path}/"
-
-            try:
-                html = read_url(dir_url).decode()
-            except BILRequestError:
-                raise
-            except Exception:
-                continue
-
-            try:
-                # Check if our target file is in this directory
-                if f'href="{filename}"' in html:
-                    return f"{DOWNLOAD_BASE}/{download_path}/{filename}"
-            except Exception:
-                continue
-
-    return None
-
-
-def download_file(url: str, output_path: Path) -> bool:
-    """Download a file from URL to output_path."""
-    try:
-        output_path.write_bytes(read_url(url))
-        return True
-    except BILRequestError:
-        raise
-    except Exception:
-        return False
+def _require_fixture(filename: str) -> Path:
+    """Return a committed fixture path or fail with a clear message."""
+    path = FIXTURE_DIR / filename
+    if not path.exists():
+        pytest.fail(f"Expected fixture file not found: {path}")
+    return path
 
 
 @pytest.fixture(scope="module")
 def bil_test_file() -> Path:
-    """Download the test SWC file from BIL if not already present.
-
-    Returns the path to the downloaded file.
-    """
-    output_path = TEST_DATA_DIR / TEST_FILENAME
-
-    if output_path.exists():
-        return output_path
-
-    # Find and download the file
-    try:
-        url = find_file_url(TEST_FILENAME)
-    except BILRequestError as exc:
-        pytest.skip(str(exc))
-
-    if url is None:
-        pytest.skip(f"Could not find {TEST_FILENAME} in BIL dataset")
-
-    try:
-        downloaded = download_file(url, output_path)
-    except BILRequestError as exc:
-        pytest.skip(str(exc))
-
-    if not downloaded:
-        pytest.skip(f"Failed to download {TEST_FILENAME} from BIL")
-
-    return output_path
+    """Return the vendored original SWC fixture."""
+    return _require_fixture(TEST_FILENAME)
 
 
 @pytest.fixture(scope="module")
 def expected_flipped_file() -> Path:
-    """Get path to the expected flipped SWC file."""
-    path = FLIPPED_DIR / EXPECTED_FLIPPED_FILENAME
-    if not path.exists():
-        pytest.fail(f"Expected flipped file not found: {path}")
-    return path
+    """Return the vendored flipped SWC fixture."""
+    return _require_fixture(EXPECTED_FLIPPED_FILENAME)
 
 
 class TestHemisphereFlippingIntegration:
@@ -202,18 +40,13 @@ class TestHemisphereFlippingIntegration:
     def test_flip_bil_file_matches_expected(
         self, bil_test_file: Path, expected_flipped_file: Path
     ):
-        """Test that flipping a BIL file produces expected coordinates.
-
-        This test downloads a real SWC file from the Brain Image Library,
-        flips it using the hemisphere module, and compares the result
-        against a known-good flipped file.
-        """
+        """Test that flipping a BIL file produces expected coordinates."""
         # Parse the original and expected files
         original = parse_swc(bil_test_file)
         expected = parse_swc(expected_flipped_file)
 
-        # Flip the original file using the hemisphere module
-        flipped = flip_swc(original, atlas_name="allen_mouse_10um")
+        # Flip the original file using the documented allen_mouse_10um midline.
+        flipped = flip_swc(original, midline=ALLEN_MOUSE_10UM_MIDLINE)
 
         # Compare the number of nodes
         assert flipped.n_nodes == expected.n_nodes, (
@@ -247,17 +80,16 @@ class TestHemisphereFlippingIntegration:
         self, bil_test_file: Path, expected_flipped_file: Path
     ):
         """Test that the flipped file is in the opposite hemisphere."""
-        from napari_swc_viewer.hemisphere import Hemisphere, detect_soma_hemisphere
-
         original = parse_swc(bil_test_file)
         expected = parse_swc(expected_flipped_file)
 
-        # Detect hemispheres (use validate=False to avoid atlas download in quick test)
         original_hemisphere = detect_soma_hemisphere(
-            original, atlas_name="allen_mouse_10um", validate=False
+            original,
+            midline=ALLEN_MOUSE_10UM_MIDLINE,
         )
         expected_hemisphere = detect_soma_hemisphere(
-            expected, atlas_name="allen_mouse_10um", validate=False
+            expected,
+            midline=ALLEN_MOUSE_10UM_MIDLINE,
         )
 
         # The expected file should be on the opposite hemisphere or original was midline
@@ -272,8 +104,8 @@ class TestHemisphereFlippingIntegration:
         original = parse_swc(bil_test_file)
 
         # Flip twice
-        flipped_once = flip_swc(original, atlas_name="allen_mouse_10um")
-        flipped_twice = flip_swc(flipped_once, atlas_name="allen_mouse_10um")
+        flipped_once = flip_swc(original, midline=ALLEN_MOUSE_10UM_MIDLINE)
+        flipped_twice = flip_swc(flipped_once, midline=ALLEN_MOUSE_10UM_MIDLINE)
 
         # Should match original coordinates
         np.testing.assert_array_almost_equal(

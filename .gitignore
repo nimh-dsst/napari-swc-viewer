@@ -230,6 +230,8 @@ example_data_aligned/
 
 # SWC files
 *.swc
+!tests/data/hemisphere/1119749665_17545_3134-X21894-Y19320_reg.swc
+!tests/data/hemisphere/1119749665_17545_3134-X21894-Y19320_reg_right.swc
 
 # ZIP files
 *.zip
