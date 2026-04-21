@@ -19,6 +19,7 @@ from napari_swc_viewer.analysis.clustering import (
     ClusterRunMetadata,
 )
 from napari_swc_viewer.analysis.export import (
+    CLUSTERMAP_HEIGHT_RATIOS,
     DENDROGRAM_LINEWIDTH,
     export_cluster_workbook,
     export_distance_workbook,
@@ -362,6 +363,52 @@ def test_build_clustermap_figure_uses_thinner_dendrogram_lines() -> None:
                     collection.get_linewidths(),
                     DENDROGRAM_LINEWIDTH,
                 )
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
+def test_build_clustermap_figure_allocates_more_height_to_top_dendrogram() -> None:
+    from scipy.cluster.hierarchy import linkage
+
+    result = ClusterResult(
+        correlation_matrix=np.eye(3, dtype=np.float32),
+        distance_matrix=np.eye(3, dtype=np.float32),
+        linkage_matrix=linkage(
+            np.arange(3, dtype=np.float64).reshape(-1, 1),
+            method="single",
+        ),
+        neuron_ids=["n0", "n1", "n2"],
+        reorder_indices=np.array([0, 1, 2], dtype=np.intp),
+        labels=np.array([1, 2, 3], dtype=np.int32),
+    )
+    cluster_color_map = {
+        "n0": [1.0, 0.0, 0.0, 1.0],
+        "n1": [0.0, 1.0, 0.0, 1.0],
+        "n2": [0.0, 0.0, 1.0, 1.0],
+    }
+
+    figure = build_clustermap_figure(result, cluster_color_map)
+    try:
+        top_dendrogram_axis = next(
+            axis
+            for axis in figure.axes
+            if not axis.images and axis.collections and axis.get_xlim()[0] < axis.get_xlim()[1]
+        )
+        heatmap_axis = next(
+            axis
+            for axis in figure.axes
+            if getattr(axis, "images", None)
+            and axis.images
+            and getattr(axis.images[0].get_array(), "ndim", 0) == 2
+        )
+
+        top_dendrogram_height = top_dendrogram_axis.get_position().height
+        heatmap_height = heatmap_axis.get_position().height
+
+        assert CLUSTERMAP_HEIGHT_RATIOS[0] > 0.30
+        assert top_dendrogram_height > heatmap_height * 0.50
     finally:
         import matplotlib.pyplot as plt
 

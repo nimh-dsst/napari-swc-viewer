@@ -23,7 +23,9 @@ PARQUET_EXPORT_VERSION = "1"
 PARQUET_METADATA_PREFIX = "napari_swc_viewer.analysis_export."
 DEFAULT_PREVIEW_HEATMAP_SIZE = 1024
 MIN_EXPORT_HEATMAP_SIZE = 512
-DENDROGRAM_LINEWIDTH = 0.8
+DENDROGRAM_LINEWIDTH = 0.5
+CLUSTERMAP_WIDTH_RATIOS = [0.18, 0.03, 0.75, 0.04]
+CLUSTERMAP_HEIGHT_RATIOS = [0.36, 0.03, 0.61]
 
 
 def rgba_to_hex(rgba: Sequence[float]) -> str:
@@ -212,8 +214,8 @@ def populate_clustermap_figure(
         3,
         4,
         figure=figure,
-        width_ratios=[0.18, 0.03, 0.75, 0.04],
-        height_ratios=[0.18, 0.03, 0.79],
+        width_ratios=CLUSTERMAP_WIDTH_RATIOS,
+        height_ratios=CLUSTERMAP_HEIGHT_RATIOS,
         wspace=0.02,
         hspace=0.02,
     )
