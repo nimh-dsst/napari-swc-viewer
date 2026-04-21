@@ -20,6 +20,7 @@ from napari_swc_viewer.analysis.clustering import (
 )
 from napari_swc_viewer.analysis.export import (
     CLUSTERMAP_HEIGHT_RATIOS,
+    CLUSTERMAP_FIGURE_XLABEL_Y,
     DENDROGRAM_LINEWIDTH,
     export_cluster_workbook,
     export_distance_workbook,
@@ -213,8 +214,18 @@ def test_build_clustermap_figure_applies_title_and_axis_labels(tmp_path: Path) -
     )
     try:
         assert figure._suptitle.get_text() == "Publication Figure"
-        assert any(axis.get_xlabel() == "X Label" for axis in figure.axes)
-        assert any(axis.get_ylabel() == "Y Label" for axis in figure.axes)
+        heatmap_axis = next(
+            axis
+            for axis in figure.axes
+            if getattr(axis, "images", None)
+            and axis.images
+            and getattr(axis.images[0].get_array(), "ndim", 0) == 2
+        )
+        assert figure._supxlabel.get_text() == "X Label"
+        assert figure._supxlabel.get_position()[1] == CLUSTERMAP_FIGURE_XLABEL_Y
+        assert figure._supxlabel.get_position()[1] < heatmap_axis.get_position().y0
+        assert all(axis.get_xlabel() == "" for axis in figure.axes)
+        assert all(axis.get_ylabel() != "Y Label" for axis in figure.axes)
     finally:
         import matplotlib.pyplot as plt
 

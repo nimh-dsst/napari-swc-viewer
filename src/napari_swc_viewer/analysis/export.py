@@ -26,6 +26,7 @@ MIN_EXPORT_HEATMAP_SIZE = 512
 DENDROGRAM_LINEWIDTH = 0.5
 CLUSTERMAP_WIDTH_RATIOS = [0.18, 0.03, 0.75, 0.04]
 CLUSTERMAP_HEIGHT_RATIOS = [0.36, 0.03, 0.61]
+CLUSTERMAP_FIGURE_XLABEL_Y = 0.04
 
 
 def rgba_to_hex(rgba: Sequence[float]) -> str:
@@ -298,9 +299,7 @@ def populate_clustermap_figure(
         figure.subplots_adjust(top=0.94)
         figure.suptitle(title)
     if x_label:
-        ax_heatmap.set_xlabel(x_label)
-    if y_label:
-        ax_heatmap.set_ylabel(y_label)
+        figure.supxlabel(x_label, y=CLUSTERMAP_FIGURE_XLABEL_Y)
 
     # Keep one shared color scale without adding another axis.
     lower = float(np.nanmin(heatmap_data))

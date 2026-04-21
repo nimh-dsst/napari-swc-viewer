@@ -385,7 +385,6 @@ class AnalysisTabWidget(QWidget):
         if hasattr(self, "_export_title_edit"):
             self._export_title_edit.setEnabled(analysis_ready)
             self._export_xlabel_edit.setEnabled(analysis_ready)
-            self._export_ylabel_edit.setEnabled(analysis_ready)
             self._export_dpi_combo.setEnabled(analysis_ready)
             self._save_cluster_workbook_btn.setEnabled(analysis_ready)
             self._save_distance_workbook_btn.setEnabled(analysis_ready)
@@ -665,12 +664,6 @@ class AnalysisTabWidget(QWidget):
         self._export_xlabel_edit = QLineEdit()
         export_xlabel_row.addWidget(self._export_xlabel_edit)
         export_layout.addLayout(export_xlabel_row)
-
-        export_ylabel_row = QHBoxLayout()
-        export_ylabel_row.addWidget(QLabel("Y label:"))
-        self._export_ylabel_edit = QLineEdit()
-        export_ylabel_row.addWidget(self._export_ylabel_edit)
-        export_layout.addLayout(export_ylabel_row)
 
         export_dpi_row = QHBoxLayout()
         export_dpi_row.addWidget(QLabel("DPI:"))
@@ -1934,10 +1927,6 @@ class AnalysisTabWidget(QWidget):
         """Return the current export x-axis label."""
         return self._export_xlabel_edit.text().strip()
 
-    def _export_y_label(self) -> str:
-        """Return the current export y-axis label."""
-        return self._export_ylabel_edit.text().strip()
-
     def _selected_export_dpi(self) -> int:
         """Return the selected raster DPI preset."""
         index = self._export_dpi_combo.currentIndex()
@@ -1975,7 +1964,7 @@ class AnalysisTabWidget(QWidget):
             self._cluster_color_map,
             figure_title=self._export_title(),
             x_label=self._export_x_label(),
-            y_label=self._export_y_label(),
+            y_label="",
         )
         self._progress_label.setText(f"Saving {Path(output_path).name}...")
         self._start_background_worker(worker, self._on_export_finished)
@@ -2040,7 +2029,7 @@ class AnalysisTabWidget(QWidget):
                 self._cluster_color_map,
                 title=self._export_title(),
                 x_label=self._export_x_label(),
-                y_label=self._export_y_label(),
+                y_label="",
                 dpi=dpi,
             )
         except Exception as error:
