@@ -23,6 +23,7 @@ PARQUET_EXPORT_VERSION = "1"
 PARQUET_METADATA_PREFIX = "napari_swc_viewer.analysis_export."
 DEFAULT_PREVIEW_HEATMAP_SIZE = 1024
 MIN_EXPORT_HEATMAP_SIZE = 512
+DENDROGRAM_LINEWIDTH = 0.8
 
 
 def rgba_to_hex(rgba: Sequence[float]) -> str:
@@ -239,6 +240,10 @@ def populate_clustermap_figure(
         color_threshold=0,
         above_threshold_color="black",
     )
+    ax_left.invert_yaxis()
+    for axis in (ax_top, ax_left):
+        for collection in axis.collections:
+            collection.set_linewidth(DENDROGRAM_LINEWIDTH)
 
     for axis in (ax_top, ax_left):
         axis.set_xticks([])
@@ -257,7 +262,7 @@ def populate_clustermap_figure(
         heatmap_data,
         cmap="coolwarm",
         interpolation="nearest",
-        origin="lower",
+        origin="upper",
         aspect="auto",
     )
     ax_heatmap.set_xticks([])
@@ -276,7 +281,7 @@ def populate_clustermap_figure(
         ax_left_colors.imshow(
             cluster_array[:, np.newaxis, :],
             interpolation="nearest",
-            origin="lower",
+            origin="upper",
             aspect="auto",
         )
     for axis in (ax_top_colors, ax_left_colors):

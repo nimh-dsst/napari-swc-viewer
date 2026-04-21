@@ -19,6 +19,7 @@ from napari_swc_viewer.analysis.clustering import (
     ClusterRunMetadata,
 )
 from napari_swc_viewer.analysis.export import (
+    DENDROGRAM_LINEWIDTH,
     export_cluster_workbook,
     export_distance_workbook,
     export_extended_parquet,
@@ -233,6 +234,134 @@ def test_build_clustermap_figure_includes_distance_colorbar(tmp_path: Path) -> N
             axis.get_ylabel() == "Distance (1 - Pearson r)"
             for axis in figure.axes
         )
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
+def test_build_clustermap_figure_uses_top_origin_row_orientation() -> None:
+    from scipy.cluster.hierarchy import leaves_list, linkage
+
+    linkage_matrix = linkage(
+        np.arange(3, dtype=np.float64).reshape(-1, 1),
+        method="single",
+    )
+    reorder_indices = leaves_list(linkage_matrix)
+    result = ClusterResult(
+        correlation_matrix=np.eye(3, dtype=np.float32),
+        distance_matrix=np.array(
+            [
+                [0.0, 1.0, 2.0],
+                [1.0, 0.0, 3.0],
+                [2.0, 3.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        linkage_matrix=linkage_matrix,
+        neuron_ids=["n0", "n1", "n2"],
+        reorder_indices=reorder_indices,
+        labels=np.array([1, 2, 3], dtype=np.int32),
+    )
+    cluster_color_map = {
+        "n0": [1.0, 0.0, 0.0, 1.0],
+        "n1": [0.0, 1.0, 0.0, 1.0],
+        "n2": [0.0, 0.0, 1.0, 1.0],
+    }
+
+    figure = build_clustermap_figure(result, cluster_color_map)
+    try:
+        heatmap_axis = next(
+            axis
+            for axis in figure.axes
+            if getattr(axis, "images", None)
+            and axis.images
+            and getattr(axis.images[0].get_array(), "ndim", 0) == 2
+        )
+        left_color_axis = next(
+            axis
+            for axis in figure.axes
+            if getattr(axis, "images", None)
+            and axis.images
+            and getattr(axis.images[0].get_array(), "ndim", 0) == 3
+            and np.asarray(axis.images[0].get_array()).shape[1] == 1
+        )
+        top_color_axis = next(
+            axis
+            for axis in figure.axes
+            if getattr(axis, "images", None)
+            and axis.images
+            and getattr(axis.images[0].get_array(), "ndim", 0) == 3
+            and np.asarray(axis.images[0].get_array()).shape[0] == 1
+        )
+        left_dendrogram_axis = next(
+            axis
+            for axis in figure.axes
+            if not axis.images and axis.get_xlim()[0] > axis.get_xlim()[1]
+        )
+
+        heatmap_image = heatmap_axis.images[0]
+        left_color_image = left_color_axis.images[0]
+        top_color_image = top_color_axis.images[0]
+
+        expected_heatmap = result.distance_matrix[
+            np.ix_(result.reorder_indices, result.reorder_indices)
+        ]
+        expected_left_colors = np.asarray(
+            [
+                cluster_color_map[result.neuron_ids[int(index)]][:3]
+                for index in result.reorder_indices.tolist()
+            ],
+            dtype=np.float32,
+        )
+
+        assert heatmap_image.origin == "upper"
+        assert left_color_image.origin == "upper"
+        assert top_color_image.origin == "lower"
+        assert heatmap_axis.get_ylim()[0] > heatmap_axis.get_ylim()[1]
+        assert left_color_axis.get_ylim()[0] > left_color_axis.get_ylim()[1]
+        assert left_dendrogram_axis.get_ylim()[0] > left_dendrogram_axis.get_ylim()[1]
+        np.testing.assert_allclose(heatmap_image.get_array(), expected_heatmap)
+        np.testing.assert_allclose(
+            np.asarray(left_color_image.get_array())[:, 0, :],
+            expected_left_colors,
+        )
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+
+
+def test_build_clustermap_figure_uses_thinner_dendrogram_lines() -> None:
+    from scipy.cluster.hierarchy import linkage
+
+    result = ClusterResult(
+        correlation_matrix=np.eye(3, dtype=np.float32),
+        distance_matrix=np.eye(3, dtype=np.float32),
+        linkage_matrix=linkage(
+            np.arange(3, dtype=np.float64).reshape(-1, 1),
+            method="single",
+        ),
+        neuron_ids=["n0", "n1", "n2"],
+        reorder_indices=np.array([0, 1, 2], dtype=np.intp),
+        labels=np.array([1, 2, 3], dtype=np.int32),
+    )
+
+    figure = build_clustermap_figure(result)
+    try:
+        dendrogram_axes = [
+            axis
+            for axis in figure.axes
+            if not axis.images and axis.collections and not axis.get_ylabel()
+        ]
+
+        assert len(dendrogram_axes) == 2
+        for axis in dendrogram_axes:
+            for collection in axis.collections:
+                np.testing.assert_allclose(
+                    collection.get_linewidths(),
+                    DENDROGRAM_LINEWIDTH,
+                )
     finally:
         import matplotlib.pyplot as plt
 
