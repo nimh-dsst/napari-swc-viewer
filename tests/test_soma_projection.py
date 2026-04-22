@@ -366,11 +366,27 @@ class _DummyLabel:
 
 
 class _DummyButton:
-    def __init__(self) -> None:
+    def __init__(self, text: str = "") -> None:
         self.enabled = True
+        self.visible = True
+        self.text = text
 
     def setEnabled(self, value: bool) -> None:
         self.enabled = value
+
+    def setVisible(self, value: bool) -> None:
+        self.visible = value
+
+    def setText(self, value: str) -> None:
+        self.text = value
+
+
+class _DummyStack:
+    def __init__(self) -> None:
+        self.index = None
+
+    def setCurrentIndex(self, index: int) -> None:
+        self.index = index
 
 
 class _DummyProgressBar:
@@ -894,43 +910,112 @@ def test_on_soma_selected_uses_metadata_file_ids_for_projected_layer() -> None:
 
 
 @pytest.mark.parametrize(
-    ("query_source", "expected_message", "handler_name"),
+    ("handler_name", "expected_message", "expected_soma_only"),
     [
         (
-            "Atlas Regions",
-            "Searching selected atlas regions. Please wait...",
-            "_query_neurons_by_region",
+            "_query_atlas_neurons_any_node",
+            "Searching for neurons with any node in selected atlas regions. Please wait...",
+            False,
         ),
         (
-            "Mask Layer",
-            "Searching selected mask layers. Please wait...",
-            "_query_neurons_by_mask",
+            "_query_atlas_neurons_soma",
+            "Searching for neurons with soma in selected atlas regions. Please wait...",
+            True,
         ),
     ],
 )
-def test_query_neurons_sets_wait_message_before_dispatch(
-    query_source: str,
-    expected_message: str,
+def test_atlas_query_handlers_set_wait_message_before_dispatch(
     handler_name: str,
+    expected_message: str,
+    expected_soma_only: bool,
 ) -> None:
     observed: dict[str, str] = {}
 
     widget = types.SimpleNamespace(
-        _region_query_source=query_source,
         _regions_status_label=_DummyLabel(),
     )
 
-    def _record_status() -> None:
+    def _record_status(*, soma_only: bool = False) -> None:
         observed["status"] = widget._regions_status_label.text
+        observed["soma_only"] = soma_only
 
-    setattr(widget, handler_name, _record_status)
-    other_handler = (
-        "_query_neurons_by_mask"
-        if handler_name == "_query_neurons_by_region"
-        else "_query_neurons_by_region"
-    )
-    setattr(widget, other_handler, MagicMock())
+    widget._query_neurons_by_region = _record_status
 
-    NeuronViewerWidget._query_neurons(widget)
+    getattr(NeuronViewerWidget, handler_name)(widget)
 
     assert observed["status"] == expected_message
+    assert observed["soma_only"] is expected_soma_only
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "expected_message", "expected_soma_only"),
+    [
+        (
+            "_query_mask_neurons_any_node",
+            "Searching for neurons with any node in selected mask layers. Please wait...",
+            False,
+        ),
+        (
+            "_query_mask_neurons_soma",
+            "Searching for neurons with soma in selected mask layers. Please wait...",
+            True,
+        ),
+    ],
+)
+def test_mask_query_handlers_set_wait_message_before_dispatch(
+    handler_name: str,
+    expected_message: str,
+    expected_soma_only: bool,
+) -> None:
+    observed: dict[str, str] = {}
+
+    widget = types.SimpleNamespace(
+        _regions_status_label=_DummyLabel(),
+    )
+
+    def _record_status(*, soma_only: bool = False) -> None:
+        observed["status"] = widget._regions_status_label.text
+        observed["soma_only"] = soma_only
+
+    widget._query_neurons_by_mask = _record_status
+
+    getattr(NeuronViewerWidget, handler_name)(widget)
+
+    assert observed["status"] == expected_message
+    assert observed["soma_only"] is expected_soma_only
+
+
+def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
+    widget = types.SimpleNamespace(
+        _region_query_source="Atlas Regions",
+        _region_query_stack=_DummyStack(),
+        _regions_status_label=_DummyLabel(),
+        _atlas_query_any_node_btn=_DummyButton(),
+        _atlas_query_soma_btn=_DummyButton(),
+        _mask_query_any_node_btn=_DummyButton(),
+        _mask_query_soma_btn=_DummyButton(),
+    )
+    widget._atlas_region_query_buttons = types.MethodType(
+        NeuronViewerWidget._atlas_region_query_buttons,
+        widget,
+    )
+    widget._mask_layer_query_buttons = types.MethodType(
+        NeuronViewerWidget._mask_layer_query_buttons,
+        widget,
+    )
+
+    NeuronViewerWidget._on_region_query_source_changed(widget, "Atlas Regions")
+
+    assert widget._region_query_stack.index == 0
+    assert widget._atlas_query_any_node_btn.visible is True
+    assert widget._atlas_query_soma_btn.visible is True
+    assert widget._mask_query_any_node_btn.visible is False
+    assert widget._mask_query_soma_btn.visible is False
+
+    NeuronViewerWidget._on_region_query_source_changed(widget, "Mask Layer")
+
+    assert widget._region_query_stack.index == 1
+    assert widget._atlas_query_any_node_btn.visible is False
+    assert widget._atlas_query_soma_btn.visible is False
+    assert widget._mask_query_any_node_btn.visible is True
+    assert widget._mask_query_soma_btn.visible is True
