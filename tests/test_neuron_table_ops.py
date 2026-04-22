@@ -5,11 +5,13 @@ from matplotlib import colormaps
 
 from napari_swc_viewer.neuron_table_ops import (
     GRAY_RGBA,
+    NeuronTableSummary,
     added_flags,
     cluster_filter_matches,
     cluster_ids_available,
     cluster_sort_value,
     recolor_cluster_turbo,
+    summarize_neuron_table,
     visibility_for_selected_cluster,
 )
 
@@ -86,3 +88,29 @@ def test_available_cluster_ids_sorted_unique() -> None:
     """Cluster IDs are unique and sorted ascending, excluding None."""
     cluster_by_file = {"a": 3, "b": None, "c": -1, "d": 3, "e": 2}
     assert cluster_ids_available(cluster_by_file) == [-1, 2, 3]
+
+
+def test_summarize_neuron_table_empty() -> None:
+    """Empty table summary reports zeros and no clusters."""
+    summary = summarize_neuron_table({}, {}, {})
+
+    assert summary == NeuronTableSummary(
+        table_count=0,
+        added_count=0,
+        visible_count=0,
+        cluster_counts=(),
+    )
+
+
+def test_summarize_neuron_table_tracks_counts_and_cluster_breakdown() -> None:
+    """Summary reflects table membership, added flags, visibility, and clusters."""
+    summary = summarize_neuron_table(
+        {"n1": 2, "n2": None, "n3": 1, "n4": 2},
+        {"n1": True, "n2": False, "n3": True, "n4": False},
+        {"n1": True, "n2": False, "n3": True, "n4": True},
+    )
+
+    assert summary.table_count == 4
+    assert summary.added_count == 2
+    assert summary.visible_count == 3
+    assert summary.cluster_counts == ((1, 1), (2, 2), (None, 1))

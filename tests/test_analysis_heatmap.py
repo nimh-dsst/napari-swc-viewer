@@ -93,3 +93,48 @@ def test_build_node_counts_volume_without_region_filter_uses_all_nodes(
         conn.close()
 
     assert float(volume.sum()) == 4.0
+
+
+def test_build_node_counts_volume_filters_one_selected_file_id(
+    tmp_path: Path,
+) -> None:
+    """Selected-neuron heatmaps should support a single file_id filter."""
+    parquet_path = tmp_path / "heatmap.parquet"
+    _write_heatmap_parquet(parquet_path)
+
+    conn = duckdb.connect()
+    try:
+        volume = build_node_counts_volume(
+            conn,
+            str(parquet_path),
+            _FakeAtlas(),
+            file_ids=["n2"],
+        )
+    finally:
+        conn.close()
+
+    assert float(volume.sum()) == 1.0
+    assert float(volume[1, 0, 0]) == 1.0
+
+
+def test_build_node_counts_volume_filters_multiple_selected_file_ids(
+    tmp_path: Path,
+) -> None:
+    """Selected-neuron heatmaps should combine counts across multiple file_ids."""
+    parquet_path = tmp_path / "heatmap.parquet"
+    _write_heatmap_parquet(parquet_path)
+
+    conn = duckdb.connect()
+    try:
+        volume = build_node_counts_volume(
+            conn,
+            str(parquet_path),
+            _FakeAtlas(),
+            file_ids=["n1", "n3"],
+        )
+    finally:
+        conn.close()
+
+    assert float(volume.sum()) == 2.0
+    assert float(volume[0, 0, 0]) == 1.0
+    assert float(volume[1, 1, 0]) == 1.0
