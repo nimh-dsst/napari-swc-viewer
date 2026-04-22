@@ -297,6 +297,9 @@ class NeuronViewerWidget(QWidget):
         # Analysis tab
         self._analysis_tab = AnalysisTabWidget(self.viewer)
         self._analysis_tab.set_slice_projector(self._slice_projector)
+        self._analysis_tab.set_current_table_file_ids_provider(
+            self._current_table_file_ids
+        )
         self._analysis_tab.cluster_colors_updated.connect(
             self._on_cluster_colors_updated
         )
