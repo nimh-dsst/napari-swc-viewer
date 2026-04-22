@@ -23,6 +23,10 @@ PARQUET_EXPORT_VERSION = "1"
 PARQUET_METADATA_PREFIX = "napari_swc_viewer.analysis_export."
 DEFAULT_PREVIEW_HEATMAP_SIZE = 1024
 MIN_EXPORT_HEATMAP_SIZE = 512
+DENDROGRAM_LINEWIDTH = 0.5
+CLUSTERMAP_WIDTH_RATIOS = [0.18, 0.03, 0.75, 0.04]
+CLUSTERMAP_HEIGHT_RATIOS = [0.36, 0.03, 0.61]
+CLUSTERMAP_FIGURE_XLABEL_Y = 0.04
 
 
 def rgba_to_hex(rgba: Sequence[float]) -> str:
@@ -211,8 +215,8 @@ def populate_clustermap_figure(
         3,
         4,
         figure=figure,
-        width_ratios=[0.18, 0.03, 0.75, 0.04],
-        height_ratios=[0.18, 0.03, 0.79],
+        width_ratios=CLUSTERMAP_WIDTH_RATIOS,
+        height_ratios=CLUSTERMAP_HEIGHT_RATIOS,
         wspace=0.02,
         hspace=0.02,
     )
@@ -239,6 +243,10 @@ def populate_clustermap_figure(
         color_threshold=0,
         above_threshold_color="black",
     )
+    ax_left.invert_yaxis()
+    for axis in (ax_top, ax_left):
+        for collection in axis.collections:
+            collection.set_linewidth(DENDROGRAM_LINEWIDTH)
 
     for axis in (ax_top, ax_left):
         axis.set_xticks([])
@@ -257,7 +265,7 @@ def populate_clustermap_figure(
         heatmap_data,
         cmap="coolwarm",
         interpolation="nearest",
-        origin="lower",
+        origin="upper",
         aspect="auto",
     )
     ax_heatmap.set_xticks([])
@@ -276,7 +284,7 @@ def populate_clustermap_figure(
         ax_left_colors.imshow(
             cluster_array[:, np.newaxis, :],
             interpolation="nearest",
-            origin="lower",
+            origin="upper",
             aspect="auto",
         )
     for axis in (ax_top_colors, ax_left_colors):
@@ -291,9 +299,7 @@ def populate_clustermap_figure(
         figure.subplots_adjust(top=0.94)
         figure.suptitle(title)
     if x_label:
-        ax_heatmap.set_xlabel(x_label)
-    if y_label:
-        ax_heatmap.set_ylabel(y_label)
+        figure.supxlabel(x_label, y=CLUSTERMAP_FIGURE_XLABEL_Y)
 
     # Keep one shared color scale without adding another axis.
     lower = float(np.nanmin(heatmap_data))

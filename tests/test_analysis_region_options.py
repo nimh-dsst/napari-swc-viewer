@@ -754,6 +754,16 @@ def test_analysis_tab_exposes_bulk_cluster_heatmap_button():
     assert not widget._add_all_cluster_heatmaps_btn.isEnabled()
 
 
+def test_analysis_tab_export_section_omits_y_label_field():
+    """Export Results should no longer expose a separate y-label input."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert hasattr(widget, "_export_title_edit")
+    assert hasattr(widget, "_export_xlabel_edit")
+    assert not hasattr(widget, "_export_ylabel_edit")
+
+
 def test_analysis_allowed_structure_ids_include_dataset_regions_and_ancestors():
     """Dataset-backed Analysis trees should expose represented leaves plus ancestors."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
