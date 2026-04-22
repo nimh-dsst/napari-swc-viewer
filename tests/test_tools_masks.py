@@ -226,3 +226,37 @@ def test_get_neurons_by_mask_supports_any_node_and_soma_only(tmp_path: Path) -> 
 
     assert any_node["file_id"].tolist() == ["file_a", "file_b"]
     assert soma_only["file_id"].tolist() == ["file_b"]
+
+
+def test_get_neurons_by_region_supports_any_node_and_soma_only(
+    tmp_path: Path,
+) -> None:
+    parquet_path = tmp_path / "neurons.parquet"
+    df = pd.DataFrame(
+        {
+            "file_id": ["file_a", "file_a", "file_b", "file_c"],
+            "neuron_id": ["n1", "n1", "n2", "n3"],
+            "subject": ["s1", "s1", "s2", "s3"],
+            "node_id": [1, 2, 1, 1],
+            "parent_id": [-1, 1, -1, -1],
+            "x": [0.0, 50.0, 100.0, 75.0],
+            "y": [0.0, 75.0, 75.0, 75.0],
+            "z": [0.0, 100.0, 100.0, 100.0],
+            "type": [1, 2, 1, 1],
+            "region_id": [202, 101, 101, 303],
+            "region_name": ["Region Two", "Region One", "Region One", "Region Three"],
+            "region_acronym": ["R2", "R1", "R1", "R3"],
+        }
+    )
+    df.to_parquet(parquet_path, index=False)
+
+    with NeuronDatabase(parquet_path) as db:
+        any_node = db.get_neurons_by_region(["R1"], soma_only=False)
+        soma_only = db.get_neurons_by_region(["R1"], soma_only=True)
+        any_node_by_id = db.get_neurons_by_region_id([101], soma_only=False)
+        soma_only_by_id = db.get_neurons_by_region_id([101], soma_only=True)
+
+    assert any_node["file_id"].tolist() == ["file_a", "file_b"]
+    assert soma_only["file_id"].tolist() == ["file_b"]
+    assert any_node_by_id["file_id"].tolist() == ["file_a", "file_b"]
+    assert soma_only_by_id["file_id"].tolist() == ["file_b"]

@@ -605,14 +605,6 @@ class NeuronViewerWidget(QWidget):
         )
         mask_layout.addWidget(self._mask_layer_selector)
 
-        membership_row = QHBoxLayout()
-        membership_row.addWidget(QLabel("Membership:"))
-        self._mask_query_membership_combo = QComboBox()
-        self._mask_query_membership_combo.addItem("Any node in mask", False)
-        self._mask_query_membership_combo.addItem("Soma in mask", True)
-        membership_row.addWidget(self._mask_query_membership_combo)
-        mask_layout.addLayout(membership_row)
-
         self._mask_query_hint_label = QLabel("")
         self._mask_query_hint_label.setWordWrap(True)
         mask_layout.addWidget(self._mask_query_hint_label)
@@ -621,13 +613,41 @@ class NeuronViewerWidget(QWidget):
 
         layout.addWidget(self._region_query_stack)
 
-        # Query button
-        btn_row = QHBoxLayout()
-        self._query_btn = QPushButton("Find Neurons in Selected Regions")
-        self._query_btn.clicked.connect(self._query_neurons)
-        self._query_btn.setEnabled(False)
-        btn_row.addWidget(self._query_btn)
-        layout.addLayout(btn_row)
+        atlas_btn_row = QHBoxLayout()
+        self._atlas_query_any_node_btn = QPushButton(
+            "Find Neurons with Any Node in Selected Regions"
+        )
+        self._atlas_query_any_node_btn.clicked.connect(
+            self._query_atlas_neurons_any_node
+        )
+        self._atlas_query_any_node_btn.setEnabled(False)
+        atlas_btn_row.addWidget(self._atlas_query_any_node_btn)
+
+        self._atlas_query_soma_btn = QPushButton(
+            "Find Neurons with Soma in Selected Regions"
+        )
+        self._atlas_query_soma_btn.clicked.connect(self._query_atlas_neurons_soma)
+        self._atlas_query_soma_btn.setEnabled(False)
+        atlas_btn_row.addWidget(self._atlas_query_soma_btn)
+        layout.addLayout(atlas_btn_row)
+
+        mask_btn_row = QHBoxLayout()
+        self._mask_query_any_node_btn = QPushButton(
+            "Find Neurons with Any Node in Selected Mask Layers"
+        )
+        self._mask_query_any_node_btn.clicked.connect(
+            self._query_mask_neurons_any_node
+        )
+        self._mask_query_any_node_btn.setEnabled(False)
+        mask_btn_row.addWidget(self._mask_query_any_node_btn)
+
+        self._mask_query_soma_btn = QPushButton(
+            "Find Neurons with Soma in Selected Mask Layers"
+        )
+        self._mask_query_soma_btn.clicked.connect(self._query_mask_neurons_soma)
+        self._mask_query_soma_btn.setEnabled(False)
+        mask_btn_row.addWidget(self._mask_query_soma_btn)
+        layout.addLayout(mask_btn_row)
 
         self._regions_status_label = QLabel("")
         self._regions_status_label.setWordWrap(True)
@@ -1041,7 +1061,7 @@ class NeuronViewerWidget(QWidget):
                 f"Regions: {stats['n_regions']:,}"
             )
 
-            self._query_btn.setEnabled(True)
+            self._set_region_query_buttons_enabled(True)
             self._analysis_tab.set_database(self._db)
             self._regions_status_label.setText("")
             logger.info(f"Loaded Parquet file: {filepath}")
@@ -2695,28 +2715,67 @@ class NeuronViewerWidget(QWidget):
         if not hasattr(self, "_region_query_stack"):
             return
 
-        if text == "Mask Layer":
-            self._region_query_stack.setCurrentIndex(1)
-            self._query_btn.setText("Find Neurons in Selected Mask Layers")
-        else:
-            self._region_query_stack.setCurrentIndex(0)
-            self._query_btn.setText("Find Neurons in Selected Regions")
+        show_mask_buttons = text == "Mask Layer"
+        self._region_query_stack.setCurrentIndex(1 if show_mask_buttons else 0)
+        for button in self._atlas_region_query_buttons():
+            button.setVisible(not show_mask_buttons)
+        for button in self._mask_layer_query_buttons():
+            button.setVisible(show_mask_buttons)
         self._regions_status_label.setText("")
 
-    def _query_neurons(self) -> None:
-        """Dispatch Regions-tab queries by the selected source type."""
-        if self._region_query_source == "Mask Layer":
-            self._regions_status_label.setText(
-                "Searching selected mask layers. Please wait..."
-            )
-            QApplication.processEvents()
-            self._query_neurons_by_mask()
-        else:
-            self._regions_status_label.setText(
-                "Searching selected atlas regions. Please wait..."
-            )
-            QApplication.processEvents()
-            self._query_neurons_by_region()
+    def _atlas_region_query_buttons(self) -> tuple[QPushButton, QPushButton]:
+        """Return the atlas-region query buttons."""
+        return (
+            self._atlas_query_any_node_btn,
+            self._atlas_query_soma_btn,
+        )
+
+    def _mask_layer_query_buttons(self) -> tuple[QPushButton, QPushButton]:
+        """Return the mask-layer query buttons."""
+        return (
+            self._mask_query_any_node_btn,
+            self._mask_query_soma_btn,
+        )
+
+    def _set_region_query_buttons_enabled(self, enabled: bool) -> None:
+        """Enable or disable all Regions-tab query buttons."""
+        for button in (
+            *self._atlas_region_query_buttons(),
+            *self._mask_layer_query_buttons(),
+        ):
+            button.setEnabled(enabled)
+
+    def _query_atlas_neurons_any_node(self) -> None:
+        """Query neurons with any node in the selected atlas regions."""
+        self._regions_status_label.setText(
+            "Searching for neurons with any node in selected atlas regions. Please wait..."
+        )
+        QApplication.processEvents()
+        self._query_neurons_by_region(soma_only=False)
+
+    def _query_atlas_neurons_soma(self) -> None:
+        """Query neurons with soma in the selected atlas regions."""
+        self._regions_status_label.setText(
+            "Searching for neurons with soma in selected atlas regions. Please wait..."
+        )
+        QApplication.processEvents()
+        self._query_neurons_by_region(soma_only=True)
+
+    def _query_mask_neurons_any_node(self) -> None:
+        """Query neurons with any node in the selected mask layers."""
+        self._regions_status_label.setText(
+            "Searching for neurons with any node in selected mask layers. Please wait..."
+        )
+        QApplication.processEvents()
+        self._query_neurons_by_mask(soma_only=False)
+
+    def _query_mask_neurons_soma(self) -> None:
+        """Query neurons with soma in the selected mask layers."""
+        self._regions_status_label.setText(
+            "Searching for neurons with soma in selected mask layers. Please wait..."
+        )
+        QApplication.processEvents()
+        self._query_neurons_by_mask(soma_only=True)
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
@@ -2731,7 +2790,7 @@ class NeuronViewerWidget(QWidget):
             )
             self._update_region_segmentation(parent_acronyms)
 
-    def _query_neurons_by_region(self) -> None:
+    def _query_neurons_by_region(self, soma_only: bool = False) -> None:
         """Query neurons in selected regions."""
         if self._db is None:
             return
@@ -2742,18 +2801,23 @@ class NeuronViewerWidget(QWidget):
             return
 
         try:
-            result = self._db.get_neurons_by_region(acronyms)
+            result = self._db.get_neurons_by_region(acronyms, soma_only=soma_only)
             self._populate_neuron_table(result)
+            membership = "soma" if soma_only else "any node"
             self._regions_status_label.setText(
-                f"Found {len(result)} neuron(s) in selected atlas regions."
+                f"Found {len(result)} neuron(s) with {membership} in selected atlas regions."
             )
-            logger.info(f"Found {len(result)} neurons in selected regions")
+            logger.info(
+                "Found %d neurons with %s in selected atlas regions",
+                len(result),
+                membership,
+            )
 
         except Exception as e:
             logger.error(f"Query failed: {e}")
             self._regions_status_label.setText(f"Region query failed: {e}")
 
-    def _query_neurons_by_mask(self) -> None:
+    def _query_neurons_by_mask(self, soma_only: bool = False) -> None:
         """Query neurons using a generated mask layer."""
         if self._db is None or self._atlas is None:
             return
@@ -2770,20 +2834,20 @@ class NeuronViewerWidget(QWidget):
             show_warning(message)
             return
 
-        soma_only = bool(self._mask_query_membership_combo.currentData())
         try:
             result = self._db.get_neurons_by_mask(mask, self._atlas, soma_only=soma_only)
             self._populate_neuron_table(result)
-            mode = "somas" if soma_only else "nodes"
+            membership = "soma" if soma_only else "any node"
             selected_names = ", ".join(layer.name for layer in layers[:3])
             if len(layers) > 3:
                 selected_names += ", ..."
             self._regions_status_label.setText(
-                f"Found {len(result)} neuron(s) with {mode} in {len(layers)} selected mask layer(s): {selected_names}"
+                f"Found {len(result)} neuron(s) with {membership} in {len(layers)} selected mask layer(s): {selected_names}"
             )
             logger.info(
-                "Found %d neurons in %d selected mask layers",
+                "Found %d neurons with %s in %d selected mask layers",
                 len(result),
+                membership,
                 len(layers),
             )
         except Exception as e:

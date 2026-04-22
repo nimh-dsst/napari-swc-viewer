@@ -65,6 +65,7 @@ class NeuronDatabase:
         self,
         region_acronyms: list[str],
         include_children: bool = False,
+        soma_only: bool = False,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified regions.
 
@@ -74,6 +75,8 @@ class NeuronDatabase:
             List of region acronyms to query (e.g., ["VISp", "VISl"]).
         include_children : bool, default=False
             If True, include child regions in the query.
+        soma_only : bool, default=False
+            If True, only match soma/body rows (``type = 1``).
 
         Returns
         -------
@@ -84,10 +87,13 @@ class NeuronDatabase:
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
         placeholders = ", ".join(["?"] * len(region_acronyms))
+        where_parts = [f"region_acronym IN ({placeholders})"]
+        if soma_only:
+            where_parts.append("type = 1")
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
-            WHERE region_acronym IN ({placeholders})
+            WHERE {' AND '.join(where_parts)}
             ORDER BY file_id
         """
         return self.conn.execute(query, region_acronyms).fetchdf()
@@ -95,6 +101,7 @@ class NeuronDatabase:
     def get_neurons_by_region_id(
         self,
         region_ids: list[int],
+        soma_only: bool = False,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified region IDs.
 
@@ -102,6 +109,8 @@ class NeuronDatabase:
         ----------
         region_ids : list[int]
             List of Allen CCF region IDs.
+        soma_only : bool, default=False
+            If True, only match soma/body rows (``type = 1``).
 
         Returns
         -------
@@ -112,10 +121,13 @@ class NeuronDatabase:
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
         placeholders = ", ".join(["?"] * len(region_ids))
+        where_parts = [f"region_id IN ({placeholders})"]
+        if soma_only:
+            where_parts.append("type = 1")
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
-            WHERE region_id IN ({placeholders})
+            WHERE {' AND '.join(where_parts)}
             ORDER BY file_id
         """
         return self.conn.execute(query, region_ids).fetchdf()
