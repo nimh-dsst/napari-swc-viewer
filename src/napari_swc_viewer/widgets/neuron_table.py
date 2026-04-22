@@ -33,11 +33,13 @@ from qtpy.QtWidgets import (
 
 from ..neuron_table_ops import (
     GRAY_RGBA,
+    NeuronTableSummary,
     added_flags,
     cluster_filter_matches,
     cluster_ids_available,
     cluster_sort_value,
     recolor_cluster_turbo,
+    summarize_neuron_table,
     visibility_for_selected_cluster,
 )
 
@@ -87,11 +89,14 @@ class NeuronTableWidget(QWidget):
         Emitted when neuron colors change. Payload is ``{file_id: [r,g,b,a]}``.
     visibility_changed : dict
         Emitted when neuron visibility changes. Payload is ``{file_id: bool}``.
+    state_changed
+        Emitted when tracked table state changes in a way that affects summary UI.
     """
 
     colors_changed = Signal(dict)
     visibility_changed = Signal(dict)
     selection_changed = Signal(list)
+    state_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -151,6 +156,7 @@ class NeuronTableWidget(QWidget):
             self._populate_row(row, entry)
 
         self._table.setSortingEnabled(sorting_enabled)
+        self.state_changed.emit()
 
     def _populate_row(self, row: int, entry: NeuronEntry) -> None:
         """Populate a single table row from a NeuronEntry."""
@@ -253,6 +259,7 @@ class NeuronTableWidget(QWidget):
 
         entry.visible = bool(state)
         self.visibility_changed.emit({fid: e.visible for fid, e in self._entries.items()})
+        self.state_changed.emit()
 
     def _file_id_from_row(self, row: int) -> object | None:
         """Resolve a row to its file_id using item metadata."""
@@ -341,6 +348,29 @@ class NeuronTableWidget(QWidget):
         """Return a mapping of all file_ids to their visibility state."""
         return {fid: e.visible for fid, e in self._entries.items()}
 
+    def summary(self) -> NeuronTableSummary:
+        """Return summary counts for the current table contents."""
+        return summarize_neuron_table(
+            {fid: entry.cluster_id for fid, entry in self._entries.items()},
+            {fid: entry.added_to_scene for fid, entry in self._entries.items()},
+            {fid: entry.visible for fid, entry in self._entries.items()},
+        )
+
+    def clear(self) -> None:
+        """Clear all table rows and tracked neuron state."""
+        sorting_enabled = self._table.isSortingEnabled()
+        signals_blocked = self._table.blockSignals(True)
+        self._table.setSortingEnabled(False)
+        try:
+            self._table.clearContents()
+            self._table.setRowCount(0)
+            self._entries.clear()
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
+            self._table.blockSignals(signals_blocked)
+
+        self.state_changed.emit()
+
     def set_added_file_ids(self, file_ids_in_scene: set[object] | list[object]) -> None:
         """Set whether each neuron is currently added to the scene."""
         flags = added_flags(self._entries.keys(), file_ids_in_scene)
@@ -360,6 +390,7 @@ class NeuronTableWidget(QWidget):
                     self._set_added_cell(row, added)
         finally:
             self._table.setSortingEnabled(sorting_enabled)
+        self.state_changed.emit()
 
     def available_cluster_ids(self) -> list[int]:
         """Return sorted unique cluster IDs in the table."""
@@ -393,6 +424,7 @@ class NeuronTableWidget(QWidget):
 
         if changed:
             self.visibility_changed.emit(self.get_visibility_map())
+            self.state_changed.emit()
 
     def set_all_visible(self) -> None:
         """Set visibility on for all neurons."""
@@ -408,6 +440,7 @@ class NeuronTableWidget(QWidget):
 
         if changed:
             self.visibility_changed.emit(self.get_visibility_map())
+            self.state_changed.emit()
 
     def recolor_cluster_turbo(self, cluster_id: int, gray_others: bool = True) -> None:
         """Recolor selected cluster with turbo; optionally gray non-selected neurons."""
@@ -456,6 +489,7 @@ class NeuronTableWidget(QWidget):
                     self._set_cluster_cell(row, entry.cluster_id)
         finally:
             self._table.setSortingEnabled(sorting_enabled)
+        self.state_changed.emit()
 
     def select_file_ids(self, file_ids: list[str]) -> None:
         """Programmatically select table rows matching *file_ids*.

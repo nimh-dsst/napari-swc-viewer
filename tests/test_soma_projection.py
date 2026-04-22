@@ -308,6 +308,19 @@ class _DummyShapesLayer:
         self.edge_width = kwargs.get("edge_width")
 
 
+class _DummyImageLayer:
+    def __init__(self, data: np.ndarray, **kwargs) -> None:
+        self.data = np.asarray(data, dtype=float)
+        self.name = kwargs["name"]
+        self.metadata = kwargs.get("metadata", {})
+        self.opacity = kwargs.get("opacity", 1.0)
+        self.colormap = kwargs.get("colormap")
+        self.blending = kwargs.get("blending")
+        self.rendering = kwargs.get("rendering")
+        self.contrast_limits = kwargs.get("contrast_limits")
+        self.visible = kwargs.get("visible", True)
+
+
 class _DummyViewer:
     def __init__(
         self,
@@ -330,6 +343,11 @@ class _DummyViewer:
 
     def add_shapes(self, data: np.ndarray, **kwargs) -> _DummyShapesLayer:
         layer = _DummyShapesLayer(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_image(self, data: np.ndarray, **kwargs) -> _DummyImageLayer:
+        layer = _DummyImageLayer(data, **kwargs)
         self.layers.append(layer)
         return layer
 
@@ -1019,3 +1037,215 @@ def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
     assert widget._atlas_query_soma_btn.visible is False
     assert widget._mask_query_any_node_btn.visible is True
     assert widget._mask_query_soma_btn.visible is True
+
+
+def test_refresh_neuron_table_summary_formats_counts_and_clusters() -> None:
+    summary = types.SimpleNamespace(
+        table_count=4,
+        added_count=2,
+        visible_count=3,
+        cluster_counts=((1, 2), (3, 1), (None, 1)),
+    )
+    widget = types.SimpleNamespace(
+        _neuron_table=types.SimpleNamespace(summary=lambda: summary),
+        _neuron_table_summary_label=_DummyLabel(),
+    )
+
+    NeuronViewerWidget._refresh_neuron_table_summary(widget)
+
+    assert widget._neuron_table_summary_label.text == (
+        "In table: 4 | Added to scene: 2 | Visible: 3\n"
+        "Clusters: Cluster 1: 2, Cluster 3: 1, Unclustered: 1"
+    )
+
+
+def test_clear_neuron_table_preserves_scene_render_modes() -> None:
+    widget = types.SimpleNamespace(
+        _highlighted_file_ids=None,
+        _current_neuron_layers=[object()],
+        _neuron_table=types.SimpleNamespace(
+            clear=MagicMock(),
+            _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},
+        ),
+        _last_soma_selection={"n1"},
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+        _scene_render_modes={"n1": "full"},
+    )
+
+    NeuronViewerWidget._clear_neuron_table(widget)
+
+    widget._neuron_table.clear.assert_called_once_with()
+    widget._refresh_cluster_filter_controls.assert_called_once_with()
+    widget._refresh_neuron_table_summary.assert_called_once_with()
+    assert widget._scene_render_modes == {"n1": "full"}
+    assert widget._last_soma_selection == set()
+    assert widget._render_status_label.text == "Cleared neuron table."
+    assert widget._regions_status_label.text == "Cleared neuron table."
+
+
+def test_clear_neuron_table_clears_highlight_without_recoloring_scene_to_gray() -> None:
+    entry = types.SimpleNamespace(color=[0.2, 0.3, 0.4, 1.0], visible=True)
+    widget = types.SimpleNamespace(
+        _highlighted_file_ids={"n1"},
+        _current_neuron_layers=[object()],
+        _neuron_table=types.SimpleNamespace(
+            clear=MagicMock(),
+            _entries={"n1": entry},
+        ),
+        _last_soma_selection=set(),
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+        _update_layer_colors=MagicMock(),
+    )
+    widget._build_effective_color_map = types.MethodType(
+        NeuronViewerWidget._build_effective_color_map,
+        widget,
+    )
+
+    NeuronViewerWidget._clear_neuron_table(widget)
+
+    widget._update_layer_colors.assert_called_once_with(
+        {"n1": [0.2, 0.3, 0.4, 1.0]}
+    )
+    assert widget._highlighted_file_ids is None
+
+
+def test_selected_neuron_heatmap_layer_name_appends_suffixes() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    viewer.layers.extend(
+        [
+            types.SimpleNamespace(name="Neuron Heatmap: n1"),
+            types.SimpleNamespace(name="Neuron Heatmap: n1 (2)"),
+        ]
+    )
+    widget = types.SimpleNamespace(viewer=viewer)
+    widget._iter_viewer_layers = types.MethodType(
+        NeuronViewerWidget._iter_viewer_layers,
+        widget,
+    )
+    widget._unique_layer_name = types.MethodType(
+        NeuronViewerWidget._unique_layer_name,
+        widget,
+    )
+    widget._selected_neuron_heatmap_base_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_base_name,
+        widget,
+    )
+
+    layer_name = NeuronViewerWidget._selected_neuron_heatmap_layer_name(
+        widget,
+        ["n1"],
+    )
+
+    assert layer_name == "Neuron Heatmap: n1 (3)"
+
+
+def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _db=types.SimpleNamespace(parquet_path=Path("/tmp/neurons.parquet")),
+        _atlas=types.SimpleNamespace(atlas_name="fake_atlas"),
+        _opacity_slider=_DummyValueControl(80),
+    )
+    widget._iter_viewer_layers = types.MethodType(
+        NeuronViewerWidget._iter_viewer_layers,
+        widget,
+    )
+    widget._unique_layer_name = types.MethodType(
+        NeuronViewerWidget._unique_layer_name,
+        widget,
+    )
+    widget._selected_neuron_heatmap_base_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_base_name,
+        widget,
+    )
+    widget._selected_neuron_heatmap_layer_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_layer_name,
+        widget,
+    )
+    widget._current_atlas_name = types.MethodType(
+        NeuronViewerWidget._current_atlas_name,
+        widget,
+    )
+
+    layer = NeuronViewerWidget._add_selected_neuron_heatmap_layer(
+        widget,
+        np.array([[[0.0, 5.0]]], dtype=np.float32),
+        ["n1"],
+    )
+
+    assert layer.name == "Neuron Heatmap: n1"
+    assert layer.contrast_limits == (0.0, 5.0)
+    assert layer.metadata["heatmap_kind"] == "selected_neurons"
+    assert layer.metadata["atlas_name"] == "fake_atlas"
+    assert layer.metadata["source_path"] == "/tmp/neurons.parquet"
+    assert layer.metadata["file_ids"] == ["n1"]
+    assert layer.metadata["selection_count"] == 1
+    assert layer.metadata["heatmap_source"] is True
+    assert layer.metadata["heatmap_native_grid"] is True
+
+
+def test_selected_neuron_heatmap_finished_adds_unique_multi_selection_layer() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    viewer.layers.extend(
+        [
+            types.SimpleNamespace(name="Neuron Heatmap: 2 selected neurons"),
+            types.SimpleNamespace(name="Neuron Heatmap: 2 selected neurons (2)"),
+        ]
+    )
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _db=types.SimpleNamespace(parquet_path=Path("/tmp/neurons.parquet")),
+        _atlas=types.SimpleNamespace(atlas_name="fake_atlas"),
+        _opacity_slider=_DummyValueControl(75),
+        _render_progress=_DummyProgressBar(),
+        _render_status_label=_DummyLabel(),
+        _selected_heatmap_request_file_ids=("n1", "n2"),
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _refresh_mask_layer_options=MagicMock(),
+    )
+    widget._iter_viewer_layers = types.MethodType(
+        NeuronViewerWidget._iter_viewer_layers,
+        widget,
+    )
+    widget._unique_layer_name = types.MethodType(
+        NeuronViewerWidget._unique_layer_name,
+        widget,
+    )
+    widget._selected_neuron_heatmap_base_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_base_name,
+        widget,
+    )
+    widget._selected_neuron_heatmap_layer_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_layer_name,
+        widget,
+    )
+    widget._current_atlas_name = types.MethodType(
+        NeuronViewerWidget._current_atlas_name,
+        widget,
+    )
+    widget._add_selected_neuron_heatmap_layer = types.MethodType(
+        NeuronViewerWidget._add_selected_neuron_heatmap_layer,
+        widget,
+    )
+
+    NeuronViewerWidget._on_selected_neuron_heatmap_finished(
+        widget,
+        np.ones((2, 2, 2), dtype=np.float32),
+    )
+
+    created_layer = viewer.layers[-1]
+    assert created_layer.name == "Neuron Heatmap: 2 selected neurons (3)"
+    assert created_layer.metadata["file_ids"] == ["n1", "n2"]
+    assert created_layer.metadata["selection_count"] == 2
+    widget._refresh_heatmap_layer_list.assert_called_once_with()
+    widget._refresh_histogram_layer_list.assert_called_once_with()
+    widget._refresh_mask_layer_options.assert_called_once_with()
+    assert "Neuron Heatmap: 2 selected neurons (3)" in widget._render_status_label.text
