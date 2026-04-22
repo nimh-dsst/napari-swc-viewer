@@ -1184,7 +1184,7 @@ def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> N
     assert layer.contrast_limits == (0.0, 5.0)
     assert layer.metadata["heatmap_kind"] == "selected_neurons"
     assert layer.metadata["atlas_name"] == "fake_atlas"
-    assert layer.metadata["source_path"] == "/tmp/neurons.parquet"
+    assert layer.metadata["source_path"] == str(Path("/tmp/neurons.parquet"))
     assert layer.metadata["file_ids"] == ["n1"]
     assert layer.metadata["selection_count"] == 1
     assert layer.metadata["heatmap_source"] is True
