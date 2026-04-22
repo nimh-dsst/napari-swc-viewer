@@ -364,11 +364,41 @@ class _DummyCheckBox:
 
 
 class _DummyComboBox:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, data=None) -> None:
         self._text = text
+        self._data = text if data is None else data
 
     def currentText(self) -> str:
         return self._text
+
+    def currentData(self):
+        return self._data
+
+
+class _DummyRegionSelector:
+    def __init__(
+        self,
+        *,
+        direct_acronyms: list[str] | None = None,
+        query_acronyms: list[str] | None = None,
+        include_children: bool = True,
+    ) -> None:
+        self._direct_acronyms = list(direct_acronyms or [])
+        self._query_acronyms = list(
+            self._direct_acronyms if query_acronyms is None else query_acronyms
+        )
+        self._include_children = bool(include_children)
+
+    def get_selected_acronyms(self, include_children: bool = True) -> list[str]:
+        if include_children:
+            return list(self._query_acronyms)
+        return list(self._direct_acronyms)
+
+    def get_query_acronyms(self) -> list[str]:
+        return list(self._query_acronyms)
+
+    def include_children_enabled(self) -> bool:
+        return self._include_children
 
 
 class _DummyLabel:
@@ -477,6 +507,14 @@ def _bind_scene_helpers(widget) -> None:
         NeuronViewerWidget._current_scene_file_ids,
         widget,
     )
+    widget._base_display_state_for_file_id = types.MethodType(
+        NeuronViewerWidget._base_display_state_for_file_id,
+        widget,
+    )
+    widget._build_effective_color_map = types.MethodType(
+        NeuronViewerWidget._build_effective_color_map,
+        widget,
+    )
     widget._build_soma_projection_batch = types.MethodType(
         NeuronViewerWidget._build_soma_projection_batch,
         widget,
@@ -487,6 +525,77 @@ def _bind_scene_helpers(widget) -> None:
     )
     widget._render_selected_with_mode = types.MethodType(
         NeuronViewerWidget._render_selected_with_mode,
+        widget,
+    )
+
+
+def _bind_table_membership_helpers(widget) -> None:
+    widget._current_scene_file_ids = types.MethodType(
+        NeuronViewerWidget._current_scene_file_ids,
+        widget,
+    )
+    widget._current_table_file_ids = types.MethodType(
+        NeuronViewerWidget._current_table_file_ids,
+        widget,
+    )
+    widget._current_table_file_ids_in_scene = types.MethodType(
+        NeuronViewerWidget._current_table_file_ids_in_scene,
+        widget,
+    )
+    widget._base_display_state_for_file_id = types.MethodType(
+        NeuronViewerWidget._base_display_state_for_file_id,
+        widget,
+    )
+    widget._cache_scene_display_state = types.MethodType(
+        NeuronViewerWidget._cache_scene_display_state,
+        widget,
+    )
+    widget._discard_scene_display_state = types.MethodType(
+        NeuronViewerWidget._discard_scene_display_state,
+        widget,
+    )
+    widget._build_effective_color_map = types.MethodType(
+        NeuronViewerWidget._build_effective_color_map,
+        widget,
+    )
+    widget._sync_after_neuron_table_membership_change = types.MethodType(
+        NeuronViewerWidget._sync_after_neuron_table_membership_change,
+        widget,
+    )
+
+
+def _bind_region_query_scope_helpers(widget) -> None:
+    widget._selected_region_query_scope = types.MethodType(
+        NeuronViewerWidget._selected_region_query_scope,
+        widget,
+    )
+    widget._current_table_file_ids = types.MethodType(
+        NeuronViewerWidget._current_table_file_ids,
+        widget,
+    )
+    widget._resolve_region_query_file_scope = types.MethodType(
+        NeuronViewerWidget._resolve_region_query_file_scope,
+        widget,
+    )
+    widget._query_scope_status_suffix = NeuronViewerWidget._query_scope_status_suffix
+    widget._region_selector_for_scope = types.MethodType(
+        NeuronViewerWidget._region_selector_for_scope,
+        widget,
+    )
+    widget._active_region_selector = types.MethodType(
+        NeuronViewerWidget._active_region_selector,
+        widget,
+    )
+    widget._active_region_preview_acronyms = types.MethodType(
+        NeuronViewerWidget._active_region_preview_acronyms,
+        widget,
+    )
+    widget._sync_region_query_scope_selector = types.MethodType(
+        NeuronViewerWidget._sync_region_query_scope_selector,
+        widget,
+    )
+    widget._sync_active_region_reference_layers = types.MethodType(
+        NeuronViewerWidget._sync_active_region_reference_layers,
         widget,
     )
 
@@ -1003,15 +1112,110 @@ def test_mask_query_handlers_set_wait_message_before_dispatch(
     assert observed["soma_only"] is expected_soma_only
 
 
+def test_resolve_region_query_file_scope_defaults_to_whole_parquet() -> None:
+    widget = types.SimpleNamespace(
+        _region_query_scope="whole",
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    assert widget._selected_region_query_scope() == "whole"
+    assert widget._resolve_region_query_file_scope() == (
+        True,
+        None,
+        "whole parquet",
+        None,
+    )
+
+
+def test_query_neurons_by_region_uses_current_table_scope_without_inheriting_whole_selection(
+) -> None:
+    result = pd.DataFrame(
+        {
+            "file_id": ["n1"],
+            "neuron_id": ["N1"],
+            "subject": ["s1"],
+        }
+    )
+    widget = types.SimpleNamespace(
+        _db=MagicMock(),
+        _whole_parquet_region_selector=_DummyRegionSelector(
+            direct_acronyms=["ROOT"],
+            query_acronyms=["ROOT", "R1"],
+            include_children=True,
+        ),
+        _current_table_region_selector=_DummyRegionSelector(
+            direct_acronyms=["R1"],
+            query_acronyms=["R1"],
+            include_children=False,
+        ),
+        _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: ["n1", "n2"]),
+        _populate_neuron_table=MagicMock(),
+    )
+    widget._db.get_neurons_by_region.return_value = result
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_region(widget, soma_only=True)
+
+    widget._db.get_neurons_by_region.assert_called_once_with(
+        ["R1"],
+        soma_only=True,
+        file_ids=["n1", "n2"],
+    )
+    widget._populate_neuron_table.assert_called_once_with(
+        result,
+        preserve_existing=True,
+    )
+    assert widget._regions_status_label.text == (
+        "Found 1 neuron(s) with soma in selected atlas regions "
+        "within current table (from 2 input neurons). "
+        "Query: R1; descendants: off."
+    )
+
+
+def test_query_neurons_by_mask_current_table_scope_requires_nonempty_table() -> None:
+    widget = types.SimpleNamespace(
+        _db=MagicMock(),
+        _atlas=types.SimpleNamespace(annotation=np.zeros((2, 2, 2), dtype=np.uint8)),
+        _selected_mask_query_layers=lambda: [
+            types.SimpleNamespace(
+                name="Mask A",
+                data=np.ones((2, 2, 2), dtype=np.uint8),
+            )
+        ],
+        _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: []),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_mask(widget, soma_only=False)
+
+    widget._db.get_neurons_by_mask.assert_not_called()
+    assert widget._regions_status_label.text == (
+        "Current table is empty; switch search scope to Whole Parquet or "
+        "populate the table first."
+    )
+
+
 def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
     widget = types.SimpleNamespace(
         _region_query_source="Atlas Regions",
         _region_query_stack=_DummyStack(),
+        _atlas_region_scope_stack=_DummyStack(),
+        _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
         _regions_status_label=_DummyLabel(),
         _atlas_query_any_node_btn=_DummyButton(),
         _atlas_query_soma_btn=_DummyButton(),
         _mask_query_any_node_btn=_DummyButton(),
         _mask_query_soma_btn=_DummyButton(),
+        _whole_parquet_region_selector=_DummyRegionSelector(direct_acronyms=["ROOT"]),
+        _current_table_region_selector=_DummyRegionSelector(direct_acronyms=["R1"]),
+        _show_region_meshes_cb=_DummyCheckBox(False),
+        _show_region_seg_cb=_DummyCheckBox(False),
     )
     widget._atlas_region_query_buttons = types.MethodType(
         NeuronViewerWidget._atlas_region_query_buttons,
@@ -1021,10 +1225,12 @@ def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
         NeuronViewerWidget._mask_layer_query_buttons,
         widget,
     )
+    _bind_region_query_scope_helpers(widget)
 
     NeuronViewerWidget._on_region_query_source_changed(widget, "Atlas Regions")
 
     assert widget._region_query_stack.index == 0
+    assert widget._atlas_region_scope_stack.index == 1
     assert widget._atlas_query_any_node_btn.visible is True
     assert widget._atlas_query_soma_btn.visible is True
     assert widget._mask_query_any_node_btn.visible is False
@@ -1037,6 +1243,90 @@ def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
     assert widget._atlas_query_soma_btn.visible is False
     assert widget._mask_query_any_node_btn.visible is True
     assert widget._mask_query_soma_btn.visible is True
+
+
+def test_on_region_query_scope_changed_switches_preview_to_active_selector() -> None:
+    widget = types.SimpleNamespace(
+        _region_query_source="Atlas Regions",
+        _region_query_scope="whole",
+        _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
+        _atlas_region_scope_stack=_DummyStack(),
+        _regions_status_label=_DummyLabel(),
+        _whole_parquet_region_selector=_DummyRegionSelector(
+            direct_acronyms=["ROOT"],
+            query_acronyms=["ROOT", "R1"],
+            include_children=True,
+        ),
+        _current_table_region_selector=_DummyRegionSelector(
+            direct_acronyms=["R1"],
+            query_acronyms=["R1"],
+            include_children=False,
+        ),
+        _show_region_meshes_cb=_DummyCheckBox(True),
+        _show_region_seg_cb=_DummyCheckBox(True),
+        _update_region_meshes=MagicMock(),
+        _update_region_segmentation=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._on_region_query_scope_changed(widget, "Current Table")
+
+    assert widget._region_query_scope == "current"
+    assert widget._atlas_region_scope_stack.index == 1
+    widget._update_region_meshes.assert_called_once_with(["R1"])
+    widget._update_region_segmentation.assert_called_once_with(["R1"])
+
+    widget._region_query_scope_combo = _DummyComboBox("Whole Parquet", data="whole")
+    widget._update_region_meshes.reset_mock()
+    widget._update_region_segmentation.reset_mock()
+
+    NeuronViewerWidget._on_region_query_scope_changed(widget, "Whole Parquet")
+
+    assert widget._region_query_scope == "whole"
+    assert widget._atlas_region_scope_stack.index == 0
+    widget._update_region_meshes.assert_called_once_with(["ROOT"])
+    widget._update_region_segmentation.assert_called_once_with(["ROOT"])
+
+
+def test_query_neurons_by_region_reports_union_details() -> None:
+    result = pd.DataFrame(
+        {
+            "file_id": ["n1", "n2"],
+            "neuron_id": ["N1", "N2"],
+            "subject": ["s1", "s2"],
+        }
+    )
+    widget = types.SimpleNamespace(
+        _db=MagicMock(),
+        _whole_parquet_region_selector=_DummyRegionSelector(
+            direct_acronyms=["R1", "R2"],
+            query_acronyms=["R1", "R2"],
+            include_children=True,
+        ),
+        _current_table_region_selector=_DummyRegionSelector(),
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: ["n1", "n2"]),
+        _populate_neuron_table=MagicMock(),
+    )
+    widget._db.get_neurons_by_region.return_value = result
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_region(widget, soma_only=False)
+
+    widget._db.get_neurons_by_region.assert_called_once_with(
+        ["R1", "R2"],
+        soma_only=False,
+        file_ids=None,
+    )
+    widget._populate_neuron_table.assert_called_once_with(
+        result,
+        preserve_existing=False,
+    )
+    assert widget._regions_status_label.text == (
+        "Found 2 neuron(s) with any node in selected atlas regions "
+        "within whole parquet. Query: union of R1, R2; descendants: on."
+    )
 
 
 def test_refresh_neuron_table_summary_formats_counts_and_clusters() -> None:
@@ -1060,26 +1350,37 @@ def test_refresh_neuron_table_summary_formats_counts_and_clusters() -> None:
 
 
 def test_clear_neuron_table_preserves_scene_render_modes() -> None:
+    table = types.SimpleNamespace(
+        _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},
+    )
+    table.clear = MagicMock(side_effect=table._entries.clear)
+    table.set_added_file_ids = MagicMock()
+    table.get_selected_file_ids = MagicMock(return_value=[])
+    table.file_ids = lambda: list(table._entries.keys())
+
     widget = types.SimpleNamespace(
         _highlighted_file_ids=None,
         _current_neuron_layers=[object()],
-        _neuron_table=types.SimpleNamespace(
-            clear=MagicMock(),
-            _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},
-        ),
+        _neuron_table=table,
         _last_soma_selection={"n1"},
         _refresh_cluster_filter_controls=MagicMock(),
         _refresh_neuron_table_summary=MagicMock(),
         _render_status_label=_DummyLabel(),
         _regions_status_label=_DummyLabel(),
         _scene_render_modes={"n1": "full"},
+        _scene_display_state={},
+        _update_layer_colors=MagicMock(),
     )
+    _bind_table_membership_helpers(widget)
 
     NeuronViewerWidget._clear_neuron_table(widget)
 
     widget._neuron_table.clear.assert_called_once_with()
     widget._refresh_cluster_filter_controls.assert_called_once_with()
     widget._refresh_neuron_table_summary.assert_called_once_with()
+    widget._update_layer_colors.assert_called_once_with(
+        {"n1": [1.0, 0.0, 0.0, 1.0]}
+    )
     assert widget._scene_render_modes == {"n1": "full"}
     assert widget._last_soma_selection == set()
     assert widget._render_status_label.text == "Cleared neuron table."
@@ -1088,24 +1389,25 @@ def test_clear_neuron_table_preserves_scene_render_modes() -> None:
 
 def test_clear_neuron_table_clears_highlight_without_recoloring_scene_to_gray() -> None:
     entry = types.SimpleNamespace(color=[0.2, 0.3, 0.4, 1.0], visible=True)
+    table = types.SimpleNamespace(_entries={"n1": entry})
+    table.clear = MagicMock(side_effect=table._entries.clear)
+    table.set_added_file_ids = MagicMock()
+    table.get_selected_file_ids = MagicMock(return_value=[])
+    table.file_ids = lambda: list(table._entries.keys())
     widget = types.SimpleNamespace(
         _highlighted_file_ids={"n1"},
         _current_neuron_layers=[object()],
-        _neuron_table=types.SimpleNamespace(
-            clear=MagicMock(),
-            _entries={"n1": entry},
-        ),
+        _neuron_table=table,
         _last_soma_selection=set(),
         _refresh_cluster_filter_controls=MagicMock(),
         _refresh_neuron_table_summary=MagicMock(),
         _render_status_label=_DummyLabel(),
         _regions_status_label=_DummyLabel(),
         _update_layer_colors=MagicMock(),
+        _scene_render_modes={"n1": "full"},
+        _scene_display_state={},
     )
-    widget._build_effective_color_map = types.MethodType(
-        NeuronViewerWidget._build_effective_color_map,
-        widget,
-    )
+    _bind_table_membership_helpers(widget)
 
     NeuronViewerWidget._clear_neuron_table(widget)
 
@@ -1113,6 +1415,52 @@ def test_clear_neuron_table_clears_highlight_without_recoloring_scene_to_gray() 
         {"n1": [0.2, 0.3, 0.4, 1.0]}
     )
     assert widget._highlighted_file_ids is None
+
+
+def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_removes_row() -> None:
+    entry = types.SimpleNamespace(color=[0.2, 0.3, 0.4, 1.0], visible=True)
+    table = types.SimpleNamespace(_entries={"n1": entry})
+
+    def _retain_file_ids(file_ids) -> None:
+        keep = set(file_ids)
+        table._entries = {
+            fid: value for fid, value in table._entries.items() if fid in keep
+        }
+
+    table.retain_file_ids = _retain_file_ids
+    table.set_added_file_ids = MagicMock()
+    table.get_selected_file_ids = MagicMock(return_value=[])
+    table.file_ids = lambda: list(table._entries.keys())
+
+    widget = types.SimpleNamespace(
+        _neuron_table=table,
+        _scene_render_modes={"n1": "full"},
+        _scene_display_state={},
+        _current_neuron_layers=[object()],
+        _highlighted_file_ids=None,
+        _last_soma_selection=set(),
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _update_layer_colors=MagicMock(),
+    )
+    _bind_table_membership_helpers(widget)
+
+    empty_result = pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+
+    NeuronViewerWidget._populate_neuron_table(
+        widget,
+        empty_result,
+        preserve_existing=True,
+    )
+
+    assert table._entries == {}
+    assert widget._scene_render_modes == {"n1": "full"}
+    assert widget._scene_display_state == {
+        "n1": {"color": [0.2, 0.3, 0.4, 1.0], "visible": True}
+    }
+    widget._update_layer_colors.assert_called_once_with(
+        {"n1": [0.2, 0.3, 0.4, 1.0]}
+    )
 
 
 def test_selected_neuron_heatmap_layer_name_appends_suffixes() -> None:
