@@ -112,6 +112,7 @@ class TestColorByClusterLines:
 
         summary = widget._color_neurons_by_cluster()
 
+        assert summary.matched_table_count == 0
         assert summary.updated_layer_count == 0
         assert summary.rendered_count == 0
         assert summary.colored_count == 0
@@ -350,6 +351,7 @@ class TestColorByClusterBothLayers:
 
         summary = widget._color_neurons_by_cluster()
 
+        assert summary.matched_table_count == 0
         assert summary.updated_layer_count == 2
         assert summary.rendered_count == 1
         assert summary.colored_count == 1

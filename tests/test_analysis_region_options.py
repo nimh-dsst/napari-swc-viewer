@@ -1297,6 +1297,54 @@ def test_on_correlation_finished_auto_colors_rendered_layers_and_emits_updates()
     assert "Auto-colored 2/2 rendered neurons by cluster." in widget._progress_label.text()
 
 
+def test_has_cached_clusters_for_current_table_false_without_cache_or_provider():
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._last_cluster_result = None
+    widget._cluster_color_map = None
+    widget._current_table_file_ids_provider = None
+
+    assert widget.has_cached_clusters_for_current_table() is False
+
+
+def test_has_cached_clusters_for_current_table_true_with_overlap_and_mixed_id_types():
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._last_cluster_result = types.SimpleNamespace(neuron_ids=["1", "n2"])
+    widget._cluster_color_map = {"1": [0.1, 0.2, 0.3, 1.0], "n2": [0.4, 0.5, 0.6, 1.0]}
+    widget.set_current_table_file_ids_provider(lambda: [1, "x"])
+
+    assert widget.has_cached_clusters_for_current_table() is True
+
+
+def test_apply_cluster_colors_emits_updates_and_returns_table_match_summary():
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._viewer = _DummyViewer()
+    widget._slice_projector = None
+    widget._last_cluster_result = types.SimpleNamespace(
+        neuron_ids=["n1", "n2"],
+        labels=np.array([1, 2], dtype=np.int32),
+    )
+    widget._cluster_color_map = {
+        "n1": [0.12, 0.47, 0.71, 1.0],
+        "n2": [0.84, 0.15, 0.16, 1.0],
+    }
+    widget.set_current_table_file_ids_provider(lambda: ["n2", "other"])
+    emitted: list[tuple[object, dict]] = []
+    widget.cluster_colors_updated.connect(
+        lambda result, color_map: emitted.append((result, color_map))
+    )
+
+    summary = widget.apply_cluster_colors()
+
+    assert summary.matched_table_count == 1
+    assert summary.rendered_count == 0
+    assert summary.colored_count == 0
+    assert summary.gray_count == 0
+    assert emitted == [(widget._last_cluster_result, widget._cluster_color_map)]
+
+
 def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     """Analysis heatmaps should be added with explicit full-volume contrast limits."""
     module = _import_analysis_tab_module()

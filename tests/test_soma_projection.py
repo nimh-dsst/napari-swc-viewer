@@ -1358,6 +1358,7 @@ def test_on_cluster_colors_updated_sorts_and_refreshes_filters() -> None:
     widget = types.SimpleNamespace(
         _neuron_table=neuron_table,
         _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_apply_existing_clusters_button=MagicMock(),
     )
     result = types.SimpleNamespace(neuron_ids=["n1"])
     color_map = {"n1": [0.1, 0.2, 0.3, 1.0]}
@@ -1375,6 +1376,95 @@ def test_on_cluster_colors_updated_sorts_and_refreshes_filters() -> None:
     )
     neuron_table.sort_by_cluster.assert_called_once_with()
     widget._refresh_cluster_filter_controls.assert_called_once_with()
+    widget._refresh_apply_existing_clusters_button.assert_called_once_with()
+
+
+def test_refresh_apply_existing_clusters_button_hidden_without_overlap() -> None:
+    button = _DummyButton()
+    widget = types.SimpleNamespace(
+        _analysis_tab=types.SimpleNamespace(
+            has_cached_clusters_for_current_table=lambda: False
+        ),
+        _apply_existing_clusters_btn=button,
+    )
+
+    NeuronViewerWidget._refresh_apply_existing_clusters_button(widget)
+
+    assert button.visible is False
+    assert button.enabled is False
+
+
+def test_refresh_apply_existing_clusters_button_visible_with_overlap() -> None:
+    button = _DummyButton()
+    widget = types.SimpleNamespace(
+        _analysis_tab=types.SimpleNamespace(
+            has_cached_clusters_for_current_table=lambda: True
+        ),
+        _apply_existing_clusters_btn=button,
+    )
+
+    NeuronViewerWidget._refresh_apply_existing_clusters_button(widget)
+
+    assert button.visible is True
+    assert button.enabled is True
+
+
+def test_sync_after_neuron_table_membership_change_refreshes_apply_existing_clusters_button() -> None:
+    widget = types.SimpleNamespace(
+        _last_soma_selection={"n1"},
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_apply_existing_clusters_button=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _neuron_table=types.SimpleNamespace(get_selected_file_ids=lambda: []),
+        _current_neuron_layers=[],
+        _highlighted_file_ids={"n1"},
+    )
+
+    NeuronViewerWidget._sync_after_neuron_table_membership_change(widget)
+
+    widget._refresh_cluster_filter_controls.assert_called_once_with()
+    widget._refresh_apply_existing_clusters_button.assert_called_once_with()
+    widget._refresh_neuron_table_summary.assert_called_once_with()
+
+
+def test_apply_existing_clusters_from_analysis_updates_render_status() -> None:
+    summary = types.SimpleNamespace(
+        matched_table_count=3,
+        rendered_count=2,
+        colored_count=2,
+        gray_count=1,
+    )
+    widget = types.SimpleNamespace(
+        _analysis_tab=types.SimpleNamespace(apply_cluster_colors=lambda: summary),
+        _render_status_label=_DummyLabel(),
+        _refresh_apply_existing_clusters_button=MagicMock(),
+    )
+
+    NeuronViewerWidget._apply_existing_clusters_from_analysis(widget)
+
+    assert widget._render_status_label.text == (
+        "Applied cached cluster data to 3 table neuron(s). "
+        "Recolored 2/2 rendered neuron(s). 1 shown in gray."
+    )
+
+
+def test_apply_existing_clusters_from_analysis_no_overlap_only_refreshes_button() -> None:
+    summary = types.SimpleNamespace(
+        matched_table_count=0,
+        rendered_count=0,
+        colored_count=0,
+        gray_count=0,
+    )
+    widget = types.SimpleNamespace(
+        _analysis_tab=types.SimpleNamespace(apply_cluster_colors=lambda: summary),
+        _render_status_label=_DummyLabel(),
+        _refresh_apply_existing_clusters_button=MagicMock(),
+    )
+
+    NeuronViewerWidget._apply_existing_clusters_from_analysis(widget)
+
+    assert widget._render_status_label.text == ""
+    widget._refresh_apply_existing_clusters_button.assert_called_once_with()
 
 
 def test_clear_neuron_table_preserves_scene_render_modes() -> None:

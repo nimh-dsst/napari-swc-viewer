@@ -70,8 +70,9 @@ class _HeatmapRequest:
 
 @dataclass(frozen=True)
 class _ClusterColorApplicationSummary:
-    """Summary of cluster-color application to currently rendered layers."""
+    """Summary of cached cluster application to the table and rendered layers."""
 
+    matched_table_count: int
     updated_layer_count: int
     rendered_count: int
     colored_count: int
@@ -376,6 +377,47 @@ class AnalysisTabWidget(QWidget):
     def set_current_table_file_ids_provider(self, provider) -> None:
         """Set a callback returning the current neuron-table file IDs."""
         self._current_table_file_ids_provider = provider
+
+    def _raw_current_table_file_ids(self) -> list[object]:
+        """Return current neuron-table file IDs from the configured provider."""
+        provider = self.__dict__.get("_current_table_file_ids_provider")
+        if not callable(provider):
+            return []
+        try:
+            file_ids = provider()
+        except Exception:
+            return []
+        if file_ids is None:
+            return []
+        return list(file_ids)
+
+    def _matched_current_table_file_ids(self) -> list[object]:
+        """Return current table file IDs that exist in the cached cluster result."""
+        result = getattr(self, "_last_cluster_result", None)
+        if result is None:
+            return []
+
+        current_file_ids = self._raw_current_table_file_ids()
+        if not current_file_ids:
+            return []
+
+        result_ids = list(getattr(result, "neuron_ids", []))
+        if not result_ids:
+            return []
+
+        result_id_set = set(result_ids)
+        result_id_strs = {str(file_id) for file_id in result_ids}
+        return [
+            file_id
+            for file_id in current_file_ids
+            if file_id in result_id_set or str(file_id) in result_id_strs
+        ]
+
+    def has_cached_clusters_for_current_table(self) -> bool:
+        """Return whether cached clustering overlaps the current table."""
+        if self._cluster_color_map is None or self._last_cluster_result is None:
+            return False
+        return bool(self._matched_current_table_file_ids())
 
     def _update_button_states(self) -> None:
         """Enable/disable buttons based on loaded data."""
@@ -938,10 +980,7 @@ class AnalysisTabWidget(QWidget):
 
     def _current_table_file_ids(self) -> list[str]:
         """Return file IDs currently present in the main neuron table."""
-        provider = getattr(self, "_current_table_file_ids_provider", None)
-        if not callable(provider):
-            return []
-        return [str(file_id) for file_id in provider()]
+        return [str(file_id) for file_id in self._raw_current_table_file_ids()]
 
     def _resolve_cluster_query_file_scope(
         self,
@@ -2265,9 +2304,26 @@ class AnalysisTabWidget(QWidget):
             batch_mode=len(updated_requests) > 1,
         )
 
-    def apply_cluster_colors(self) -> None:
-        """Reapply cached cluster colors to currently rendered neuron layers."""
-        self._color_neurons_by_cluster()
+    def apply_cluster_colors(self) -> _ClusterColorApplicationSummary:
+        """Reapply cached cluster colors and assignments to the current table."""
+        if self._cluster_color_map is None or self._last_cluster_result is None:
+            return _ClusterColorApplicationSummary(
+                matched_table_count=0,
+                updated_layer_count=0,
+                rendered_count=0,
+                colored_count=0,
+                gray_count=0,
+            )
+
+        summary = self._color_neurons_by_cluster()
+        try:
+            self.cluster_colors_updated.emit(
+                self._last_cluster_result,
+                self._cluster_color_map,
+            )
+        except RuntimeError:
+            pass
+        return summary
 
     def _color_neurons_by_cluster(self) -> _ClusterColorApplicationSummary:
         """Color existing neuron layers by their cluster assignment.
@@ -2284,6 +2340,7 @@ class AnalysisTabWidget(QWidget):
             or self._last_cluster_result is None
         ):
             return _ClusterColorApplicationSummary(
+                matched_table_count=0,
                 updated_layer_count=0,
                 rendered_count=0,
                 colored_count=0,
@@ -2291,6 +2348,7 @@ class AnalysisTabWidget(QWidget):
             )
 
         color_map = self._cluster_color_map
+        matched_table_count = len(self._matched_current_table_file_ids())
         default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
         n_rendered = 0
@@ -2335,6 +2393,7 @@ class AnalysisTabWidget(QWidget):
 
         n_gray = max(n_rendered - n_colored, 0)
         return _ClusterColorApplicationSummary(
+            matched_table_count=matched_table_count,
             updated_layer_count=updated,
             rendered_count=n_rendered,
             colored_count=n_colored,
