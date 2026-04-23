@@ -4212,6 +4212,7 @@ class NeuronViewerWidget(QWidget):
         """Handle cluster color updates from the analysis tab."""
         self._neuron_table.update_cluster_assignments(result)
         self._neuron_table.update_colors(color_map, emit_signal=False)
+        self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
 
     def _clear_neuron_layers(self, reset_render_state: bool = True) -> None:

@@ -1349,6 +1349,34 @@ def test_refresh_neuron_table_summary_formats_counts_and_clusters() -> None:
     )
 
 
+def test_on_cluster_colors_updated_sorts_and_refreshes_filters() -> None:
+    neuron_table = types.SimpleNamespace(
+        update_cluster_assignments=MagicMock(),
+        update_colors=MagicMock(),
+        sort_by_cluster=MagicMock(),
+    )
+    widget = types.SimpleNamespace(
+        _neuron_table=neuron_table,
+        _refresh_cluster_filter_controls=MagicMock(),
+    )
+    result = types.SimpleNamespace(neuron_ids=["n1"])
+    color_map = {"n1": [0.1, 0.2, 0.3, 1.0]}
+
+    NeuronViewerWidget._on_cluster_colors_updated(
+        widget,
+        result,
+        color_map,
+    )
+
+    neuron_table.update_cluster_assignments.assert_called_once_with(result)
+    neuron_table.update_colors.assert_called_once_with(
+        color_map,
+        emit_signal=False,
+    )
+    neuron_table.sort_by_cluster.assert_called_once_with()
+    widget._refresh_cluster_filter_controls.assert_called_once_with()
+
+
 def test_clear_neuron_table_preserves_scene_render_modes() -> None:
     table = types.SimpleNamespace(
         _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},

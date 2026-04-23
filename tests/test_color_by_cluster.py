@@ -95,8 +95,8 @@ class TestColorByClusterLines:
         np.testing.assert_array_almost_equal(color_array[2], expected_default)
         np.testing.assert_array_almost_equal(color_array[4], expected_default)
 
-    def test_no_lines_layer_reports_table_cluster_updates(self):
-        """Status text should still report clustered neurons when no layers are rendered."""
+    def test_no_lines_layer_returns_empty_render_summary(self):
+        """No rendered layers should return a zeroed color-application summary."""
         from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
@@ -110,12 +110,12 @@ class TestColorByClusterLines:
         widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
-        widget._color_neurons_by_cluster()
+        summary = widget._color_neurons_by_cluster()
 
-        assert widget._progress_label.setText.call_count >= 1
-        msg = widget._progress_label.setText.call_args[0][0]
-        assert "table 2 clustered neurons" in msg
-        assert "rendered" not in msg
+        assert summary.updated_layer_count == 0
+        assert summary.rendered_count == 0
+        assert summary.colored_count == 0
+        assert summary.gray_count == 0
 
 
 class TestCustomColorsSmallClusters:
@@ -323,7 +323,7 @@ class TestColorByClusterBothLayers:
     """Test that both lines and points layers are updated together."""
 
     def test_both_layers_counted(self):
-        """Progress message reports 2 layer(s) when both exist."""
+        """Color summary counts both updated layers and one rendered neuron."""
         from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
@@ -348,10 +348,12 @@ class TestColorByClusterBothLayers:
         widget._build_cluster_color_map()
         widget._progress_label = MagicMock()
 
-        widget._color_neurons_by_cluster()
+        summary = widget._color_neurons_by_cluster()
 
-        msg = widget._progress_label.setText.call_args[0][0]
-        assert "1/1 neurons" in msg
+        assert summary.updated_layer_count == 2
+        assert summary.rendered_count == 1
+        assert summary.colored_count == 1
+        assert summary.gray_count == 0
 
 
 class TestSliceProjectorColorUpdate:

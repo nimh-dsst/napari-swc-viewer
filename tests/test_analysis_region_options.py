@@ -1212,6 +1212,8 @@ def test_on_correlation_finished_leaves_clustermap_unrendered():
     widget._n_clusters_spin.setValue(2)
     widget._progress_bar = _DummyProgressBar()
     widget._progress_label = _DummyLabel()
+    widget._viewer = _DummyViewer()
+    widget._slice_projector = None
     widget._update_button_states = lambda: None
     widget._update_cluster_filter_combo = lambda: None
     placeholder_messages: list[str] = []
@@ -1234,10 +1236,12 @@ def test_on_correlation_finished_leaves_clustermap_unrendered():
 
     assert widget._last_cluster_result is result
     assert draw_calls == []
-    assert emitted == []
+    assert emitted == [(result, widget._cluster_color_map)]
     assert placeholder_messages == [
         "Clustering complete. Click Render Dendrogram to view."
     ]
+    assert "Table updated and sorted by cluster." in widget._progress_label.text()
+    assert "Auto-colored" not in widget._progress_label.text()
 
 
 def test_render_clustermap_requires_button_press():
@@ -1256,37 +1260,41 @@ def test_render_clustermap_requires_button_press():
     assert draw_calls == [result]
 
 
-def test_color_neurons_by_cluster_emits_updates_only_on_button_press():
-    """Explicit cluster-color application should drive table updates and its own message."""
+def test_on_correlation_finished_auto_colors_rendered_layers_and_emits_updates():
+    """Clustering completion should auto-color rendered neurons and update the table."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
-    widget._viewer = _DummyViewer()
+    lines_layer = MagicMock()
+    lines_layer.name = "Neuron Lines"
+    lines_layer.metadata = {
+        "file_ids": ["n1", "n2"],
+        "segments_per_neuron": [3, 5],
+    }
+    widget._viewer = types.SimpleNamespace(layers=[lines_layer])
     widget._slice_projector = None
+    widget._n_clusters_spin = _DummySpinBox()
+    widget._n_clusters_spin.setValue(2)
     widget._progress_bar = _DummyProgressBar()
     widget._progress_label = _DummyLabel()
-    widget._last_cluster_result = types.SimpleNamespace(
-        neuron_ids=["n1", "n2"]
+    widget._update_button_states = lambda: None
+    widget._update_cluster_filter_combo = lambda: None
+    result = types.SimpleNamespace(
+        neuron_ids=["n1", "n2"],
+        labels=np.array([1, 2], dtype=np.int32),
     )
-    widget._cluster_color_map = {
-        "n1": [0.12, 0.47, 0.71, 1.0],
-        "n2": [0.84, 0.15, 0.16, 1.0],
-    }
-    widget._actual_n_clusters = 2
     emitted: list[tuple[object, dict]] = []
     widget.cluster_colors_updated.connect(
         lambda result, color_map: emitted.append((result, color_map))
     )
-    widget._flush_progress_updates = lambda: None
 
-    widget._color_neurons_by_cluster()
+    widget._on_correlation_finished(result)
 
-    assert emitted == [
-        (widget._last_cluster_result, widget._cluster_color_map)
-    ]
-    assert (
-        widget._progress_label.text()
-        == "Applied cluster colors: table 2 clustered neurons (2 clusters)"
-    )
+    color_array = lines_layer.edge_color
+    assert isinstance(color_array, np.ndarray)
+    assert color_array.shape == (8, 4)
+    assert emitted == [(result, widget._cluster_color_map)]
+    assert "Table updated and sorted by cluster." in widget._progress_label.text()
+    assert "Auto-colored 2/2 rendered neurons by cluster." in widget._progress_label.text()
 
 
 def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
@@ -1778,6 +1786,8 @@ def test_on_correlation_finished_emits_debug_logs(caplog):
     widget._n_clusters_spin = types.SimpleNamespace(value=lambda: 5)
     widget._progress_bar = _DummyProgressBar()
     widget._progress_label = _DummyLabel()
+    widget._viewer = _DummyViewer()
+    widget._slice_projector = None
     widget._clustermap_status_label = _DummyLabel()
     widget._build_clustermap_btn = _DummyButton("Build Dendrogram")
     widget._update_button_states = MagicMock()

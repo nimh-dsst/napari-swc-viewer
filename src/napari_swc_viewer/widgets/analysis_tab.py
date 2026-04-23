@@ -5,7 +5,7 @@ Provides UI for:
 2. Correlation matrix computation with hierarchical clustering
 3. Clustermap visualization (embedded matplotlib canvas)
 4. Node count heatmap generation
-5. Coloring neurons by cluster assignment
+5. Applying neuron colors by cluster assignment
 """
 
 from __future__ import annotations
@@ -66,6 +66,16 @@ class _HeatmapRequest:
     file_ids: tuple[str, ...] | None
     depth_bin_factor: int
     depth_axis: int
+
+
+@dataclass(frozen=True)
+class _ClusterColorApplicationSummary:
+    """Summary of cluster-color application to currently rendered layers."""
+
+    updated_layer_count: int
+    rendered_count: int
+    colored_count: int
+    gray_count: int
 
 
 def _analysis_heatmap_contrast_limits(
@@ -387,7 +397,6 @@ class AnalysisTabWidget(QWidget):
                 has_cluster_heatmap_options
             )
         analysis_ready = self._last_cluster_result is not None and not busy
-        self._color_by_cluster_btn.setEnabled(analysis_ready)
         if hasattr(self, "_render_clustermap_btn"):
             self._render_clustermap_btn.setEnabled(analysis_ready)
         if hasattr(self, "_build_clustermap_btn"):
@@ -570,14 +579,6 @@ class AnalysisTabWidget(QWidget):
         self._run_corr_btn.setEnabled(False)
         self._run_corr_btn.clicked.connect(self._run_clustering_pipeline)
         corr_layout.addWidget(self._run_corr_btn)
-
-        # Color neurons by cluster
-        self._color_by_cluster_btn = QPushButton("Color Neurons by Cluster")
-        self._color_by_cluster_btn.setEnabled(False)
-        self._color_by_cluster_btn.clicked.connect(
-            self._color_neurons_by_cluster
-        )
-        corr_layout.addWidget(self._color_by_cluster_btn)
 
         layout.addWidget(self._clustering_section)
 
@@ -1527,6 +1528,7 @@ class AnalysisTabWidget(QWidget):
         self._last_cluster_result = result
         color_map_start = perf_counter()
         self._build_cluster_color_map()
+        color_summary = self._color_neurons_by_cluster()
         logger.debug(
             "_on_correlation_finished color map built: elapsed=%.3fs actual_clusters=%d",
             perf_counter() - color_map_start,
@@ -1542,10 +1544,25 @@ class AnalysisTabWidget(QWidget):
             )
         else:
             cluster_msg = f"{actual_k} clusters"
-        self._progress_label.setText(
+        progress_message = (
             f"Clustering complete: {len(result.neuron_ids)} neurons, "
-            f"{cluster_msg}. Click Render Dendrogram to view."
+            f"{cluster_msg}. Click Render Dendrogram to view. "
+            "Table updated and sorted by cluster."
         )
+        if color_summary.colored_count > 0 and color_summary.rendered_count > 0:
+            neuron_word = (
+                "neuron" if color_summary.rendered_count == 1 else "neurons"
+            )
+            progress_message += (
+                f" Auto-colored {color_summary.colored_count}/"
+                f"{color_summary.rendered_count} rendered {neuron_word} "
+                "by cluster."
+            )
+            if color_summary.gray_count > 0:
+                progress_message += (
+                    f" {color_summary.gray_count} shown in gray."
+                )
+        self._progress_label.setText(progress_message)
         clustermap_message = (
             "Clustering complete. Click 'Build Dendrogram' to render the cluster map."
         )
@@ -1564,14 +1581,9 @@ class AnalysisTabWidget(QWidget):
         logger.debug(
             "_on_correlation_finished worker result ready; clustermap render deferred until button click"
         )
-        if (
-            self._cluster_color_map is not None
-            and getattr(self, "_clustermap_status_label", None) is not None
-        ):
+        if self._cluster_color_map is not None:
             try:
-                self.cluster_colors_updated.emit(
-                    result, self._cluster_color_map
-                )
+                self.cluster_colors_updated.emit(result, self._cluster_color_map)
             except RuntimeError:
                 pass
         logger.debug(
@@ -1985,10 +1997,9 @@ class AnalysisTabWidget(QWidget):
     def _build_cluster_color_map(self) -> None:
         """Build and cache the neuron_id -> RGBA color mapping from cluster results.
 
-        Called once when clustering completes.  The cached map is reused
-        on every subsequent ``apply_cluster_colors`` / button-click so
-        that colors are deterministic regardless of which neurons are
-        currently rendered.
+        Called once when clustering completes. The cached map is reused
+        when rendered neurons are auto-colored after clustering and when
+        cached colors are reapplied manually.
         """
         if self._last_cluster_result is None:
             self._cluster_color_map = None
@@ -2255,41 +2266,31 @@ class AnalysisTabWidget(QWidget):
         )
 
     def apply_cluster_colors(self) -> None:
-        """Apply cached cluster colors to currently rendered neuron layers.
-
-        Safe to call at any time. Does nothing if no cluster result exists.
-        This is intentionally explicit and should be triggered by the
-        'Color Neurons by Cluster' button, not by clustering completion.
-        """
+        """Reapply cached cluster colors to currently rendered neuron layers."""
         self._color_neurons_by_cluster()
 
-    def _color_neurons_by_cluster(self) -> None:
+    def _color_neurons_by_cluster(self) -> _ClusterColorApplicationSummary:
         """Color existing neuron layers by their cluster assignment.
 
         Works with the batched single-layer rendering where all neurons
         are merged into one ``Neuron Lines`` and/or ``Neuron Points``
         layer.  Layer metadata (``file_ids``, ``segments_per_neuron``,
         ``file_ids_per_point``) is used to map cluster labels back to
-        individual segments/points.
+        individual segments/points. Returns a small summary for status
+        text composed by the caller.
         """
         if (
             self._cluster_color_map is None
             or self._last_cluster_result is None
         ):
-            return
-
-        progress_bar = self.__dict__.get("_progress_bar")
-        progress_label = self.__dict__.get("_progress_label")
-        if progress_bar is not None:
-            progress_bar.setVisible(True)
-            progress_bar.setRange(0, 0)
-        if progress_label is not None:
-            progress_label.setText("Applying cluster colors...")
-        self._flush_progress_updates()
+            return _ClusterColorApplicationSummary(
+                updated_layer_count=0,
+                rendered_count=0,
+                colored_count=0,
+                gray_count=0,
+            )
 
         color_map = self._cluster_color_map
-        clustered_total = len(self._last_cluster_result.neuron_ids)
-        n_clusters = self._actual_n_clusters
         default_color = [0.5, 0.5, 0.5, 1.0]
         updated = 0
         n_rendered = 0
@@ -2332,26 +2333,13 @@ class AnalysisTabWidget(QWidget):
         if self._slice_projector is not None:
             self._slice_projector.update_neuron_colors(color_map)
 
-        try:
-            self.cluster_colors_updated.emit(
-                self._last_cluster_result, color_map
-            )
-        except RuntimeError:
-            pass
-
-        n_gray = n_rendered - n_colored
-        msg = (
-            f"Applied cluster colors: table {clustered_total} clustered neurons "
-            f"({n_clusters} clusters)"
+        n_gray = max(n_rendered - n_colored, 0)
+        return _ClusterColorApplicationSummary(
+            updated_layer_count=updated,
+            rendered_count=n_rendered,
+            colored_count=n_colored,
+            gray_count=n_gray,
         )
-        if n_rendered > 0:
-            msg += f"; rendered {n_colored}/{n_rendered} neurons"
-            if n_gray > 0:
-                msg += f" — {n_gray} neuron(s) not in region shown in gray"
-        if progress_bar is not None:
-            progress_bar.setVisible(False)
-        if progress_label is not None:
-            progress_label.setText(msg)
 
     def _flush_progress_updates(self) -> None:
         """Give Qt a chance to repaint synchronous progress text."""
