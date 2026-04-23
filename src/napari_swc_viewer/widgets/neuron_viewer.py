@@ -538,6 +538,14 @@ class NeuronViewerWidget(QWidget):
         self._recolor_cluster_btn.clicked.connect(self._recolor_selected_cluster)
         cluster_row.addWidget(self._recolor_cluster_btn)
 
+        self._apply_existing_clusters_btn = QPushButton("Apply Existing Clusters")
+        self._apply_existing_clusters_btn.setEnabled(False)
+        self._apply_existing_clusters_btn.setVisible(False)
+        self._apply_existing_clusters_btn.clicked.connect(
+            self._apply_existing_clusters_from_analysis
+        )
+        cluster_row.addWidget(self._apply_existing_clusters_btn)
+
         neurons_layout.addLayout(cluster_row)
 
         self._selected_neurons_hint_label = QLabel(
@@ -606,6 +614,7 @@ class NeuronViewerWidget(QWidget):
         self._render_status_label = QLabel("")
         neurons_layout.addWidget(self._render_status_label)
         self._refresh_neuron_table_summary()
+        self._refresh_apply_existing_clusters_button()
         self._update_selected_neuron_heatmap_controls()
 
         layout.addWidget(neurons_section)
@@ -3270,6 +3279,11 @@ class NeuronViewerWidget(QWidget):
         """Refresh derived UI and rendered colors after table membership changes."""
         self._last_soma_selection = set()
         self._refresh_cluster_filter_controls()
+        refresh_clusters = getattr(
+            self, "_refresh_apply_existing_clusters_button", None
+        )
+        if callable(refresh_clusters):
+            refresh_clusters()
         self._refresh_neuron_table_summary()
 
         selected_getter = getattr(self._neuron_table, "get_selected_file_ids", None)
@@ -3354,6 +3368,50 @@ class NeuronViewerWidget(QWidget):
         self._hide_others_btn.setEnabled(has_selected_cluster)
         self._recolor_cluster_btn.setEnabled(has_selected_cluster)
         self._show_all_btn.setEnabled(has_entries)
+
+    def _refresh_apply_existing_clusters_button(self) -> None:
+        """Show the cached-cluster reapply button only when it can do useful work."""
+        button = getattr(self, "_apply_existing_clusters_btn", None)
+        analysis_tab = getattr(self, "_analysis_tab", None)
+        if button is None:
+            return
+
+        has_overlap = False
+        checker = getattr(analysis_tab, "has_cached_clusters_for_current_table", None)
+        if callable(checker):
+            try:
+                has_overlap = bool(checker())
+            except Exception:
+                has_overlap = False
+
+        button.setVisible(has_overlap)
+        button.setEnabled(has_overlap)
+
+    def _apply_existing_clusters_from_analysis(self) -> None:
+        """Reapply cached cluster state to the current table and rendered neurons."""
+        analysis_tab = getattr(self, "_analysis_tab", None)
+        applier = getattr(analysis_tab, "apply_cluster_colors", None)
+        if not callable(applier):
+            return
+
+        summary = applier()
+        matched_table_count = int(getattr(summary, "matched_table_count", 0))
+        if matched_table_count <= 0:
+            self._refresh_apply_existing_clusters_button()
+            return
+
+        message = f"Applied cached cluster data to {matched_table_count} table neuron(s)."
+        rendered_count = int(getattr(summary, "rendered_count", 0))
+        if rendered_count > 0:
+            colored_count = int(getattr(summary, "colored_count", 0))
+            message += (
+                f" Recolored {colored_count}/{rendered_count} rendered neuron(s)."
+            )
+            gray_count = int(getattr(summary, "gray_count", 0))
+            if gray_count > 0:
+                message += f" {gray_count} shown in gray."
+
+        self._render_status_label.setText(message)
 
     def _hide_not_in_selected_cluster(self) -> None:
         """Set visibility off for neurons not in the selected cluster."""
@@ -4212,7 +4270,9 @@ class NeuronViewerWidget(QWidget):
         """Handle cluster color updates from the analysis tab."""
         self._neuron_table.update_cluster_assignments(result)
         self._neuron_table.update_colors(color_map, emit_signal=False)
+        self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
+        self._refresh_apply_existing_clusters_button()
 
     def _clear_neuron_layers(self, reset_render_state: bool = True) -> None:
         """Remove all current neuron layers and optionally reset scene state."""

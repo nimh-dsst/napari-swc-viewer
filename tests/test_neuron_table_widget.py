@@ -63,6 +63,7 @@ class _DummyTable:
         self._user_role = user_role
         self._sorting_enabled = True
         self._signals_blocked = False
+        self.sort_calls: list[tuple[int, object]] = []
 
     def rowCount(self) -> int:
         return len(self._file_ids)
@@ -102,6 +103,9 @@ class _DummyTable:
 
     def set_file_id(self, row: int, file_id: object) -> None:
         self._file_ids[row] = file_id
+
+    def sortByColumn(self, column: int, order) -> None:
+        self.sort_calls.append((column, order))
 
 
 def _make_widget(module, entries_by_file_id: dict[object, object]):
@@ -183,3 +187,20 @@ def test_neuron_table_remove_file_ids_preserves_remaining_entry_state() -> None:
     assert widget.available_cluster_ids() == [5]
     assert widget.selection_changed.calls == [([],)]
     assert len(widget.state_changed.calls) == 1
+
+
+def test_neuron_table_sort_by_cluster_delegates_to_cluster_column_sort() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1", cluster_id=2),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2", cluster_id=1),
+        },
+    )
+
+    widget.sort_by_cluster()
+
+    assert widget._table.sort_calls == [
+        (module.COL_CLUSTER, module.Qt.AscendingOrder)
+    ]

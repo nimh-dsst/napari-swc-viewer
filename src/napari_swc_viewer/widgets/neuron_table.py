@@ -523,6 +523,10 @@ class NeuronTableWidget(QWidget):
         if changed:
             self.colors_changed.emit(changed)
 
+    def sort_by_cluster(self) -> None:
+        """Sort rows by ascending numeric cluster assignment."""
+        self._table.sortByColumn(COL_CLUSTER, Qt.AscendingOrder)
+
     def update_cluster_assignments(self, result: ClusterResult) -> None:
         """Update the Cluster column from a ClusterResult.
 
