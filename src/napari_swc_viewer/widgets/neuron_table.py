@@ -323,6 +323,35 @@ class NeuronTableWidget(QWidget):
         if btn is not None:
             self._apply_color_style(btn, color)
 
+    def _entries_in_table_order(self) -> list[NeuronEntry]:
+        """Return tracked entries in the table's current row order."""
+        ordered: list[NeuronEntry] = []
+        for _row, file_id in self._iter_rows_with_file_ids():
+            entry = self._entries.get(file_id)
+            if entry is not None:
+                ordered.append(entry)
+        return ordered
+
+    def _replace_entries(self, entries: list[NeuronEntry]) -> None:
+        """Replace the table contents with the provided entries."""
+        sorting_enabled = self._table.isSortingEnabled()
+        signals_blocked = self._table.blockSignals(True)
+        self._table.setSortingEnabled(False)
+        try:
+            self._table.clearSelection()
+            self._table.clearContents()
+            self._table.setRowCount(0)
+            self._entries = {entry.file_id: entry for entry in entries}
+            self._table.setRowCount(len(entries))
+            for row, entry in enumerate(entries):
+                self._populate_row(row, entry)
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
+            self._table.blockSignals(signals_blocked)
+
+        self.selection_changed.emit([])
+        self.state_changed.emit()
+
     # --- Public API ---
 
     def get_selected_file_ids(self) -> list[object]:
@@ -348,6 +377,10 @@ class NeuronTableWidget(QWidget):
         """Return a mapping of all file_ids to their visibility state."""
         return {fid: e.visible for fid, e in self._entries.items()}
 
+    def file_ids(self) -> list[object]:
+        """Return the file_ids currently shown in the table row order."""
+        return [file_id for _row, file_id in self._iter_rows_with_file_ids()]
+
     def summary(self) -> NeuronTableSummary:
         """Return summary counts for the current table contents."""
         return summarize_neuron_table(
@@ -370,6 +403,30 @@ class NeuronTableWidget(QWidget):
             self._table.blockSignals(signals_blocked)
 
         self.state_changed.emit()
+
+    def retain_file_ids(
+        self,
+        file_ids: list[object] | tuple[object, ...],
+    ) -> None:
+        """Keep only the supplied neuron IDs while preserving survivor state."""
+        keep_ids = set(file_ids)
+        survivors = [
+            entry for entry in self._entries_in_table_order()
+            if entry.file_id in keep_ids
+        ]
+        self._replace_entries(survivors)
+
+    def remove_file_ids(
+        self,
+        file_ids: list[object] | tuple[object, ...],
+    ) -> None:
+        """Remove the supplied neuron IDs while preserving survivor state."""
+        remove_ids = set(file_ids)
+        survivors = [
+            entry for entry in self._entries_in_table_order()
+            if entry.file_id not in remove_ids
+        ]
+        self._replace_entries(survivors)
 
     def set_added_file_ids(self, file_ids_in_scene: set[object] | list[object]) -> None:
         """Set whether each neuron is currently added to the scene."""

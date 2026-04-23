@@ -223,9 +223,23 @@ def test_get_neurons_by_mask_supports_any_node_and_soma_only(tmp_path: Path) -> 
     with NeuronDatabase(parquet_path) as db:
         any_node = db.get_neurons_by_mask(mask, atlas, soma_only=False)
         soma_only = db.get_neurons_by_mask(mask, atlas, soma_only=True)
+        restricted_any_node = db.get_neurons_by_mask(
+            mask,
+            atlas,
+            soma_only=False,
+            file_ids=["file_a"],
+        )
+        restricted_soma_only = db.get_neurons_by_mask(
+            mask,
+            atlas,
+            soma_only=True,
+            file_ids=["file_a", "file_c"],
+        )
 
     assert any_node["file_id"].tolist() == ["file_a", "file_b"]
     assert soma_only["file_id"].tolist() == ["file_b"]
+    assert restricted_any_node["file_id"].tolist() == ["file_a"]
+    assert restricted_soma_only.empty
 
 
 def test_get_neurons_by_region_supports_any_node_and_soma_only(
@@ -255,8 +269,32 @@ def test_get_neurons_by_region_supports_any_node_and_soma_only(
         soma_only = db.get_neurons_by_region(["R1"], soma_only=True)
         any_node_by_id = db.get_neurons_by_region_id([101], soma_only=False)
         soma_only_by_id = db.get_neurons_by_region_id([101], soma_only=True)
+        restricted_any_node = db.get_neurons_by_region(
+            ["R1"],
+            soma_only=False,
+            file_ids=["file_a"],
+        )
+        restricted_soma_only = db.get_neurons_by_region(
+            ["R1"],
+            soma_only=True,
+            file_ids=["file_a", "file_c"],
+        )
+        restricted_any_node_by_id = db.get_neurons_by_region_id(
+            [101],
+            soma_only=False,
+            file_ids=["file_b"],
+        )
+        restricted_soma_only_by_id = db.get_neurons_by_region_id(
+            [101],
+            soma_only=True,
+            file_ids=["file_a"],
+        )
 
     assert any_node["file_id"].tolist() == ["file_a", "file_b"]
     assert soma_only["file_id"].tolist() == ["file_b"]
     assert any_node_by_id["file_id"].tolist() == ["file_a", "file_b"]
     assert soma_only_by_id["file_id"].tolist() == ["file_b"]
+    assert restricted_any_node["file_id"].tolist() == ["file_a"]
+    assert restricted_soma_only.empty
+    assert restricted_any_node_by_id["file_id"].tolist() == ["file_b"]
+    assert restricted_soma_only_by_id.empty

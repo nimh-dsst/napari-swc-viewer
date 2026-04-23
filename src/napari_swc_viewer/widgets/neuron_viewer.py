@@ -105,6 +105,9 @@ _POINT_PREVIEW_ORIGIN_COLUMN = 1
 _POINT_PREVIEW_COUNT_COLUMN = 2
 _SCENE_RENDER_MODE_FULL = "full"
 _SCENE_RENDER_MODE_SOMA = "soma"
+_REGION_QUERY_SCOPE_WHOLE = "whole"
+_REGION_QUERY_SCOPE_CURRENT = "current"
+_DEFAULT_NEURON_RGBA = (0.5, 0.5, 0.5, 1.0)
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -222,12 +225,14 @@ class NeuronViewerWidget(QWidget):
         self._last_soma_selection: set = set()  # track to skip no-op highlights
         self._auto_center_applied_once = False
         self._region_query_source = "Atlas Regions"
+        self._region_query_scope = _REGION_QUERY_SCOPE_WHOLE
         self._mask_bounds_source = "manual"
         self._histogram_line_sync_active = False
         self._point_parquet_path: str | None = None
         self._point_parquet_has_origin_csv = False
         self._point_preview_counts: dict[tuple[str, str], int] = {}
         self._scene_render_modes: dict[object, str] = {}
+        self._scene_display_state: dict[object, dict[str, object]] = {}
 
         # Slice projection for 2D viewing
         self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
@@ -292,6 +297,9 @@ class NeuronViewerWidget(QWidget):
         # Analysis tab
         self._analysis_tab = AnalysisTabWidget(self.viewer)
         self._analysis_tab.set_slice_projector(self._slice_projector)
+        self._analysis_tab.set_current_table_file_ids_provider(
+            self._current_table_file_ids
+        )
         self._analysis_tab.cluster_colors_updated.connect(
             self._on_cluster_colors_updated
         )
@@ -565,6 +573,12 @@ class NeuronViewerWidget(QWidget):
         )
         heatmap_btn_row.addWidget(self._add_selected_heatmap_btn)
 
+        self._remove_selected_from_table_btn = QPushButton("Remove Selected From Table")
+        self._remove_selected_from_table_btn.clicked.connect(
+            self._remove_selected_from_table
+        )
+        heatmap_btn_row.addWidget(self._remove_selected_from_table_btn)
+
         self._clear_table_btn = QPushButton("Clear Table")
         self._clear_table_btn.clicked.connect(self._clear_neuron_table)
         heatmap_btn_row.addWidget(self._clear_table_btn)
@@ -621,14 +635,46 @@ class NeuronViewerWidget(QWidget):
         source_row.addWidget(self._region_query_source_combo)
         layout.addLayout(source_row)
 
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Search scope:"))
+        self._region_query_scope_combo = QComboBox()
+        self._region_query_scope_combo.addItem("Whole Parquet", _REGION_QUERY_SCOPE_WHOLE)
+        self._region_query_scope_combo.addItem("Current Table", _REGION_QUERY_SCOPE_CURRENT)
+        self._region_query_scope_combo.currentTextChanged.connect(
+            self._on_region_query_scope_changed
+        )
+        scope_row.addWidget(self._region_query_scope_combo)
+        layout.addLayout(scope_row)
+
         self._region_query_stack = QStackedWidget()
 
         atlas_page = QWidget()
         atlas_layout = QVBoxLayout(atlas_page)
         atlas_layout.setContentsMargins(0, 0, 0, 0)
-        self._region_selector = RegionSelectorWidget()
-        self._region_selector.selection_changed.connect(self._on_regions_selected)
-        atlas_layout.addWidget(self._region_selector)
+
+        self._atlas_region_scope_stack = QStackedWidget()
+
+        whole_page = QWidget()
+        whole_layout = QVBoxLayout(whole_page)
+        whole_layout.setContentsMargins(0, 0, 0, 0)
+        self._whole_parquet_region_selector = RegionSelectorWidget()
+        self._whole_parquet_region_selector.selection_changed.connect(
+            self._on_regions_selected
+        )
+        whole_layout.addWidget(self._whole_parquet_region_selector)
+        self._atlas_region_scope_stack.addWidget(whole_page)
+
+        current_page = QWidget()
+        current_layout = QVBoxLayout(current_page)
+        current_layout.setContentsMargins(0, 0, 0, 0)
+        self._current_table_region_selector = RegionSelectorWidget()
+        self._current_table_region_selector.selection_changed.connect(
+            self._on_regions_selected
+        )
+        current_layout.addWidget(self._current_table_region_selector)
+        self._atlas_region_scope_stack.addWidget(current_page)
+
+        atlas_layout.addWidget(self._atlas_region_scope_stack)
         self._region_query_stack.addWidget(atlas_page)
 
         mask_page = QWidget()
@@ -1123,7 +1169,21 @@ class NeuronViewerWidget(QWidget):
 
         try:
             self._atlas = BrainGlobeAtlas(atlas_name)
-            self._region_selector.set_atlas(self._atlas)
+            selectors = []
+            for attr_name in (
+                "_whole_parquet_region_selector",
+                "_current_table_region_selector",
+                "_region_selector",
+            ):
+                selector = getattr(self, attr_name, None)
+                if selector is None or selector in selectors:
+                    continue
+                selectors.append(selector)
+
+            for selector in selectors:
+                set_atlas = getattr(selector, "set_atlas", None)
+                if callable(set_atlas):
+                    set_atlas(self._atlas)
             self._atlas_status_label.setText(
                 f"Atlas: {atlas_name} ({len(self._atlas.structures)} structures)"
             )
@@ -2837,11 +2897,159 @@ class NeuronViewerWidget(QWidget):
 
         show_mask_buttons = text == "Mask Layer"
         self._region_query_stack.setCurrentIndex(1 if show_mask_buttons else 0)
+        self._sync_region_query_scope_selector()
         for button in self._atlas_region_query_buttons():
             button.setVisible(not show_mask_buttons)
         for button in self._mask_layer_query_buttons():
             button.setVisible(show_mask_buttons)
         self._regions_status_label.setText("")
+        if not show_mask_buttons:
+            self._sync_active_region_reference_layers()
+
+    def _on_region_query_scope_changed(self, _text: str) -> None:
+        """Track the current region-query scope selection."""
+        self._region_query_scope = self._selected_region_query_scope()
+        self._sync_region_query_scope_selector()
+        if hasattr(self, "_regions_status_label"):
+            self._regions_status_label.setText("")
+        if getattr(self, "_region_query_source", "Atlas Regions") == "Atlas Regions":
+            self._sync_active_region_reference_layers()
+
+    def _selected_region_query_scope(self) -> str:
+        """Return the active search scope for region and mask queries."""
+        combo = getattr(self, "_region_query_scope_combo", None)
+        if combo is None:
+            scope = getattr(self, "_region_query_scope", _REGION_QUERY_SCOPE_WHOLE)
+            if scope in {_REGION_QUERY_SCOPE_WHOLE, _REGION_QUERY_SCOPE_CURRENT}:
+                return scope
+            return _REGION_QUERY_SCOPE_WHOLE
+
+        current_data = getattr(combo, "currentData", None)
+        if callable(current_data):
+            data = current_data()
+            if data in {_REGION_QUERY_SCOPE_WHOLE, _REGION_QUERY_SCOPE_CURRENT}:
+                return str(data)
+
+        current_text = getattr(combo, "currentText", None)
+        text = current_text() if callable(current_text) else ""
+        if text == "Current Table":
+            return _REGION_QUERY_SCOPE_CURRENT
+        return _REGION_QUERY_SCOPE_WHOLE
+
+    def _current_table_file_ids(self) -> list[object]:
+        """Return the file IDs currently present in the neuron table."""
+        table = getattr(self, "_neuron_table", None)
+        if table is None:
+            return []
+
+        file_ids_getter = getattr(table, "file_ids", None)
+        if callable(file_ids_getter):
+            return list(file_ids_getter())
+
+        entries = getattr(table, "_entries", {})
+        return list(entries.keys())
+
+    def _resolve_region_query_file_scope(
+        self,
+    ) -> tuple[bool, list[object] | None, str, int | None]:
+        """Resolve the optional base file-ID restriction for region queries."""
+        scope = self._selected_region_query_scope()
+        if scope != _REGION_QUERY_SCOPE_CURRENT:
+            return True, None, "whole parquet", None
+
+        file_ids = self._current_table_file_ids()
+        if file_ids:
+            return True, file_ids, "current table", len(file_ids)
+
+        self._regions_status_label.setText(
+            "Current table is empty; switch search scope to Whole Parquet or populate the table first."
+        )
+        return False, None, "current table", 0
+
+    @staticmethod
+    def _query_scope_status_suffix(scope_label: str, input_count: int | None) -> str:
+        """Format a scope-aware suffix for query status messages."""
+        suffix = f" within {scope_label}"
+        if input_count is not None:
+            suffix += f" (from {input_count} input neurons)"
+        return suffix
+
+    def _region_selector_for_scope(
+        self,
+        scope: str | None = None,
+    ) -> RegionSelectorWidget | None:
+        """Return the atlas-region selector widget for the requested scope."""
+        selected_scope = scope
+        if selected_scope not in {
+            _REGION_QUERY_SCOPE_WHOLE,
+            _REGION_QUERY_SCOPE_CURRENT,
+        }:
+            selected_scope = self._selected_region_query_scope()
+
+        if selected_scope == _REGION_QUERY_SCOPE_CURRENT:
+            selector = getattr(self, "_current_table_region_selector", None)
+            if selector is not None:
+                return selector
+        else:
+            selector = getattr(self, "_whole_parquet_region_selector", None)
+            if selector is not None:
+                return selector
+
+        return getattr(self, "_region_selector", None)
+
+    def _active_region_selector(self) -> RegionSelectorWidget | None:
+        """Return the atlas-region selector for the current search scope."""
+        return self._region_selector_for_scope()
+
+    def _active_region_preview_acronyms(self) -> list[str]:
+        """Return directly selected atlas acronyms for preview layers."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+
+        get_selected = getattr(selector, "get_selected_acronyms", None)
+        if not callable(get_selected):
+            return []
+        return list(get_selected(include_children=False))
+
+    def _sync_region_query_scope_selector(self) -> None:
+        """Show the atlas selector that matches the active query scope."""
+        stack = getattr(self, "_atlas_region_scope_stack", None)
+        if stack is None:
+            return
+
+        index = (
+            1
+            if self._selected_region_query_scope() == _REGION_QUERY_SCOPE_CURRENT
+            else 0
+        )
+        stack.setCurrentIndex(index)
+
+    def _sync_active_region_reference_layers(self) -> None:
+        """Refresh region preview layers from the active atlas selector."""
+        acronyms = self._active_region_preview_acronyms()
+
+        show_meshes = getattr(self, "_show_region_meshes_cb", None)
+        if show_meshes is not None and show_meshes.isChecked():
+            self._update_region_meshes(acronyms)
+
+        show_segmentation = getattr(self, "_show_region_seg_cb", None)
+        if show_segmentation is not None and show_segmentation.isChecked():
+            self._update_region_segmentation(acronyms)
+
+    @staticmethod
+    def _atlas_query_details(
+        acronyms: list[str],
+        *,
+        include_children: bool,
+    ) -> str:
+        """Format the exact atlas-region query that was executed."""
+        if len(acronyms) == 1:
+            selection = acronyms[0]
+        else:
+            selection = f"union of {', '.join(acronyms)}"
+        descendants = "on" if include_children else "off"
+        return f"Query: {selection}; descendants: {descendants}."
 
     def _atlas_region_query_buttons(self) -> tuple[QPushButton, QPushButton]:
         """Return the atlas-region query buttons."""
@@ -2899,38 +3107,73 @@ class NeuronViewerWidget(QWidget):
 
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
+        _ = acronyms
+        preview_acronyms = self._active_region_preview_acronyms()
+
         # Update region meshes if enabled
         if self._show_region_meshes_cb.isChecked():
-            self._update_region_meshes(acronyms)
+            self._update_region_meshes(preview_acronyms)
 
         # Update region segmentation if enabled
         if self._show_region_seg_cb.isChecked():
-            parent_acronyms = self._region_selector.get_selected_acronyms(
-                include_children=False
-            )
-            self._update_region_segmentation(parent_acronyms)
+            self._update_region_segmentation(preview_acronyms)
 
     def _query_neurons_by_region(self, soma_only: bool = False) -> None:
         """Query neurons in selected regions."""
         if self._db is None:
             return
 
-        acronyms = self._region_selector.get_query_acronyms()
+        selector = self._active_region_selector()
+        if selector is None:
+            self._regions_status_label.setText("Select at least one atlas region.")
+            return
+
+        get_query_acronyms = getattr(selector, "get_query_acronyms", None)
+        acronyms = list(get_query_acronyms()) if callable(get_query_acronyms) else []
         if not acronyms:
             self._regions_status_label.setText("Select at least one atlas region.")
             return
 
         try:
-            result = self._db.get_neurons_by_region(acronyms, soma_only=soma_only)
-            self._populate_neuron_table(result)
+            proceed, base_file_ids, scope_label, input_count = (
+                self._resolve_region_query_file_scope()
+            )
+            if not proceed:
+                return
+
+            result = self._db.get_neurons_by_region(
+                acronyms,
+                soma_only=soma_only,
+                file_ids=base_file_ids,
+            )
+            self._populate_neuron_table(
+                result,
+                preserve_existing=base_file_ids is not None,
+            )
             membership = "soma" if soma_only else "any node"
+            include_children = False
+            include_children_enabled = getattr(
+                selector,
+                "include_children_enabled",
+                None,
+            )
+            if callable(include_children_enabled):
+                include_children = bool(include_children_enabled())
+            query_details = NeuronViewerWidget._atlas_query_details(
+                acronyms,
+                include_children=include_children,
+            )
             self._regions_status_label.setText(
-                f"Found {len(result)} neuron(s) with {membership} in selected atlas regions."
+                "Found "
+                f"{len(result)} neuron(s) with {membership} in selected atlas regions"
+                f"{self._query_scope_status_suffix(scope_label, input_count)}. "
+                f"{query_details}"
             )
             logger.info(
-                "Found %d neurons with %s in selected atlas regions",
+                "Found %d neurons with %s in selected atlas regions within %s",
                 len(result),
                 membership,
+                scope_label,
             )
 
         except Exception as e:
@@ -2955,34 +3198,111 @@ class NeuronViewerWidget(QWidget):
             return
 
         try:
-            result = self._db.get_neurons_by_mask(mask, self._atlas, soma_only=soma_only)
-            self._populate_neuron_table(result)
+            proceed, base_file_ids, scope_label, input_count = (
+                self._resolve_region_query_file_scope()
+            )
+            if not proceed:
+                return
+
+            result = self._db.get_neurons_by_mask(
+                mask,
+                self._atlas,
+                soma_only=soma_only,
+                file_ids=base_file_ids,
+            )
+            self._populate_neuron_table(
+                result,
+                preserve_existing=base_file_ids is not None,
+            )
             membership = "soma" if soma_only else "any node"
             selected_names = ", ".join(layer.name for layer in layers[:3])
             if len(layers) > 3:
                 selected_names += ", ..."
             self._regions_status_label.setText(
-                f"Found {len(result)} neuron(s) with {membership} in {len(layers)} selected mask layer(s): {selected_names}"
+                "Found "
+                f"{len(result)} neuron(s) with {membership} in "
+                f"{len(layers)} selected mask layer(s)"
+                f"{self._query_scope_status_suffix(scope_label, input_count)}: "
+                f"{selected_names}"
             )
             logger.info(
-                "Found %d neurons with %s in %d selected mask layers",
+                "Found %d neurons with %s in %d selected mask layers within %s",
                 len(result),
                 membership,
                 len(layers),
+                scope_label,
             )
         except Exception as e:
             logger.error(f"Mask query failed: {e}")
             self._regions_status_label.setText(f"Mask query failed: {e}")
 
-    def _populate_neuron_table(self, result) -> None:
-        """Populate the neuron table from a query result."""
-        neurons = [
-            (row["file_id"], row["subject"])
-            for _, row in result.iterrows()
-        ]
-        self._neuron_table.populate(neurons)
-        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+    def _current_table_file_ids_in_scene(self) -> list[object]:
+        """Return the subset of current table IDs that are rendered in the scene."""
+        rendered = self._current_scene_file_ids()
+        return [file_id for file_id in self._current_table_file_ids() if file_id in rendered]
+
+    def _cache_scene_display_state(self, file_ids: list[object] | tuple[object, ...]) -> None:
+        """Preserve base color and visibility for rendered neurons leaving the table."""
+        scene_state = getattr(self, "_scene_display_state", None)
+        if scene_state is None:
+            self._scene_display_state = {}
+            scene_state = self._scene_display_state
+
+        for file_id in file_ids:
+            color, visible = self._base_display_state_for_file_id(file_id)
+            scene_state[file_id] = {
+                "color": list(color),
+                "visible": bool(visible),
+            }
+
+    def _discard_scene_display_state(
+        self,
+        file_ids: list[object] | tuple[object, ...],
+    ) -> None:
+        """Drop scene-only display state for neurons that are back in the table."""
+        scene_state = getattr(self, "_scene_display_state", None)
+        if not scene_state:
+            return
+        for file_id in file_ids:
+            scene_state.pop(file_id, None)
+
+    def _sync_after_neuron_table_membership_change(self) -> None:
+        """Refresh derived UI and rendered colors after table membership changes."""
+        self._last_soma_selection = set()
         self._refresh_cluster_filter_controls()
+        self._refresh_neuron_table_summary()
+
+        selected_getter = getattr(self._neuron_table, "get_selected_file_ids", None)
+        selected_file_ids = selected_getter() if callable(selected_getter) else []
+        current_layers = getattr(self, "_current_neuron_layers", [])
+        if current_layers:
+            rendered_ids = set(getattr(self, "_scene_render_modes", {}).keys())
+            selected = set(selected_file_ids) & rendered_ids
+            if not selected or selected == rendered_ids:
+                self._highlighted_file_ids = None
+            else:
+                self._highlighted_file_ids = selected
+            self._update_layer_colors(self._build_effective_color_map())
+        else:
+            self._highlighted_file_ids = None
+
+    def _populate_neuron_table(self, result, *, preserve_existing: bool = False) -> None:
+        """Populate or subset the neuron table from a query result."""
+        self._cache_scene_display_state(self._current_table_file_ids_in_scene())
+
+        if preserve_existing:
+            matched_file_ids = result["file_id"].tolist()
+            self._neuron_table.retain_file_ids(matched_file_ids)
+        else:
+            neurons = [
+                (row["file_id"], row["subject"])
+                for _, row in result.iterrows()
+            ]
+            self._neuron_table.populate(neurons)
+
+        self._discard_scene_display_state(self._current_table_file_ids())
+        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+        self._sync_after_neuron_table_membership_change()
 
     def _selected_cluster_from_filter(self) -> int | None:
         """Return selected cluster from the Data tab dropdown."""
@@ -3056,22 +3376,36 @@ class NeuronViewerWidget(QWidget):
             gray_others=True,
         )
 
+    def _remove_selected_from_table(self) -> None:
+        """Remove selected neurons from the table while keeping the scene intact."""
+        selected_file_ids = self._neuron_table.get_selected_file_ids()
+        if not selected_file_ids:
+            self._render_status_label.setText(
+                "Select at least one neuron row to remove from the table."
+            )
+            return
+
+        rendered_selected = [
+            file_id for file_id in selected_file_ids
+            if file_id in self._current_scene_file_ids()
+        ]
+        self._cache_scene_display_state(rendered_selected)
+        self._neuron_table.remove_file_ids(selected_file_ids)
+        self._discard_scene_display_state(self._current_table_file_ids())
+        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+        self._sync_after_neuron_table_membership_change()
+
+        message = f"Removed {len(selected_file_ids)} neuron(s) from the table."
+        self._render_status_label.setText(message)
+        self._regions_status_label.setText(message)
+
     def _clear_neuron_table(self) -> None:
         """Clear the neuron table while leaving rendered scene layers in place."""
-        if (
-            self._highlighted_file_ids is not None
-            and self._current_neuron_layers
-            and bool(getattr(self._neuron_table, "_entries", {}))
-        ):
-            self._highlighted_file_ids = None
-            self._update_layer_colors(self._build_effective_color_map())
-        else:
-            self._highlighted_file_ids = None
-
-        self._last_soma_selection = set()
+        self._cache_scene_display_state(self._current_table_file_ids_in_scene())
         self._neuron_table.clear()
-        self._refresh_cluster_filter_controls()
-        self._refresh_neuron_table_summary()
+        self._discard_scene_display_state(self._current_table_file_ids())
+        self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+        self._sync_after_neuron_table_membership_change()
 
         if hasattr(self, "_render_status_label"):
             self._render_status_label.setText("Cleared neuron table.")
@@ -3284,6 +3618,9 @@ class NeuronViewerWidget(QWidget):
 
         for file_id in removed_file_ids:
             self._scene_render_modes.pop(file_id, None)
+            scene_state = getattr(self, "_scene_display_state", None)
+            if scene_state is not None:
+                scene_state.pop(file_id, None)
 
         if not self._scene_render_modes:
             depth_state = self._capture_depth_state()
@@ -3325,12 +3662,14 @@ class NeuronViewerWidget(QWidget):
         render_mode = self._render_mode_combo.currentText()
         opacity = self._opacity_slider.value() / 100.0
 
-        # Read per-neuron colors from the table
-        neuron_colors = [self._neuron_table.get_color(fid) for fid in file_ids]
-        color_map = {
-            fid: color
-            for fid, color in zip(file_ids, neuron_colors)
-        }
+        color_map = self._build_effective_color_map()
+        neuron_colors = []
+        render_color_map: dict[object, list[float]] = {}
+        for file_id in file_ids:
+            fallback_color, _visible = self._base_display_state_for_file_id(file_id)
+            color = list(color_map.get(file_id, fallback_color))
+            neuron_colors.append(color)
+            render_color_map[file_id] = color
 
         # Scale to match atlas mesh (coordinates are in microns)
         scale = None
@@ -3357,7 +3696,7 @@ class NeuronViewerWidget(QWidget):
             for i, file_id in enumerate(full_file_ids):
                 if file_id not in line_data:
                     continue
-                color = color_map[file_id]
+                color = render_color_map[file_id]
                 coords, edges = line_data[file_id]
                 if len(edges) == 0:
                     continue
@@ -3444,7 +3783,7 @@ class NeuronViewerWidget(QWidget):
                     # Per-point color based on which neuron each point belongs to
                     colors = np.array(
                         [
-                            color_map.get(fid, [0.5, 0.5, 0.5, 1.0])[:4]
+                            render_color_map.get(fid, list(_DEFAULT_NEURON_RGBA))[:4]
                             for fid in points_df["file_id"].values
                         ]
                     )
@@ -3470,7 +3809,10 @@ class NeuronViewerWidget(QWidget):
             soma_coords = soma_df[["x", "y", "z"]].values
             soma_fids = soma_df["file_id"].values.tolist()
             soma_colors = np.array(
-                [color_map.get(fid, [0.5, 0.5, 0.5, 1.0])[:4] for fid in soma_fids]
+                [
+                    render_color_map.get(fid, list(_DEFAULT_NEURON_RGBA))[:4]
+                    for fid in soma_fids
+                ]
             )
             # Use neuron_id for the label text (shorter than file_id)
             labels = soma_df["neuron_id"].astype(str).values.tolist()
@@ -3712,6 +4054,33 @@ class NeuronViewerWidget(QWidget):
             return True
         return False
 
+    def _base_display_state_for_file_id(
+        self,
+        file_id: object,
+    ) -> tuple[list[float], bool]:
+        """Return the stored base color and visibility for a neuron."""
+        entries = getattr(self._neuron_table, "_entries", {})
+        entry = entries.get(file_id)
+        if entry is not None:
+            return list(entry.color), bool(entry.visible)
+
+        color_getter = getattr(self._neuron_table, "get_color", None)
+        visibility_getter = getattr(self._neuron_table, "get_visibility_map", None)
+        if callable(color_getter):
+            color = list(color_getter(file_id))
+            visible_map = visibility_getter() if callable(visibility_getter) else {}
+            visible = bool(visible_map.get(file_id, True))
+            return color, visible
+
+        scene_state = getattr(self, "_scene_display_state", {})
+        state = scene_state.get(file_id)
+        if isinstance(state, dict):
+            color = state.get("color", _DEFAULT_NEURON_RGBA)
+            visible = bool(state.get("visible", True))
+            return list(color), visible
+
+        return list(_DEFAULT_NEURON_RGBA), True
+
     def _build_effective_color_map(self) -> dict[str, list[float]]:
         """Build a color map accounting for visibility and highlight state.
 
@@ -3719,11 +4088,18 @@ class NeuronViewerWidget(QWidget):
         - When a highlight is active, non-highlighted neurons are dimmed to
           alpha=0.1 so the highlighted ones stand out.
         """
-        highlight = self._highlighted_file_ids
+        highlight = getattr(self, "_highlighted_file_ids", None)
         result = {}
-        for fid, entry in self._neuron_table._entries.items():
-            color = list(entry.color)
-            if not entry.visible:
+        entries = getattr(self._neuron_table, "_entries", {})
+        file_ids = list(entries.keys())
+        scene_state = getattr(self, "_scene_display_state", {})
+        for fid in scene_state:
+            if fid not in entries:
+                file_ids.append(fid)
+
+        for fid in file_ids:
+            color, visible = self._base_display_state_for_file_id(fid)
+            if not visible:
                 color[3] = 0.0
             elif highlight is not None and fid not in highlight:
                 color[3] = 0.1
@@ -3732,7 +4108,7 @@ class NeuronViewerWidget(QWidget):
 
     def _update_layer_colors(self, color_map: dict[str, list[float]]) -> None:
         """Apply a color map to all neuron layers."""
-        default_color = [0.5, 0.5, 0.5, 1.0]
+        default_color = list(_DEFAULT_NEURON_RGBA)
 
         for layer in self._current_neuron_layers:
             if layer.name == "Neuron Lines":
@@ -3798,7 +4174,7 @@ class NeuronViewerWidget(QWidget):
             self._highlighted_file_ids = None
             return
 
-        rendered_ids = self._current_scene_file_ids()
+        rendered_ids = set(getattr(self, "_scene_render_modes", {}).keys())
         selected = set(selected_file_ids) & rendered_ids
         if not selected or selected == rendered_ids:
             # Nothing selected or everything selected → clear highlight
@@ -3849,6 +4225,9 @@ class NeuronViewerWidget(QWidget):
         self._current_neuron_layers.clear()
         if reset_render_state:
             self._scene_render_modes.clear()
+            scene_state = getattr(self, "_scene_display_state", None)
+            if scene_state is not None:
+                scene_state.clear()
 
         # Clear slice projector data
         self._slice_projector.clear()
@@ -3917,8 +4296,7 @@ class NeuronViewerWidget(QWidget):
     def _toggle_region_meshes(self, state: int) -> None:
         """Toggle region mesh visibility."""
         if bool(state):
-            acronyms = self._region_selector.get_selected_acronyms(include_children=False)
-            self._update_region_meshes(acronyms)
+            self._update_region_meshes(self._active_region_preview_acronyms())
         else:
             remove_region_layers(self.viewer)
 
@@ -3951,8 +4329,7 @@ class NeuronViewerWidget(QWidget):
     def _toggle_region_segmentation(self, state: int) -> None:
         """Toggle region segmentation visibility."""
         if bool(state):
-            acronyms = self._region_selector.get_selected_acronyms(include_children=False)
-            self._update_region_segmentation(acronyms)
+            self._update_region_segmentation(self._active_region_preview_acronyms())
         else:
             remove_region_segmentation(self.viewer)
 

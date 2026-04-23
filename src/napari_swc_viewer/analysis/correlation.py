@@ -29,6 +29,7 @@ def compute_pearson_correlation_matrix(
     parquet_path: str,
     voxel_id_map: NDArray[np.int32],
     resolution: float,
+    file_ids: list[str] | tuple[str, ...] | None = None,
     progress_callback: callable | None = None,
 ) -> pd.DataFrame:
     """Compute pairwise Pearson correlation of neuron node counts per voxel.
@@ -48,6 +49,8 @@ def compute_pearson_correlation_matrix(
         the target region have sequential IDs >= 0, outside = -1.
     resolution : float
         Voxel resolution in microns (e.g., 25.0).
+    file_ids : list[str] or tuple[str, ...], optional
+        Restrict the computation to this working set of neuron ``file_id`` values.
     progress_callback : callable, optional
         Called with (step_name: str, step_number: int, total_steps: int).
 
@@ -59,6 +62,13 @@ def compute_pearson_correlation_matrix(
     """
     parquet_path_escaped = str(parquet_path).replace("\\", "/")
     Z, Y, X = voxel_id_map.shape
+    scoped_file_ids = None
+    if file_ids is not None:
+        scoped_file_ids = list(
+            dict.fromkeys(str(file_id) for file_id in file_ids)
+        )
+        if not scoped_file_ids:
+            return pd.DataFrame(columns=["swc_id_1", "swc_id_2", "r"])
 
     def _progress(name: str, step: int, total: int = 7) -> None:
         logger.info(f"Correlation step {step}/{total}: {name}")
@@ -74,6 +84,11 @@ def compute_pearson_correlation_matrix(
         }
     )
     conn.register("lut", arrow_lut)
+    if scoped_file_ids is not None:
+        conn.register(
+            "scope_ids",
+            pa.table({"swc_id": np.asarray(scoped_file_ids, dtype=object)}),
+        )
 
     # Create a view that maps node coordinates to voxel IDs.
     # Axis convention from swc-mapper: parquet has (x, y, z) in microns,
@@ -81,15 +96,21 @@ def compute_pearson_correlation_matrix(
     # z -> xi (atlas dim 2), y -> yi (atlas dim 1), x -> zi (atlas dim 0)
     # linear index = zi * (Y * X) + yi * X + xi
     _progress("Mapping nodes to voxel IDs", 2)
+    scope_join = ""
+    if scoped_file_ids is not None:
+        scope_join = (
+            "JOIN scope_ids s ON CAST(p.file_id AS VARCHAR) = s.swc_id"
+        )
     conn.execute(f"""
         CREATE OR REPLACE TEMP VIEW region_nodes AS
         WITH base AS (
             SELECT
-                file_id AS swc_id,
+                CAST(p.file_id AS VARCHAR) AS swc_id,
                 CAST(FLOOR(z / {float(resolution)}) AS BIGINT) AS xi,
                 CAST(FLOOR(y / {float(resolution)}) AS BIGINT) AS yi,
                 CAST(FLOOR(x / {float(resolution)}) AS BIGINT) AS zi
-            FROM read_parquet('{parquet_path_escaped}')
+            FROM read_parquet('{parquet_path_escaped}') p
+            {scope_join}
         ),
         mapped AS (
             SELECT
@@ -208,6 +229,11 @@ def compute_pearson_correlation_matrix(
             pass
 
     conn.unregister("lut")
+    if scoped_file_ids is not None:
+        try:
+            conn.unregister("scope_ids")
+        except Exception:
+            pass
 
     n_neurons = result_df["swc_id_1"].nunique()
     logger.info(

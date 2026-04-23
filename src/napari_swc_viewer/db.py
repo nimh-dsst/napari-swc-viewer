@@ -61,11 +61,29 @@ class NeuronDatabase:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    @staticmethod
+    def _append_file_id_filter(
+        where_parts: list[str],
+        params: list[object],
+        file_ids: list[object] | tuple[object, ...] | None,
+    ) -> bool:
+        """Append an optional ``file_id`` restriction to a WHERE clause."""
+        if file_ids is None:
+            return True
+        if not file_ids:
+            return False
+
+        placeholders = ", ".join(["?"] * len(file_ids))
+        where_parts.append(f"file_id IN ({placeholders})")
+        params.extend(file_ids)
+        return True
+
     def get_neurons_by_region(
         self,
         region_acronyms: list[str],
         include_children: bool = False,
         soma_only: bool = False,
+        file_ids: list[object] | tuple[object, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified regions.
 
@@ -88,20 +106,24 @@ class NeuronDatabase:
 
         placeholders = ", ".join(["?"] * len(region_acronyms))
         where_parts = [f"region_acronym IN ({placeholders})"]
+        params: list[object] = list(region_acronyms)
         if soma_only:
             where_parts.append("type = 1")
+        if not self._append_file_id_filter(where_parts, params, file_ids):
+            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
             WHERE {' AND '.join(where_parts)}
             ORDER BY file_id
         """
-        return self.conn.execute(query, region_acronyms).fetchdf()
+        return self.conn.execute(query, params).fetchdf()
 
     def get_neurons_by_region_id(
         self,
         region_ids: list[int],
         soma_only: bool = False,
+        file_ids: list[object] | tuple[object, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified region IDs.
 
@@ -122,15 +144,18 @@ class NeuronDatabase:
 
         placeholders = ", ".join(["?"] * len(region_ids))
         where_parts = [f"region_id IN ({placeholders})"]
+        params: list[object] = [int(region_id) for region_id in region_ids]
         if soma_only:
             where_parts.append("type = 1")
+        if not self._append_file_id_filter(where_parts, params, file_ids):
+            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
             WHERE {' AND '.join(where_parts)}
             ORDER BY file_id
         """
-        return self.conn.execute(query, region_ids).fetchdf()
+        return self.conn.execute(query, params).fetchdf()
 
     def get_unique_regions(self) -> pd.DataFrame:
         """Get all unique regions in the dataset with counts.
@@ -382,6 +407,7 @@ class NeuronDatabase:
         mask_volume: NDArray[np.bool_] | NDArray[np.uint8] | np.ndarray,
         atlas: Any,
         soma_only: bool = False,
+        file_ids: list[object] | tuple[object, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons whose nodes fall inside a binary atlas-space mask."""
         mask = np.asarray(mask_volume) > 0
@@ -417,6 +443,8 @@ class NeuronDatabase:
         ]
         if soma_only:
             where_parts.append("type = 1")
+        if not self._append_file_id_filter(where_parts, params, file_ids):
+            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
         query = f"""
             SELECT file_id, neuron_id, subject, x, y, z

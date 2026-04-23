@@ -11,7 +11,10 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from napari_swc_viewer.analysis.clustering import ClusterResult
+from napari_swc_viewer.analysis.clustering import (
+    ClusterRegionSelection,
+    ClusterResult,
+)
 
 
 class _BoundSignal:
@@ -142,9 +145,11 @@ class _DummyCombo(_DummyWidget):
     def addItem(self, *args) -> None:
         if len(args) == 1:
             text = str(args[0])
+            data = None
         else:
-            text = str(args[1])
-        self._items.append({"text": text, "data": None})
+            text = str(args[0])
+            data = args[1]
+        self._items.append({"text": text, "data": data})
         if self._current_index < 0:
             self._current_index = 0
 
@@ -188,6 +193,11 @@ class _DummyCombo(_DummyWidget):
 
     def itemData(self, index: int):
         return self._items[index]["data"]
+
+    def currentData(self):
+        if 0 <= self._current_index < len(self._items):
+            return self._items[self._current_index]["data"]
+        return None
 
     def setItemData(self, index: int, data) -> None:
         self._items[index]["data"] = data
@@ -246,6 +256,21 @@ class _DummyScrollArea(_DummyWidget):
 
     def setWidget(self, widget) -> None:
         self.widget = widget
+
+
+class _DummyStack(_DummyWidget):
+    """Small QStackedWidget stand-in."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        super().__init__()
+        self.children: list[object] = []
+        self.index = 0
+
+    def addWidget(self, widget) -> None:
+        self.children.append(widget)
+
+    def setCurrentIndex(self, index: int) -> None:
+        self.index = int(index)
 
 
 class _DummyFigure:
@@ -596,6 +621,7 @@ def _import_analysis_tab_module():
         "QScrollArea": _DummyScrollArea,
         "QScrollArea": _DummyScrollArea,
         "QSpinBox": _DummySpinBox,
+        "QStackedWidget": _DummyStack,
         "QVBoxLayout": _DummyLayout,
         "QWidget": _DummyWidget,
     }.items():
@@ -962,6 +988,32 @@ def test_refresh_analysis_region_selectors_preserves_multiple_cluster_selections
     assert widget._selected_cluster_regions() == [(184, "FRP"), (500, "CP")]
 
 
+def test_active_cluster_selector_switches_with_scope() -> None:
+    """Clustering scope changes should swap between whole/current selectors."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    structures = {
+        184: {"name": "Frontal pole", "acronym": "FRP"},
+        500: {"name": "Caudoputamen", "acronym": "CP"},
+    }
+    widget._whole_parquet_cluster_region_selector._structure_map = structures
+    widget._current_table_cluster_region_selector._structure_map = structures
+    widget._whole_parquet_cluster_region_selector.select_region_by_id(184)
+    widget._current_table_cluster_region_selector.select_region_by_id(500)
+
+    widget._cluster_region_scope_combo.setCurrentText("Whole Parquet")
+
+    assert widget._selected_cluster_region() == (184, "FRP")
+    assert widget._cluster_region_scope_stack.index == 0
+    assert widget._cluster_region_summary_label.text() == "FRP (Frontal pole)"
+
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+
+    assert widget._selected_cluster_region() == (500, "CP")
+    assert widget._cluster_region_scope_stack.index == 1
+    assert widget._cluster_region_summary_label.text() == "CP (Caudoputamen)"
+
+
 def test_represented_region_ids_for_selection_expands_parent_to_dataset_descendants():
     """Parent selection for heatmaps should expand to represented descendant region IDs."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
@@ -1045,6 +1097,60 @@ def test_update_region_summary_labels_compacts_multiple_cluster_regions():
     assert (
         widget._cluster_region_summary_label.text()
         == "FRP (Frontal pole), CP (Caudoputamen) +1 more"
+    )
+
+
+def test_run_clustering_pipeline_current_scope_requires_nonempty_table() -> None:
+    """Current-table clustering scope should stop before launching workers when empty."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: [])
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+    widget._selected_cluster_region_selection = lambda: ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._run_soma_clustering = MagicMock()
+    widget._run_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    assert widget._progress_label.text() == (
+        "Current table is empty; switch clustering scope to Whole Parquet or populate the table first."
+    )
+    widget._run_soma_clustering.assert_not_called()
+    widget._run_correlation_clustering.assert_not_called()
+
+
+def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -> None:
+    """Current-table clustering scope should pass the table subset into the worker launch."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: ["n1", "n2"])
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    widget._dilation_spin.setValue(35)
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._run_soma_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    widget._run_soma_clustering.assert_called_once_with(
+        selection,
+        0.35,
+        file_ids=["n1", "n2"],
     )
 
 

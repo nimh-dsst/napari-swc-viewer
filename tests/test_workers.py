@@ -202,10 +202,17 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
         calls["increase_fraction"] = float(increase_fraction)
         return np.zeros((2, 2, 2), dtype=np.int32)
 
-    def fake_compute_pearson_correlation_matrix(conn, parquet_path, voxel_id_map, resolution):
+    def fake_compute_pearson_correlation_matrix(
+        conn,
+        parquet_path,
+        voxel_id_map,
+        resolution,
+        file_ids=None,
+    ):
         calls["parquet_path"] = parquet_path
         calls["voxel_id_map_shape"] = voxel_id_map.shape
         calls["resolution"] = resolution
+        calls["file_ids"] = file_ids
         return pd.DataFrame({"swc_id_1": [], "swc_id_2": [], "r": []})
 
     def fake_correlation_long_to_matrix(_corr_df):
@@ -255,6 +262,7 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
         dilation_fraction=0.3,
         linkage_method="average",
         n_clusters=4,
+        file_ids=["n1", "n2"],
     )
 
     finished: list[ClusterResult] = []
@@ -269,6 +277,7 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
     assert calls["increase_fraction"] == 0.3
     assert calls["voxel_id_map_shape"] == (2, 2, 2)
     assert calls["resolution"] == 25.0
+    assert calls["file_ids"] == ["n1", "n2"]
     metadata = finished[0].metadata
     assert metadata is not None
     assert metadata.analysis_method == "voxel_correlation"
@@ -334,6 +343,68 @@ def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
     assert metadata.dendrogram_linkage == "ward"
     assert metadata.requested_cluster_count == 3
     assert metadata.distance_metric == "euclidean_um"
+
+
+def test_soma_cluster_worker_filters_to_current_table_file_ids(monkeypatch):
+    """Soma clustering should respect an optional current-table file-id subset."""
+    workers = _import_workers_module()
+    SomaClusterWorker = workers.SomaClusterWorker
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
+    )
+
+    def fake_cluster_somas_hierarchical(coords, neuron_ids, method, n_clusters):
+        observed["neuron_ids"] = list(neuron_ids)
+        observed["coords_shape"] = tuple(coords.shape)
+        return _make_cluster_result(list(neuron_ids), [1, 2])
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
+        fake_cluster_somas_hierarchical,
+    )
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2", "n3"],
+                    "x": [0.0, 25.0, 50.0],
+                    "y": [0.0, 25.0, 50.0],
+                    "z": [0.0, 25.0, 50.0],
+                }
+            )
+        ),
+    )
+
+    worker = SomaClusterWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0),
+            atlas_name="fake_atlas",
+        ),
+        region_selection=ClusterRegionSelection(
+            selected_region_ids=[184],
+            selected_region_acronyms=["FRP"],
+            represented_region_ids=[68],
+            represented_region_acronyms=["FRP1"],
+        ),
+        algorithm="hierarchical",
+        linkage_method="ward",
+        n_clusters=2,
+        file_ids=["n1", "n2"],
+    )
+
+    finished: list[ClusterResult] = []
+    worker.finished.connect(lambda result: finished.append(result))
+
+    worker.run()
+
+    assert observed["neuron_ids"] == ["n1", "n2"]
+    assert observed["coords_shape"] == (2, 3)
+    assert finished[0].neuron_ids == ["n1", "n2"]
 
 
 def test_soma_cluster_worker_kmeans_uses_synthesized_dendrogram_linkage(monkeypatch):

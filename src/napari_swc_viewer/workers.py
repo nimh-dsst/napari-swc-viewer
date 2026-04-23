@@ -254,6 +254,7 @@ class CorrelationWorker(QObject):
         dilation_fraction: float = 0.2,
         linkage_method: str = "average",
         n_clusters: int = 5,
+        file_ids: list[str] | None = None,
     ):
         super().__init__()
         self._parquet_path = parquet_path
@@ -262,6 +263,7 @@ class CorrelationWorker(QObject):
         self._dilation_fraction = dilation_fraction
         self._linkage_method = linkage_method
         self._n_clusters = n_clusters
+        self._file_ids = None if file_ids is None else [str(file_id) for file_id in file_ids]
 
     def run(self) -> None:
         """Execute the full pipeline."""
@@ -292,6 +294,7 @@ class CorrelationWorker(QObject):
                     self._parquet_path,
                     voxel_id_map,
                     resolution=resolution,
+                    file_ids=self._file_ids,
                 )
             finally:
                 conn.close()
@@ -362,6 +365,7 @@ class SomaClusterWorker(QObject):
         n_clusters: int = 5,
         eps: float = 100.0,
         min_samples: int = 5,
+        file_ids: list[str] | None = None,
     ):
         super().__init__()
         self._parquet_path = parquet_path
@@ -373,6 +377,7 @@ class SomaClusterWorker(QObject):
         self._n_clusters = n_clusters
         self._eps = eps
         self._min_samples = min_samples
+        self._file_ids = None if file_ids is None else [str(file_id) for file_id in file_ids]
 
     def run(self) -> None:
         """Execute the soma clustering pipeline."""
@@ -440,6 +445,16 @@ class SomaClusterWorker(QObject):
                 list(soma_df.columns),
                 perf_counter() - query_start,
             )
+
+            if self._file_ids is not None:
+                scope_ids = set(self._file_ids)
+                soma_df = soma_df[
+                    soma_df["file_id"].astype(str).isin(scope_ids)
+                ].reset_index(drop=True)
+                logger.debug(
+                    "SomaClusterWorker current-table scope applied: rows=%d",
+                    len(soma_df),
+                )
 
             if soma_df.empty:
                 self.error.emit("No soma nodes found in the dataset.")

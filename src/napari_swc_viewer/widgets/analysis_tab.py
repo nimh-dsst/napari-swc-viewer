@@ -34,6 +34,7 @@ from qtpy.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +50,9 @@ if TYPE_CHECKING:
     from ..db import NeuronDatabase
 
 logger = logging.getLogger(__name__)
+
+_ANALYSIS_SCOPE_WHOLE = "whole"
+_ANALYSIS_SCOPE_CURRENT = "current"
 
 
 @dataclass(frozen=True)
@@ -304,6 +308,8 @@ class AnalysisTabWidget(QWidget):
         self._slice_projector = None
         self._dataset_region_ids: set[int] = set()
         self._clustermap_rendered = False
+        self._cluster_region_query_scope = _ANALYSIS_SCOPE_WHOLE
+        self._current_table_file_ids_provider = None
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -356,6 +362,10 @@ class AnalysisTabWidget(QWidget):
     def set_slice_projector(self, projector) -> None:
         """Set the slice projector for updating 2D projection colors."""
         self._slice_projector = projector
+
+    def set_current_table_file_ids_provider(self, provider) -> None:
+        """Set a callback returning the current neuron-table file IDs."""
+        self._current_table_file_ids_provider = provider
 
     def _update_button_states(self) -> None:
         """Enable/disable buttons based on loaded data."""
@@ -448,20 +458,60 @@ class AnalysisTabWidget(QWidget):
         region_row.addWidget(self._cluster_region_summary_label)
         corr_layout.addLayout(region_row)
 
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Search scope:"))
+        self._cluster_region_scope_combo = QComboBox()
+        self._cluster_region_scope_combo.addItem(
+            "Whole Parquet",
+            _ANALYSIS_SCOPE_WHOLE,
+        )
+        self._cluster_region_scope_combo.addItem(
+            "Current Table",
+            _ANALYSIS_SCOPE_CURRENT,
+        )
+        self._cluster_region_scope_combo.currentTextChanged.connect(
+            self._on_cluster_region_scope_changed
+        )
+        scope_row.addWidget(self._cluster_region_scope_combo)
+        corr_layout.addLayout(scope_row)
+
         self._cluster_region_section = CollapsibleSection(
             "Select Target Region",
             expanded=False,
         )
         cluster_region_layout = self._cluster_region_section.content_layout()
-        self._cluster_region_selector = RegionSelectorWidget(
+
+        self._cluster_region_scope_stack = QStackedWidget()
+
+        whole_page = QWidget()
+        whole_layout = QVBoxLayout(whole_page)
+        whole_layout.setContentsMargins(0, 0, 0, 0)
+        self._whole_parquet_cluster_region_selector = RegionSelectorWidget(
             single_select=False,
             show_include_children=False,
             force_include_children=True,
         )
-        self._cluster_region_selector.selection_changed.connect(
+        self._whole_parquet_cluster_region_selector.selection_changed.connect(
             self._on_cluster_region_selection_changed
         )
-        cluster_region_layout.addWidget(self._cluster_region_selector)
+        whole_layout.addWidget(self._whole_parquet_cluster_region_selector)
+        self._cluster_region_scope_stack.addWidget(whole_page)
+
+        current_page = QWidget()
+        current_layout = QVBoxLayout(current_page)
+        current_layout.setContentsMargins(0, 0, 0, 0)
+        self._current_table_cluster_region_selector = RegionSelectorWidget(
+            single_select=False,
+            show_include_children=False,
+            force_include_children=True,
+        )
+        self._current_table_cluster_region_selector.selection_changed.connect(
+            self._on_cluster_region_selection_changed
+        )
+        current_layout.addWidget(self._current_table_cluster_region_selector)
+        self._cluster_region_scope_stack.addWidget(current_page)
+
+        cluster_region_layout.addWidget(self._cluster_region_scope_stack)
         corr_layout.addWidget(self._cluster_region_section)
 
         # Dilation fraction
@@ -708,6 +758,7 @@ class AnalysisTabWidget(QWidget):
         self._show_clustermap_message(
             "Run clustering, then click Render Dendrogram."
         )
+        self._sync_cluster_region_scope_selector()
         self._refresh_analysis_region_selectors()
         self._update_button_states()
 
@@ -739,7 +790,7 @@ class AnalysisTabWidget(QWidget):
         """Refresh the visible region summary labels for Analysis workflows."""
         self._cluster_region_summary_label.setText(
             self._format_selected_region_text(
-                getattr(self, "_cluster_region_selector", None),
+                self._active_cluster_region_selector(),
                 empty_text="None selected",
             )
         )
@@ -770,12 +821,12 @@ class AnalysisTabWidget(QWidget):
 
     def _refresh_analysis_region_selectors(self) -> None:
         """Rebuild Analysis region selectors from atlas hierarchy and dataset IDs."""
-        cluster_selector = getattr(self, "_cluster_region_selector", None)
         heat_selector = getattr(self, "_heat_region_selector", None)
-        if cluster_selector is None or heat_selector is None:
+        cluster_selectors = self._cluster_region_selectors()
+        if not cluster_selectors or heat_selector is None:
             return
 
-        selectors = (cluster_selector, heat_selector)
+        selectors = (*cluster_selectors, heat_selector)
         previous_regions = [
             self._selected_regions(selector) for selector in selectors
         ]
@@ -804,6 +855,109 @@ class AnalysisTabWidget(QWidget):
                 selector.select_region_by_id(previous_id)
 
         self._update_region_summary_labels()
+
+    def _selected_cluster_region_scope(self) -> str:
+        """Return the active clustering scope."""
+        combo = getattr(self, "_cluster_region_scope_combo", None)
+        if combo is None:
+            scope = getattr(
+                self,
+                "_cluster_region_query_scope",
+                _ANALYSIS_SCOPE_WHOLE,
+            )
+            if scope in {_ANALYSIS_SCOPE_WHOLE, _ANALYSIS_SCOPE_CURRENT}:
+                return scope
+            return _ANALYSIS_SCOPE_WHOLE
+
+        current_data = getattr(combo, "currentData", None)
+        if callable(current_data):
+            data = current_data()
+            if data in {_ANALYSIS_SCOPE_WHOLE, _ANALYSIS_SCOPE_CURRENT}:
+                return str(data)
+
+        current_text = getattr(combo, "currentText", None)
+        text = current_text() if callable(current_text) else ""
+        if text == "Current Table":
+            return _ANALYSIS_SCOPE_CURRENT
+        return _ANALYSIS_SCOPE_WHOLE
+
+    def _cluster_region_selectors(self) -> tuple[RegionSelectorWidget, ...]:
+        """Return all clustering region selectors, de-duplicated."""
+        selectors = []
+        for attr_name in (
+            "_whole_parquet_cluster_region_selector",
+            "_current_table_cluster_region_selector",
+            "_cluster_region_selector",
+        ):
+            selector = getattr(self, attr_name, None)
+            if selector is None or selector in selectors:
+                continue
+            selectors.append(selector)
+        return tuple(selectors)
+
+    def _cluster_region_selector_for_scope(
+        self,
+        scope: str | None = None,
+    ) -> RegionSelectorWidget | None:
+        """Return the clustering region selector for one scope."""
+        selected_scope = scope
+        if selected_scope not in {
+            _ANALYSIS_SCOPE_WHOLE,
+            _ANALYSIS_SCOPE_CURRENT,
+        }:
+            selected_scope = self._selected_cluster_region_scope()
+
+        if selected_scope == _ANALYSIS_SCOPE_CURRENT:
+            selector = getattr(self, "_current_table_cluster_region_selector", None)
+            if selector is not None:
+                return selector
+        else:
+            selector = getattr(self, "_whole_parquet_cluster_region_selector", None)
+            if selector is not None:
+                return selector
+
+        return getattr(self, "_cluster_region_selector", None)
+
+    def _active_cluster_region_selector(self) -> RegionSelectorWidget | None:
+        """Return the currently visible clustering selector."""
+        return self._cluster_region_selector_for_scope()
+
+    def _sync_cluster_region_scope_selector(self) -> None:
+        """Show the clustering selector matching the active scope."""
+        stack = getattr(self, "_cluster_region_scope_stack", None)
+        if stack is None:
+            return
+
+        index = (
+            1
+            if self._selected_cluster_region_scope() == _ANALYSIS_SCOPE_CURRENT
+            else 0
+        )
+        stack.setCurrentIndex(index)
+
+    def _current_table_file_ids(self) -> list[str]:
+        """Return file IDs currently present in the main neuron table."""
+        provider = getattr(self, "_current_table_file_ids_provider", None)
+        if not callable(provider):
+            return []
+        return [str(file_id) for file_id in provider()]
+
+    def _resolve_cluster_query_file_scope(
+        self,
+    ) -> tuple[bool, list[str] | None, str, int | None]:
+        """Resolve the optional current-table restriction for clustering."""
+        scope = self._selected_cluster_region_scope()
+        if scope != _ANALYSIS_SCOPE_CURRENT:
+            return True, None, "whole parquet", None
+
+        file_ids = self._current_table_file_ids()
+        if file_ids:
+            return True, file_ids, "current table", len(file_ids)
+
+        self._progress_label.setText(
+            "Current table is empty; switch clustering scope to Whole Parquet or populate the table first."
+        )
+        return False, None, "current table", 0
 
     def _selected_regions(
         self,
@@ -836,15 +990,11 @@ class AnalysisTabWidget(QWidget):
 
     def _selected_cluster_region(self) -> tuple[int, str] | None:
         """Return the first currently selected clustering region."""
-        return self._selected_region(
-            getattr(self, "_cluster_region_selector", None)
-        )
+        return self._selected_region(self._active_cluster_region_selector())
 
     def _selected_cluster_regions(self) -> list[tuple[int, str]]:
         """Return all currently selected clustering regions."""
-        return self._selected_regions(
-            getattr(self, "_cluster_region_selector", None)
-        )
+        return self._selected_regions(self._active_cluster_region_selector())
 
     def _selected_heat_region(self) -> tuple[int, str] | None:
         """Return the currently selected heatmap region."""
@@ -934,6 +1084,12 @@ class AnalysisTabWidget(QWidget):
         """Keep the clustering region summary in sync with tree selection."""
         self._update_region_summary_labels()
 
+    def _on_cluster_region_scope_changed(self, _text: str) -> None:
+        """Switch the visible clustering selector to the active scope."""
+        self._cluster_region_query_scope = self._selected_cluster_region_scope()
+        self._sync_cluster_region_scope_selector()
+        self._update_region_summary_labels()
+
     def _on_heat_region_selection_changed(self, _acronyms: list[str]) -> None:
         """Keep the heatmap region summary in sync with tree selection."""
         self._update_region_summary_labels()
@@ -981,6 +1137,12 @@ class AnalysisTabWidget(QWidget):
         if self._worker_thread is not None and self._worker_thread.isRunning():
             return
 
+        proceed, base_file_ids, _scope_label, _input_count = (
+            self._resolve_cluster_query_file_scope()
+        )
+        if not proceed:
+            return
+
         region_selection = self._selected_cluster_region_selection()
         if region_selection is None:
             self._progress_label.setText("Select at least one target region.")
@@ -995,14 +1157,24 @@ class AnalysisTabWidget(QWidget):
         clustering_method = self._clustering_method_combo.currentText()
 
         if clustering_method == "Soma Location":
-            self._run_soma_clustering(region_selection, dilation)
+            self._run_soma_clustering(
+                region_selection,
+                dilation,
+                file_ids=base_file_ids,
+            )
         else:
-            self._run_correlation_clustering(region_selection, dilation)
+            self._run_correlation_clustering(
+                region_selection,
+                dilation,
+                file_ids=base_file_ids,
+            )
 
     def _run_correlation_clustering(
         self,
         region_selection: ClusterRegionSelection,
         dilation: float,
+        *,
+        file_ids: list[str] | None = None,
     ) -> None:
         """Start the voxel correlation + clustering pipeline."""
         from ..workers import CorrelationWorker
@@ -1017,6 +1189,7 @@ class AnalysisTabWidget(QWidget):
             dilation_fraction=dilation,
             linkage_method=method,
             n_clusters=n_clusters,
+            file_ids=file_ids,
         )
 
         self._start_background_worker(worker, self._on_correlation_finished)
@@ -1025,6 +1198,8 @@ class AnalysisTabWidget(QWidget):
         self,
         region_selection: ClusterRegionSelection,
         dilation: float,
+        *,
+        file_ids: list[str] | None = None,
     ) -> None:
         """Start the soma-location clustering pipeline."""
         from ..workers import SomaClusterWorker
@@ -1047,6 +1222,7 @@ class AnalysisTabWidget(QWidget):
             n_clusters=self._n_clusters_spin.value(),
             eps=self._eps_spin.value(),
             min_samples=self._min_samples_spin.value(),
+            file_ids=file_ids,
         )
 
         self._start_background_worker(worker, self._on_correlation_finished)
