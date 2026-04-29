@@ -49,6 +49,33 @@ def merge_heatmap_volumes(
     return np.sum(arrays, axis=0, dtype=np.float32)
 
 
+def isolate_heatmap_volume_to_region_ids(
+    volume: NDArray[np.floating] | np.ndarray,
+    atlas: BrainGlobeAtlas,
+    region_ids: list[int] | tuple[int, ...],
+) -> NDArray[np.float32]:
+    """Return a heatmap copy with values outside selected atlas regions set to zero."""
+    arr = np.asarray(volume, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, got shape {arr.shape}")
+
+    selected_ids = [int(region_id) for region_id in region_ids]
+    if not selected_ids:
+        raise ValueError("At least one region ID is required.")
+
+    annotation = np.asarray(atlas.annotation)
+    if annotation.shape != arr.shape:
+        raise ValueError(
+            "Heatmap shape does not match atlas annotation shape: "
+            f"{arr.shape} != {annotation.shape}"
+        )
+
+    region_mask = np.isin(annotation, selected_ids)
+    isolated = np.zeros_like(arr, dtype=np.float32)
+    isolated[region_mask] = arr[region_mask]
+    return isolated
+
+
 def otsu_threshold_positive(
     volume: NDArray[np.floating] | np.ndarray,
     bins: int = 256,

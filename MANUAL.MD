@@ -150,12 +150,16 @@ This fills the **Selected Neurons** table in the Data tab.
 2. Choose `Separate layers` or `Merged layer`
 3. Set Gaussian sigma in atlas voxels
 4. Click `Create Blurred Layer`
+5. To isolate heatmaps after they already exist, use `Region Isolation`: choose
+   `Separate layers` or `Merged layer`, select one or more atlas regions, choose
+   whether child regions are included, and click `Create Isolated Heatmap`
 
 Notes:
 
 - Only app-created heatmaps on the native atlas voxel grid are eligible
 - Depth-binned analysis heatmaps are excluded from mask creation in this version
 - Generated blurred layers are also eligible native-grid sources in both the `Tools` and `Histogram` tabs
+- Generated region-isolated heatmaps are new native-grid image layers and are also eligible sources in the `Tools` and `Histogram` tabs
 - Gaussian sigma is in atlas voxels; for example, on `allen_mouse_25um`, `1.0` means `1 voxel = 25 µm`
 
 ### 5. Inspect histograms and build masks (Histogram tab)

@@ -137,13 +137,16 @@ mismatches. For older point Parquets without `origin_csv`, the table shows
 `(not recorded)` and still imports one heatmap layer per selected `label`.
 
 In the `Tools` tab, eligible native-grid heatmaps can be turned into blurred
-napari `Image` layers. In the `Histogram` tab, those same eligible heatmaps and
-blurred heatmaps can be inspected as overlaid interactive intensity histograms
-and then converted into 3D binary mask `Labels` layers using explicit lower and
-optional upper intensity bounds. The histogram view supports zooming and panning
-so narrow intensity ranges are easier to inspect. A typical flow is: select a
-heatmap in `Tools`, create a blurred layer, open `Histogram`, inspect the
-distribution, optionally tune the blurred layer's `contrast_limits` in napari,
+napari `Image` layers or post-hoc region-isolated heatmaps. The region isolation
+panel reuses the atlas region tree and creates new heatmap layers that preserve
+source intensities inside selected regions while zeroing values outside them. In
+the `Histogram` tab, those same eligible heatmaps and blurred heatmaps can be
+inspected as overlaid interactive intensity histograms and then converted into 3D
+binary mask `Labels` layers using explicit lower and optional upper intensity
+bounds. The histogram view supports zooming and panning so narrow intensity
+ranges are easier to inspect. A typical flow is: select a heatmap in `Tools`,
+create a blurred layer, open `Histogram`, inspect the distribution, optionally
+tune the blurred layer's `contrast_limits` in napari,
 copy those limits into the threshold bounds, and then create the mask. The
 `Regions` tab can then query neurons either by Allen regions or by one or more
 of these generated mask layers, using either any-node or soma-only membership.

@@ -381,18 +381,31 @@ class _DummyRegionSelector:
         *,
         direct_acronyms: list[str] | None = None,
         query_acronyms: list[str] | None = None,
+        direct_ids: list[int] | None = None,
+        query_ids: list[int] | None = None,
+        structure_map: dict[int, dict] | None = None,
         include_children: bool = True,
     ) -> None:
         self._direct_acronyms = list(direct_acronyms or [])
         self._query_acronyms = list(
             self._direct_acronyms if query_acronyms is None else query_acronyms
         )
+        self._direct_ids = list(direct_ids or [])
+        self._query_ids = list(self._direct_ids if query_ids is None else query_ids)
+        self._structure_map = dict(structure_map or {})
+        for struct_id, acronym in zip(self._direct_ids, self._direct_acronyms):
+            self._structure_map.setdefault(int(struct_id), {"acronym": acronym})
         self._include_children = bool(include_children)
 
     def get_selected_acronyms(self, include_children: bool = True) -> list[str]:
         if include_children:
             return list(self._query_acronyms)
         return list(self._direct_acronyms)
+
+    def get_selected_ids(self, include_children: bool = True) -> list[int]:
+        if include_children:
+            return list(self._query_ids)
+        return list(self._direct_ids)
 
     def get_query_acronyms(self) -> list[str]:
         return list(self._query_acronyms)
@@ -485,6 +498,42 @@ def _make_soma_projector(
     projector._last_result = None
     projector._update_timer = MagicMock()
     return projector
+
+
+def _install_fake_colormaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DummyColormap:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_napari = types.ModuleType("napari")
+    fake_utils = types.ModuleType("napari.utils")
+    fake_utils.__path__ = []
+    fake_colormaps = types.ModuleType("napari.utils.colormaps")
+    fake_colormaps.Colormap = _DummyColormap
+    fake_napari.utils = fake_utils
+    fake_utils.colormaps = fake_colormaps
+
+    monkeypatch.setitem(sys.modules, "napari", fake_napari)
+    monkeypatch.setitem(sys.modules, "napari.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
+
+
+def _bind_region_isolation_methods(widget) -> None:
+    for method_name in (
+        "_current_region_isolation_create_mode",
+        "_selected_region_isolation_entries",
+        "_selected_region_isolation_region_ids",
+        "_region_isolation_label",
+        "_add_region_isolated_heatmap_layer",
+        "_unique_layer_name",
+        "_iter_viewer_layers",
+        "_current_atlas_name",
+    ):
+        setattr(
+            widget,
+            method_name,
+            types.MethodType(getattr(NeuronViewerWidget, method_name), widget),
+        )
 
 
 def _bind_projection_helpers(widget) -> None:
@@ -1715,3 +1764,163 @@ def test_selected_neuron_heatmap_finished_adds_unique_multi_selection_layer() ->
     widget._refresh_histogram_layer_list.assert_called_once_with()
     widget._refresh_mask_layer_options.assert_called_once_with()
     assert "Neuron Heatmap: 2 selected neurons (3)" in widget._render_status_label.text
+
+
+def test_region_isolation_region_ids_follow_include_children_state() -> None:
+    selector = _DummyRegionSelector(
+        direct_acronyms=["R1"],
+        direct_ids=[1],
+        query_ids=[1, 2],
+        include_children=True,
+    )
+    widget = types.SimpleNamespace(_tools_region_selector=selector)
+
+    assert NeuronViewerWidget._selected_region_isolation_region_ids(widget) == [1, 2]
+    assert NeuronViewerWidget._selected_region_isolation_entries(widget) == [(1, "R1")]
+
+    selector._include_children = False
+    assert NeuronViewerWidget._selected_region_isolation_region_ids(widget) == [1]
+
+
+def test_create_region_isolated_heatmaps_separate_layers_sets_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_colormaps(monkeypatch)
+    viewer = _DummyViewer(ndisplay=3)
+    annotation = np.array([[[1, 2, 3], [2, 1, 0]]], dtype=np.int32)
+    atlas = types.SimpleNamespace(annotation=annotation, atlas_name="fake_atlas")
+    source_a = _DummyImageLayer(
+        np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=np.float32),
+        name="Source A",
+        colormap="source_cmap",
+        blending="additive",
+        rendering="mip",
+        opacity=0.6,
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+            "color": (1.0, 0.0, 0.0, 1.0),
+            "heatmap_selected_region_id": 99,
+        },
+    )
+    source_b = _DummyImageLayer(
+        np.array([[[0.0, 1.0, 0.0], [3.0, 0.0, 9.0]]], dtype=np.float32),
+        name="Source B",
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+        },
+    )
+    viewer.layers.extend([source_a, source_b])
+    selector = _DummyRegionSelector(
+        direct_acronyms=["R1"],
+        direct_ids=[1],
+        query_ids=[1, 2],
+        include_children=True,
+    )
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _atlas=atlas,
+        _opacity_slider=_DummyValueControl(50),
+        _tools_status_label=_DummyLabel(),
+        _tools_region_selector=selector,
+        _region_isolation_create_mode_combo=_DummyComboBox("Separate", "separate"),
+        _selected_heatmap_layers=lambda: [source_a, source_b],
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _select_heatmap_layer_names=MagicMock(),
+        _select_histogram_layer_names=MagicMock(),
+    )
+    _bind_region_isolation_methods(widget)
+
+    NeuronViewerWidget._create_region_isolated_heatmaps(widget)
+
+    created_a, created_b = viewer.layers[-2:]
+    expected_a = np.where(np.isin(annotation, [1, 2]), source_a.data, 0.0)
+    expected_b = np.where(np.isin(annotation, [1, 2]), source_b.data, 0.0)
+    np.testing.assert_array_equal(created_a.data, expected_a)
+    np.testing.assert_array_equal(created_b.data, expected_b)
+    assert created_a.name == "Region Isolated (R1): Source A"
+    assert created_b.name == "Region Isolated (R1): Source B"
+    assert created_a.colormap == "source_cmap"
+    assert created_a.blending == "additive"
+    assert created_a.rendering == "mip"
+    assert created_a.opacity == 0.6
+    assert created_a.contrast_limits == (0.0, 5.0)
+    assert created_a.metadata["heatmap_kind"] == "region_isolated"
+    assert created_a.metadata["source_heatmap_layers"] == ["Source A"]
+    assert created_a.metadata["heatmap_selected_region_ids"] == [1]
+    assert created_a.metadata["heatmap_selected_region_acronyms"] == ["R1"]
+    assert created_a.metadata["heatmap_region_ids"] == [1, 2]
+    assert created_a.metadata["heatmap_include_child_regions"] is True
+    assert created_a.metadata["merge_mode"] == "separate"
+    assert created_a.metadata["atlas_name"] == "fake_atlas"
+    assert "heatmap_selected_region_id" not in created_a.metadata
+    widget._select_heatmap_layer_names.assert_called_once_with(
+        ["Region Isolated (R1): Source A", "Region Isolated (R1): Source B"]
+    )
+    assert "Created 2 isolated heatmap layer(s)" in widget._tools_status_label.text
+
+
+def test_create_region_isolated_heatmaps_merged_sums_before_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_colormaps(monkeypatch)
+    viewer = _DummyViewer(ndisplay=3)
+    annotation = np.array([[[1, 2], [1, 0]]], dtype=np.int32)
+    atlas = types.SimpleNamespace(annotation=annotation, atlas_name="fake_atlas")
+    source_a = _DummyImageLayer(
+        np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+        name="Source A",
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+            "color": (1.0, 0.0, 0.0, 1.0),
+        },
+    )
+    source_b = _DummyImageLayer(
+        np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32),
+        name="Source B",
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+            "color": (0.0, 1.0, 0.0, 1.0),
+        },
+    )
+    viewer.layers.extend([source_a, source_b])
+    selector = _DummyRegionSelector(
+        direct_acronyms=["R1"],
+        direct_ids=[1],
+        query_ids=[1, 2],
+        include_children=False,
+    )
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _atlas=atlas,
+        _opacity_slider=_DummyValueControl(50),
+        _tools_status_label=_DummyLabel(),
+        _tools_region_selector=selector,
+        _region_isolation_create_mode_combo=_DummyComboBox("Merged", "merged"),
+        _selected_heatmap_layers=lambda: [source_a, source_b],
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _select_heatmap_layer_names=MagicMock(),
+        _select_histogram_layer_names=MagicMock(),
+    )
+    _bind_region_isolation_methods(widget)
+
+    NeuronViewerWidget._create_region_isolated_heatmaps(widget)
+
+    created = viewer.layers[-1]
+    expected = np.where(annotation == 1, source_a.data + source_b.data, 0.0)
+    np.testing.assert_array_equal(created.data, expected)
+    assert created.name == "Region Isolated (R1): merged 2 heatmaps"
+    assert created.metadata["source_heatmap_layers"] == ["Source A", "Source B"]
+    assert created.metadata["heatmap_region_ids"] == [1]
+    assert created.metadata["heatmap_include_child_regions"] is False
+    assert created.metadata["merge_mode"] == "merged_sum"
+    assert created.contrast_limits == (0.0, 10.0)

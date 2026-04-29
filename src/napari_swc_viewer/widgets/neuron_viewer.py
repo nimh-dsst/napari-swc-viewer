@@ -45,6 +45,7 @@ from qtpy.QtWidgets import (
 
 from ..analysis.mask import (
     build_binary_mask_from_threshold_range,
+    isolate_heatmap_volume_to_region_ids,
     merge_heatmap_volumes,
     otsu_threshold_positive,
     smooth_heatmap_volume,
@@ -755,7 +756,17 @@ class NeuronViewerWidget(QWidget):
 
     def _setup_tools_tab(self, parent: QWidget) -> None:
         """Set up the blur-generation tools tab."""
-        layout = QVBoxLayout(parent)
+        parent_layout = QVBoxLayout(parent)
+
+        self._tools_scroll_area = QScrollArea()
+        self._tools_scroll_area.setWidgetResizable(True)
+        parent_layout.addWidget(self._tools_scroll_area)
+
+        self._tools_scroll_content = QWidget()
+        self._tools_scroll_area.setWidget(self._tools_scroll_content)
+
+        layout = QVBoxLayout(self._tools_scroll_content)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         sources_group = QGroupBox("Heatmap Sources")
         sources_layout = QVBoxLayout(sources_group)
@@ -807,6 +818,36 @@ class NeuronViewerWidget(QWidget):
         blur_layout.addWidget(self._create_blur_btn)
 
         layout.addWidget(blur_group)
+
+        isolation_group = QGroupBox("Region Isolation")
+        isolation_layout = QVBoxLayout(isolation_group)
+
+        isolation_mode_row = QHBoxLayout()
+        isolation_mode_row.addWidget(QLabel("Create mode:"))
+        self._region_isolation_create_mode_combo = QComboBox()
+        self._region_isolation_create_mode_combo.addItem("Separate layers", "separate")
+        self._region_isolation_create_mode_combo.addItem("Merged layer", "merged")
+        self._region_isolation_create_mode_combo.currentIndexChanged.connect(
+            self._update_tools_controls
+        )
+        isolation_mode_row.addWidget(self._region_isolation_create_mode_combo)
+        isolation_layout.addLayout(isolation_mode_row)
+
+        self._tools_region_selector = RegionSelectorWidget()
+        self._tools_region_selector.selection_changed.connect(
+            lambda _acronyms: self._update_tools_controls()
+        )
+        isolation_layout.addWidget(self._tools_region_selector)
+
+        self._create_region_isolated_heatmap_btn = QPushButton(
+            "Create Isolated Heatmap"
+        )
+        self._create_region_isolated_heatmap_btn.clicked.connect(
+            self._create_region_isolated_heatmaps
+        )
+        isolation_layout.addWidget(self._create_region_isolated_heatmap_btn)
+
+        layout.addWidget(isolation_group)
 
         self._tools_status_label = QLabel("")
         self._tools_status_label.setWordWrap(True)
@@ -1183,6 +1224,7 @@ class NeuronViewerWidget(QWidget):
                 "_whole_parquet_region_selector",
                 "_current_table_region_selector",
                 "_region_selector",
+                "_tools_region_selector",
             ):
                 selector = getattr(self, attr_name, None)
                 if selector is None or selector in selectors:
@@ -2164,11 +2206,66 @@ class NeuronViewerWidget(QWidget):
         mode = combo.currentData() if combo is not None else None
         return "merged" if mode == "merged" else "separate"
 
+    def _current_region_isolation_create_mode(self) -> str:
+        """Return the active Tools region-isolation create mode."""
+        combo = getattr(self, "_region_isolation_create_mode_combo", None)
+        mode = combo.currentData() if combo is not None else None
+        return "merged" if mode == "merged" else "separate"
+
     def _current_histogram_create_mode(self) -> str:
         """Return the active Histogram create mode."""
         combo = getattr(self, "_histogram_create_mode_combo", None)
         mode = combo.currentData() if combo is not None else None
         return "merged" if mode == "merged" else "separate"
+
+    def _selected_region_isolation_entries(self) -> list[tuple[int, str]]:
+        """Return directly selected Tools isolation regions as IDs and acronyms."""
+        selector = getattr(self, "_tools_region_selector", None)
+        if selector is None:
+            return []
+
+        entries: list[tuple[int, str]] = []
+        if hasattr(selector, "get_selected_ids"):
+            selected_ids = selector.get_selected_ids(include_children=False)
+            structure_map = getattr(selector, "_structure_map", {})
+            for struct_id in selected_ids:
+                struct = structure_map.get(int(struct_id), {})
+                acronym = str(struct.get("acronym", "")).strip()
+                if acronym:
+                    entries.append((int(struct_id), acronym))
+            if entries:
+                return entries
+
+        if hasattr(selector, "get_single_selected_region"):
+            selected = selector.get_single_selected_region()
+            if selected is not None:
+                struct_id, acronym = selected
+                return [(int(struct_id), str(acronym))]
+        return []
+
+    def _selected_region_isolation_region_ids(self) -> list[int]:
+        """Return effective atlas annotation IDs for Tools region isolation."""
+        selector = getattr(self, "_tools_region_selector", None)
+        if selector is None or not hasattr(selector, "get_selected_ids"):
+            return []
+
+        include_children = True
+        if hasattr(selector, "include_children_enabled"):
+            include_children = bool(selector.include_children_enabled())
+        return [
+            int(region_id)
+            for region_id in selector.get_selected_ids(
+                include_children=include_children
+            )
+        ]
+
+    def _region_isolation_label(self, acronyms: list[str]) -> str:
+        """Return a compact region label for isolated heatmap layer names."""
+        if not acronyms:
+            return "selected regions"
+        if len(acronyms) <= 2:
+            return ", ".join(acronyms)
+        return f"{', '.join(acronyms[:2])} +{len(acronyms) - 2} more"
 
     def _selected_layer_names_from_widget(self, widget: QListWidget | None) -> set[str]:
         """Return selected layer names from a list widget."""
@@ -2377,14 +2474,18 @@ class NeuronViewerWidget(QWidget):
             return
         self._mask_bounds_source = "manual"
 
-    def _update_tools_controls(self) -> None:
+    def _update_tools_controls(self, *_args) -> None:
         """Enable or disable Tools actions based on current selection."""
         if not hasattr(self, "_heatmap_layer_list"):
             return
 
-        ready = self._atlas is not None and bool(self._selected_heatmap_layers())
+        selected_layers = self._selected_heatmap_layers()
+        ready = self._atlas is not None and bool(selected_layers)
         if hasattr(self, "_create_blur_btn"):
             self._create_blur_btn.setEnabled(ready)
+        if hasattr(self, "_create_region_isolated_heatmap_btn"):
+            has_regions = bool(self._selected_region_isolation_region_ids())
+            self._create_region_isolated_heatmap_btn.setEnabled(ready and has_regions)
 
     def _update_histogram_controls(self) -> None:
         """Enable or disable Histogram actions based on current selection."""
@@ -2708,6 +2809,102 @@ class NeuronViewerWidget(QWidget):
             f"Created {len(created_layers)} blurred layer(s); {nonempty} contain nonzero voxels."
         )
 
+    def _create_region_isolated_heatmaps(self) -> None:
+        """Create heatmap image layers limited to selected atlas regions."""
+        if self._atlas is None:
+            message = "Load an atlas before creating isolated heatmap layers."
+            self._tools_status_label.setText(message)
+            show_warning(message)
+            return
+
+        selected_layers = self._selected_heatmap_layers()
+        if not selected_layers:
+            message = "Select at least one eligible heatmap layer."
+            self._tools_status_label.setText(message)
+            return
+
+        region_ids = self._selected_region_isolation_region_ids()
+        if not region_ids:
+            message = "Select at least one atlas region for isolation."
+            self._tools_status_label.setText(message)
+            return
+
+        selected_regions = self._selected_region_isolation_entries()
+        selected_region_ids = [
+            region_id for region_id, _acronym in selected_regions
+        ]
+        selected_region_acronyms = [
+            acronym for _region_id, acronym in selected_regions
+        ]
+        region_label = self._region_isolation_label(selected_region_acronyms)
+        selector = getattr(self, "_tools_region_selector", None)
+        include_children = (
+            bool(selector.include_children_enabled())
+            if selector is not None and hasattr(selector, "include_children_enabled")
+            else True
+        )
+        create_mode = self._current_region_isolation_create_mode()
+        created_layers = []
+
+        try:
+            if create_mode == "merged":
+                merged_volume = merge_heatmap_volumes(
+                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+                )
+                isolated = isolate_heatmap_volume_to_region_ids(
+                    merged_volume,
+                    self._atlas,
+                    region_ids,
+                )
+                created_layers.append(
+                    self._add_region_isolated_heatmap_layer(
+                        layer_name=(
+                            f"Region Isolated ({region_label}): "
+                            f"merged {len(selected_layers)} heatmaps"
+                        ),
+                        volume=isolated,
+                        source_layers=selected_layers,
+                        selected_region_ids=selected_region_ids,
+                        selected_region_acronyms=selected_region_acronyms,
+                        region_ids=region_ids,
+                        include_children=include_children,
+                        merge_mode="merged_sum",
+                    )
+                )
+            else:
+                for layer in selected_layers:
+                    isolated = isolate_heatmap_volume_to_region_ids(
+                        np.asarray(layer.data, dtype=np.float32),
+                        self._atlas,
+                        region_ids,
+                    )
+                    created_layers.append(
+                        self._add_region_isolated_heatmap_layer(
+                            layer_name=f"Region Isolated ({region_label}): {layer.name}",
+                            volume=isolated,
+                            source_layers=[layer],
+                            selected_region_ids=selected_region_ids,
+                            selected_region_acronyms=selected_region_acronyms,
+                            region_ids=region_ids,
+                            include_children=include_children,
+                            merge_mode="separate",
+                        )
+                    )
+        except Exception as e:
+            logger.error("Failed to create isolated heatmap layers: %s", e)
+            self._tools_status_label.setText(f"Failed to create isolated heatmap layers: {e}")
+            return
+
+        self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
+        self._select_heatmap_layer_names([layer.name for layer in created_layers])
+        self._select_histogram_layer_names([layer.name for layer in created_layers])
+        nonempty = sum(int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers)
+        self._tools_status_label.setText(
+            f"Created {len(created_layers)} isolated heatmap layer(s); "
+            f"{nonempty} contain nonzero voxels."
+        )
+
     def _create_masks_from_heatmaps(self) -> None:
         """Create binary mask label layers from selected heatmap image layers."""
         if self._atlas is None:
@@ -2845,6 +3042,82 @@ class NeuronViewerWidget(QWidget):
             **add_kwargs,
         )
         return layer
+
+    def _add_region_isolated_heatmap_layer(
+        self,
+        layer_name: str,
+        volume: np.ndarray,
+        source_layers: list,
+        selected_region_ids: list[int],
+        selected_region_acronyms: list[str],
+        region_ids: list[int],
+        include_children: bool,
+        merge_mode: str,
+    ):
+        """Add one post-hoc region-isolated heatmap image layer."""
+        from napari.utils.colormaps import Colormap
+
+        first_layer = source_layers[0]
+        rgba = _mask_layer_color(source_layers)
+
+        colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        if colormap is None and rgba is not None:
+            colormap = Colormap(
+                colors=[[0.0, 0.0, 0.0, 0.0], list(rgba)],
+                name=f"region_isolated_{layer_name.lower().replace(' ', '_')}",
+            )
+        elif colormap is None:
+            colormap = "hot"
+
+        contrast_limits = _heatmap_contrast_limits(volume)
+        metadata = dict(_layer_metadata(first_layer)) if len(source_layers) == 1 else {}
+        for stale_key in (
+            "heatmap_region",
+            "heatmap_selected_region_id",
+            "heatmap_selected_region_acronym",
+        ):
+            metadata.pop(stale_key, None)
+        metadata.update(
+            {
+                "heatmap_source": True,
+                "heatmap_native_grid": True,
+                "heatmap_kind": "region_isolated",
+                "source_heatmap_layers": [layer.name for layer in source_layers],
+                "heatmap_selected_region_ids": [
+                    int(region_id) for region_id in selected_region_ids
+                ],
+                "heatmap_selected_region_acronyms": [
+                    str(acronym) for acronym in selected_region_acronyms
+                ],
+                "heatmap_region_ids": [int(region_id) for region_id in region_ids],
+                "heatmap_include_child_regions": bool(include_children),
+                "atlas_name": self._current_atlas_name(),
+                "color": rgba,
+                "merge_mode": merge_mode,
+                "heatmap_contrast_limits": contrast_limits,
+                "heatmap_autocontrast_policy": "stable_full_volume",
+            }
+        )
+
+        add_kwargs = {
+            "name": self._unique_layer_name(layer_name),
+            "colormap": colormap,
+            "blending": getattr(first_layer, "blending", "additive"),
+            "rendering": getattr(first_layer, "rendering", "mip"),
+            "opacity": getattr(first_layer, "opacity", self._opacity_slider.value() / 100.0),
+            "visible": True,
+            "contrast_limits": contrast_limits,
+            "metadata": metadata,
+        }
+        for attr_name in ("scale", "translate"):
+            value = getattr(first_layer, attr_name, None)
+            if value is not None:
+                add_kwargs[attr_name] = value
+
+        return self.viewer.add_image(
+            np.asarray(volume, dtype=np.float32),
+            **add_kwargs,
+        )
 
     def _add_mask_layer(
         self,
