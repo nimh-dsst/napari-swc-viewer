@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from napari_swc_viewer.neuron_table_ops import ClusterFilterSelection
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 _PATCHED_MODULE_NAMES = [
@@ -102,6 +104,12 @@ class _FakeQt:
     Horizontal = 1
 
 
+class _FakeQEvent:
+    MouseButtonPress = 2
+    MouseButtonRelease = 3
+    MouseButtonDblClick = 4
+
+
 class _FakeWidget:
     def __init__(self, *_args, **_kwargs) -> None:
         return None
@@ -114,6 +122,7 @@ class _FakeApplication(_FakeWidget):
 
 
 fake_qtcore = types.ModuleType("qtpy.QtCore")
+fake_qtcore.QEvent = _FakeQEvent
 fake_qtcore.Qt = _FakeQt
 fake_qtcore.QThread = _FakeWidget
 fake_qtcore.QTimer = _FakeQTimer
@@ -450,6 +459,38 @@ class _DummyButton:
 
     def setText(self, value: str) -> None:
         self.text = value
+
+
+class _DummyClusterFilterCombo:
+    def __init__(self, selection: ClusterFilterSelection | None = None) -> None:
+        self.selection = selection or ClusterFilterSelection()
+        self.calls: list[dict[str, object]] = []
+
+    def cluster_filter_selection(self) -> ClusterFilterSelection:
+        return self.selection
+
+    def set_cluster_options(
+        self,
+        cluster_ids: list[int],
+        *,
+        include_unclustered: bool,
+        selection: ClusterFilterSelection,
+    ) -> None:
+        self.calls.append(
+            {
+                "cluster_ids": list(cluster_ids),
+                "include_unclustered": include_unclustered,
+                "selection": selection,
+            }
+        )
+        available_ids = {int(cluster_id) for cluster_id in cluster_ids}
+        if selection.is_all:
+            self.selection = ClusterFilterSelection()
+        else:
+            self.selection = ClusterFilterSelection(
+                selection.cluster_ids & available_ids,
+                selection.include_unclustered and include_unclustered,
+            )
 
 
 class _DummyStack:
@@ -892,6 +933,17 @@ def _bind_table_membership_helpers(widget) -> None:
     )
     widget._sync_after_neuron_table_membership_change = types.MethodType(
         NeuronViewerWidget._sync_after_neuron_table_membership_change,
+        widget,
+    )
+
+
+def _bind_cluster_filter_helpers(widget) -> None:
+    widget._selected_cluster_filter = types.MethodType(
+        NeuronViewerWidget._selected_cluster_filter,
+        widget,
+    )
+    widget._on_cluster_filter_changed = types.MethodType(
+        NeuronViewerWidget._on_cluster_filter_changed,
         widget,
     )
 
@@ -1709,6 +1761,92 @@ def test_on_cluster_colors_updated_sorts_and_refreshes_filters() -> None:
     neuron_table.sort_by_cluster.assert_called_once_with()
     widget._refresh_cluster_filter_controls.assert_called_once_with()
     widget._refresh_apply_existing_clusters_button.assert_called_once_with()
+
+
+def test_refresh_cluster_filter_controls_preserves_valid_multi_selection() -> None:
+    selection = ClusterFilterSelection({1, 3}, include_unclustered=True)
+    combo = _DummyClusterFilterCombo(selection)
+    applied: list[ClusterFilterSelection] = []
+    table = types.SimpleNamespace(
+        available_cluster_ids=lambda: [1, 2, 3],
+        has_unclustered_entries=lambda: True,
+        apply_cluster_filter=lambda selected: applied.append(selected),
+        get_visibility_map=lambda: {"n1": True},
+    )
+    widget = types.SimpleNamespace(
+        _cluster_filter_combo=combo,
+        _neuron_table=table,
+        _hide_others_btn=_DummyButton(),
+        _recolor_cluster_btn=_DummyButton(),
+        _show_all_btn=_DummyButton(),
+    )
+    _bind_cluster_filter_helpers(widget)
+
+    NeuronViewerWidget._refresh_cluster_filter_controls(widget)
+
+    assert combo.calls == [
+        {
+            "cluster_ids": [1, 2, 3],
+            "include_unclustered": True,
+            "selection": selection,
+        }
+    ]
+    assert combo.selection == selection
+    assert applied == [selection]
+    assert widget._hide_others_btn.enabled is True
+    assert widget._recolor_cluster_btn.enabled is True
+    assert widget._show_all_btn.enabled is True
+
+
+def test_refresh_cluster_filter_controls_falls_back_to_all_when_invalid() -> None:
+    combo = _DummyClusterFilterCombo(
+        ClusterFilterSelection({9}, include_unclustered=True)
+    )
+    applied: list[ClusterFilterSelection] = []
+    table = types.SimpleNamespace(
+        available_cluster_ids=lambda: [1, 2],
+        has_unclustered_entries=lambda: False,
+        apply_cluster_filter=lambda selected: applied.append(selected),
+        get_visibility_map=lambda: {"n1": True},
+    )
+    widget = types.SimpleNamespace(
+        _cluster_filter_combo=combo,
+        _neuron_table=table,
+        _hide_others_btn=_DummyButton(),
+        _recolor_cluster_btn=_DummyButton(),
+        _show_all_btn=_DummyButton(),
+    )
+    _bind_cluster_filter_helpers(widget)
+
+    NeuronViewerWidget._refresh_cluster_filter_controls(widget)
+
+    assert combo.selection == ClusterFilterSelection()
+    assert applied == [ClusterFilterSelection()]
+    assert widget._hide_others_btn.enabled is False
+    assert widget._recolor_cluster_btn.enabled is False
+    assert widget._show_all_btn.enabled is True
+
+
+def test_cluster_selection_actions_apply_full_selection() -> None:
+    selection = ClusterFilterSelection({1, 2}, include_unclustered=True)
+    table = types.SimpleNamespace(
+        hide_all_not_in_cluster=MagicMock(),
+        recolor_cluster_turbo=MagicMock(),
+    )
+    widget = types.SimpleNamespace(
+        _cluster_filter_combo=_DummyClusterFilterCombo(selection),
+        _neuron_table=table,
+    )
+    _bind_cluster_filter_helpers(widget)
+
+    NeuronViewerWidget._hide_not_in_selected_cluster(widget)
+    NeuronViewerWidget._recolor_selected_cluster(widget)
+
+    table.hide_all_not_in_cluster.assert_called_once_with(selection)
+    table.recolor_cluster_turbo.assert_called_once_with(
+        selection,
+        gray_others=True,
+    )
 
 
 def test_refresh_apply_existing_clusters_button_hidden_without_overlap() -> None:

@@ -4,12 +4,14 @@ import numpy as np
 from matplotlib import colormaps
 
 from napari_swc_viewer.neuron_table_ops import (
+    ClusterFilterSelection,
     GRAY_RGBA,
     NeuronTableSummary,
     added_flags,
     cluster_filter_matches,
     cluster_ids_available,
     cluster_sort_value,
+    has_unclustered_entries,
     recolor_cluster_turbo,
     summarize_neuron_table,
     visibility_for_selected_cluster,
@@ -56,6 +58,28 @@ def test_cluster_filter_matches() -> None:
     assert all(all_rows.values())
 
 
+def test_cluster_filter_selection_matches_multiple_groups() -> None:
+    """Filtering supports multiple clusters plus unclustered rows."""
+    cluster_by_file = {"n1": 1, "n2": 2, "n3": None, "n4": 3}
+    selection = ClusterFilterSelection({1, 3}, include_unclustered=True)
+
+    matches = cluster_filter_matches(cluster_by_file, selection)
+
+    assert matches == {"n1": True, "n2": False, "n3": True, "n4": True}
+    assert selection.is_all is False
+
+
+def test_cluster_filter_selection_all_rows_when_empty() -> None:
+    """An empty explicit selection means all rows."""
+    cluster_by_file = {"n1": 1, "n2": None}
+    selection = ClusterFilterSelection()
+
+    matches = cluster_filter_matches(cluster_by_file, selection)
+
+    assert selection.is_all is True
+    assert matches == {"n1": True, "n2": True}
+
+
 def test_visibility_for_selected_cluster_and_show_all() -> None:
     """Visibility map hides non-cluster members and restores all for None."""
     cluster_by_file = {"n1": 1, "n2": 2, "n3": 1}
@@ -64,6 +88,16 @@ def test_visibility_for_selected_cluster_and_show_all() -> None:
 
     assert hidden == {"n1": True, "n2": False, "n3": True}
     assert shown == {"n1": True, "n2": True, "n3": True}
+
+
+def test_visibility_for_cluster_selection_with_unclustered() -> None:
+    """Visibility can keep selected clusters and unclustered rows visible."""
+    cluster_by_file = {"n1": 1, "n2": 2, "n3": None, "n4": 3}
+    selection = ClusterFilterSelection({2}, include_unclustered=True)
+
+    visibility = visibility_for_selected_cluster(cluster_by_file, selection)
+
+    assert visibility == {"n1": False, "n2": True, "n3": True, "n4": False}
 
 
 def test_recolor_cluster_turbo_grays_others() -> None:
@@ -84,10 +118,34 @@ def test_recolor_cluster_turbo_grays_others() -> None:
     assert colors["n10"] == list(GRAY_RGBA)
 
 
+def test_recolor_cluster_turbo_handles_multi_selection_and_unclustered() -> None:
+    """Turbo recoloring samples across all selected groups together."""
+    cluster_by_file = {"n3": None, "n2": 2, "n1": 1, "n4": 3}
+    selection = ClusterFilterSelection({1, 2}, include_unclustered=True)
+
+    colors = recolor_cluster_turbo(cluster_by_file, selection, gray_others=True)
+
+    selected_ids = sorted(["n1", "n2", "n3"])
+    expected_samples = np.linspace(0.0, 1.0, 3)
+    expected_colors = [
+        [float(c) for c in colormaps["turbo"](float(sample))]
+        for sample in expected_samples
+    ]
+    for file_id, expected_color in zip(selected_ids, expected_colors):
+        assert colors[file_id] == expected_color
+    assert colors["n4"] == list(GRAY_RGBA)
+
+
 def test_available_cluster_ids_sorted_unique() -> None:
     """Cluster IDs are unique and sorted ascending, excluding None."""
     cluster_by_file = {"a": 3, "b": None, "c": -1, "d": 3, "e": 2}
     assert cluster_ids_available(cluster_by_file) == [-1, 2, 3]
+
+
+def test_has_unclustered_entries() -> None:
+    """Unclustered availability detects rows without cluster assignment."""
+    assert has_unclustered_entries({"a": 1, "b": None}) is True
+    assert has_unclustered_entries({"a": 1, "b": 2}) is False
 
 
 def test_summarize_neuron_table_empty() -> None:
