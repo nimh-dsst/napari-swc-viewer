@@ -15,12 +15,82 @@ from typing import TYPE_CHECKING
 import numpy as np
 from qtpy.QtCore import QObject, Signal
 
+from .logging_utils import startup_timing
+
 if TYPE_CHECKING:
     from brainglobe_atlasapi import BrainGlobeAtlas
 
     from .analysis.clustering import ClusterRegionSelection, ClusterResult
 
 logger = logging.getLogger(__name__)
+
+
+def cached_brainglobe_atlas_dir(
+    atlas_name: str,
+    *,
+    brainglobe_dir: str | Path | None = None,
+    config_dir: str | Path | None = None,
+) -> Path | None:
+    """Return the single local cache directory for an atlas, if available."""
+    if brainglobe_dir is None:
+        try:
+            from brainglobe_atlasapi import config
+
+            conf = config.read_config(config_dir)
+            brainglobe_dir = conf["default_dirs"]["brainglobe_dir"]
+        except Exception:
+            logger.debug(
+                "Failed to resolve BrainGlobe cache directory.",
+                exc_info=True,
+            )
+            return None
+
+    root = Path(brainglobe_dir).expanduser()
+    candidates = sorted(
+        path for path in root.glob(f"{atlas_name}_v*") if path.is_dir()
+    )
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def load_cached_brainglobe_atlas(atlas_name: str, atlas_dir: str | Path):
+    """Load an already-cached BrainGlobe atlas without remote checks/downloads."""
+    from brainglobe_atlasapi.core import Atlas
+
+    atlas = Atlas(Path(atlas_dir))
+    atlas.atlas_name = atlas_name
+    return atlas
+
+
+class CachedAtlasLoadWorker(QObject):
+    """Load a locally cached BrainGlobe atlas in the background."""
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, atlas_name: str, atlas_dir: str | Path):
+        super().__init__()
+        self._atlas_name = str(atlas_name)
+        self._atlas_dir = Path(atlas_dir)
+
+    def run(self) -> None:
+        """Load the cached atlas and emit it."""
+        try:
+            with startup_timing(
+                logger,
+                "cached_atlas_load_worker",
+                atlas=self._atlas_name,
+                atlas_dir=self._atlas_dir,
+            ):
+                atlas = load_cached_brainglobe_atlas(
+                    self._atlas_name,
+                    self._atlas_dir,
+                )
+            self.finished.emit(atlas)
+        except Exception as e:
+            logger.exception("Cached atlas load failed")
+            self.error.emit(str(e))
 
 
 def _attach_cluster_run_metadata(
@@ -506,7 +576,6 @@ class SomaClusterWorker(QObject):
                 return
 
             self.progress.emit(f"Clustering {len(filtered_ids)} somas ({self._algorithm})...", 3, total)
-            cluster_start = perf_counter()
 
             if self._algorithm == "hierarchical":
                 result = cluster_somas_hierarchical(

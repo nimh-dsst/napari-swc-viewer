@@ -11,11 +11,28 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from ..logging_utils import startup_timing
+
 if TYPE_CHECKING:
     import napari
     from brainglobe_atlasapi import BrainGlobeAtlas
 
 logger = logging.getLogger(__name__)
+
+
+def _array_startup_metadata(array) -> dict[str, object]:
+    """Return compact array metadata without forcing a copy."""
+    shape = getattr(array, "shape", None)
+    dtype = getattr(array, "dtype", None)
+    nbytes = getattr(array, "nbytes", None)
+    metadata: dict[str, object] = {}
+    if shape is not None:
+        metadata["shape"] = tuple(int(value) for value in shape)
+    if dtype is not None:
+        metadata["dtype"] = dtype
+    if nbytes is not None:
+        metadata["size_mb"] = float(nbytes) / (1024.0 * 1024.0)
+    return metadata
 
 
 def add_allen_template(
@@ -50,19 +67,35 @@ def add_allen_template(
     napari.layers.Image
         The created image layer.
     """
-    # Get reference image (in voxel space)
-    reference = atlas.reference
+    with startup_timing(logger, "add_allen_template", layer=name) as timing:
+        with startup_timing(
+            logger,
+            "add_allen_template_phase",
+            phase="atlas.reference",
+            layer=name,
+        ) as reference_timing:
+            reference = atlas.reference
+            metadata = _array_startup_metadata(reference)
+            reference_timing.set(**metadata)
+            timing.set(**metadata)
 
-    layer = viewer.add_image(
-        reference,
-        name=name,
-        opacity=opacity,
-        colormap=colormap,
-        visible=visible,
-        blending="additive",
-    )
+        with startup_timing(
+            logger,
+            "add_allen_template_phase",
+            phase="viewer.add_image",
+            layer=name,
+            **metadata,
+        ):
+            layer = viewer.add_image(
+                reference,
+                name=name,
+                opacity=opacity,
+                colormap=colormap,
+                visible=visible,
+                blending="additive",
+            )
 
-    return layer
+        return layer
 
 
 def add_annotation_volume(

@@ -355,12 +355,22 @@ class _DummyViewer:
 class _DummyCheckBox:
     def __init__(self, checked: bool) -> None:
         self._checked = checked
+        self.enabled = True
+        self.signals_blocked = False
 
     def isChecked(self) -> bool:
         return self._checked
 
     def setChecked(self, checked: bool) -> None:
         self._checked = checked
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+    def blockSignals(self, blocked: bool) -> bool:
+        previous = self.signals_blocked
+        self.signals_blocked = bool(blocked)
+        return previous
 
 
 class _DummyComboBox:
@@ -474,6 +484,18 @@ class _DummyValueControl:
         return self._value
 
 
+class _DummyStatusLabel:
+    def __init__(self) -> None:
+        self.text = ""
+        self.repaint_count = 0
+
+    def setText(self, value: str) -> None:
+        self.text = value
+
+    def repaint(self) -> None:
+        self.repaint_count += 1
+
+
 def _make_soma_projector(
     viewer: _DummyViewer,
     *,
@@ -498,6 +520,267 @@ def _make_soma_projector(
     projector._last_result = None
     projector._update_timer = MagicMock()
     return projector
+
+
+def test_widget_startup_schedules_cached_template_autoload_without_atlas_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup should only schedule the cached-background template path."""
+    single_shot_calls = []
+
+    class _TimerRecorder:
+        @staticmethod
+        def singleShot(*args, **kwargs) -> None:
+            single_shot_calls.append((args, kwargs))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget.__init__.__globals__,
+        "QTimer",
+        _TimerRecorder,
+    )
+    atlas_factory = MagicMock()
+    monkeypatch.setitem(
+        NeuronViewerWidget.__init__.__globals__,
+        "BrainGlobeAtlas",
+        atlas_factory,
+    )
+    monkeypatch.setattr(NeuronViewerWidget, "_setup_ui", lambda self: None)
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_connect_layer_events",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_refresh_heatmap_layer_list",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_refresh_histogram_layer_list",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_refresh_mask_layer_options",
+        lambda self: None,
+    )
+
+    widget = NeuronViewerWidget(_DummyViewer())
+
+    assert len(single_shot_calls) == 1
+    assert single_shot_calls[0][0][0] == 0
+    assert single_shot_calls[0][0][1].__self__ is widget
+    assert single_shot_calls[0][0][1].__name__ == "_start_cached_template_autoload"
+    atlas_factory.assert_not_called()
+
+
+def test_reference_template_checkbox_defaults_to_lazy_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reference template should be opt-in, not loaded at startup."""
+
+    class _Layout:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.items = []
+
+        def addWidget(self, widget) -> None:
+            self.items.append(widget)
+
+        def addLayout(self, layout) -> None:
+            self.items.append(layout)
+
+        def addStretch(self) -> None:
+            self.items.append("stretch")
+
+    class _SignalStub:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def connect(self, callback) -> None:
+            self.callbacks.append(callback)
+
+    class _CheckBoxStub:
+        def __init__(self, text: str = "") -> None:
+            self.text = text
+            self.checked = None
+            self.tooltip = ""
+            self.stateChanged = _SignalStub()
+
+        def setChecked(self, checked: bool) -> None:
+            self.checked = bool(checked)
+
+        def isChecked(self) -> bool:
+            return bool(self.checked)
+
+        def setToolTip(self, text: str) -> None:
+            self.tooltip = text
+
+    class _SliderStub:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.valueChanged = _SignalStub()
+
+        def setRange(self, *_args) -> None:
+            return None
+
+        def setValue(self, *_args) -> None:
+            return None
+
+    globals_dict = NeuronViewerWidget._setup_reference_tab.__globals__
+    monkeypatch.setitem(globals_dict, "QVBoxLayout", _Layout)
+    monkeypatch.setitem(globals_dict, "QHBoxLayout", _Layout)
+    monkeypatch.setitem(globals_dict, "QGroupBox", _FakeWidget)
+    monkeypatch.setitem(globals_dict, "QLabel", _FakeWidget)
+    monkeypatch.setitem(globals_dict, "QCheckBox", _CheckBoxStub)
+    monkeypatch.setitem(globals_dict, "QSlider", _SliderStub)
+
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._toggle_template = lambda _state: None
+    widget._update_template_opacity = lambda _value: None
+    widget._toggle_outline = lambda _state: None
+    widget._toggle_region_meshes = lambda _state: None
+    widget._toggle_region_segmentation = lambda _state: None
+    widget._update_seg_opacity = lambda _value: None
+
+    NeuronViewerWidget._setup_reference_tab(widget, _FakeWidget())
+
+    assert widget._show_template_cb.isChecked() is False
+    assert "on demand" in widget._show_template_cb.tooltip
+
+
+def test_load_atlas_skips_remote_latest_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit atlas loads should avoid BrainGlobe's remote latest check."""
+    calls = []
+
+    class _FakeAtlas:
+        def __init__(self, atlas_name: str, **kwargs) -> None:
+            calls.append((atlas_name, kwargs))
+            self.structures = {1: {"acronym": "R1"}}
+
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas_combo = _DummyComboBox("allen_mouse_25um")
+    widget._atlas_status_label = _DummyStatusLabel()
+    widget._analysis_tab = types.SimpleNamespace(set_atlas=lambda _atlas: None)
+    widget._update_mask_sigma_units_label = lambda: None
+    widget._refresh_heatmap_layer_list = lambda: None
+    widget._refresh_histogram_layer_list = lambda: None
+    widget._refresh_mask_layer_options = lambda: None
+    widget._update_point_import_controls = lambda: None
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._load_atlas.__globals__,
+        "BrainGlobeAtlas",
+        _FakeAtlas,
+    )
+
+    NeuronViewerWidget._load_atlas(widget)
+
+    assert calls == [("allen_mouse_25um", {"check_latest": False})]
+    assert widget._atlas_status_label.text == "Atlas: allen_mouse_25um (1 structures)"
+
+
+def test_toggle_template_loads_atlas_on_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checking the template box should still load the atlas when needed."""
+    load_calls = []
+    template_calls = []
+    atlas = object()
+
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget.viewer = _DummyViewer()
+    widget._show_template_cb = _DummyCheckBox(True)
+    widget._template_opacity_slider = _DummyValueControl(30)
+
+    def _load_atlas() -> None:
+        load_calls.append(True)
+        widget._atlas = atlas
+
+    widget._load_atlas = _load_atlas
+
+    def _add_template(viewer, loaded_atlas, **kwargs) -> None:
+        template_calls.append((viewer, loaded_atlas, kwargs))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._toggle_template.__globals__,
+        "add_allen_template",
+        _add_template,
+    )
+
+    NeuronViewerWidget._toggle_template(widget, True)
+
+    assert load_calls == [True]
+    assert template_calls == [(widget.viewer, atlas, {"opacity": 0.3})]
+
+
+def test_toggle_template_hide_without_atlas_does_not_load() -> None:
+    """Turning the template off before atlas load should not load an atlas."""
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget._cached_atlas_thread = None
+    widget._show_template_after_cached_atlas_load = True
+    widget._load_atlas = MagicMock()
+    widget._show_template_cb = _DummyCheckBox(False)
+
+    NeuronViewerWidget._toggle_template(widget, False)
+
+    widget._load_atlas.assert_not_called()
+    assert widget._show_template_after_cached_atlas_load is False
+
+
+def test_toggle_template_waits_for_cached_autoload() -> None:
+    """Manual template-on requests should not start a second atlas load."""
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget._cached_atlas_thread = types.SimpleNamespace(isRunning=lambda: True)
+    widget._show_template_after_cached_atlas_load = False
+    widget._load_atlas = MagicMock()
+    widget._show_template_cb = _DummyCheckBox(True)
+
+    NeuronViewerWidget._toggle_template(widget, True)
+
+    widget._load_atlas.assert_not_called()
+    assert widget._show_template_after_cached_atlas_load is True
+
+
+def test_cached_template_atlas_loaded_applies_atlas_and_shows_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finished background loads should refresh atlas UI and show the template."""
+    atlas = types.SimpleNamespace(
+        atlas_name="fake_atlas",
+        structures={1: {"acronym": "R1"}},
+    )
+    template_calls = []
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget._atlas_combo = _DummyComboBox("fake_atlas")
+    widget._show_template_cb = _DummyCheckBox(True)
+    widget._show_template_after_cached_atlas_load = True
+    widget._template_opacity_slider = _DummyValueControl(30)
+    widget.viewer = _DummyViewer()
+    widget._apply_loaded_atlas = MagicMock(
+        side_effect=lambda loaded, _name: setattr(widget, "_atlas", loaded)
+    )
+
+    def _add_template(viewer, loaded_atlas, **kwargs) -> None:
+        template_calls.append((viewer, loaded_atlas, kwargs))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._toggle_template.__globals__,
+        "add_allen_template",
+        _add_template,
+    )
+
+    NeuronViewerWidget._on_cached_template_atlas_loaded(widget, atlas)
+
+    widget._apply_loaded_atlas.assert_called_once_with(atlas, "fake_atlas")
+    assert template_calls == [(widget.viewer, atlas, {"opacity": 0.3})]
+    assert widget._show_template_cb.isChecked() is True
+    assert widget._show_template_cb.enabled is True
 
 
 def _install_fake_colormaps(monkeypatch: pytest.MonkeyPatch) -> None:

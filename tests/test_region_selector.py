@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import types
 from pathlib import Path
@@ -156,7 +157,7 @@ def _import_region_selector_module():
             / "region_selector.py"
         )
         spec = importlib.util.spec_from_file_location(
-            "region_selector_test_module",
+            "napari_swc_viewer.widgets.region_selector_test_module",
             module_path,
         )
         assert spec is not None
@@ -269,6 +270,45 @@ def test_populate_tree_limits_visible_nodes_to_allowed_ids():
     assert set(widget._items_by_id) == {68, 184, 315}
     assert widget._tree.topLevelItemCount() == 1
     assert widget._tree.topLevelItem(0).text(1) == "ISO"
+
+
+def test_populate_tree_logs_startup_counts(caplog):
+    """Tree population timing should include aggregate atlas counts."""
+    module = _import_region_selector_module()
+    RegionSelectorWidget = module.RegionSelectorWidget
+
+    widget = RegionSelectorWidget.__new__(RegionSelectorWidget)
+    widget._tree = _DummyTree()
+    widget._items_by_id = {}
+    widget._structure_map = {}
+    widget._allowed_structure_ids = {315, 184, 68}
+    widget._update_selection_label = lambda: None
+    widget._atlas = types.SimpleNamespace(
+        atlas_name="fake_atlas",
+        structures={
+            997: {"id": 997, "acronym": "root", "structure_id_path": [997]},
+            315: {"id": 315, "acronym": "ISO", "structure_id_path": [997, 315]},
+            184: {"id": 184, "acronym": "FRP", "structure_id_path": [997, 315, 184]},
+            68: {"id": 68, "acronym": "FRP1", "structure_id_path": [997, 315, 184, 68]},
+            500: {"id": 500, "acronym": "CP", "structure_id_path": [997, 500]},
+        },
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        widget._populate_tree()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "startup_timing event=region_selector_populate_tree" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "status=ok" in messages[0]
+    assert "atlas=fake_atlas" in messages[0]
+    assert "total_structures=5" in messages[0]
+    assert "allowed_structures=3" in messages[0]
+    assert "root_count=1" in messages[0]
+    assert "created_items=3" in messages[0]
 
 
 def test_force_include_children_hides_checkbox_and_overrides_toggle():
