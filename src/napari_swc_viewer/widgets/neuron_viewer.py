@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info, show_warning
-from qtpy.QtCore import Qt, QThread, QTimer
+from qtpy.QtCore import QEvent, Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -58,6 +58,7 @@ from ..auto_center import (
 )
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
+from ..neuron_table_ops import ClusterFilterSelection
 from ..point_import import (
     POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
@@ -109,6 +110,9 @@ _SCENE_RENDER_MODE_SOMA = "soma"
 _REGION_QUERY_SCOPE_WHOLE = "whole"
 _REGION_QUERY_SCOPE_CURRENT = "current"
 _DEFAULT_NEURON_RGBA = (0.5, 0.5, 0.5, 1.0)
+_CLUSTER_FILTER_ALL = "all"
+_CLUSTER_FILTER_UNCLUSTERED = "unclustered"
+_CLUSTER_FILTER_CLUSTER = "cluster"
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -195,6 +199,218 @@ def _heatmap_contrast_limits(volume: np.ndarray) -> tuple[float, float]:
     if not np.isfinite(upper) or upper <= 0.0:
         return (0.0, 1.0)
     return (0.0, upper)
+
+
+class _ClusterFilterComboBox(QComboBox):
+    """Compact checkable cluster filter for the Data tab."""
+
+    selection_changed = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._updating = False
+        self._available_cluster_ids: tuple[int, ...] = ()
+        self._has_unclustered_option = False
+        self.setEditable(True)
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setReadOnly(True)
+            line_edit.setText("All")
+        view = self.view()
+        viewport = view.viewport()
+        if viewport is not None:
+            viewport.installEventFilter(self)
+        else:
+            view.pressed.connect(self._on_item_pressed)
+        self.activated.connect(self._restore_display_text)
+
+    def set_cluster_options(
+        self,
+        cluster_ids: list[int] | tuple[int, ...],
+        *,
+        include_unclustered: bool,
+        selection: ClusterFilterSelection | None = None,
+    ) -> None:
+        """Populate the dropdown while preserving a valid selection."""
+        available_ids = tuple(sorted(int(cluster_id) for cluster_id in cluster_ids))
+        available_set = set(available_ids)
+        self._available_cluster_ids = available_ids
+        self._has_unclustered_option = bool(include_unclustered)
+
+        selected = selection or ClusterFilterSelection()
+        if not selected.is_all:
+            selected = ClusterFilterSelection(
+                selected.cluster_ids & available_set,
+                selected.include_unclustered and include_unclustered,
+            )
+
+        signals_blocked = self.blockSignals(True)
+        self._updating = True
+        try:
+            self.clear()
+            all_checked = selected.is_all
+            self._add_check_item(
+                "All",
+                _CLUSTER_FILTER_ALL,
+                checked=all_checked,
+            )
+            if include_unclustered:
+                self._add_check_item(
+                    "Unclustered",
+                    _CLUSTER_FILTER_UNCLUSTERED,
+                    checked=selected.include_unclustered,
+                )
+            for cluster_id in available_ids:
+                self._add_check_item(
+                    f"Cluster {cluster_id}",
+                    (_CLUSTER_FILTER_CLUSTER, cluster_id),
+                    checked=cluster_id in selected.cluster_ids,
+                )
+            self.setCurrentIndex(0)
+        finally:
+            self._updating = False
+            self.blockSignals(signals_blocked)
+
+        self._update_display_text()
+
+    def cluster_filter_selection(self) -> ClusterFilterSelection:
+        """Return the currently checked cluster filter."""
+        cluster_ids: set[int] = set()
+        include_unclustered = False
+        for index in range(self.count()):
+            if not self._item_checked(index):
+                continue
+            data = self.itemData(index)
+            if data == _CLUSTER_FILTER_UNCLUSTERED:
+                include_unclustered = True
+            elif (
+                isinstance(data, tuple)
+                and len(data) == 2
+                and data[0] == _CLUSTER_FILTER_CLUSTER
+            ):
+                cluster_ids.add(int(data[1]))
+        return ClusterFilterSelection(frozenset(cluster_ids), include_unclustered)
+
+    def _add_check_item(
+        self,
+        text: str,
+        data: object,
+        *,
+        checked: bool,
+    ) -> None:
+        self.addItem(text, data)
+        index = self.count() - 1
+        self._set_item_checked(index, checked)
+        item_getter = getattr(self.model(), "item", None)
+        item = (
+            item_getter(index, self.modelColumn()) if callable(item_getter) else None
+        )
+        if item is not None:
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+
+    def _item_checked(self, index: int) -> bool:
+        return self.itemData(index, Qt.CheckStateRole) == Qt.Checked
+
+    def _set_item_checked(self, index: int, checked: bool) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        self.setItemData(index, state, Qt.CheckStateRole)
+
+    def eventFilter(self, watched, event) -> bool:
+        """Toggle popup checkboxes directly and keep the popup open."""
+        viewport = self.view().viewport()
+        if watched is viewport:
+            row = self._event_row(event)
+            event_type = event.type()
+            if row is not None and event_type in (
+                QEvent.MouseButtonPress,
+                QEvent.MouseButtonDblClick,
+            ):
+                return True
+            if row is not None and event_type == QEvent.MouseButtonRelease:
+                self._toggle_item_at_row(row)
+                return True
+        return super().eventFilter(watched, event)
+
+    def _event_row(self, event) -> int | None:
+        pos_getter = getattr(event, "pos", None)
+        if not callable(pos_getter):
+            return None
+        model_index = self.view().indexAt(pos_getter())
+        is_valid = getattr(model_index, "isValid", None)
+        if callable(is_valid) and not is_valid():
+            return None
+        row_getter = getattr(model_index, "row", None)
+        if not callable(row_getter):
+            return None
+        row = int(row_getter())
+        if row < 0 or row >= self.count():
+            return None
+        return row
+
+    def _on_item_pressed(self, model_index) -> None:
+        """Toggle the pressed row without relying on current-index changes."""
+        row_getter = getattr(model_index, "row", None)
+        if not callable(row_getter):
+            return
+        self._toggle_item_at_row(int(row_getter()))
+
+    def _toggle_item_at_row(self, index: int) -> None:
+        """Toggle one popup item and emit the updated selection."""
+        if self._updating:
+            return
+        if index < 0 or index >= self.count():
+            return
+
+        data = self.itemData(index)
+        if data == _CLUSTER_FILTER_ALL:
+            self._check_all_only()
+        else:
+            self._set_item_checked(index, not self._item_checked(index))
+            self._set_item_checked(0, False)
+            if not self._has_specific_selection():
+                self._set_item_checked(0, True)
+
+        self.setCurrentIndex(0)
+        self._update_display_text()
+        self.selection_changed.emit(self.cluster_filter_selection())
+
+    def _restore_display_text(self, _index: int) -> None:
+        """Keep the editable combo display on the compact selection summary."""
+        if self._updating:
+            return
+        self.setCurrentIndex(0)
+        self._update_display_text()
+
+    def _check_all_only(self) -> None:
+        for index in range(self.count()):
+            self._set_item_checked(index, index == 0)
+
+    def _has_specific_selection(self) -> bool:
+        return any(self._item_checked(index) for index in range(1, self.count()))
+
+    def _update_display_text(self) -> None:
+        selection = self.cluster_filter_selection()
+        text = self._selection_text(selection)
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setText(text)
+        self.setToolTip(text)
+
+    @staticmethod
+    def _selection_text(selection: ClusterFilterSelection) -> str:
+        if selection.is_all:
+            return "All"
+
+        cluster_ids = sorted(selection.cluster_ids)
+        if not cluster_ids:
+            return "Unclustered"
+        if len(cluster_ids) == 1:
+            cluster_text = f"Cluster {cluster_ids[0]}"
+        else:
+            cluster_text = f"{len(cluster_ids)} clusters"
+        if selection.include_unclustered:
+            return f"{cluster_text} + Unclustered"
+        return cluster_text
 
 
 class NeuronViewerWidget(QWidget):
@@ -569,31 +785,37 @@ class NeuronViewerWidget(QWidget):
             state_changed.connect(self._refresh_neuron_table_summary)
         neurons_layout.addWidget(self._neuron_table)
 
-        cluster_row = QHBoxLayout()
-        cluster_row.addWidget(QLabel("Cluster:"))
+        cluster_filter_row = QHBoxLayout()
+        cluster_filter_row.addWidget(QLabel("Cluster:"))
 
-        self._cluster_filter_combo = QComboBox()
-        self._cluster_filter_combo.addItem("All")
-        self._cluster_filter_combo.setItemData(0, None)
-        self._cluster_filter_combo.currentIndexChanged.connect(
+        self._cluster_filter_combo = _ClusterFilterComboBox()
+        self._cluster_filter_combo.set_cluster_options(
+            [],
+            include_unclustered=False,
+            selection=ClusterFilterSelection(),
+        )
+        self._cluster_filter_combo.selection_changed.connect(
             self._on_cluster_filter_changed
         )
-        cluster_row.addWidget(self._cluster_filter_combo)
+        cluster_filter_row.addWidget(self._cluster_filter_combo, 1)
+        neurons_layout.addLayout(cluster_filter_row)
+
+        cluster_action_row = QHBoxLayout()
 
         self._hide_others_btn = QPushButton("Hide Others")
         self._hide_others_btn.setEnabled(False)
         self._hide_others_btn.clicked.connect(self._hide_not_in_selected_cluster)
-        cluster_row.addWidget(self._hide_others_btn)
+        cluster_action_row.addWidget(self._hide_others_btn)
 
         self._show_all_btn = QPushButton("Show All")
         self._show_all_btn.setEnabled(False)
         self._show_all_btn.clicked.connect(self._show_all_neurons)
-        cluster_row.addWidget(self._show_all_btn)
+        cluster_action_row.addWidget(self._show_all_btn)
 
-        self._recolor_cluster_btn = QPushButton("Recolor Cluster")
+        self._recolor_cluster_btn = QPushButton("Recolor Selection")
         self._recolor_cluster_btn.setEnabled(False)
         self._recolor_cluster_btn.clicked.connect(self._recolor_selected_cluster)
-        cluster_row.addWidget(self._recolor_cluster_btn)
+        cluster_action_row.addWidget(self._recolor_cluster_btn)
 
         self._apply_existing_clusters_btn = QPushButton("Apply Existing Clusters")
         self._apply_existing_clusters_btn.setEnabled(False)
@@ -601,9 +823,9 @@ class NeuronViewerWidget(QWidget):
         self._apply_existing_clusters_btn.clicked.connect(
             self._apply_existing_clusters_from_analysis
         )
-        cluster_row.addWidget(self._apply_existing_clusters_btn)
+        cluster_action_row.addWidget(self._apply_existing_clusters_btn)
 
-        neurons_layout.addLayout(cluster_row)
+        neurons_layout.addLayout(cluster_action_row)
 
         self._selected_neurons_hint_label = QLabel(
             "Only Neurons highlighted in the above table will be added to "
@@ -3859,55 +4081,81 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
         self._sync_after_neuron_table_membership_change()
 
-    def _selected_cluster_from_filter(self) -> int | None:
-        """Return selected cluster from the Data tab dropdown."""
+    def _selected_cluster_filter(self) -> ClusterFilterSelection:
+        """Return selected cluster groups from the Data tab dropdown."""
+        getter = getattr(self._cluster_filter_combo, "cluster_filter_selection", None)
+        if callable(getter):
+            return getter()
+
         idx = self._cluster_filter_combo.currentIndex()
         if idx < 0:
-            return None
+            return ClusterFilterSelection()
         data = self._cluster_filter_combo.itemData(idx)
         if data is None:
-            return None
+            return ClusterFilterSelection()
         try:
-            return int(data)
+            return ClusterFilterSelection(frozenset({int(data)}))
         except (TypeError, ValueError):
+            return ClusterFilterSelection()
+
+    def _selected_cluster_from_filter(self) -> int | None:
+        """Return the single selected cluster, if the filter is single-cluster."""
+        selection = self._selected_cluster_filter()
+        if selection.include_unclustered or len(selection.cluster_ids) != 1:
             return None
+        return next(iter(selection.cluster_ids))
 
     def _refresh_cluster_filter_controls(self) -> None:
         """Refresh cluster filter dropdown options from table cluster assignments."""
-        previous = self._selected_cluster_from_filter()
+        previous = self._selected_cluster_filter()
+        cluster_ids = self._neuron_table.available_cluster_ids()
+        has_unclustered = False
+        unclustered_getter = getattr(self._neuron_table, "has_unclustered_entries", None)
+        if callable(unclustered_getter):
+            has_unclustered = bool(unclustered_getter())
 
-        self._cluster_filter_combo.blockSignals(True)
-        try:
-            self._cluster_filter_combo.clear()
-            self._cluster_filter_combo.addItem("All")
-            self._cluster_filter_combo.setItemData(0, None)
+        setter = getattr(self._cluster_filter_combo, "set_cluster_options", None)
+        if callable(setter):
+            setter(
+                cluster_ids,
+                include_unclustered=has_unclustered,
+                selection=previous,
+            )
+        else:
+            self._cluster_filter_combo.blockSignals(True)
+            try:
+                self._cluster_filter_combo.clear()
+                self._cluster_filter_combo.addItem("All")
+                self._cluster_filter_combo.setItemData(0, None)
+                for cluster_id in cluster_ids:
+                    self._cluster_filter_combo.addItem(f"Cluster {cluster_id}")
+                    self._cluster_filter_combo.setItemData(
+                        self._cluster_filter_combo.count() - 1,
+                        int(cluster_id),
+                    )
+                if previous.include_unclustered or len(previous.cluster_ids) != 1:
+                    selected_cluster = None
+                else:
+                    selected_cluster = next(iter(previous.cluster_ids), None)
+                if selected_cluster is not None:
+                    idx = self._cluster_filter_combo.findData(selected_cluster)
+                    self._cluster_filter_combo.setCurrentIndex(idx if idx >= 0 else 0)
+                else:
+                    self._cluster_filter_combo.setCurrentIndex(0)
+            finally:
+                self._cluster_filter_combo.blockSignals(False)
 
-            for cluster_id in self._neuron_table.available_cluster_ids():
-                self._cluster_filter_combo.addItem(f"Cluster {cluster_id}")
-                self._cluster_filter_combo.setItemData(
-                    self._cluster_filter_combo.count() - 1,
-                    int(cluster_id),
-                )
+        self._on_cluster_filter_changed(self._selected_cluster_filter())
 
-            if previous is not None:
-                idx = self._cluster_filter_combo.findData(previous)
-                self._cluster_filter_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            else:
-                self._cluster_filter_combo.setCurrentIndex(0)
-        finally:
-            self._cluster_filter_combo.blockSignals(False)
+    def _on_cluster_filter_changed(self, _selection: object = None) -> None:
+        """Filter table rows by selected cluster groups and update action buttons."""
+        selection = self._selected_cluster_filter()
+        self._neuron_table.apply_cluster_filter(selection)
 
-        self._on_cluster_filter_changed(self._cluster_filter_combo.currentIndex())
-
-    def _on_cluster_filter_changed(self, _index: int) -> None:
-        """Filter table rows by selected cluster and update action buttons."""
-        selected_cluster = self._selected_cluster_from_filter()
-        self._neuron_table.apply_cluster_filter(selected_cluster)
-
-        has_selected_cluster = selected_cluster is not None
+        has_filter = not selection.is_all
         has_entries = bool(self._neuron_table.get_visibility_map())
-        self._hide_others_btn.setEnabled(has_selected_cluster)
-        self._recolor_cluster_btn.setEnabled(has_selected_cluster)
+        self._hide_others_btn.setEnabled(has_filter)
+        self._recolor_cluster_btn.setEnabled(has_filter)
         self._show_all_btn.setEnabled(has_entries)
 
     def _refresh_apply_existing_clusters_button(self) -> None:
@@ -3955,23 +4203,23 @@ class NeuronViewerWidget(QWidget):
         self._render_status_label.setText(message)
 
     def _hide_not_in_selected_cluster(self) -> None:
-        """Set visibility off for neurons not in the selected cluster."""
-        selected_cluster = self._selected_cluster_from_filter()
-        if selected_cluster is None:
+        """Set visibility off for neurons outside the selected cluster groups."""
+        selection = self._selected_cluster_filter()
+        if selection.is_all:
             return
-        self._neuron_table.hide_all_not_in_cluster(selected_cluster)
+        self._neuron_table.hide_all_not_in_cluster(selection)
 
     def _show_all_neurons(self) -> None:
         """Restore visibility on for all neurons in the table."""
         self._neuron_table.set_all_visible()
 
     def _recolor_selected_cluster(self) -> None:
-        """Recolor selected cluster with turbo and gray non-selected neurons."""
-        selected_cluster = self._selected_cluster_from_filter()
-        if selected_cluster is None:
+        """Recolor selected cluster groups with turbo and gray non-selected neurons."""
+        selection = self._selected_cluster_filter()
+        if selection.is_all:
             return
         self._neuron_table.recolor_cluster_turbo(
-            selected_cluster,
+            selection,
             gray_others=True,
         )
 

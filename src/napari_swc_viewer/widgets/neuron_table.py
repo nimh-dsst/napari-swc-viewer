@@ -32,12 +32,14 @@ from qtpy.QtWidgets import (
 )
 
 from ..neuron_table_ops import (
+    ClusterFilterSelection,
     GRAY_RGBA,
     NeuronTableSummary,
     added_flags,
     cluster_filter_matches,
     cluster_ids_available,
     cluster_sort_value,
+    has_unclustered_entries,
     recolor_cluster_turbo,
     summarize_neuron_table,
     visibility_for_selected_cluster,
@@ -454,17 +456,28 @@ class NeuronTableWidget(QWidget):
         cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
         return cluster_ids_available(cluster_map)
 
-    def apply_cluster_filter(self, cluster_id: int | None) -> None:
-        """Hide rows not in ``cluster_id``. ``None`` means show all rows."""
+    def has_unclustered_entries(self) -> bool:
+        """Return whether any table row has no cluster assignment."""
         cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
-        matches = cluster_filter_matches(cluster_map, cluster_id)
+        return has_unclustered_entries(cluster_map)
+
+    def apply_cluster_filter(
+        self,
+        selection: ClusterFilterSelection | int | None,
+    ) -> None:
+        """Hide rows outside the selected cluster groups."""
+        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        matches = cluster_filter_matches(cluster_map, selection)
         for row, file_id in self._iter_rows_with_file_ids():
             self._table.setRowHidden(row, not matches.get(file_id, True))
 
-    def hide_all_not_in_cluster(self, cluster_id: int) -> None:
-        """Set visibility off for all neurons not in ``cluster_id``."""
+    def hide_all_not_in_cluster(
+        self,
+        selection: ClusterFilterSelection | int | None,
+    ) -> None:
+        """Set visibility off for neurons outside the selected cluster groups."""
         cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
-        visibility = visibility_for_selected_cluster(cluster_map, cluster_id)
+        visibility = visibility_for_selected_cluster(cluster_map, selection)
 
         row_map = self._file_id_to_row_map()
         changed = False
@@ -499,10 +512,14 @@ class NeuronTableWidget(QWidget):
             self.visibility_changed.emit(self.get_visibility_map())
             self.state_changed.emit()
 
-    def recolor_cluster_turbo(self, cluster_id: int, gray_others: bool = True) -> None:
-        """Recolor selected cluster with turbo; optionally gray non-selected neurons."""
+    def recolor_cluster_turbo(
+        self,
+        selection: ClusterFilterSelection | int | None,
+        gray_others: bool = True,
+    ) -> None:
+        """Recolor selected groups with turbo; optionally gray non-selected neurons."""
         cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
-        updates = recolor_cluster_turbo(cluster_map, cluster_id, gray_others=gray_others)
+        updates = recolor_cluster_turbo(cluster_map, selection, gray_others=gray_others)
         if not updates:
             return
 
