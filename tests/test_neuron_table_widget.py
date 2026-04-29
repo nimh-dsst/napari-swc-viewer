@@ -58,18 +58,25 @@ class _DummyItem:
 
 
 class _DummyTable:
-    def __init__(self, file_ids: list[object], user_role) -> None:
+    def __init__(
+        self,
+        file_ids: list[object],
+        user_role,
+        neuron_id_column: int,
+    ) -> None:
         self._file_ids = list(file_ids)
         self._user_role = user_role
+        self._neuron_id_column = neuron_id_column
         self._sorting_enabled = True
         self._signals_blocked = False
         self.sort_calls: list[tuple[int, object]] = []
+        self.hidden_rows: dict[int, bool] = {}
 
     def rowCount(self) -> int:
         return len(self._file_ids)
 
     def item(self, row: int, column: int):
-        if column != 2:
+        if column != self._neuron_id_column:
             return None
         if row < 0 or row >= len(self._file_ids):
             return None
@@ -107,6 +114,9 @@ class _DummyTable:
     def sortByColumn(self, column: int, order) -> None:
         self.sort_calls.append((column, order))
 
+    def setRowHidden(self, row: int, hidden: bool) -> None:
+        self.hidden_rows[int(row)] = bool(hidden)
+
 
 def _make_widget(module, entries_by_file_id: dict[object, object]):
     widget = module.NeuronTableWidget.__new__(module.NeuronTableWidget)
@@ -114,6 +124,7 @@ def _make_widget(module, entries_by_file_id: dict[object, object]):
     widget._table = _DummyTable(
         list(entries_by_file_id.keys()),
         module.Qt.UserRole,
+        module.COL_NEURON_ID,
     )
     widget.selection_changed = _DummySignal()
     widget.state_changed = _DummySignal()
@@ -134,6 +145,7 @@ def test_neuron_table_retain_file_ids_preserves_survivor_state() -> None:
         cluster_id=7,
         visible=False,
         added_to_scene=True,
+        heatmap_layer_names=("alpha Heatmap",),
     )
     entry_b = module.NeuronEntry(file_id="n2", subject="s2")
     entry_c = module.NeuronEntry(
@@ -155,6 +167,7 @@ def test_neuron_table_retain_file_ids_preserves_survivor_state() -> None:
     assert widget.summary().added_count == 1
     assert widget.summary().visible_count == 1
     assert widget.available_cluster_ids() == [3, 7]
+    assert widget._entries["n1"].heatmap_layer_names == ("alpha Heatmap",)
     assert widget.selection_changed.calls == [([],)]
     assert len(widget.state_changed.calls) == 1
 
@@ -204,3 +217,73 @@ def test_neuron_table_sort_by_cluster_delegates_to_cluster_column_sort() -> None
     assert widget._table.sort_calls == [
         (module.COL_CLUSTER, module.Qt.AscendingOrder)
     ]
+
+
+def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallback() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            1: module.NeuronEntry(file_id=1, subject="s1"),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+        },
+    )
+    heatmap_cells: list[tuple[int, tuple[str, ...]]] = []
+    widget._set_heatmap_cell = (
+        lambda row, layer_names: heatmap_cells.append((row, tuple(layer_names)))
+    )
+
+    widget.set_heatmap_layers_by_file_id(
+        {
+            "1": ["alpha Heatmap", "beta Heatmap"],
+        }
+    )
+
+    assert widget._entries[1].heatmap_layer_names == (
+        "alpha Heatmap",
+        "beta Heatmap",
+    )
+    assert widget._entries["n2"].heatmap_layer_names == ()
+    assert heatmap_cells == [
+        (0, ("alpha Heatmap", "beta Heatmap")),
+        (1, ()),
+    ]
+    assert len(widget.state_changed.calls) == 1
+
+
+def test_neuron_table_apply_filters_intersects_cluster_and_heatmap_filters() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1", cluster_id=1),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2", cluster_id=1),
+            "n3": module.NeuronEntry(file_id="n3", subject="s3", cluster_id=2),
+        },
+    )
+
+    widget.apply_filters(module.ClusterFilterSelection({1}), ["n2", "n3"])
+
+    assert widget._table.hidden_rows == {
+        0: True,
+        1: False,
+        2: True,
+    }
+
+
+def test_neuron_table_apply_filters_manual_heatmap_uses_string_fallback() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            1: module.NeuronEntry(file_id=1, subject="s1"),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+        },
+    )
+
+    widget.apply_filters(module.ClusterFilterSelection(), ["1"])
+
+    assert widget._table.hidden_rows == {
+        0: False,
+        1: True,
+    }

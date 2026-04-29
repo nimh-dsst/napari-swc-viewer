@@ -113,6 +113,33 @@ _DEFAULT_NEURON_RGBA = (0.5, 0.5, 0.5, 1.0)
 _CLUSTER_FILTER_ALL = "all"
 _CLUSTER_FILTER_UNCLUSTERED = "unclustered"
 _CLUSTER_FILTER_CLUSTER = "cluster"
+_MANUAL_HEATMAP_ALL_LABEL = "All Manual Heatmaps"
+_GREEK_HEATMAP_IDENTIFIERS = (
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "xi",
+    "omicron",
+    "pi",
+    "rho",
+    "sigma",
+    "tau",
+    "upsilon",
+    "phi",
+    "chi",
+    "psi",
+    "omega",
+)
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -784,6 +811,16 @@ class NeuronViewerWidget(QWidget):
         if state_changed is not None:
             state_changed.connect(self._refresh_neuron_table_summary)
         neurons_layout.addWidget(self._neuron_table)
+
+        manual_heatmap_row = QHBoxLayout()
+        manual_heatmap_row.addWidget(QLabel("Manual Heatmap:"))
+        self._manual_heatmap_combo = QComboBox()
+        self._manual_heatmap_combo.currentIndexChanged.connect(
+            self._on_manual_heatmap_selection_changed
+        )
+        manual_heatmap_row.addWidget(self._manual_heatmap_combo, 1)
+        neurons_layout.addLayout(manual_heatmap_row)
+        self._refresh_manual_heatmap_combo()
 
         cluster_filter_row = QHBoxLayout()
         cluster_filter_row.addWidget(QLabel("Cluster:"))
@@ -2420,6 +2457,12 @@ class NeuronViewerWidget(QWidget):
         self._refresh_mask_layer_options()
         self._update_tools_controls()
         self._update_histogram_controls()
+        sync_heatmaps = getattr(self, "_sync_neuron_table_heatmap_membership", None)
+        if callable(sync_heatmaps):
+            sync_heatmaps()
+        refresh_manual_heatmaps = getattr(self, "_refresh_manual_heatmap_combo", None)
+        if callable(refresh_manual_heatmaps):
+            refresh_manual_heatmaps()
 
     def _iter_viewer_layers(self) -> list:
         """Return current viewer layers as a list."""
@@ -2427,6 +2470,137 @@ class NeuronViewerWidget(QWidget):
             return list(self.viewer.layers)
         except Exception:
             return []
+
+    def _manual_heatmap_layers(self) -> list:
+        """Return selected-neuron heatmap layers created from the Data tab."""
+        return [
+            layer for layer in self._iter_viewer_layers()
+            if _layer_metadata(layer).get("heatmap_kind") == "selected_neurons"
+        ]
+
+    @staticmethod
+    def _normalise_layer_file_ids(file_ids: object) -> tuple[object, ...]:
+        """Return layer file IDs as a tuple without splitting string IDs."""
+        if file_ids is None:
+            return ()
+        if isinstance(file_ids, (str, bytes)):
+            return (file_ids,)
+        try:
+            return tuple(file_ids)
+        except TypeError:
+            return (file_ids,)
+
+    def _current_selected_neuron_heatmap_layers_by_file_id(
+        self,
+    ) -> dict[object, tuple[str, ...]]:
+        """Return Data-tab selected-neuron heatmap layer names by file ID."""
+        layer_names_by_file_id: dict[object, list[str]] = {}
+        for layer in self._manual_heatmap_layers():
+            layer_name = str(getattr(layer, "name", ""))
+            if not layer_name:
+                continue
+
+            metadata = _layer_metadata(layer)
+            for file_id in self._normalise_layer_file_ids(metadata.get("file_ids", [])):
+                names = layer_names_by_file_id.setdefault(file_id, [])
+                if layer_name not in names:
+                    names.append(layer_name)
+
+        return {
+            file_id: tuple(layer_names)
+            for file_id, layer_names in layer_names_by_file_id.items()
+        }
+
+    def _sync_neuron_table_heatmap_membership(self) -> None:
+        """Sync the neuron table Heatmap column from Data-tab heatmap layers."""
+        table = getattr(self, "_neuron_table", None)
+        setter = getattr(table, "set_heatmap_layers_by_file_id", None)
+        if not callable(setter):
+            return
+        setter(self._current_selected_neuron_heatmap_layers_by_file_id())
+
+    def _manual_heatmap_combo_options(self) -> list[tuple[str, tuple[object, ...]]]:
+        """Return manual heatmap dropdown options as layer-name/file-ID tuples."""
+        options: list[tuple[str, tuple[object, ...]]] = []
+        for layer in self._manual_heatmap_layers():
+            layer_name = str(getattr(layer, "name", ""))
+            if not layer_name:
+                continue
+            file_ids = self._normalise_layer_file_ids(
+                _layer_metadata(layer).get("file_ids", [])
+            )
+            options.append((layer_name, file_ids))
+        return options
+
+    def _manual_heatmap_combo_data(self) -> tuple[str, tuple[object, ...]] | None:
+        """Return the currently selected manual heatmap dropdown payload."""
+        combo = getattr(self, "_manual_heatmap_combo", None)
+        if combo is None:
+            return None
+        current_data = getattr(combo, "currentData", None)
+        data = current_data() if callable(current_data) else None
+        if (
+            isinstance(data, tuple)
+            and len(data) == 2
+            and isinstance(data[0], str)
+        ):
+            return data[0], self._normalise_layer_file_ids(data[1])
+        return None
+
+    def _refresh_manual_heatmap_combo(self) -> None:
+        """Refresh the Data-tab manual heatmap selector."""
+        combo = getattr(self, "_manual_heatmap_combo", None)
+        if combo is None:
+            return
+
+        previous = self._manual_heatmap_combo_data()
+        previous_name = previous[0] if previous is not None else None
+        options = self._manual_heatmap_combo_options()
+
+        signals_blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(_MANUAL_HEATMAP_ALL_LABEL, None)
+            selected_index = 0
+            for layer_name, file_ids in options:
+                combo.addItem(layer_name, (layer_name, tuple(file_ids)))
+                if layer_name == previous_name:
+                    selected_index = combo.count() - 1
+            combo.setCurrentIndex(selected_index)
+        finally:
+            combo.blockSignals(signals_blocked)
+
+        set_enabled = getattr(combo, "setEnabled", None)
+        if callable(set_enabled):
+            set_enabled(bool(options))
+        if previous_name is not None and selected_index == 0:
+            self._on_manual_heatmap_selection_changed()
+
+    def _on_manual_heatmap_selection_changed(self, _index: int = 0) -> None:
+        """Filter table rows for the chosen manual heatmap layer."""
+        self._apply_neuron_table_filters()
+
+    def _selected_manual_heatmap_file_ids(self) -> tuple[object, ...] | None:
+        """Return the currently selected manual heatmap file IDs, if any."""
+        data = self._manual_heatmap_combo_data()
+        return None if data is None else data[1]
+
+    def _apply_neuron_table_filters(self) -> None:
+        """Apply current Data-tab row filters to the neuron table."""
+        table = getattr(self, "_neuron_table", None)
+        if table is None:
+            return
+
+        selection = self._selected_cluster_filter()
+        heatmap_file_ids = self._selected_manual_heatmap_file_ids()
+        applier = getattr(table, "apply_filters", None)
+        if callable(applier):
+            applier(selection, heatmap_file_ids)
+            return
+
+        cluster_applier = getattr(table, "apply_cluster_filter", None)
+        if callable(cluster_applier):
+            cluster_applier(selection)
 
     def _current_atlas_name(self) -> str | None:
         """Return the currently loaded atlas name, if any."""
@@ -2483,10 +2657,7 @@ class NeuronViewerWidget(QWidget):
         file_ids: list[object] | tuple[object, ...],
     ) -> str:
         """Return the base layer name for a selected-neuron heatmap."""
-        normalized = [str(file_id) for file_id in file_ids]
-        if len(normalized) == 1:
-            return f"Neuron Heatmap: {normalized[0]}"
-        return f"Neuron Heatmap: {len(normalized)} selected neurons"
+        return f"{self._next_manual_heatmap_identifier()} Heatmap"
 
     def _unique_layer_name(self, base_name: str) -> str:
         """Return a viewer layer name that does not collide with existing names."""
@@ -2502,14 +2673,47 @@ class NeuronViewerWidget(QWidget):
             suffix += 1
         return f"{base_name} ({suffix})"
 
+    @staticmethod
+    def _greek_heatmap_identifier(index: int) -> str:
+        """Return a deterministic Greek-word identifier for a zero-based index."""
+        if index < 0:
+            raise ValueError("index must be non-negative")
+
+        alphabet = _GREEK_HEATMAP_IDENTIFIERS
+        base = len(alphabet)
+        length = 1
+        remaining = int(index)
+        block_size = base
+        while remaining >= block_size:
+            remaining -= block_size
+            length += 1
+            block_size *= base
+
+        indices = [0] * length
+        for offset in range(length - 1, -1, -1):
+            indices[offset] = remaining % base
+            remaining //= base
+        return " ".join(alphabet[i] for i in indices)
+
+    def _next_manual_heatmap_identifier(self) -> str:
+        """Return the first Greek identifier whose layer name is unused."""
+        existing_names = {
+            str(getattr(layer, "name", ""))
+            for layer in self._iter_viewer_layers()
+        }
+        index = 0
+        while True:
+            identifier = NeuronViewerWidget._greek_heatmap_identifier(index)
+            if f"{identifier} Heatmap" not in existing_names:
+                return identifier
+            index += 1
+
     def _selected_neuron_heatmap_layer_name(
         self,
         file_ids: list[object] | tuple[object, ...],
     ) -> str:
         """Return the next unique layer name for a selected-neuron heatmap."""
-        return self._unique_layer_name(
-            self._selected_neuron_heatmap_base_name(file_ids)
-        )
+        return f"{self._next_manual_heatmap_identifier()} Heatmap"
 
     def _update_mask_sigma_units_label(self) -> None:
         """Show Gaussian sigma units in voxels with atlas micron equivalence."""
@@ -4079,6 +4283,24 @@ class NeuronViewerWidget(QWidget):
 
         self._discard_scene_display_state(self._current_table_file_ids())
         self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+        sync_heatmaps = getattr(self, "_sync_neuron_table_heatmap_membership", None)
+        if callable(sync_heatmaps):
+            sync_heatmaps()
+        refresh_manual_heatmaps = getattr(self, "_refresh_manual_heatmap_combo", None)
+        if callable(refresh_manual_heatmaps):
+            refresh_manual_heatmaps()
+        manual_heatmap_data = getattr(self, "_manual_heatmap_combo_data", None)
+        manual_heatmap_handler = getattr(
+            self,
+            "_on_manual_heatmap_selection_changed",
+            None,
+        )
+        if (
+            callable(manual_heatmap_data)
+            and manual_heatmap_data() is not None
+            and callable(manual_heatmap_handler)
+        ):
+            manual_heatmap_handler()
         self._sync_after_neuron_table_membership_change()
 
     def _selected_cluster_filter(self) -> ClusterFilterSelection:
@@ -4150,7 +4372,7 @@ class NeuronViewerWidget(QWidget):
     def _on_cluster_filter_changed(self, _selection: object = None) -> None:
         """Filter table rows by selected cluster groups and update action buttons."""
         selection = self._selected_cluster_filter()
-        self._neuron_table.apply_cluster_filter(selection)
+        self._apply_neuron_table_filters()
 
         has_filter = not selection.is_all
         has_entries = bool(self._neuron_table.get_visibility_map())
@@ -4342,11 +4564,13 @@ class NeuronViewerWidget(QWidget):
     ):
         """Add one selected-neuron heatmap layer to the viewer."""
         layer_name = self._selected_neuron_heatmap_layer_name(file_ids)
+        manual_heatmap_id = layer_name.removesuffix(" Heatmap")
         contrast_limits = _heatmap_contrast_limits(volume)
         metadata = {
             "heatmap_source": True,
             "heatmap_native_grid": True,
             "heatmap_kind": "selected_neurons",
+            "manual_heatmap_id": manual_heatmap_id,
             "atlas_name": self._current_atlas_name(),
             "source_path": (
                 str(self._db.parquet_path)
@@ -4387,6 +4611,12 @@ class NeuronViewerWidget(QWidget):
             layer.name,
             len(file_ids),
         )
+        sync_heatmaps = getattr(self, "_sync_neuron_table_heatmap_membership", None)
+        if callable(sync_heatmaps):
+            sync_heatmaps()
+        refresh_manual_heatmaps = getattr(self, "_refresh_manual_heatmap_combo", None)
+        if callable(refresh_manual_heatmaps):
+            refresh_manual_heatmaps()
         self._refresh_heatmap_layer_list()
         self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
