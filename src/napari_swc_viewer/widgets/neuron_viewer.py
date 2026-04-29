@@ -45,6 +45,7 @@ from qtpy.QtWidgets import (
 
 from ..analysis.mask import (
     build_binary_mask_from_threshold_range,
+    isolate_heatmap_volume_to_region_ids,
     merge_heatmap_volumes,
     otsu_threshold_positive,
     smooth_heatmap_volume,
@@ -56,7 +57,7 @@ from ..auto_center import (
     depth_axis_from_not_displayed,
 )
 from ..db import NeuronDatabase
-from ..logging_utils import configure_debug_logging
+from ..logging_utils import configure_debug_logging, startup_timing
 from ..point_import import (
     POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
@@ -212,59 +213,109 @@ class NeuronViewerWidget(QWidget):
     """
 
     def __init__(self, napari_viewer: napari.Viewer):
-        super().__init__()
         log_path = configure_debug_logging()
-        if log_path is not None:
-            logger.debug("Debug logging enabled for NeuronViewerWidget: %s", log_path)
-        self.viewer = napari_viewer
-        self._db: NeuronDatabase | None = None
-        self._atlas: BrainGlobeAtlas | None = None
-        self._current_neuron_layers: list = []
-        self._current_region_layers: list = []
-        self._highlighted_file_ids: set[str] | None = None  # None = no highlight
-        self._last_soma_selection: set = set()  # track to skip no-op highlights
-        self._auto_center_applied_once = False
-        self._region_query_source = "Atlas Regions"
-        self._region_query_scope = _REGION_QUERY_SCOPE_WHOLE
-        self._mask_bounds_source = "manual"
-        self._histogram_line_sync_active = False
-        self._point_parquet_path: str | None = None
-        self._point_parquet_has_origin_csv = False
-        self._point_preview_counts: dict[tuple[str, str], int] = {}
-        self._scene_render_modes: dict[object, str] = {}
-        self._scene_display_state: dict[object, dict[str, object]] = {}
+        with startup_timing(logger, "neuron_viewer_init") as timing:
+            super().__init__()
+            if log_path is not None:
+                timing.set(log_path=log_path)
+                logger.debug(
+                    "Debug logging enabled for NeuronViewerWidget: %s",
+                    log_path,
+                )
+            self.viewer = napari_viewer
+            self._db: NeuronDatabase | None = None
+            self._atlas: BrainGlobeAtlas | None = None
+            self._current_neuron_layers: list = []
+            self._current_region_layers: list = []
+            self._highlighted_file_ids: set[str] | None = None
+            self._last_soma_selection: set = set()  # track no-op highlights
+            self._auto_center_applied_once = False
+            self._region_query_source = "Atlas Regions"
+            self._region_query_scope = _REGION_QUERY_SCOPE_WHOLE
+            self._mask_bounds_source = "manual"
+            self._histogram_line_sync_active = False
+            self._point_parquet_path: str | None = None
+            self._point_parquet_has_origin_csv = False
+            self._point_preview_counts: dict[tuple[str, str], int] = {}
+            self._scene_render_modes: dict[object, str] = {}
+            self._scene_display_state: dict[object, dict[str, object]] = {}
 
-        # Slice projection for 2D viewing
-        self._slice_projector = NeuronSliceProjector(napari_viewer, tolerance=100.0)
-        self._soma_slice_projector = SomaSliceProjector(
-            napari_viewer,
-            tolerance=100.0,
-            point_size=_SOMA_SLICE_PROJECTION_POINT_SIZE,
-            highlight_callback=self._on_soma_selected,
-        )
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="slice_projectors",
+            ):
+                self._slice_projector = NeuronSliceProjector(
+                    napari_viewer,
+                    tolerance=100.0,
+                )
+                self._soma_slice_projector = SomaSliceProjector(
+                    napari_viewer,
+                    tolerance=100.0,
+                    point_size=_SOMA_SLICE_PROJECTION_POINT_SIZE,
+                    highlight_callback=self._on_soma_selected,
+                )
 
-        # Conversion worker state
-        self._convert_thread: QThread | None = None
-        self._convert_worker = None
-        self._point_convert_thread: QThread | None = None
-        self._point_convert_worker = None
-        self._point_append_thread: QThread | None = None
-        self._point_append_worker = None
-        self._selected_heatmap_thread: QThread | None = None
-        self._selected_heatmap_worker = None
-        self._selected_heatmap_request_file_ids: tuple[str, ...] = ()
+            # Conversion worker state
+            self._convert_thread: QThread | None = None
+            self._convert_worker = None
+            self._point_convert_thread: QThread | None = None
+            self._point_convert_worker = None
+            self._point_append_thread: QThread | None = None
+            self._point_append_worker = None
+            self._selected_heatmap_thread: QThread | None = None
+            self._selected_heatmap_worker = None
+            self._selected_heatmap_request_file_ids: tuple[str, ...] = ()
+            self._cached_atlas_thread: QThread | None = None
+            self._cached_atlas_worker = None
+            self._show_template_after_cached_atlas_load = False
 
-        self._setup_ui()
-        self._connect_layer_events()
-        self._refresh_heatmap_layer_list()
-        self._refresh_histogram_layer_list()
-        self._refresh_mask_layer_options()
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="setup_ui",
+            ):
+                self._setup_ui()
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="connect_layer_events",
+            ):
+                self._connect_layer_events()
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="refresh_heatmap_layer_list",
+            ):
+                self._refresh_heatmap_layer_list()
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="refresh_histogram_layer_list",
+            ):
+                self._refresh_histogram_layer_list()
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="refresh_mask_layer_options",
+            ):
+                self._refresh_mask_layer_options()
 
-        # Auto-hide neuron line layers in 2D mode
-        self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="connect_ndisplay_event",
+            ):
+                self.viewer.dims.events.ndisplay.connect(
+                    self._on_ndisplay_changed
+                )
 
-        # Load reference template after the widget is fully initialized
-        QTimer.singleShot(0, lambda: self._toggle_template(True))
+            with startup_timing(
+                logger,
+                "neuron_viewer_init_phase",
+                phase="schedule_cached_template_autoload",
+            ):
+                QTimer.singleShot(0, self._start_cached_template_autoload)
 
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
@@ -274,44 +325,50 @@ class NeuronViewerWidget(QWidget):
         tabs = QTabWidget()
         layout.addWidget(tabs)
 
-        # Data tab
-        data_tab = QWidget()
-        tabs.addTab(data_tab, "Data")
-        self._setup_data_tab(data_tab)
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Data"):
+            data_tab = QWidget()
+            tabs.addTab(data_tab, "Data")
+            self._setup_data_tab(data_tab)
 
-        # Regions tab
-        regions_tab = QWidget()
-        tabs.addTab(regions_tab, "Regions")
-        self._setup_regions_tab(regions_tab)
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Regions"):
+            regions_tab = QWidget()
+            tabs.addTab(regions_tab, "Regions")
+            self._setup_regions_tab(regions_tab)
 
-        # Visualization tab
-        viz_tab = QWidget()
-        tabs.addTab(viz_tab, "Visualization")
-        self._setup_viz_tab(viz_tab)
+        with startup_timing(
+            logger,
+            "neuron_viewer_setup_tab",
+            tab="Visualization",
+        ):
+            viz_tab = QWidget()
+            tabs.addTab(viz_tab, "Visualization")
+            self._setup_viz_tab(viz_tab)
 
-        # Reference tab
-        ref_tab = QWidget()
-        tabs.addTab(ref_tab, "Reference")
-        self._setup_reference_tab(ref_tab)
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Reference"):
+            ref_tab = QWidget()
+            tabs.addTab(ref_tab, "Reference")
+            self._setup_reference_tab(ref_tab)
 
-        # Analysis tab
-        self._analysis_tab = AnalysisTabWidget(self.viewer)
-        self._analysis_tab.set_slice_projector(self._slice_projector)
-        self._analysis_tab.set_current_table_file_ids_provider(
-            self._current_table_file_ids
-        )
-        self._analysis_tab.cluster_colors_updated.connect(
-            self._on_cluster_colors_updated
-        )
-        tabs.addTab(self._analysis_tab, "Analysis")
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Analysis"):
+            self._analysis_tab = AnalysisTabWidget(self.viewer)
+            self._analysis_tab.set_slice_projector(self._slice_projector)
+            self._analysis_tab.set_current_table_file_ids_provider(
+                self._current_table_file_ids
+            )
+            self._analysis_tab.cluster_colors_updated.connect(
+                self._on_cluster_colors_updated
+            )
+            tabs.addTab(self._analysis_tab, "Analysis")
 
-        tools_tab = QWidget()
-        tabs.addTab(tools_tab, "Tools")
-        self._setup_tools_tab(tools_tab)
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Tools"):
+            tools_tab = QWidget()
+            tabs.addTab(tools_tab, "Tools")
+            self._setup_tools_tab(tools_tab)
 
-        histogram_tab = QWidget()
-        tabs.addTab(histogram_tab, "Histogram")
-        self._setup_histogram_tab(histogram_tab)
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Histogram"):
+            histogram_tab = QWidget()
+            tabs.addTab(histogram_tab, "Histogram")
+            self._setup_histogram_tab(histogram_tab)
 
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
@@ -755,7 +812,17 @@ class NeuronViewerWidget(QWidget):
 
     def _setup_tools_tab(self, parent: QWidget) -> None:
         """Set up the blur-generation tools tab."""
-        layout = QVBoxLayout(parent)
+        parent_layout = QVBoxLayout(parent)
+
+        self._tools_scroll_area = QScrollArea()
+        self._tools_scroll_area.setWidgetResizable(True)
+        parent_layout.addWidget(self._tools_scroll_area)
+
+        self._tools_scroll_content = QWidget()
+        self._tools_scroll_area.setWidget(self._tools_scroll_content)
+
+        layout = QVBoxLayout(self._tools_scroll_content)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         sources_group = QGroupBox("Heatmap Sources")
         sources_layout = QVBoxLayout(sources_group)
@@ -807,6 +874,41 @@ class NeuronViewerWidget(QWidget):
         blur_layout.addWidget(self._create_blur_btn)
 
         layout.addWidget(blur_group)
+
+        isolation_group = QGroupBox("Region Isolation")
+        isolation_layout = QVBoxLayout(isolation_group)
+
+        isolation_mode_row = QHBoxLayout()
+        isolation_mode_row.addWidget(QLabel("Create mode:"))
+        self._region_isolation_create_mode_combo = QComboBox()
+        self._region_isolation_create_mode_combo.addItem("Separate layers", "separate")
+        self._region_isolation_create_mode_combo.addItem("Merged layer", "merged")
+        self._region_isolation_create_mode_combo.currentIndexChanged.connect(
+            self._update_tools_controls
+        )
+        isolation_mode_row.addWidget(self._region_isolation_create_mode_combo)
+        isolation_layout.addLayout(isolation_mode_row)
+
+        with startup_timing(
+            logger,
+            "neuron_viewer_tools_region_selector",
+            log_start=False,
+        ):
+            self._tools_region_selector = RegionSelectorWidget()
+            self._tools_region_selector.selection_changed.connect(
+                lambda _acronyms: self._update_tools_controls()
+            )
+            isolation_layout.addWidget(self._tools_region_selector)
+
+        self._create_region_isolated_heatmap_btn = QPushButton(
+            "Create Isolated Heatmap"
+        )
+        self._create_region_isolated_heatmap_btn.clicked.connect(
+            self._create_region_isolated_heatmaps
+        )
+        isolation_layout.addWidget(self._create_region_isolated_heatmap_btn)
+
+        layout.addWidget(isolation_group)
 
         self._tools_status_label = QLabel("")
         self._tools_status_label.setWordWrap(True)
@@ -1067,7 +1169,10 @@ class NeuronViewerWidget(QWidget):
         template_layout = QVBoxLayout(template_group)
 
         self._show_template_cb = QCheckBox("Show template")
-        self._show_template_cb.setChecked(True)
+        self._show_template_cb.setChecked(False)
+        self._show_template_cb.setToolTip(
+            "Load and show the Allen reference template on demand."
+        )
         self._show_template_cb.stateChanged.connect(self._toggle_template)
         template_layout.addWidget(self._show_template_cb)
 
@@ -1172,43 +1277,248 @@ class NeuronViewerWidget(QWidget):
         """Load the selected BrainGlobe atlas."""
         atlas_name = self._atlas_combo.currentText()
 
+        if self._cached_atlas_autoload_running():
+            self._atlas_status_label.setText(
+                f"Atlas: Loading cached {atlas_name} in background..."
+            )
+            return
+
         self._atlas_status_label.setText(f"Atlas: Loading {atlas_name}...")
         # Force UI update
         self._atlas_status_label.repaint()
 
         try:
-            self._atlas = BrainGlobeAtlas(atlas_name)
-            selectors = []
-            for attr_name in (
-                "_whole_parquet_region_selector",
-                "_current_table_region_selector",
-                "_region_selector",
-            ):
-                selector = getattr(self, attr_name, None)
-                if selector is None or selector in selectors:
-                    continue
-                selectors.append(selector)
+            with startup_timing(logger, "load_atlas", atlas=atlas_name) as timing:
+                with startup_timing(
+                    logger,
+                    "load_atlas_phase",
+                    phase="BrainGlobeAtlas",
+                    atlas=atlas_name,
+                ) as atlas_timing:
+                    self._atlas = BrainGlobeAtlas(
+                        atlas_name,
+                        check_latest=False,
+                    )
+                    structure_count = len(self._atlas.structures)
+                    atlas_timing.set(structures=structure_count)
+                    timing.set(structures=structure_count)
 
-            for selector in selectors:
-                set_atlas = getattr(selector, "set_atlas", None)
-                if callable(set_atlas):
-                    set_atlas(self._atlas)
-            self._atlas_status_label.setText(
-                f"Atlas: {atlas_name} ({len(self._atlas.structures)} structures)"
-            )
-            self._analysis_tab.set_atlas(self._atlas)
-            self._update_mask_sigma_units_label()
-            self._refresh_heatmap_layer_list()
-            self._refresh_histogram_layer_list()
-            self._refresh_mask_layer_options()
-            self._update_point_import_controls()
-            logger.info(f"Loaded atlas: {atlas_name}")
+                self._apply_loaded_atlas(self._atlas, atlas_name)
+                logger.info(f"Loaded atlas: {atlas_name}")
 
         except Exception as e:
             logger.error(f"Failed to load atlas: {e}")
             self._atlas_status_label.setText(f"Atlas: Error - {e}")
             self._update_mask_sigma_units_label()
             self._update_point_import_controls()
+
+    def _apply_loaded_atlas(self, atlas, atlas_name: str) -> None:
+        """Store a loaded atlas and refresh atlas-dependent UI."""
+        self._atlas = atlas
+
+        selectors = []
+        for attr_name in (
+            "_whole_parquet_region_selector",
+            "_current_table_region_selector",
+            "_region_selector",
+            "_tools_region_selector",
+        ):
+            selector = getattr(self, attr_name, None)
+            if selector is None or any(
+                existing is selector for _name, existing in selectors
+            ):
+                continue
+            selectors.append((attr_name, selector))
+
+        for attr_name, selector in selectors:
+            set_atlas = getattr(selector, "set_atlas", None)
+            if not callable(set_atlas):
+                continue
+            with startup_timing(
+                logger,
+                "load_atlas_selector",
+                selector=attr_name,
+                atlas=atlas_name,
+            ) as selector_timing:
+                set_atlas(atlas)
+                selector_timing.set(
+                    items=len(getattr(selector, "_items_by_id", {}))
+                )
+        self._atlas_status_label.setText(
+            f"Atlas: {atlas_name} ({len(atlas.structures)} structures)"
+        )
+        with startup_timing(
+            logger,
+            "load_atlas_phase",
+            phase="analysis_tab_set_atlas",
+            atlas=atlas_name,
+        ):
+            self._analysis_tab.set_atlas(atlas)
+        with startup_timing(
+            logger,
+            "load_atlas_phase",
+            phase="update_mask_sigma_units_label",
+            atlas=atlas_name,
+        ):
+            self._update_mask_sigma_units_label()
+        with startup_timing(
+            logger,
+            "load_atlas_phase",
+            phase="refresh_heatmap_layer_list",
+            atlas=atlas_name,
+        ):
+            self._refresh_heatmap_layer_list()
+        with startup_timing(
+            logger,
+            "load_atlas_phase",
+            phase="refresh_histogram_layer_list",
+            atlas=atlas_name,
+        ):
+            self._refresh_histogram_layer_list()
+        with startup_timing(
+            logger,
+            "load_atlas_phase",
+            phase="refresh_mask_layer_options",
+            atlas=atlas_name,
+        ):
+            self._refresh_mask_layer_options()
+        with startup_timing(
+            logger,
+            "load_atlas_phase",
+            phase="update_point_import_controls",
+            atlas=atlas_name,
+        ):
+            self._update_point_import_controls()
+
+    def _cached_atlas_autoload_running(self) -> bool:
+        """Return whether a cached atlas auto-load worker is active."""
+        thread = getattr(self, "_cached_atlas_thread", None)
+        is_running = getattr(thread, "isRunning", None)
+        return bool(thread is not None and callable(is_running) and is_running())
+
+    def _set_template_checkbox_checked(
+        self,
+        checked: bool,
+        *,
+        emit_signal: bool,
+    ) -> None:
+        """Set the template checkbox without optionally emitting stateChanged."""
+        checkbox = getattr(self, "_show_template_cb", None)
+        if checkbox is None:
+            return
+
+        if emit_signal or not hasattr(checkbox, "blockSignals"):
+            checkbox.setChecked(checked)
+            return
+
+        previous = checkbox.blockSignals(True)
+        try:
+            checkbox.setChecked(checked)
+        finally:
+            checkbox.blockSignals(previous)
+
+    def _set_template_checkbox_enabled(self, enabled: bool) -> None:
+        """Enable or disable the template checkbox when available."""
+        checkbox = getattr(self, "_show_template_cb", None)
+        if checkbox is not None and hasattr(checkbox, "setEnabled"):
+            checkbox.setEnabled(enabled)
+
+    def _start_cached_template_autoload(self) -> None:
+        """Auto-load and show the reference template only when the atlas is cached."""
+        if self._atlas is not None or self._cached_atlas_autoload_running():
+            return
+
+        from ..workers import CachedAtlasLoadWorker, cached_brainglobe_atlas_dir
+
+        atlas_name = self._atlas_combo.currentText()
+        with startup_timing(
+            logger,
+            "cached_template_autoload",
+            atlas=atlas_name,
+        ) as timing:
+            atlas_dir = cached_brainglobe_atlas_dir(atlas_name)
+            timing.set(cached=atlas_dir is not None, atlas_dir=atlas_dir)
+            if atlas_dir is None:
+                self._set_template_checkbox_checked(False, emit_signal=False)
+                return
+
+            self._show_template_after_cached_atlas_load = True
+            self._set_template_checkbox_checked(True, emit_signal=False)
+            self._set_template_checkbox_enabled(False)
+            self._atlas_status_label.setText(
+                f"Atlas: Loading cached {atlas_name} in background..."
+            )
+
+            thread = QThread()
+            worker = CachedAtlasLoadWorker(atlas_name, atlas_dir)
+            self._cached_atlas_thread = thread
+            self._cached_atlas_worker = worker
+            worker.moveToThread(thread)
+
+            thread.started.connect(worker.run)
+            worker.finished.connect(self._on_cached_template_atlas_loaded)
+            worker.error.connect(self._on_cached_template_atlas_error)
+            worker.finished.connect(thread.quit)
+            worker.error.connect(thread.quit)
+            thread.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(
+                lambda: self._cleanup_cached_atlas_thread(thread, worker)
+            )
+            thread.start()
+
+    def _on_cached_template_atlas_loaded(self, atlas) -> None:
+        """Apply a cached atlas loaded in the background and show the template."""
+        atlas_name = str(
+            getattr(atlas, "atlas_name", None)
+            or self._atlas_combo.currentText()
+        )
+        try:
+            with startup_timing(
+                logger,
+                "cached_template_autoload_apply",
+                atlas=atlas_name,
+            ):
+                if self._atlas is None:
+                    self._apply_loaded_atlas(atlas, atlas_name)
+                self._set_template_checkbox_enabled(True)
+                if (
+                    self._show_template_after_cached_atlas_load
+                    or self._show_template_cb.isChecked()
+                ):
+                    self._toggle_template(True)
+                    self._set_template_checkbox_checked(
+                        True,
+                        emit_signal=False,
+                    )
+        except Exception as e:
+            logger.error("Failed to show cached atlas template: %s", e)
+            self._atlas_status_label.setText(f"Atlas: Template error - {e}")
+            self._set_template_checkbox_checked(False, emit_signal=False)
+            self._set_template_checkbox_enabled(True)
+        finally:
+            self._show_template_after_cached_atlas_load = False
+
+    def _on_cached_template_atlas_error(self, error_msg: str) -> None:
+        """Handle cached atlas auto-load failure."""
+        self._show_template_after_cached_atlas_load = False
+        self._set_template_checkbox_checked(False, emit_signal=False)
+        self._set_template_checkbox_enabled(True)
+        self._atlas_status_label.setText(
+            f"Atlas: Cached auto-load failed - {error_msg}"
+        )
+        logger.error("Cached atlas auto-load failed: %s", error_msg)
+
+    def _cleanup_cached_atlas_thread(
+        self,
+        thread: QThread,
+        worker: object,
+    ) -> None:
+        """Release cached atlas worker objects after the thread stops."""
+        if self._cached_atlas_thread is thread:
+            self._cached_atlas_thread = None
+        if self._cached_atlas_worker is worker:
+            self._cached_atlas_worker = None
 
     def _open_point_parquet(self) -> None:
         """Open file dialog and preview a standardized point Parquet."""
@@ -2164,11 +2474,66 @@ class NeuronViewerWidget(QWidget):
         mode = combo.currentData() if combo is not None else None
         return "merged" if mode == "merged" else "separate"
 
+    def _current_region_isolation_create_mode(self) -> str:
+        """Return the active Tools region-isolation create mode."""
+        combo = getattr(self, "_region_isolation_create_mode_combo", None)
+        mode = combo.currentData() if combo is not None else None
+        return "merged" if mode == "merged" else "separate"
+
     def _current_histogram_create_mode(self) -> str:
         """Return the active Histogram create mode."""
         combo = getattr(self, "_histogram_create_mode_combo", None)
         mode = combo.currentData() if combo is not None else None
         return "merged" if mode == "merged" else "separate"
+
+    def _selected_region_isolation_entries(self) -> list[tuple[int, str]]:
+        """Return directly selected Tools isolation regions as IDs and acronyms."""
+        selector = getattr(self, "_tools_region_selector", None)
+        if selector is None:
+            return []
+
+        entries: list[tuple[int, str]] = []
+        if hasattr(selector, "get_selected_ids"):
+            selected_ids = selector.get_selected_ids(include_children=False)
+            structure_map = getattr(selector, "_structure_map", {})
+            for struct_id in selected_ids:
+                struct = structure_map.get(int(struct_id), {})
+                acronym = str(struct.get("acronym", "")).strip()
+                if acronym:
+                    entries.append((int(struct_id), acronym))
+            if entries:
+                return entries
+
+        if hasattr(selector, "get_single_selected_region"):
+            selected = selector.get_single_selected_region()
+            if selected is not None:
+                struct_id, acronym = selected
+                return [(int(struct_id), str(acronym))]
+        return []
+
+    def _selected_region_isolation_region_ids(self) -> list[int]:
+        """Return effective atlas annotation IDs for Tools region isolation."""
+        selector = getattr(self, "_tools_region_selector", None)
+        if selector is None or not hasattr(selector, "get_selected_ids"):
+            return []
+
+        include_children = True
+        if hasattr(selector, "include_children_enabled"):
+            include_children = bool(selector.include_children_enabled())
+        return [
+            int(region_id)
+            for region_id in selector.get_selected_ids(
+                include_children=include_children
+            )
+        ]
+
+    def _region_isolation_label(self, acronyms: list[str]) -> str:
+        """Return a compact region label for isolated heatmap layer names."""
+        if not acronyms:
+            return "selected regions"
+        if len(acronyms) <= 2:
+            return ", ".join(acronyms)
+        return f"{', '.join(acronyms[:2])} +{len(acronyms) - 2} more"
 
     def _selected_layer_names_from_widget(self, widget: QListWidget | None) -> set[str]:
         """Return selected layer names from a list widget."""
@@ -2377,14 +2742,18 @@ class NeuronViewerWidget(QWidget):
             return
         self._mask_bounds_source = "manual"
 
-    def _update_tools_controls(self) -> None:
+    def _update_tools_controls(self, *_args) -> None:
         """Enable or disable Tools actions based on current selection."""
         if not hasattr(self, "_heatmap_layer_list"):
             return
 
-        ready = self._atlas is not None and bool(self._selected_heatmap_layers())
+        selected_layers = self._selected_heatmap_layers()
+        ready = self._atlas is not None and bool(selected_layers)
         if hasattr(self, "_create_blur_btn"):
             self._create_blur_btn.setEnabled(ready)
+        if hasattr(self, "_create_region_isolated_heatmap_btn"):
+            has_regions = bool(self._selected_region_isolation_region_ids())
+            self._create_region_isolated_heatmap_btn.setEnabled(ready and has_regions)
 
     def _update_histogram_controls(self) -> None:
         """Enable or disable Histogram actions based on current selection."""
@@ -2708,6 +3077,102 @@ class NeuronViewerWidget(QWidget):
             f"Created {len(created_layers)} blurred layer(s); {nonempty} contain nonzero voxels."
         )
 
+    def _create_region_isolated_heatmaps(self) -> None:
+        """Create heatmap image layers limited to selected atlas regions."""
+        if self._atlas is None:
+            message = "Load an atlas before creating isolated heatmap layers."
+            self._tools_status_label.setText(message)
+            show_warning(message)
+            return
+
+        selected_layers = self._selected_heatmap_layers()
+        if not selected_layers:
+            message = "Select at least one eligible heatmap layer."
+            self._tools_status_label.setText(message)
+            return
+
+        region_ids = self._selected_region_isolation_region_ids()
+        if not region_ids:
+            message = "Select at least one atlas region for isolation."
+            self._tools_status_label.setText(message)
+            return
+
+        selected_regions = self._selected_region_isolation_entries()
+        selected_region_ids = [
+            region_id for region_id, _acronym in selected_regions
+        ]
+        selected_region_acronyms = [
+            acronym for _region_id, acronym in selected_regions
+        ]
+        region_label = self._region_isolation_label(selected_region_acronyms)
+        selector = getattr(self, "_tools_region_selector", None)
+        include_children = (
+            bool(selector.include_children_enabled())
+            if selector is not None and hasattr(selector, "include_children_enabled")
+            else True
+        )
+        create_mode = self._current_region_isolation_create_mode()
+        created_layers = []
+
+        try:
+            if create_mode == "merged":
+                merged_volume = merge_heatmap_volumes(
+                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+                )
+                isolated = isolate_heatmap_volume_to_region_ids(
+                    merged_volume,
+                    self._atlas,
+                    region_ids,
+                )
+                created_layers.append(
+                    self._add_region_isolated_heatmap_layer(
+                        layer_name=(
+                            f"Region Isolated ({region_label}): "
+                            f"merged {len(selected_layers)} heatmaps"
+                        ),
+                        volume=isolated,
+                        source_layers=selected_layers,
+                        selected_region_ids=selected_region_ids,
+                        selected_region_acronyms=selected_region_acronyms,
+                        region_ids=region_ids,
+                        include_children=include_children,
+                        merge_mode="merged_sum",
+                    )
+                )
+            else:
+                for layer in selected_layers:
+                    isolated = isolate_heatmap_volume_to_region_ids(
+                        np.asarray(layer.data, dtype=np.float32),
+                        self._atlas,
+                        region_ids,
+                    )
+                    created_layers.append(
+                        self._add_region_isolated_heatmap_layer(
+                            layer_name=f"Region Isolated ({region_label}): {layer.name}",
+                            volume=isolated,
+                            source_layers=[layer],
+                            selected_region_ids=selected_region_ids,
+                            selected_region_acronyms=selected_region_acronyms,
+                            region_ids=region_ids,
+                            include_children=include_children,
+                            merge_mode="separate",
+                        )
+                    )
+        except Exception as e:
+            logger.error("Failed to create isolated heatmap layers: %s", e)
+            self._tools_status_label.setText(f"Failed to create isolated heatmap layers: {e}")
+            return
+
+        self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
+        self._select_heatmap_layer_names([layer.name for layer in created_layers])
+        self._select_histogram_layer_names([layer.name for layer in created_layers])
+        nonempty = sum(int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers)
+        self._tools_status_label.setText(
+            f"Created {len(created_layers)} isolated heatmap layer(s); "
+            f"{nonempty} contain nonzero voxels."
+        )
+
     def _create_masks_from_heatmaps(self) -> None:
         """Create binary mask label layers from selected heatmap image layers."""
         if self._atlas is None:
@@ -2845,6 +3310,82 @@ class NeuronViewerWidget(QWidget):
             **add_kwargs,
         )
         return layer
+
+    def _add_region_isolated_heatmap_layer(
+        self,
+        layer_name: str,
+        volume: np.ndarray,
+        source_layers: list,
+        selected_region_ids: list[int],
+        selected_region_acronyms: list[str],
+        region_ids: list[int],
+        include_children: bool,
+        merge_mode: str,
+    ):
+        """Add one post-hoc region-isolated heatmap image layer."""
+        from napari.utils.colormaps import Colormap
+
+        first_layer = source_layers[0]
+        rgba = _mask_layer_color(source_layers)
+
+        colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        if colormap is None and rgba is not None:
+            colormap = Colormap(
+                colors=[[0.0, 0.0, 0.0, 0.0], list(rgba)],
+                name=f"region_isolated_{layer_name.lower().replace(' ', '_')}",
+            )
+        elif colormap is None:
+            colormap = "hot"
+
+        contrast_limits = _heatmap_contrast_limits(volume)
+        metadata = dict(_layer_metadata(first_layer)) if len(source_layers) == 1 else {}
+        for stale_key in (
+            "heatmap_region",
+            "heatmap_selected_region_id",
+            "heatmap_selected_region_acronym",
+        ):
+            metadata.pop(stale_key, None)
+        metadata.update(
+            {
+                "heatmap_source": True,
+                "heatmap_native_grid": True,
+                "heatmap_kind": "region_isolated",
+                "source_heatmap_layers": [layer.name for layer in source_layers],
+                "heatmap_selected_region_ids": [
+                    int(region_id) for region_id in selected_region_ids
+                ],
+                "heatmap_selected_region_acronyms": [
+                    str(acronym) for acronym in selected_region_acronyms
+                ],
+                "heatmap_region_ids": [int(region_id) for region_id in region_ids],
+                "heatmap_include_child_regions": bool(include_children),
+                "atlas_name": self._current_atlas_name(),
+                "color": rgba,
+                "merge_mode": merge_mode,
+                "heatmap_contrast_limits": contrast_limits,
+                "heatmap_autocontrast_policy": "stable_full_volume",
+            }
+        )
+
+        add_kwargs = {
+            "name": self._unique_layer_name(layer_name),
+            "colormap": colormap,
+            "blending": getattr(first_layer, "blending", "additive"),
+            "rendering": getattr(first_layer, "rendering", "mip"),
+            "opacity": getattr(first_layer, "opacity", self._opacity_slider.value() / 100.0),
+            "visible": True,
+            "contrast_limits": contrast_limits,
+            "metadata": metadata,
+        }
+        for attr_name in ("scale", "translate"):
+            value = getattr(first_layer, attr_name, None)
+            if value is not None:
+                add_kwargs[attr_name] = value
+
+        return self.viewer.add_image(
+            np.asarray(volume, dtype=np.float32),
+            **add_kwargs,
+        )
 
     def _add_mask_layer(
         self,
@@ -4296,28 +4837,62 @@ class NeuronViewerWidget(QWidget):
 
     def _toggle_template(self, state: int) -> None:
         """Toggle the template layer visibility."""
-        if self._atlas is None:
-            self._load_atlas()
+        requested = bool(state)
+        with startup_timing(
+            logger,
+            "toggle_template",
+            requested_state=requested,
+            atlas_loaded=self._atlas is not None,
+        ) as timing:
             if self._atlas is None:
-                self._show_template_cb.setChecked(False)
-                return
+                if not requested:
+                    self._show_template_after_cached_atlas_load = False
+                    timing.set(result="no_atlas_hide")
+                    return
+                if self._cached_atlas_autoload_running():
+                    self._show_template_after_cached_atlas_load = True
+                    timing.set(result="cached_atlas_loading")
+                    return
+                with startup_timing(
+                    logger,
+                    "toggle_template_phase",
+                    phase="load_atlas",
+                ):
+                    self._load_atlas()
+                if self._atlas is None:
+                    self._show_template_cb.setChecked(False)
+                    timing.set(result="atlas_unavailable")
+                    return
 
-        layer_name = "Allen Template"
+            layer_name = "Allen Template"
 
-        if bool(state):
-            # Check if layer already exists
-            existing = [
-                layer for layer in self.viewer.layers if layer.name == layer_name
-            ]
-            if not existing:
-                opacity = self._template_opacity_slider.value() / 100.0
-                add_allen_template(self.viewer, self._atlas, opacity=opacity)
-        else:
-            # Remove template layer
-            for layer in self.viewer.layers:
-                if layer.name == layer_name:
-                    self.viewer.layers.remove(layer)
-                    break
+            if requested:
+                existing = [
+                    layer for layer in self.viewer.layers
+                    if layer.name == layer_name
+                ]
+                timing.set(existing_template_layers=len(existing))
+                if not existing:
+                    opacity = self._template_opacity_slider.value() / 100.0
+                    with startup_timing(
+                        logger,
+                        "toggle_template_phase",
+                        phase="add_allen_template",
+                        opacity=opacity,
+                    ):
+                        add_allen_template(
+                            self.viewer,
+                            self._atlas,
+                            opacity=opacity,
+                        )
+            else:
+                removed = False
+                for layer in self.viewer.layers:
+                    if layer.name == layer_name:
+                        self.viewer.layers.remove(layer)
+                        removed = True
+                        break
+                timing.set(removed=removed)
 
     def _update_template_opacity(self, value: int) -> None:
         """Update the template layer opacity."""

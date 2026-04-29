@@ -99,6 +99,52 @@ def _make_cluster_result(neuron_ids: list[str], labels: list[int]) -> ClusterRes
     )
 
 
+def test_cached_brainglobe_atlas_dir_finds_single_cache(tmp_path):
+    """Cache lookup should only return an unambiguous local atlas directory."""
+    workers = _import_workers_module()
+    atlas_dir = tmp_path / "allen_mouse_25um_v1.2"
+    atlas_dir.mkdir()
+
+    assert workers.cached_brainglobe_atlas_dir(
+        "allen_mouse_25um",
+        brainglobe_dir=tmp_path,
+    ) == atlas_dir
+    assert workers.cached_brainglobe_atlas_dir(
+        "allen_mouse_10um",
+        brainglobe_dir=tmp_path,
+    ) is None
+
+    (tmp_path / "allen_mouse_25um_v1.3").mkdir()
+    assert workers.cached_brainglobe_atlas_dir(
+        "allen_mouse_25um",
+        brainglobe_dir=tmp_path,
+    ) is None
+
+
+def test_cached_atlas_load_worker_uses_local_loader(monkeypatch, tmp_path):
+    """CachedAtlasLoadWorker should emit the locally loaded atlas object."""
+    workers = _import_workers_module()
+    atlas = types.SimpleNamespace(atlas_name="fake_atlas")
+    calls = []
+
+    def fake_load_cached(atlas_name, atlas_dir):
+        calls.append((atlas_name, Path(atlas_dir)))
+        return atlas
+
+    monkeypatch.setattr(workers, "load_cached_brainglobe_atlas", fake_load_cached)
+    worker = workers.CachedAtlasLoadWorker("fake_atlas", tmp_path)
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert calls == [("fake_atlas", tmp_path)]
+    assert finished == [atlas]
+    assert errors == []
+
+
 class _FakeDuckConnection:
     """Very small DuckDB connection stub used for worker tests."""
 

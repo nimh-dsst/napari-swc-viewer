@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from qtpy.QtCore import Qt, Signal
@@ -18,8 +19,12 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ..logging_utils import startup_timing
+
 if TYPE_CHECKING:
     from brainglobe_atlasapi import BrainGlobeAtlas
+
+logger = logging.getLogger(__name__)
 
 
 def _get_parent_structure_id(struct: dict[str, Any]) -> int | None:
@@ -189,31 +194,48 @@ class RegionSelectorWidget(QWidget):
         if self._atlas is None:
             return
 
-        self._tree.blockSignals(True)
-        self._tree.clear()
-        self._items_by_id.clear()
-        self._structure_map.clear()
+        atlas_name = getattr(self._atlas, "atlas_name", "unknown")
+        with startup_timing(
+            logger,
+            "region_selector_populate_tree",
+            log_start=False,
+            atlas=atlas_name,
+        ) as timing:
+            self._tree.blockSignals(True)
+            self._tree.clear()
+            self._items_by_id.clear()
+            self._structure_map.clear()
 
-        # Build structure lookup
-        for struct_id, struct in self._atlas.structures.items():
-            if isinstance(struct_id, int):
-                self._structure_map[struct_id] = struct
+            total_structures = 0
+            # Build structure lookup
+            for struct_id, struct in self._atlas.structures.items():
+                total_structures += 1
+                if isinstance(struct_id, int):
+                    self._structure_map[struct_id] = struct
 
-        # Find root structures (those without a parent in our map)
-        root_ids = set()
-        for struct_id, struct in self._structure_map.items():
-            if not self._is_structure_allowed(struct_id):
-                continue
-            parent_id = _get_parent_structure_id(struct)
-            if parent_id is None or not self._is_structure_allowed(parent_id):
-                root_ids.add(struct_id)
+            # Find root structures (those without a parent in our map)
+            root_ids = set()
+            allowed_structures = 0
+            for struct_id, struct in self._structure_map.items():
+                if not self._is_structure_allowed(struct_id):
+                    continue
+                allowed_structures += 1
+                parent_id = _get_parent_structure_id(struct)
+                if parent_id is None or not self._is_structure_allowed(parent_id):
+                    root_ids.add(struct_id)
 
-        # Build tree recursively from roots
-        for root_id in sorted(root_ids):
-            self._add_structure_to_tree(root_id, None)
+            # Build tree recursively from roots
+            for root_id in sorted(root_ids):
+                self._add_structure_to_tree(root_id, None)
 
-        self._tree.blockSignals(False)
-        self._update_selection_label()
+            timing.set(
+                total_structures=total_structures,
+                allowed_structures=allowed_structures,
+                root_count=len(root_ids),
+                created_items=len(self._items_by_id),
+            )
+            self._tree.blockSignals(False)
+            self._update_selection_label()
 
     def _add_structure_to_tree(
         self,

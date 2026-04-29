@@ -14,6 +14,7 @@ from napari_swc_viewer.analysis.mask import (
     build_binary_mask_from_threshold_range,
     get_expanded_region_voxel_ids_for_regions,
     get_regions_mask,
+    isolate_heatmap_volume_to_region_ids,
     merge_heatmap_volumes,
     otsu_threshold_positive,
     smooth_heatmap_volume,
@@ -26,6 +27,14 @@ class FakeAtlas:
         self.annotation = np.zeros((5, 5, 5), dtype=np.int32)
         self.resolution = (25.0, 25.0, 25.0)
         self.atlas_name = "fake_atlas"
+        self.structures = {}
+
+
+class _AnnotationAtlas:
+    def __init__(self, annotation: np.ndarray) -> None:
+        self.annotation = np.asarray(annotation, dtype=np.int32)
+        self.resolution = (25.0, 25.0, 25.0)
+        self.atlas_name = "annotation_atlas"
         self.structures = {}
 
 
@@ -61,6 +70,51 @@ def test_merge_heatmap_volumes_sums_inputs() -> None:
 
     assert float(merged[1, 1, 1]) == 5.0
     assert float(merged[2, 1, 1]) == 1.0
+
+
+def test_isolate_heatmap_volume_to_region_ids_keeps_selected_region_values() -> None:
+    annotation = np.array(
+        [
+            [[1, 2], [3, 1]],
+            [[2, 3], [1, 0]],
+        ],
+        dtype=np.int32,
+    )
+    volume = np.arange(annotation.size, dtype=np.float32).reshape(annotation.shape)
+    atlas = _AnnotationAtlas(annotation)
+
+    isolated = isolate_heatmap_volume_to_region_ids(volume, atlas, [1])
+
+    expected = np.where(annotation == 1, volume, 0.0).astype(np.float32)
+    assert isolated.dtype == np.float32
+    np.testing.assert_array_equal(isolated, expected)
+
+
+def test_isolate_heatmap_volume_to_region_ids_supports_multiple_regions() -> None:
+    annotation = np.array([[[1, 2], [3, 4]]], dtype=np.int32)
+    volume = np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32)
+    atlas = _AnnotationAtlas(annotation)
+
+    isolated = isolate_heatmap_volume_to_region_ids(volume, atlas, [2, 4])
+
+    expected = np.array([[[0.0, 6.0], [0.0, 8.0]]], dtype=np.float32)
+    np.testing.assert_array_equal(isolated, expected)
+
+
+def test_isolate_heatmap_volume_to_region_ids_rejects_empty_selection() -> None:
+    volume = np.zeros((2, 2, 2), dtype=np.float32)
+    atlas = _AnnotationAtlas(np.zeros((2, 2, 2), dtype=np.int32))
+
+    with pytest.raises(ValueError, match="At least one region ID"):
+        isolate_heatmap_volume_to_region_ids(volume, atlas, [])
+
+
+def test_isolate_heatmap_volume_to_region_ids_rejects_shape_mismatch() -> None:
+    volume = np.zeros((2, 2, 2), dtype=np.float32)
+    atlas = _AnnotationAtlas(np.zeros((2, 2, 3), dtype=np.int32))
+
+    with pytest.raises(ValueError, match="does not match atlas annotation shape"):
+        isolate_heatmap_volume_to_region_ids(volume, atlas, [1])
 
 
 def test_get_regions_mask_unions_selected_region_masks() -> None:

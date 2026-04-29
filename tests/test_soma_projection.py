@@ -355,12 +355,22 @@ class _DummyViewer:
 class _DummyCheckBox:
     def __init__(self, checked: bool) -> None:
         self._checked = checked
+        self.enabled = True
+        self.signals_blocked = False
 
     def isChecked(self) -> bool:
         return self._checked
 
     def setChecked(self, checked: bool) -> None:
         self._checked = checked
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+    def blockSignals(self, blocked: bool) -> bool:
+        previous = self.signals_blocked
+        self.signals_blocked = bool(blocked)
+        return previous
 
 
 class _DummyComboBox:
@@ -381,18 +391,31 @@ class _DummyRegionSelector:
         *,
         direct_acronyms: list[str] | None = None,
         query_acronyms: list[str] | None = None,
+        direct_ids: list[int] | None = None,
+        query_ids: list[int] | None = None,
+        structure_map: dict[int, dict] | None = None,
         include_children: bool = True,
     ) -> None:
         self._direct_acronyms = list(direct_acronyms or [])
         self._query_acronyms = list(
             self._direct_acronyms if query_acronyms is None else query_acronyms
         )
+        self._direct_ids = list(direct_ids or [])
+        self._query_ids = list(self._direct_ids if query_ids is None else query_ids)
+        self._structure_map = dict(structure_map or {})
+        for struct_id, acronym in zip(self._direct_ids, self._direct_acronyms):
+            self._structure_map.setdefault(int(struct_id), {"acronym": acronym})
         self._include_children = bool(include_children)
 
     def get_selected_acronyms(self, include_children: bool = True) -> list[str]:
         if include_children:
             return list(self._query_acronyms)
         return list(self._direct_acronyms)
+
+    def get_selected_ids(self, include_children: bool = True) -> list[int]:
+        if include_children:
+            return list(self._query_ids)
+        return list(self._direct_ids)
 
     def get_query_acronyms(self) -> list[str]:
         return list(self._query_acronyms)
@@ -461,6 +484,18 @@ class _DummyValueControl:
         return self._value
 
 
+class _DummyStatusLabel:
+    def __init__(self) -> None:
+        self.text = ""
+        self.repaint_count = 0
+
+    def setText(self, value: str) -> None:
+        self.text = value
+
+    def repaint(self) -> None:
+        self.repaint_count += 1
+
+
 def _make_soma_projector(
     viewer: _DummyViewer,
     *,
@@ -485,6 +520,303 @@ def _make_soma_projector(
     projector._last_result = None
     projector._update_timer = MagicMock()
     return projector
+
+
+def test_widget_startup_schedules_cached_template_autoload_without_atlas_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup should only schedule the cached-background template path."""
+    single_shot_calls = []
+
+    class _TimerRecorder:
+        @staticmethod
+        def singleShot(*args, **kwargs) -> None:
+            single_shot_calls.append((args, kwargs))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget.__init__.__globals__,
+        "QTimer",
+        _TimerRecorder,
+    )
+    atlas_factory = MagicMock()
+    monkeypatch.setitem(
+        NeuronViewerWidget.__init__.__globals__,
+        "BrainGlobeAtlas",
+        atlas_factory,
+    )
+    monkeypatch.setattr(NeuronViewerWidget, "_setup_ui", lambda self: None)
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_connect_layer_events",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_refresh_heatmap_layer_list",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_refresh_histogram_layer_list",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        NeuronViewerWidget,
+        "_refresh_mask_layer_options",
+        lambda self: None,
+    )
+
+    widget = NeuronViewerWidget(_DummyViewer())
+
+    assert len(single_shot_calls) == 1
+    assert single_shot_calls[0][0][0] == 0
+    assert single_shot_calls[0][0][1].__self__ is widget
+    assert single_shot_calls[0][0][1].__name__ == "_start_cached_template_autoload"
+    atlas_factory.assert_not_called()
+
+
+def test_reference_template_checkbox_defaults_to_lazy_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reference template should be opt-in, not loaded at startup."""
+
+    class _Layout:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.items = []
+
+        def addWidget(self, widget) -> None:
+            self.items.append(widget)
+
+        def addLayout(self, layout) -> None:
+            self.items.append(layout)
+
+        def addStretch(self) -> None:
+            self.items.append("stretch")
+
+    class _SignalStub:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def connect(self, callback) -> None:
+            self.callbacks.append(callback)
+
+    class _CheckBoxStub:
+        def __init__(self, text: str = "") -> None:
+            self.text = text
+            self.checked = None
+            self.tooltip = ""
+            self.stateChanged = _SignalStub()
+
+        def setChecked(self, checked: bool) -> None:
+            self.checked = bool(checked)
+
+        def isChecked(self) -> bool:
+            return bool(self.checked)
+
+        def setToolTip(self, text: str) -> None:
+            self.tooltip = text
+
+    class _SliderStub:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.valueChanged = _SignalStub()
+
+        def setRange(self, *_args) -> None:
+            return None
+
+        def setValue(self, *_args) -> None:
+            return None
+
+    globals_dict = NeuronViewerWidget._setup_reference_tab.__globals__
+    monkeypatch.setitem(globals_dict, "QVBoxLayout", _Layout)
+    monkeypatch.setitem(globals_dict, "QHBoxLayout", _Layout)
+    monkeypatch.setitem(globals_dict, "QGroupBox", _FakeWidget)
+    monkeypatch.setitem(globals_dict, "QLabel", _FakeWidget)
+    monkeypatch.setitem(globals_dict, "QCheckBox", _CheckBoxStub)
+    monkeypatch.setitem(globals_dict, "QSlider", _SliderStub)
+
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._toggle_template = lambda _state: None
+    widget._update_template_opacity = lambda _value: None
+    widget._toggle_outline = lambda _state: None
+    widget._toggle_region_meshes = lambda _state: None
+    widget._toggle_region_segmentation = lambda _state: None
+    widget._update_seg_opacity = lambda _value: None
+
+    NeuronViewerWidget._setup_reference_tab(widget, _FakeWidget())
+
+    assert widget._show_template_cb.isChecked() is False
+    assert "on demand" in widget._show_template_cb.tooltip
+
+
+def test_load_atlas_skips_remote_latest_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit atlas loads should avoid BrainGlobe's remote latest check."""
+    calls = []
+
+    class _FakeAtlas:
+        def __init__(self, atlas_name: str, **kwargs) -> None:
+            calls.append((atlas_name, kwargs))
+            self.structures = {1: {"acronym": "R1"}}
+
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas_combo = _DummyComboBox("allen_mouse_25um")
+    widget._atlas_status_label = _DummyStatusLabel()
+    widget._analysis_tab = types.SimpleNamespace(set_atlas=lambda _atlas: None)
+    widget._update_mask_sigma_units_label = lambda: None
+    widget._refresh_heatmap_layer_list = lambda: None
+    widget._refresh_histogram_layer_list = lambda: None
+    widget._refresh_mask_layer_options = lambda: None
+    widget._update_point_import_controls = lambda: None
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._load_atlas.__globals__,
+        "BrainGlobeAtlas",
+        _FakeAtlas,
+    )
+
+    NeuronViewerWidget._load_atlas(widget)
+
+    assert calls == [("allen_mouse_25um", {"check_latest": False})]
+    assert widget._atlas_status_label.text == "Atlas: allen_mouse_25um (1 structures)"
+
+
+def test_toggle_template_loads_atlas_on_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checking the template box should still load the atlas when needed."""
+    load_calls = []
+    template_calls = []
+    atlas = object()
+
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget.viewer = _DummyViewer()
+    widget._show_template_cb = _DummyCheckBox(True)
+    widget._template_opacity_slider = _DummyValueControl(30)
+
+    def _load_atlas() -> None:
+        load_calls.append(True)
+        widget._atlas = atlas
+
+    widget._load_atlas = _load_atlas
+
+    def _add_template(viewer, loaded_atlas, **kwargs) -> None:
+        template_calls.append((viewer, loaded_atlas, kwargs))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._toggle_template.__globals__,
+        "add_allen_template",
+        _add_template,
+    )
+
+    NeuronViewerWidget._toggle_template(widget, True)
+
+    assert load_calls == [True]
+    assert template_calls == [(widget.viewer, atlas, {"opacity": 0.3})]
+
+
+def test_toggle_template_hide_without_atlas_does_not_load() -> None:
+    """Turning the template off before atlas load should not load an atlas."""
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget._cached_atlas_thread = None
+    widget._show_template_after_cached_atlas_load = True
+    widget._load_atlas = MagicMock()
+    widget._show_template_cb = _DummyCheckBox(False)
+
+    NeuronViewerWidget._toggle_template(widget, False)
+
+    widget._load_atlas.assert_not_called()
+    assert widget._show_template_after_cached_atlas_load is False
+
+
+def test_toggle_template_waits_for_cached_autoload() -> None:
+    """Manual template-on requests should not start a second atlas load."""
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget._cached_atlas_thread = types.SimpleNamespace(isRunning=lambda: True)
+    widget._show_template_after_cached_atlas_load = False
+    widget._load_atlas = MagicMock()
+    widget._show_template_cb = _DummyCheckBox(True)
+
+    NeuronViewerWidget._toggle_template(widget, True)
+
+    widget._load_atlas.assert_not_called()
+    assert widget._show_template_after_cached_atlas_load is True
+
+
+def test_cached_template_atlas_loaded_applies_atlas_and_shows_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finished background loads should refresh atlas UI and show the template."""
+    atlas = types.SimpleNamespace(
+        atlas_name="fake_atlas",
+        structures={1: {"acronym": "R1"}},
+    )
+    template_calls = []
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas = None
+    widget._atlas_combo = _DummyComboBox("fake_atlas")
+    widget._show_template_cb = _DummyCheckBox(True)
+    widget._show_template_after_cached_atlas_load = True
+    widget._template_opacity_slider = _DummyValueControl(30)
+    widget.viewer = _DummyViewer()
+    widget._apply_loaded_atlas = MagicMock(
+        side_effect=lambda loaded, _name: setattr(widget, "_atlas", loaded)
+    )
+
+    def _add_template(viewer, loaded_atlas, **kwargs) -> None:
+        template_calls.append((viewer, loaded_atlas, kwargs))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._toggle_template.__globals__,
+        "add_allen_template",
+        _add_template,
+    )
+
+    NeuronViewerWidget._on_cached_template_atlas_loaded(widget, atlas)
+
+    widget._apply_loaded_atlas.assert_called_once_with(atlas, "fake_atlas")
+    assert template_calls == [(widget.viewer, atlas, {"opacity": 0.3})]
+    assert widget._show_template_cb.isChecked() is True
+    assert widget._show_template_cb.enabled is True
+
+
+def _install_fake_colormaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DummyColormap:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_napari = types.ModuleType("napari")
+    fake_utils = types.ModuleType("napari.utils")
+    fake_utils.__path__ = []
+    fake_colormaps = types.ModuleType("napari.utils.colormaps")
+    fake_colormaps.Colormap = _DummyColormap
+    fake_napari.utils = fake_utils
+    fake_utils.colormaps = fake_colormaps
+
+    monkeypatch.setitem(sys.modules, "napari", fake_napari)
+    monkeypatch.setitem(sys.modules, "napari.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
+
+
+def _bind_region_isolation_methods(widget) -> None:
+    for method_name in (
+        "_current_region_isolation_create_mode",
+        "_selected_region_isolation_entries",
+        "_selected_region_isolation_region_ids",
+        "_region_isolation_label",
+        "_add_region_isolated_heatmap_layer",
+        "_unique_layer_name",
+        "_iter_viewer_layers",
+        "_current_atlas_name",
+    ):
+        setattr(
+            widget,
+            method_name,
+            types.MethodType(getattr(NeuronViewerWidget, method_name), widget),
+        )
 
 
 def _bind_projection_helpers(widget) -> None:
@@ -1715,3 +2047,163 @@ def test_selected_neuron_heatmap_finished_adds_unique_multi_selection_layer() ->
     widget._refresh_histogram_layer_list.assert_called_once_with()
     widget._refresh_mask_layer_options.assert_called_once_with()
     assert "Neuron Heatmap: 2 selected neurons (3)" in widget._render_status_label.text
+
+
+def test_region_isolation_region_ids_follow_include_children_state() -> None:
+    selector = _DummyRegionSelector(
+        direct_acronyms=["R1"],
+        direct_ids=[1],
+        query_ids=[1, 2],
+        include_children=True,
+    )
+    widget = types.SimpleNamespace(_tools_region_selector=selector)
+
+    assert NeuronViewerWidget._selected_region_isolation_region_ids(widget) == [1, 2]
+    assert NeuronViewerWidget._selected_region_isolation_entries(widget) == [(1, "R1")]
+
+    selector._include_children = False
+    assert NeuronViewerWidget._selected_region_isolation_region_ids(widget) == [1]
+
+
+def test_create_region_isolated_heatmaps_separate_layers_sets_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_colormaps(monkeypatch)
+    viewer = _DummyViewer(ndisplay=3)
+    annotation = np.array([[[1, 2, 3], [2, 1, 0]]], dtype=np.int32)
+    atlas = types.SimpleNamespace(annotation=annotation, atlas_name="fake_atlas")
+    source_a = _DummyImageLayer(
+        np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=np.float32),
+        name="Source A",
+        colormap="source_cmap",
+        blending="additive",
+        rendering="mip",
+        opacity=0.6,
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+            "color": (1.0, 0.0, 0.0, 1.0),
+            "heatmap_selected_region_id": 99,
+        },
+    )
+    source_b = _DummyImageLayer(
+        np.array([[[0.0, 1.0, 0.0], [3.0, 0.0, 9.0]]], dtype=np.float32),
+        name="Source B",
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+        },
+    )
+    viewer.layers.extend([source_a, source_b])
+    selector = _DummyRegionSelector(
+        direct_acronyms=["R1"],
+        direct_ids=[1],
+        query_ids=[1, 2],
+        include_children=True,
+    )
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _atlas=atlas,
+        _opacity_slider=_DummyValueControl(50),
+        _tools_status_label=_DummyLabel(),
+        _tools_region_selector=selector,
+        _region_isolation_create_mode_combo=_DummyComboBox("Separate", "separate"),
+        _selected_heatmap_layers=lambda: [source_a, source_b],
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _select_heatmap_layer_names=MagicMock(),
+        _select_histogram_layer_names=MagicMock(),
+    )
+    _bind_region_isolation_methods(widget)
+
+    NeuronViewerWidget._create_region_isolated_heatmaps(widget)
+
+    created_a, created_b = viewer.layers[-2:]
+    expected_a = np.where(np.isin(annotation, [1, 2]), source_a.data, 0.0)
+    expected_b = np.where(np.isin(annotation, [1, 2]), source_b.data, 0.0)
+    np.testing.assert_array_equal(created_a.data, expected_a)
+    np.testing.assert_array_equal(created_b.data, expected_b)
+    assert created_a.name == "Region Isolated (R1): Source A"
+    assert created_b.name == "Region Isolated (R1): Source B"
+    assert created_a.colormap == "source_cmap"
+    assert created_a.blending == "additive"
+    assert created_a.rendering == "mip"
+    assert created_a.opacity == 0.6
+    assert created_a.contrast_limits == (0.0, 5.0)
+    assert created_a.metadata["heatmap_kind"] == "region_isolated"
+    assert created_a.metadata["source_heatmap_layers"] == ["Source A"]
+    assert created_a.metadata["heatmap_selected_region_ids"] == [1]
+    assert created_a.metadata["heatmap_selected_region_acronyms"] == ["R1"]
+    assert created_a.metadata["heatmap_region_ids"] == [1, 2]
+    assert created_a.metadata["heatmap_include_child_regions"] is True
+    assert created_a.metadata["merge_mode"] == "separate"
+    assert created_a.metadata["atlas_name"] == "fake_atlas"
+    assert "heatmap_selected_region_id" not in created_a.metadata
+    widget._select_heatmap_layer_names.assert_called_once_with(
+        ["Region Isolated (R1): Source A", "Region Isolated (R1): Source B"]
+    )
+    assert "Created 2 isolated heatmap layer(s)" in widget._tools_status_label.text
+
+
+def test_create_region_isolated_heatmaps_merged_sums_before_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_colormaps(monkeypatch)
+    viewer = _DummyViewer(ndisplay=3)
+    annotation = np.array([[[1, 2], [1, 0]]], dtype=np.int32)
+    atlas = types.SimpleNamespace(annotation=annotation, atlas_name="fake_atlas")
+    source_a = _DummyImageLayer(
+        np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+        name="Source A",
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+            "color": (1.0, 0.0, 0.0, 1.0),
+        },
+    )
+    source_b = _DummyImageLayer(
+        np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32),
+        name="Source B",
+        metadata={
+            "heatmap_source": True,
+            "heatmap_native_grid": True,
+            "atlas_name": "fake_atlas",
+            "color": (0.0, 1.0, 0.0, 1.0),
+        },
+    )
+    viewer.layers.extend([source_a, source_b])
+    selector = _DummyRegionSelector(
+        direct_acronyms=["R1"],
+        direct_ids=[1],
+        query_ids=[1, 2],
+        include_children=False,
+    )
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _atlas=atlas,
+        _opacity_slider=_DummyValueControl(50),
+        _tools_status_label=_DummyLabel(),
+        _tools_region_selector=selector,
+        _region_isolation_create_mode_combo=_DummyComboBox("Merged", "merged"),
+        _selected_heatmap_layers=lambda: [source_a, source_b],
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _select_heatmap_layer_names=MagicMock(),
+        _select_histogram_layer_names=MagicMock(),
+    )
+    _bind_region_isolation_methods(widget)
+
+    NeuronViewerWidget._create_region_isolated_heatmaps(widget)
+
+    created = viewer.layers[-1]
+    expected = np.where(annotation == 1, source_a.data + source_b.data, 0.0)
+    np.testing.assert_array_equal(created.data, expected)
+    assert created.name == "Region Isolated (R1): merged 2 heatmaps"
+    assert created.metadata["source_heatmap_layers"] == ["Source A", "Source B"]
+    assert created.metadata["heatmap_region_ids"] == [1]
+    assert created.metadata["heatmap_include_child_regions"] is False
+    assert created.metadata["merge_mode"] == "merged_sum"
+    assert created.contrast_limits == (0.0, 10.0)

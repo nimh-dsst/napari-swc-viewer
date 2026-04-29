@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from napari_swc_viewer.logging_utils import configure_debug_logging
+from napari_swc_viewer.logging_utils import (
+    configure_debug_logging,
+    startup_timing,
+)
 
 
 def _reset_plugin_logger() -> None:
@@ -100,3 +103,57 @@ def test_configure_debug_logging_honors_custom_log_path(
 
     assert log_path == nested
     assert nested.parent.exists()
+
+
+def test_startup_timing_logs_start_and_ok_records(caplog) -> None:
+    """Timing spans should emit stable startup_timing records."""
+    logger = logging.getLogger("napari_swc_viewer.tests.startup_timing")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        with startup_timing(logger, "unit_event", phase="setup") as timing:
+            timing.set(count=3)
+
+    messages = [record.getMessage() for record in caplog.records]
+
+    assert any(
+        "startup_timing event=unit_event status=start elapsed_s=0.000000"
+        in message
+        and "phase=setup" in message
+        for message in messages
+    )
+    assert any(
+        "startup_timing event=unit_event status=ok elapsed_s=" in message
+        and "phase=setup" in message
+        and "count=3" in message
+        for message in messages
+    )
+
+
+def test_startup_timing_logs_exception_with_exc_info(caplog) -> None:
+    """Error spans should log the exception without swallowing it."""
+    logger = logging.getLogger("napari_swc_viewer.tests.startup_timing_error")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with caplog.at_level(logging.DEBUG, logger=logger.name):
+            with startup_timing(logger, "unit_error", log_start=False):
+                raise RuntimeError("boom")
+
+    error_records = [
+        record
+        for record in caplog.records
+        if "startup_timing event=unit_error status=error" in record.getMessage()
+    ]
+    assert len(error_records) == 1
+    assert error_records[0].exc_info is not None
+    assert error_records[0].exc_info[0] is RuntimeError
+
+
+def test_startup_timing_is_quiet_when_debug_disabled(caplog) -> None:
+    """Timing spans should avoid DEBUG records when the logger is not enabled."""
+    logger = logging.getLogger("napari_swc_viewer.tests.startup_timing_disabled")
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        with startup_timing(logger, "disabled_event") as timing:
+            timing.set(count=1)
+
+    assert not any("startup_timing" in record.getMessage() for record in caplog.records)
