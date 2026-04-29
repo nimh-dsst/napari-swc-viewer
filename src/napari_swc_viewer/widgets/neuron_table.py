@@ -10,6 +10,7 @@ Provides an interactive table for viewing and controlling neurons:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING
@@ -53,10 +54,11 @@ logger = logging.getLogger(__name__)
 # Column indices
 COL_VISIBLE = 0
 COL_ADDED = 1
-COL_NEURON_ID = 2
-COL_SUBJECT = 3
-COL_CLUSTER = 4
-COL_COLOR = 5
+COL_HEATMAP = 2
+COL_NEURON_ID = 3
+COL_SUBJECT = 4
+COL_CLUSTER = 5
+COL_COLOR = 6
 
 
 class _NumericSortItem(QTableWidgetItem):
@@ -80,6 +82,7 @@ class NeuronEntry:
     cluster_id: int | None = None
     visible: bool = True
     added_to_scene: bool = False
+    heatmap_layer_names: tuple[str, ...] = ()
 
 
 class NeuronTableWidget(QWidget):
@@ -109,9 +112,9 @@ class NeuronTableWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 6)
+        self._table = QTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
-            ["Vis", "Added", "Neuron ID", "Subject", "Cluster", "Color"]
+            ["Vis", "Added", "Heatmap", "Neuron ID", "Subject", "Cluster", "Color"]
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -120,6 +123,7 @@ class NeuronTableWidget(QWidget):
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(COL_VISIBLE, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_ADDED, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_HEATMAP, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_NEURON_ID, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_CLUSTER, QHeaderView.ResizeToContents)
@@ -176,6 +180,9 @@ class NeuronTableWidget(QWidget):
         # Added state
         self._set_added_cell(row, entry.added_to_scene)
 
+        # Heatmap state
+        self._set_heatmap_cell(row, entry.heatmap_layer_names)
+
         # Neuron ID
         id_item = QTableWidgetItem(str(entry.file_id))
         id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
@@ -207,6 +214,22 @@ class NeuronTableWidget(QWidget):
 
         item.setText("Yes" if added else "No")
         item.setData(Qt.UserRole, 1 if added else 0)
+
+    def _set_heatmap_cell(
+        self,
+        row: int,
+        layer_names: Iterable[object],
+    ) -> None:
+        """Set the Heatmap column cell text and sort key."""
+        item = self._table.item(row, COL_HEATMAP)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(row, COL_HEATMAP, item)
+
+        display = ", ".join(str(name) for name in layer_names)
+        item.setText(display)
+        item.setData(Qt.UserRole, display.casefold())
 
     def _set_cluster_cell(self, row: int, cluster_id: int | None) -> None:
         """Set cluster cell text and numeric sort key."""
@@ -451,6 +474,58 @@ class NeuronTableWidget(QWidget):
             self._table.setSortingEnabled(sorting_enabled)
         self.state_changed.emit()
 
+    @staticmethod
+    def _normalized_heatmap_layer_names(layer_names: object) -> tuple[str, ...]:
+        """Return layer names as a deduplicated display tuple."""
+        if layer_names is None:
+            return ()
+        if isinstance(layer_names, (str, bytes)):
+            raw_names = [layer_names]
+        else:
+            try:
+                raw_names = list(layer_names)
+            except TypeError:
+                raw_names = [layer_names]
+
+        names: list[str] = []
+        seen: set[str] = set()
+        for name in raw_names:
+            display = str(name)
+            if not display or display in seen:
+                continue
+            names.append(display)
+            seen.add(display)
+        return tuple(names)
+
+    def set_heatmap_layers_by_file_id(
+        self,
+        heatmap_layers_by_file_id: Mapping[object, object],
+    ) -> None:
+        """Set Data-tab heatmap layer names for each neuron."""
+        exact = {
+            file_id: self._normalized_heatmap_layer_names(layer_names)
+            for file_id, layer_names in heatmap_layers_by_file_id.items()
+        }
+        by_string = {str(file_id): layer_names for file_id, layer_names in exact.items()}
+        row_map = self._file_id_to_row_map()
+
+        sorting_enabled = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
+        try:
+            for file_id in self._entries:
+                entry = self._entries.get(file_id)
+                if entry is None:
+                    continue
+
+                layer_names = exact.get(file_id, by_string.get(str(file_id), ()))
+                entry.heatmap_layer_names = layer_names
+                row = row_map.get(file_id)
+                if row is not None:
+                    self._set_heatmap_cell(row, layer_names)
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
+        self.state_changed.emit()
+
     def available_cluster_ids(self) -> list[int]:
         """Return sorted unique cluster IDs in the table."""
         cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
@@ -466,10 +541,27 @@ class NeuronTableWidget(QWidget):
         selection: ClusterFilterSelection | int | None,
     ) -> None:
         """Hide rows outside the selected cluster groups."""
+        self.apply_filters(selection)
+
+    def apply_filters(
+        self,
+        selection: ClusterFilterSelection | int | None,
+        heatmap_file_ids: set[object] | list[object] | tuple[object, ...] | None = None,
+    ) -> None:
+        """Hide rows outside the combined cluster and manual heatmap filters."""
         cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
-        matches = cluster_filter_matches(cluster_map, selection)
+        cluster_matches = cluster_filter_matches(cluster_map, selection)
+        if heatmap_file_ids is None:
+            heatmap_matches = {file_id: True for file_id in self._entries}
+        else:
+            heatmap_matches = added_flags(self._entries.keys(), heatmap_file_ids)
+
         for row, file_id in self._iter_rows_with_file_ids():
-            self._table.setRowHidden(row, not matches.get(file_id, True))
+            visible = cluster_matches.get(file_id, True) and heatmap_matches.get(
+                file_id,
+                False,
+            )
+            self._table.setRowHidden(row, not visible)
 
     def hide_all_not_in_cluster(
         self,

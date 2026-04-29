@@ -394,6 +394,47 @@ class _DummyComboBox:
         return self._data
 
 
+class _DummyMutableComboBox:
+    def __init__(self) -> None:
+        self.items: list[tuple[str, object]] = []
+        self.current_index = -1
+        self.enabled = True
+        self.signals_blocked = False
+
+    def addItem(self, text: str, data=None) -> None:
+        self.items.append((text, data))
+        if self.current_index < 0:
+            self.current_index = 0
+
+    def clear(self) -> None:
+        self.items.clear()
+        self.current_index = -1
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def setCurrentIndex(self, index: int) -> None:
+        self.current_index = int(index)
+
+    def currentData(self):
+        if self.current_index < 0 or self.current_index >= len(self.items):
+            return None
+        return self.items[self.current_index][1]
+
+    def currentText(self) -> str:
+        if self.current_index < 0 or self.current_index >= len(self.items):
+            return ""
+        return self.items[self.current_index][0]
+
+    def blockSignals(self, blocked: bool) -> bool:
+        previous = self.signals_blocked
+        self.signals_blocked = bool(blocked)
+        return previous
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+
 class _DummyRegionSelector:
     def __init__(
         self,
@@ -937,9 +978,66 @@ def _bind_table_membership_helpers(widget) -> None:
     )
 
 
-def _bind_cluster_filter_helpers(widget) -> None:
+def _bind_manual_heatmap_helpers(widget) -> None:
+    widget._iter_viewer_layers = types.MethodType(
+        NeuronViewerWidget._iter_viewer_layers,
+        widget,
+    )
+    widget._manual_heatmap_layers = types.MethodType(
+        NeuronViewerWidget._manual_heatmap_layers,
+        widget,
+    )
+    widget._normalise_layer_file_ids = NeuronViewerWidget._normalise_layer_file_ids
+    widget._manual_heatmap_combo_options = types.MethodType(
+        NeuronViewerWidget._manual_heatmap_combo_options,
+        widget,
+    )
+    widget._current_selected_neuron_heatmap_layers_by_file_id = types.MethodType(
+        NeuronViewerWidget._current_selected_neuron_heatmap_layers_by_file_id,
+        widget,
+    )
+    widget._manual_heatmap_combo_data = types.MethodType(
+        NeuronViewerWidget._manual_heatmap_combo_data,
+        widget,
+    )
+    widget._selected_manual_heatmap_file_ids = types.MethodType(
+        NeuronViewerWidget._selected_manual_heatmap_file_ids,
+        widget,
+    )
     widget._selected_cluster_filter = types.MethodType(
         NeuronViewerWidget._selected_cluster_filter,
+        widget,
+    )
+    widget._apply_neuron_table_filters = types.MethodType(
+        NeuronViewerWidget._apply_neuron_table_filters,
+        widget,
+    )
+    widget._refresh_manual_heatmap_combo = types.MethodType(
+        NeuronViewerWidget._refresh_manual_heatmap_combo,
+        widget,
+    )
+    widget._on_manual_heatmap_selection_changed = types.MethodType(
+        NeuronViewerWidget._on_manual_heatmap_selection_changed,
+        widget,
+    )
+
+
+def _bind_cluster_filter_helpers(widget) -> None:
+    widget._normalise_layer_file_ids = NeuronViewerWidget._normalise_layer_file_ids
+    widget._selected_cluster_filter = types.MethodType(
+        NeuronViewerWidget._selected_cluster_filter,
+        widget,
+    )
+    widget._manual_heatmap_combo_data = types.MethodType(
+        NeuronViewerWidget._manual_heatmap_combo_data,
+        widget,
+    )
+    widget._selected_manual_heatmap_file_ids = types.MethodType(
+        NeuronViewerWidget._selected_manual_heatmap_file_ids,
+        widget,
+    )
+    widget._apply_neuron_table_filters = types.MethodType(
+        NeuronViewerWidget._apply_neuron_table_filters,
         widget,
     )
     widget._on_cluster_filter_changed = types.MethodType(
@@ -1827,6 +1925,34 @@ def test_refresh_cluster_filter_controls_falls_back_to_all_when_invalid() -> Non
     assert widget._show_all_btn.enabled is True
 
 
+def test_cluster_filter_change_preserves_manual_heatmap_filter() -> None:
+    selection = ClusterFilterSelection({1})
+    manual_combo = _DummyMutableComboBox()
+    manual_combo.addItem("All Manual Heatmaps", None)
+    manual_combo.addItem("alpha Heatmap", ("alpha Heatmap", ("n1", "n2")))
+    manual_combo.setCurrentIndex(1)
+    table = types.SimpleNamespace(
+        apply_filters=MagicMock(),
+        get_visibility_map=lambda: {"n1": True},
+    )
+    widget = types.SimpleNamespace(
+        _cluster_filter_combo=_DummyClusterFilterCombo(selection),
+        _manual_heatmap_combo=manual_combo,
+        _neuron_table=table,
+        _hide_others_btn=_DummyButton(),
+        _recolor_cluster_btn=_DummyButton(),
+        _show_all_btn=_DummyButton(),
+    )
+    _bind_cluster_filter_helpers(widget)
+
+    NeuronViewerWidget._on_cluster_filter_changed(widget)
+
+    table.apply_filters.assert_called_once_with(selection, ("n1", "n2"))
+    assert widget._hide_others_btn.enabled is True
+    assert widget._recolor_cluster_btn.enabled is True
+    assert widget._show_all_btn.enabled is True
+
+
 def test_cluster_selection_actions_apply_full_selection() -> None:
     selection = ClusterFilterSelection({1, 2}, include_unclustered=True)
     table = types.SimpleNamespace(
@@ -2051,25 +2177,19 @@ def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_remov
     )
 
 
-def test_selected_neuron_heatmap_layer_name_appends_suffixes() -> None:
+def test_selected_neuron_heatmap_layer_name_uses_greek_identifiers() -> None:
     viewer = _DummyViewer(ndisplay=3)
     viewer.layers.extend(
         [
-            types.SimpleNamespace(name="Neuron Heatmap: n1"),
-            types.SimpleNamespace(name="Neuron Heatmap: n1 (2)"),
+            types.SimpleNamespace(name="alpha Heatmap"),
+            types.SimpleNamespace(name="beta Heatmap"),
+            types.SimpleNamespace(name="Cluster 1 Heatmap"),
         ]
     )
     widget = types.SimpleNamespace(viewer=viewer)
-    widget._iter_viewer_layers = types.MethodType(
-        NeuronViewerWidget._iter_viewer_layers,
-        widget,
-    )
-    widget._unique_layer_name = types.MethodType(
-        NeuronViewerWidget._unique_layer_name,
-        widget,
-    )
-    widget._selected_neuron_heatmap_base_name = types.MethodType(
-        NeuronViewerWidget._selected_neuron_heatmap_base_name,
+    _bind_manual_heatmap_helpers(widget)
+    widget._next_manual_heatmap_identifier = types.MethodType(
+        NeuronViewerWidget._next_manual_heatmap_identifier,
         widget,
     )
 
@@ -2078,7 +2198,32 @@ def test_selected_neuron_heatmap_layer_name_appends_suffixes() -> None:
         ["n1"],
     )
 
-    assert layer_name == "Neuron Heatmap: n1 (3)"
+    assert layer_name == "gamma Heatmap"
+
+
+def test_selected_neuron_heatmap_layer_name_continues_after_omega() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    viewer.layers.extend(
+        [
+            types.SimpleNamespace(
+                name=f"{NeuronViewerWidget._greek_heatmap_identifier(index)} Heatmap"
+            )
+            for index in range(24)
+        ]
+    )
+    widget = types.SimpleNamespace(viewer=viewer)
+    _bind_manual_heatmap_helpers(widget)
+    widget._next_manual_heatmap_identifier = types.MethodType(
+        NeuronViewerWidget._next_manual_heatmap_identifier,
+        widget,
+    )
+
+    layer_name = NeuronViewerWidget._selected_neuron_heatmap_layer_name(
+        widget,
+        ["n1"],
+    )
+
+    assert layer_name == "alpha alpha Heatmap"
 
 
 def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> None:
@@ -2089,16 +2234,9 @@ def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> N
         _atlas=types.SimpleNamespace(atlas_name="fake_atlas"),
         _opacity_slider=_DummyValueControl(80),
     )
-    widget._iter_viewer_layers = types.MethodType(
-        NeuronViewerWidget._iter_viewer_layers,
-        widget,
-    )
-    widget._unique_layer_name = types.MethodType(
-        NeuronViewerWidget._unique_layer_name,
-        widget,
-    )
-    widget._selected_neuron_heatmap_base_name = types.MethodType(
-        NeuronViewerWidget._selected_neuron_heatmap_base_name,
+    _bind_manual_heatmap_helpers(widget)
+    widget._next_manual_heatmap_identifier = types.MethodType(
+        NeuronViewerWidget._next_manual_heatmap_identifier,
         widget,
     )
     widget._selected_neuron_heatmap_layer_name = types.MethodType(
@@ -2116,9 +2254,10 @@ def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> N
         ["n1"],
     )
 
-    assert layer.name == "Neuron Heatmap: n1"
+    assert layer.name == "alpha Heatmap"
     assert layer.contrast_limits == (0.0, 5.0)
     assert layer.metadata["heatmap_kind"] == "selected_neurons"
+    assert layer.metadata["manual_heatmap_id"] == "alpha"
     assert layer.metadata["atlas_name"] == "fake_atlas"
     assert layer.metadata["source_path"] == str(Path("/tmp/neurons.parquet"))
     assert layer.metadata["file_ids"] == ["n1"]
@@ -2127,12 +2266,193 @@ def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> N
     assert layer.metadata["heatmap_native_grid"] is True
 
 
+def test_current_selected_neuron_heatmap_layers_ignores_analysis_heatmaps() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    viewer.layers.extend(
+        [
+            types.SimpleNamespace(
+                name="alpha Heatmap",
+                metadata={
+                    "heatmap_kind": "selected_neurons",
+                    "file_ids": ["n2"],
+                    "manual_heatmap_id": "alpha",
+                },
+            ),
+            types.SimpleNamespace(
+                name="beta Heatmap",
+                metadata={
+                    "heatmap_kind": "selected_neurons",
+                    "file_ids": ["n1", "n2"],
+                    "manual_heatmap_id": "beta",
+                },
+            ),
+            types.SimpleNamespace(
+                name="Cluster 1 Heatmap",
+                metadata={
+                    "heatmap_kind": "analysis",
+                    "heatmap_cluster": 1,
+                    "file_ids": ["n3"],
+                },
+            ),
+            types.SimpleNamespace(
+                name="Points Heatmap: imported",
+                metadata={
+                    "heatmap_kind": "point_import",
+                    "file_ids": ["n4"],
+                },
+            ),
+        ]
+    )
+    widget = types.SimpleNamespace(viewer=viewer)
+    _bind_manual_heatmap_helpers(widget)
+
+    layer_names_by_file_id = (
+        NeuronViewerWidget._current_selected_neuron_heatmap_layers_by_file_id(
+            widget
+        )
+    )
+
+    assert layer_names_by_file_id == {
+        "n1": ("beta Heatmap",),
+        "n2": ("alpha Heatmap", "beta Heatmap"),
+    }
+
+
+def test_manual_heatmap_combo_lists_only_manual_heatmaps_and_preserves_selection() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    viewer.layers.extend(
+        [
+            types.SimpleNamespace(
+                name="alpha Heatmap",
+                metadata={
+                    "heatmap_kind": "selected_neurons",
+                    "file_ids": ["n1"],
+                    "manual_heatmap_id": "alpha",
+                },
+            ),
+            types.SimpleNamespace(
+                name="Cluster 1 Heatmap",
+                metadata={
+                    "heatmap_kind": "analysis",
+                    "file_ids": ["n2"],
+                },
+            ),
+            types.SimpleNamespace(
+                name="beta Heatmap",
+                metadata={
+                    "heatmap_kind": "selected_neurons",
+                    "file_ids": ["n3", "n4"],
+                    "manual_heatmap_id": "beta",
+                },
+            ),
+            types.SimpleNamespace(
+                name="Points Heatmap: imported",
+                metadata={
+                    "heatmap_kind": "point_import",
+                    "file_ids": ["n5"],
+                },
+            ),
+        ]
+    )
+    combo = _DummyMutableComboBox()
+    table = types.SimpleNamespace(apply_filters=MagicMock())
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _manual_heatmap_combo=combo,
+        _neuron_table=table,
+    )
+    _bind_manual_heatmap_helpers(widget)
+
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+    combo.setCurrentIndex(2)
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+
+    assert [text for text, _data in combo.items] == [
+        "All Manual Heatmaps",
+        "alpha Heatmap",
+        "beta Heatmap",
+    ]
+    assert combo.currentText() == "beta Heatmap"
+    assert combo.enabled is True
+    table.apply_filters.assert_not_called()
+
+
+def test_manual_heatmap_combo_filters_rows_and_all_clears_manual_filter() -> None:
+    combo = _DummyMutableComboBox()
+    combo.addItem("All Manual Heatmaps", None)
+    combo.addItem("alpha Heatmap", ("alpha Heatmap", ("n1", "n2")))
+    table = types.SimpleNamespace(apply_filters=MagicMock())
+    selection = ClusterFilterSelection({1})
+    widget = types.SimpleNamespace(
+        _manual_heatmap_combo=combo,
+        _cluster_filter_combo=_DummyClusterFilterCombo(selection),
+        _neuron_table=table,
+    )
+    _bind_manual_heatmap_helpers(widget)
+
+    combo.setCurrentIndex(1)
+    NeuronViewerWidget._on_manual_heatmap_selection_changed(widget)
+    combo.setCurrentIndex(0)
+    NeuronViewerWidget._on_manual_heatmap_selection_changed(widget)
+
+    assert [record.args for record in table.apply_filters.call_args_list] == [
+        (selection, ("n1", "n2")),
+        (selection, None),
+    ]
+
+
+def test_manual_heatmap_combo_removed_selection_clears_manual_filter() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    viewer.layers.extend(
+        [
+            types.SimpleNamespace(
+                name="alpha Heatmap",
+                metadata={
+                    "heatmap_kind": "selected_neurons",
+                    "file_ids": ["n1"],
+                    "manual_heatmap_id": "alpha",
+                },
+            ),
+            types.SimpleNamespace(
+                name="beta Heatmap",
+                metadata={
+                    "heatmap_kind": "selected_neurons",
+                    "file_ids": ["n2"],
+                    "manual_heatmap_id": "beta",
+                },
+            ),
+        ]
+    )
+    combo = _DummyMutableComboBox()
+    selection = ClusterFilterSelection({2})
+    table = types.SimpleNamespace(apply_filters=MagicMock())
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _manual_heatmap_combo=combo,
+        _cluster_filter_combo=_DummyClusterFilterCombo(selection),
+        _neuron_table=table,
+    )
+    _bind_manual_heatmap_helpers(widget)
+
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+    combo.setCurrentIndex(1)
+    viewer.layers.pop(0)
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+
+    assert combo.currentText() == "All Manual Heatmaps"
+    assert [text for text, _data in combo.items] == [
+        "All Manual Heatmaps",
+        "beta Heatmap",
+    ]
+    table.apply_filters.assert_called_once_with(selection, None)
+
+
 def test_selected_neuron_heatmap_finished_adds_unique_multi_selection_layer() -> None:
     viewer = _DummyViewer(ndisplay=3)
     viewer.layers.extend(
         [
-            types.SimpleNamespace(name="Neuron Heatmap: 2 selected neurons"),
-            types.SimpleNamespace(name="Neuron Heatmap: 2 selected neurons (2)"),
+            types.SimpleNamespace(name="alpha Heatmap"),
+            types.SimpleNamespace(name="beta Heatmap"),
         ]
     )
     widget = types.SimpleNamespace(
@@ -2147,16 +2467,9 @@ def test_selected_neuron_heatmap_finished_adds_unique_multi_selection_layer() ->
         _refresh_histogram_layer_list=MagicMock(),
         _refresh_mask_layer_options=MagicMock(),
     )
-    widget._iter_viewer_layers = types.MethodType(
-        NeuronViewerWidget._iter_viewer_layers,
-        widget,
-    )
-    widget._unique_layer_name = types.MethodType(
-        NeuronViewerWidget._unique_layer_name,
-        widget,
-    )
-    widget._selected_neuron_heatmap_base_name = types.MethodType(
-        NeuronViewerWidget._selected_neuron_heatmap_base_name,
+    _bind_manual_heatmap_helpers(widget)
+    widget._next_manual_heatmap_identifier = types.MethodType(
+        NeuronViewerWidget._next_manual_heatmap_identifier,
         widget,
     )
     widget._selected_neuron_heatmap_layer_name = types.MethodType(
@@ -2178,13 +2491,65 @@ def test_selected_neuron_heatmap_finished_adds_unique_multi_selection_layer() ->
     )
 
     created_layer = viewer.layers[-1]
-    assert created_layer.name == "Neuron Heatmap: 2 selected neurons (3)"
+    assert created_layer.name == "gamma Heatmap"
     assert created_layer.metadata["file_ids"] == ["n1", "n2"]
     assert created_layer.metadata["selection_count"] == 2
+    assert created_layer.metadata["manual_heatmap_id"] == "gamma"
     widget._refresh_heatmap_layer_list.assert_called_once_with()
     widget._refresh_histogram_layer_list.assert_called_once_with()
     widget._refresh_mask_layer_options.assert_called_once_with()
-    assert "Neuron Heatmap: 2 selected neurons (3)" in widget._render_status_label.text
+    assert "gamma Heatmap" in widget._render_status_label.text
+
+
+def test_selected_neuron_heatmap_finished_updates_table_heatmap_membership() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _db=types.SimpleNamespace(parquet_path=Path("/tmp/neurons.parquet")),
+        _atlas=types.SimpleNamespace(atlas_name="fake_atlas"),
+        _opacity_slider=_DummyValueControl(75),
+        _render_progress=_DummyProgressBar(),
+        _render_status_label=_DummyLabel(),
+        _selected_heatmap_request_file_ids=("n1", "n2"),
+        _neuron_table=table,
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _refresh_mask_layer_options=MagicMock(),
+    )
+    _bind_manual_heatmap_helpers(widget)
+    widget._next_manual_heatmap_identifier = types.MethodType(
+        NeuronViewerWidget._next_manual_heatmap_identifier,
+        widget,
+    )
+    widget._selected_neuron_heatmap_layer_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_layer_name,
+        widget,
+    )
+    widget._current_atlas_name = types.MethodType(
+        NeuronViewerWidget._current_atlas_name,
+        widget,
+    )
+    widget._sync_neuron_table_heatmap_membership = types.MethodType(
+        NeuronViewerWidget._sync_neuron_table_heatmap_membership,
+        widget,
+    )
+    widget._add_selected_neuron_heatmap_layer = types.MethodType(
+        NeuronViewerWidget._add_selected_neuron_heatmap_layer,
+        widget,
+    )
+
+    NeuronViewerWidget._on_selected_neuron_heatmap_finished(
+        widget,
+        np.ones((2, 2, 2), dtype=np.float32),
+    )
+
+    table.set_heatmap_layers_by_file_id.assert_called_once_with(
+        {
+            "n1": ("alpha Heatmap",),
+            "n2": ("alpha Heatmap",),
+        }
+    )
 
 
 def test_region_isolation_region_ids_follow_include_children_state() -> None:
