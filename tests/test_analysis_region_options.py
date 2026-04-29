@@ -771,6 +771,33 @@ def test_analysis_tab_wraps_content_in_scroll_area():
     assert widget._scroll_area.widget is widget._scroll_content
 
 
+def test_analysis_tab_defaults_to_ward_linkage_and_no_dilation():
+    """Analysis clustering controls should start with Ward linkage and 0% dilation."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert widget._method_combo.currentText() == "ward"
+    assert widget._dilation_spin.value() == 0
+
+
+def test_analysis_tab_search_scope_precedes_target_region_summary():
+    """Search scope should appear before the target region summary display."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    clustering_labels = [
+        child.children[0].text()
+        for child in widget._clustering_section.content_layout().children
+        if isinstance(child, _DummyLayout)
+        and child.children
+        and isinstance(child.children[0], _DummyLabel)
+    ]
+
+    assert clustering_labels.index("Search scope:") < clustering_labels.index(
+        "Target region:"
+    )
+
+
 def test_analysis_tab_exposes_bulk_cluster_heatmap_button():
     """Analysis tab should expose a dedicated bulk cluster-heatmap action."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget

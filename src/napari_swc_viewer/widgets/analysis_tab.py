@@ -502,13 +502,7 @@ class AnalysisTabWidget(QWidget):
         self._algorithm_row.addWidget(self._algorithm_combo)
         corr_layout.addLayout(self._algorithm_row)
 
-        # Target region
-        region_row = QHBoxLayout()
-        region_row.addWidget(QLabel("Target region:"))
-        self._cluster_region_summary_label = QLabel("None selected")
-        region_row.addWidget(self._cluster_region_summary_label)
-        corr_layout.addLayout(region_row)
-
+        # Search scope
         scope_row = QHBoxLayout()
         scope_row.addWidget(QLabel("Search scope:"))
         self._cluster_region_scope_combo = QComboBox()
@@ -525,6 +519,13 @@ class AnalysisTabWidget(QWidget):
         )
         scope_row.addWidget(self._cluster_region_scope_combo)
         corr_layout.addLayout(scope_row)
+
+        # Target region
+        region_row = QHBoxLayout()
+        region_row.addWidget(QLabel("Target region:"))
+        self._cluster_region_summary_label = QLabel("None selected")
+        region_row.addWidget(self._cluster_region_summary_label)
+        corr_layout.addLayout(region_row)
 
         self._cluster_region_section = CollapsibleSection(
             "Select Target Region",
@@ -570,7 +571,7 @@ class AnalysisTabWidget(QWidget):
         dilation_row.addWidget(QLabel("Dilation %:"))
         self._dilation_spin = QSpinBox()
         self._dilation_spin.setRange(0, 100)
-        self._dilation_spin.setValue(20)
+        self._dilation_spin.setValue(0)
         self._dilation_spin.setSuffix("%")
         dilation_row.addWidget(self._dilation_spin)
         corr_layout.addLayout(dilation_row)
@@ -581,6 +582,7 @@ class AnalysisTabWidget(QWidget):
         self._linkage_row.addWidget(self._linkage_label)
         self._method_combo = QComboBox()
         self._method_combo.addItems(["average", "ward", "complete", "single"])
+        self._method_combo.setCurrentText("ward")
         self._linkage_row.addWidget(self._method_combo)
         corr_layout.addLayout(self._linkage_row)
 
