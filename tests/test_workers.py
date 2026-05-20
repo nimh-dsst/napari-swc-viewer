@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 import types
 from pathlib import Path
@@ -161,6 +162,37 @@ class _FakeDuckConnection:
         return None
 
 
+class _FakeAtlasStruct:
+    """Minimal BrainGlobe structure record for cached atlas tests."""
+
+    def __init__(self, data: dict) -> None:
+        self.data = data
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+
+class _FakeCachedAtlas:
+    """Small atlas object exposing fields used by conversion caching."""
+
+    atlas_name = "allen_mouse_25um"
+    shape = (8, 8, 8)
+    resolution = (25.0, 25.0, 25.0)
+
+    def __init__(self) -> None:
+        self.annotation = np.zeros((8, 8, 8), dtype=np.int32)
+        self.structures = {
+            5: _FakeAtlasStruct(
+                {
+                    "name": "Cached Region",
+                    "acronym": "CR",
+                    "structure_id_path": [5],
+                    "rgb_triplet": [1, 2, 3],
+                }
+            )
+        }
+
+
 def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_path):
     """ConvertWorker should delegate to the batch helper with UI-selected options."""
     workers = _import_workers_module()
@@ -177,6 +209,7 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
         coord_axis,
         annotate_regions,
         resolution,
+        n_workers,
         progress_callback,
         **_kwargs,
     ):
@@ -188,6 +221,7 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
         calls["coord_axis"] = coord_axis
         calls["annotate_regions"] = annotate_regions
         calls["resolution"] = resolution
+        calls["n_workers"] = n_workers
         progress_callback("Processing a.swc...", 0, 2)
         return BatchParquetConversionSummary(
             discovered_files=2,
@@ -229,11 +263,241 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
     assert calls["coord_axis"] == 2
     assert calls["annotate_regions"] is True
     assert calls["resolution"] == 25
+    assert calls["n_workers"] == 1
     assert progress_events[0] == ("Preparing SWC-to-Parquet conversion...", 0, 2)
     assert progress_events[-1] == ("Finalizing Parquet...", 2, 2)
     assert not errors
     assert finished[0][0] == str(output_path)
     assert finished[0][1].flipped_files == 1
+
+
+def test_convert_worker_passes_cached_atlas_inputs(monkeypatch, tmp_path):
+    """ConvertWorker should pass cached atlas-derived inputs to the batch helper."""
+    workers = _import_workers_module()
+    ConvertWorker = workers.ConvertWorker
+    cached_atlas = _FakeCachedAtlas()
+    calls: dict[str, object] = {}
+
+    def fake_batch_convert_swc_to_parquet(
+        input_path,
+        output_path,
+        *,
+        midline,
+        annotation_volume,
+        region_lookup,
+        progress_callback,
+        **_kwargs,
+    ):
+        calls["input_path"] = input_path
+        calls["output_path"] = output_path
+        calls["midline"] = midline
+        calls["annotation_volume"] = annotation_volume
+        calls["region_lookup"] = region_lookup
+        progress_callback("Processing a.swc...", 0, 1)
+        return BatchParquetConversionSummary(
+            discovered_files=1,
+            processed_files=1,
+            rows_written=2,
+        )
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        fake_batch_convert_swc_to_parquet,
+    )
+
+    worker = ConvertWorker(
+        ["a.swc"],
+        str(tmp_path / "cached.parquet"),
+        hemisphere="left",
+        cached_atlas=cached_atlas,
+        use_cached_annotation=True,
+    )
+
+    finished: list[tuple[str, BatchParquetConversionSummary]] = []
+    errors: list[str] = []
+    worker.finished.connect(lambda path, summary: finished.append((path, summary)))
+    worker.error.connect(lambda message: errors.append(message))
+
+    worker.run()
+
+    assert calls["midline"] == 87.5
+    assert calls["annotation_volume"] is cached_atlas.annotation
+    assert calls["region_lookup"][5]["acronym"] == "CR"
+    assert not errors
+    assert finished[0][1].processed_files == 1
+
+
+def test_convert_worker_accepts_directory_source(monkeypatch, tmp_path):
+    """Directory conversion should be discovered inside the worker, not the UI."""
+    workers = _import_workers_module()
+    ConvertWorker = workers.ConvertWorker
+    calls: dict[str, object] = {}
+
+    def fake_batch_convert_swc_to_parquet(
+        input_path,
+        output_path,
+        *,
+        recursive,
+        hemisphere,
+        atlas_name,
+        coord_axis,
+        annotate_regions,
+        resolution,
+        n_workers,
+        progress_callback,
+        **_kwargs,
+    ):
+        calls["input_path"] = input_path
+        calls["output_path"] = output_path
+        calls["recursive"] = recursive
+        calls["hemisphere"] = hemisphere
+        calls["atlas_name"] = atlas_name
+        calls["coord_axis"] = coord_axis
+        calls["annotate_regions"] = annotate_regions
+        calls["resolution"] = resolution
+        calls["n_workers"] = n_workers
+        progress_callback("Discovered 3 SWC file(s).", 0, 3)
+        return BatchParquetConversionSummary(
+            discovered_files=3,
+            processed_files=3,
+            rows_written=6,
+        )
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        fake_batch_convert_swc_to_parquet,
+    )
+
+    input_dir = tmp_path / "swcs"
+    output_path = tmp_path / "neurons.parquet"
+    worker = ConvertWorker(
+        str(input_dir),
+        str(output_path),
+        resolution=25,
+        recursive=True,
+    )
+
+    progress_events: list[tuple[str, int, int]] = []
+    finished: list[tuple[str, BatchParquetConversionSummary]] = []
+    errors: list[str] = []
+    worker.progress.connect(
+        lambda message, current, total: progress_events.append((message, current, total))
+    )
+    worker.finished.connect(lambda path, summary: finished.append((path, summary)))
+    worker.error.connect(lambda message: errors.append(message))
+
+    worker.run()
+
+    assert calls["input_path"] == input_dir
+    assert Path(calls["output_path"]) == output_path
+    assert calls["recursive"] is True
+    assert calls["annotate_regions"] is True
+    assert calls["n_workers"] == 1
+    assert progress_events[0] == ("Searching for SWC files...", 0, 0)
+    assert ("Discovered 3 SWC file(s).", 0, 3) in progress_events
+    assert progress_events[-1] == ("Finalizing Parquet...", 3, 3)
+    assert not errors
+    assert finished[0][0] == str(output_path)
+
+
+def test_convert_worker_logs_files_source_timing(monkeypatch, tmp_path, caplog):
+    """ConvertWorker should time explicit file-list conversions in debug logs."""
+    workers = _import_workers_module()
+    ConvertWorker = workers.ConvertWorker
+    calls: dict[str, object] = {}
+
+    def fake_batch_convert_swc_to_parquet(
+        input_path,
+        output_path,
+        *,
+        recursive,
+        source_mode,
+        progress_callback,
+        **_kwargs,
+    ):
+        calls["input_path"] = input_path
+        calls["output_path"] = output_path
+        calls["recursive"] = recursive
+        calls["source_mode"] = source_mode
+        progress_callback("Processing a.swc...", 0, 2)
+        return BatchParquetConversionSummary(
+            discovered_files=2,
+            processed_files=2,
+            rows_written=4,
+        )
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        fake_batch_convert_swc_to_parquet,
+    )
+
+    worker = ConvertWorker(
+        ["a.swc", "b.swc"],
+        str(tmp_path / "files.parquet"),
+        source_mode="files",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=workers.logger.name):
+        worker.run()
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert calls["source_mode"] == "files"
+    assert "swc_conversion_worker_start source_mode=files" in messages
+    assert "file_count=2" in messages
+    assert "swc_conversion_worker_batch_ok source_mode=files elapsed_s=" in messages
+    assert "swc_conversion_worker_finished source_mode=files elapsed_s=" in messages
+
+
+def test_convert_worker_logs_directory_source_timing(monkeypatch, tmp_path, caplog):
+    """ConvertWorker should time directory conversions in debug logs."""
+    workers = _import_workers_module()
+    ConvertWorker = workers.ConvertWorker
+    calls: dict[str, object] = {}
+
+    def fake_batch_convert_swc_to_parquet(
+        input_path,
+        output_path,
+        *,
+        recursive,
+        source_mode,
+        progress_callback,
+        **_kwargs,
+    ):
+        calls["input_path"] = input_path
+        calls["output_path"] = output_path
+        calls["recursive"] = recursive
+        calls["source_mode"] = source_mode
+        progress_callback("Discovered 26 SWC file(s).", 0, 26)
+        return BatchParquetConversionSummary(
+            discovered_files=26,
+            processed_files=26,
+            rows_written=52,
+        )
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        fake_batch_convert_swc_to_parquet,
+    )
+
+    input_dir = tmp_path / "swcs"
+    worker = ConvertWorker(
+        str(input_dir),
+        str(tmp_path / "directory.parquet"),
+        recursive=True,
+        source_mode="directory",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=workers.logger.name):
+        worker.run()
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert calls["input_path"] == input_dir
+    assert calls["recursive"] is True
+    assert calls["source_mode"] == "directory"
+    assert "swc_conversion_worker_start source_mode=directory" in messages
+    assert f"source={input_dir}" in messages
+    assert "swc_conversion_worker_batch_ok source_mode=directory elapsed_s=" in messages
+    assert "discovered=26 processed=26 failed=0 rows=52" in messages
 
 
 def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeypatch):

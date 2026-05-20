@@ -10,6 +10,7 @@ import tempfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Callable, Iterable
 
 import numpy as np
@@ -24,6 +25,9 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
+_SWC_GLOB_PATTERN = "*.[sS][wW][cC]"
+_DISCOVERED_FILE_LOG_LIMIT = 50
+_DISCOVERED_FILE_SAMPLE_SIZE = 10
 
 # Parquet schema for annotated neuron data
 NEURON_SCHEMA = pa.schema(
@@ -99,6 +103,43 @@ class _ChunkConversionResult:
 _WORKER_CONFIG: _BatchWorkerConfig | None = None
 _WORKER_ANNOTATION_VOLUME: NDArray[np.int32] | None = None
 _WORKER_REGION_LOOKUP: dict[int, dict] | None = None
+
+
+def _infer_source_mode(
+    input_source: Path | str | Iterable[Path | str],
+    source_mode: str | None,
+) -> str:
+    """Return a stable label for conversion timing logs."""
+    if source_mode:
+        return source_mode
+    if isinstance(input_source, (str, Path)):
+        return "directory" if Path(input_source).is_dir() else "file"
+    return "files"
+
+
+def _source_kind(input_source: Path | str | Iterable[Path | str]) -> str:
+    """Return the source container kind for debug logs."""
+    if isinstance(input_source, (str, Path)):
+        return "path"
+    return "iterable"
+
+
+def _source_count_for_log(input_source: Path | str | Iterable[Path | str]) -> str:
+    """Return a cheap source count label without consuming arbitrary iterables."""
+    if isinstance(input_source, (str, Path)):
+        return "unknown"
+    try:
+        return str(len(input_source))  # type: ignore[arg-type]
+    except TypeError:
+        return "unknown"
+
+
+def _paths_for_log(paths: list[Path]) -> list[str]:
+    """Return all paths for small batches, or a bounded sample for large batches."""
+    if len(paths) <= _DISCOVERED_FILE_LOG_LIMIT:
+        return [str(path) for path in paths]
+    sample = paths[:_DISCOVERED_FILE_SAMPLE_SIZE] + paths[-_DISCOVERED_FILE_SAMPLE_SIZE:]
+    return [str(path) for path in sample]
 
 
 def _clear_batch_worker_state() -> None:
@@ -301,8 +342,8 @@ def discover_swc_files(input_path: Path, recursive: bool = True) -> list[Path]:
         return []
 
     if recursive:
-        return sorted(input_path.rglob("*.swc"))
-    return sorted(input_path.glob("*.swc"))
+        return sorted(input_path.rglob(_SWC_GLOB_PATTERN))
+    return sorted(input_path.glob(_SWC_GLOB_PATTERN))
 
 
 def _resolve_swc_files(
@@ -376,15 +417,41 @@ def _write_table_batch(
     writer: pq.ParquetWriter | None,
     output_path: Path,
     tables: list[pa.Table],
+    *,
+    source_mode: str = "unknown",
+    flush_label: str = "batch",
 ) -> pq.ParquetWriter | None:
     """Write a batch of tables to an output Parquet file."""
     if not tables:
         return writer
 
+    flush_start = perf_counter()
     table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+    logger.debug(
+        (
+            "swc_conversion_parquet_flush_start source_mode=%s "
+            "flush_label=%s output=%s table_count=%d rows=%d"
+        ),
+        source_mode,
+        flush_label,
+        output_path,
+        len(tables),
+        table.num_rows,
+    )
     if writer is None:
         writer = _open_parquet_writer(output_path)
     writer.write_table(table)
+    logger.debug(
+        (
+            "swc_conversion_parquet_flush_ok source_mode=%s "
+            "flush_label=%s output=%s rows=%d elapsed_s=%.6f"
+        ),
+        source_mode,
+        flush_label,
+        output_path,
+        table.num_rows,
+        perf_counter() - flush_start,
+    )
     return writer
 
 
@@ -513,7 +580,13 @@ def _process_swc_chunk(args: tuple[int, tuple[str, ...], str]) -> _ChunkConversi
                     annotation_volume=_WORKER_ANNOTATION_VOLUME,
                     region_lookup=_WORKER_REGION_LOOKUP,
                 )
-                writer = _write_table_batch(writer, shard_path, [file_result.table])
+                writer = _write_table_batch(
+                    writer,
+                    shard_path,
+                    [file_result.table],
+                    source_mode="parallel_worker",
+                    flush_label="chunk_file",
+                )
                 result.processed_files += 1
                 result.rows_written += file_result.table.num_rows
                 if file_result.flipped_file:
@@ -577,16 +650,29 @@ def _run_serial_batch_conversion(
     annotation_volume: NDArray[np.int32] | None,
     region_lookup: dict[int, dict] | None,
     batch_size: int,
+    source_mode: str,
     progress_callback: Callable[[str, int, int], None] | None,
 ) -> BatchParquetConversionSummary:
     """Convert SWCs serially while reusing the shared per-file logic."""
+    serial_start = perf_counter()
     summary = BatchParquetConversionSummary(discovered_files=len(swc_files))
     writer: pq.ParquetWriter | None = None
     buffered_tables: list[pa.Table] = []
     total_files = len(swc_files)
+    logger.debug(
+        (
+            "swc_conversion_serial_start source_mode=%s total_files=%d "
+            "batch_size=%d output=%s"
+        ),
+        source_mode,
+        total_files,
+        batch_size,
+        output_path,
+    )
 
     try:
-        for swc_path in swc_files:
+        for file_index, swc_path in enumerate(swc_files, start=1):
+            file_start = perf_counter()
             try:
                 if progress_callback is not None:
                     progress_callback(
@@ -595,6 +681,16 @@ def _run_serial_batch_conversion(
                         total_files,
                     )
 
+                logger.debug(
+                    (
+                        "swc_conversion_file_start source_mode=%s index=%d "
+                        "total=%d file=%s"
+                    ),
+                    source_mode,
+                    file_index,
+                    total_files,
+                    swc_path,
+                )
                 file_result = _convert_swc_file_to_table(
                     swc_path,
                     target_hemisphere=target_hemisphere,
@@ -608,20 +704,73 @@ def _run_serial_batch_conversion(
                 )
                 _add_file_result_to_summary(summary, file_result)
                 buffered_tables.append(file_result.table)
+                logger.debug(
+                    (
+                        "swc_conversion_file_ok source_mode=%s index=%d "
+                        "total=%d file=%s rows=%d flipped=%s "
+                        "already_target=%s midline=%s elapsed_s=%.6f"
+                    ),
+                    source_mode,
+                    file_index,
+                    total_files,
+                    swc_path,
+                    file_result.table.num_rows,
+                    file_result.flipped_file,
+                    file_result.already_target_file,
+                    file_result.midline_file,
+                    perf_counter() - file_start,
+                )
 
                 if len(buffered_tables) >= batch_size:
-                    writer = _write_table_batch(writer, output_path, buffered_tables)
+                    writer = _write_table_batch(
+                        writer,
+                        output_path,
+                        buffered_tables,
+                        source_mode=source_mode,
+                        flush_label="serial_batch",
+                    )
                     buffered_tables = []
 
             except Exception as exc:
                 summary.failed_files += 1
                 summary.failures.append((str(swc_path), str(exc)))
+                logger.debug(
+                    (
+                        "swc_conversion_file_error source_mode=%s index=%d "
+                        "total=%d file=%s elapsed_s=%.6f error=%s"
+                    ),
+                    source_mode,
+                    file_index,
+                    total_files,
+                    swc_path,
+                    perf_counter() - file_start,
+                    exc,
+                )
                 logger.error("Error processing %s: %s", swc_path, exc)
 
-        writer = _write_table_batch(writer, output_path, buffered_tables)
+        writer = _write_table_batch(
+            writer,
+            output_path,
+            buffered_tables,
+            source_mode=source_mode,
+            flush_label="serial_final",
+        )
     finally:
         if writer is not None:
             writer.close()
+        logger.debug(
+            (
+                "swc_conversion_serial_finished source_mode=%s "
+                "elapsed_s=%.6f discovered=%d processed=%d failed=%d "
+                "rows=%d"
+            ),
+            source_mode,
+            perf_counter() - serial_start,
+            summary.discovered_files,
+            summary.processed_files,
+            summary.failed_files,
+            summary.rows_written,
+        )
 
     return summary
 
@@ -641,11 +790,24 @@ def _run_parallel_batch_conversion(
     region_lookup: dict[int, dict] | None,
     batch_size: int,
     temp_dir: Path | str | None,
+    source_mode: str,
     progress_callback: Callable[[str, int, int], None] | None,
 ) -> BatchParquetConversionSummary:
     """Convert SWCs in parallel using chunk-local shard files."""
+    parallel_start = perf_counter()
     summary = BatchParquetConversionSummary(discovered_files=len(swc_files))
     total_files = len(swc_files)
+    logger.debug(
+        (
+            "swc_conversion_parallel_start source_mode=%s total_files=%d "
+            "worker_count=%d batch_size=%d output=%s"
+        ),
+        source_mode,
+        total_files,
+        worker_count,
+        batch_size,
+        output_path,
+    )
 
     if total_files == 0:
         return summary
@@ -747,6 +909,19 @@ def _run_parallel_batch_conversion(
     finally:
         _clear_batch_worker_state()
         shutil.rmtree(work_dir, ignore_errors=True)
+        logger.debug(
+            (
+                "swc_conversion_parallel_finished source_mode=%s "
+                "elapsed_s=%.6f discovered=%d processed=%d failed=%d "
+                "rows=%d"
+            ),
+            source_mode,
+            perf_counter() - parallel_start,
+            summary.discovered_files,
+            summary.processed_files,
+            summary.failed_files,
+            summary.rows_written,
+        )
 
     return summary
 
@@ -766,33 +941,177 @@ def batch_convert_swc_to_parquet(
     batch_size: int = 25,
     n_workers: int | None = None,
     temp_dir: Path | str | None = None,
+    annotation_volume: NDArray[np.int32] | None = None,
+    region_lookup: dict[int, dict] | None = None,
+    source_mode: str | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> BatchParquetConversionSummary:
     """Convert SWC files into one Parquet file with optional alignment."""
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
 
+    batch_start = perf_counter()
     output_path = Path(output_path)
+    resolved_source_mode = _infer_source_mode(input_path, source_mode)
+    logger.debug(
+        (
+            "swc_conversion_batch_start source_mode=%s source_kind=%s "
+            "source_count=%s recursive=%s annotate_regions=%s "
+            "resolution=%s output=%s batch_size=%d n_workers=%s"
+        ),
+        resolved_source_mode,
+        _source_kind(input_path),
+        _source_count_for_log(input_path),
+        recursive,
+        annotate_regions,
+        resolution,
+        output_path,
+        batch_size,
+        n_workers,
+    )
+    if progress_callback is not None:
+        progress_callback("Searching for SWC files...", 0, 0)
+    resolve_start = perf_counter()
+    logger.debug(
+        "swc_conversion_source_resolve_start source_mode=%s recursive=%s",
+        resolved_source_mode,
+        recursive,
+    )
     swc_files = _resolve_swc_files(input_path, recursive=recursive)
     total_files = len(swc_files)
+    logger.debug(
+        (
+            "swc_conversion_source_resolve_ok source_mode=%s "
+            "elapsed_s=%.6f discovered_files=%d files=%s"
+        ),
+        resolved_source_mode,
+        perf_counter() - resolve_start,
+        total_files,
+        _paths_for_log(swc_files),
+    )
+    if progress_callback is not None:
+        progress_callback(
+            f"Discovered {total_files} SWC file(s).",
+            0,
+            total_files,
+        )
 
     target_hemisphere = _normalize_target_hemisphere(hemisphere)
+    if total_files == 0:
+        logger.debug(
+            (
+                "swc_conversion_empty_source source_mode=%s elapsed_s=%.6f "
+                "output=%s"
+            ),
+            resolved_source_mode,
+            perf_counter() - batch_start,
+            output_path,
+        )
+        return BatchParquetConversionSummary(discovered_files=0)
 
     if target_hemisphere is not None and midline is None:
         from brainglobe_atlasapi import BrainGlobeAtlas
 
+        if progress_callback is not None:
+            progress_callback("Loading atlas midline...", 0, total_files)
+        atlas_start = perf_counter()
+        logger.debug(
+            (
+                "swc_conversion_atlas_midline_start source_mode=%s "
+                "atlas=%s coord_axis=%d"
+            ),
+            resolved_source_mode,
+            atlas_name,
+            coord_axis,
+        )
         atlas = BrainGlobeAtlas(atlas_name)
         midline = get_atlas_midline(atlas, coord_axis)
+        logger.debug(
+            (
+                "swc_conversion_atlas_midline_ok source_mode=%s "
+                "atlas=%s coord_axis=%d midline=%s elapsed_s=%.6f"
+            ),
+            resolved_source_mode,
+            atlas_name,
+            coord_axis,
+            midline,
+            perf_counter() - atlas_start,
+        )
+    elif target_hemisphere is not None:
+        logger.debug(
+            (
+                "swc_conversion_atlas_midline_cached source_mode=%s "
+                "atlas=%s coord_axis=%d midline=%s"
+            ),
+            resolved_source_mode,
+            atlas_name,
+            coord_axis,
+            midline,
+        )
 
-    annotation_volume = None
-    region_lookup: dict[int, dict] | None = None
     if annotate_regions:
-        _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
-        region_lookup = build_region_lookup(structure_tree)
+        if (annotation_volume is None) != (region_lookup is None):
+            raise ValueError(
+                "annotation_volume and region_lookup must be provided together"
+            )
+
+        if annotation_volume is not None and region_lookup is not None:
+            logger.debug(
+                (
+                    "swc_conversion_annotation_cached source_mode=%s "
+                    "resolution=%d annotation_shape=%s region_count=%d"
+                ),
+                resolved_source_mode,
+                resolution,
+                getattr(annotation_volume, "shape", None),
+                len(region_lookup),
+            )
+        else:
+            if progress_callback is not None:
+                progress_callback(
+                    f"Loading Allen annotation ({resolution}um)...",
+                    0,
+                    total_files,
+                )
+            annotation_start = perf_counter()
+            logger.debug(
+                (
+                    "swc_conversion_annotation_load_start source_mode=%s "
+                    "resolution=%d cache_dir=%s"
+                ),
+                resolved_source_mode,
+                resolution,
+                cache_dir,
+            )
+            _, annotation_volume, structure_tree = setup_allen_sdk(resolution, cache_dir)
+            region_lookup = build_region_lookup(structure_tree)
+            logger.debug(
+                (
+                    "swc_conversion_annotation_load_ok source_mode=%s "
+                    "resolution=%d annotation_shape=%s region_count=%d "
+                    "elapsed_s=%.6f"
+                ),
+                resolved_source_mode,
+                resolution,
+                getattr(annotation_volume, "shape", None),
+                len(region_lookup),
+                perf_counter() - annotation_start,
+            )
 
     worker_count = _resolve_worker_count(n_workers, total_files, batch_size)
+    logger.debug(
+        (
+            "swc_conversion_worker_count source_mode=%s worker_count=%d "
+            "total_files=%d batch_size=%d"
+        ),
+        resolved_source_mode,
+        worker_count,
+        total_files,
+        batch_size,
+    )
     if worker_count <= 1 or total_files == 0:
-        return _run_serial_batch_conversion(
+        logger.debug("swc_conversion_path_selected source_mode=%s path=serial", resolved_source_mode)
+        summary = _run_serial_batch_conversion(
             swc_files,
             output_path,
             target_hemisphere=target_hemisphere,
@@ -804,10 +1123,25 @@ def batch_convert_swc_to_parquet(
             annotation_volume=annotation_volume,
             region_lookup=region_lookup,
             batch_size=batch_size,
+            source_mode=resolved_source_mode,
             progress_callback=progress_callback,
         )
+        logger.debug(
+            (
+                "swc_conversion_batch_finished source_mode=%s path=serial "
+                "elapsed_s=%.6f discovered=%d processed=%d failed=%d rows=%d"
+            ),
+            resolved_source_mode,
+            perf_counter() - batch_start,
+            summary.discovered_files,
+            summary.processed_files,
+            summary.failed_files,
+            summary.rows_written,
+        )
+        return summary
 
-    return _run_parallel_batch_conversion(
+    logger.debug("swc_conversion_path_selected source_mode=%s path=parallel", resolved_source_mode)
+    summary = _run_parallel_batch_conversion(
         swc_files,
         output_path,
         worker_count=worker_count,
@@ -821,8 +1155,22 @@ def batch_convert_swc_to_parquet(
         region_lookup=region_lookup,
         batch_size=batch_size,
         temp_dir=temp_dir,
+        source_mode=resolved_source_mode,
         progress_callback=progress_callback,
     )
+    logger.debug(
+        (
+            "swc_conversion_batch_finished source_mode=%s path=parallel "
+            "elapsed_s=%.6f discovered=%d processed=%d failed=%d rows=%d"
+        ),
+        resolved_source_mode,
+        perf_counter() - batch_start,
+        summary.discovered_files,
+        summary.processed_files,
+        summary.failed_files,
+        summary.rows_written,
+    )
+    return summary
 
 
 def swc_files_to_parquet(

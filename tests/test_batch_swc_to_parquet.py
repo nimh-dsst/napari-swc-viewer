@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from concurrent.futures import Future
 from pathlib import Path
 
@@ -170,6 +171,54 @@ def test_batch_convert_fast_path_writes_plugin_compatible_parquet(tmp_path):
     assert somas["file_id"].tolist() == ["1001_2002_test.swc", "simple.swc"]
 
 
+def test_batch_convert_reports_discovery_progress(tmp_path):
+    """Batch conversion should report discovery before slower conversion setup."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "cell.swc", soma_z=10.0, child_z=20.0)
+
+    events: list[tuple[str, int, int]] = []
+    output_path = tmp_path / "neurons.parquet"
+    summary = batch_convert_swc_to_parquet(
+        input_dir,
+        output_path,
+        progress_callback=lambda message, current, total: events.append(
+            (message, current, total)
+        ),
+    )
+
+    assert summary.processed_files == 1
+    assert events[:2] == [
+        ("Searching for SWC files...", 0, 0),
+        ("Discovered 1 SWC file(s).", 0, 1),
+    ]
+
+
+def test_batch_convert_empty_directory_skips_atlas_setup(tmp_path, monkeypatch):
+    """Empty directory conversion should fail fast instead of loading annotations."""
+    input_dir = tmp_path / "empty"
+    input_dir.mkdir()
+
+    def fail_setup_allen_sdk(*_args, **_kwargs):
+        raise AssertionError("setup_allen_sdk should not run for an empty directory")
+
+    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fail_setup_allen_sdk)
+
+    events: list[tuple[str, int, int]] = []
+    summary = batch_convert_swc_to_parquet(
+        input_dir,
+        tmp_path / "empty.parquet",
+        annotate_regions=True,
+        progress_callback=lambda message, current, total: events.append(
+            (message, current, total)
+        ),
+    )
+
+    assert summary.discovered_files == 0
+    assert summary.processed_files == 0
+    assert events[-1] == ("Discovered 0 SWC file(s).", 0, 0)
+
+
 def test_batch_convert_accepts_explicit_swc_file_lists(tmp_path):
     """The batch helper should support the explicit file list flow used by the UI."""
     first = tmp_path / "first.swc"
@@ -185,6 +234,176 @@ def test_batch_convert_accepts_explicit_swc_file_lists(tmp_path):
 
     rows = _read_parquet_rows(output_path)
     assert rows["file_id"].unique().tolist() == ["first.swc", "second.swc"]
+
+
+def test_batch_convert_discovers_uppercase_swc_extensions(tmp_path):
+    """Directory discovery should accept common uppercase SWC extensions."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "cell.SWC", soma_z=10.0, child_z=20.0)
+
+    output_path = tmp_path / "uppercase.parquet"
+    summary = batch_convert_swc_to_parquet(input_dir, output_path)
+
+    assert summary.discovered_files == 1
+    assert summary.processed_files == 1
+    rows = _read_parquet_rows(output_path)
+    assert rows["file_id"].unique().tolist() == ["cell.SWC"]
+
+
+def test_batch_convert_uses_provided_annotation_inputs(tmp_path, monkeypatch, caplog):
+    """Cached annotation inputs should skip BrainGlobe annotation setup."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "cached.swc", soma_z=10.0, child_z=20.0)
+
+    def fail_setup_allen_sdk(*_args, **_kwargs):
+        raise AssertionError("setup_allen_sdk should not run with cached inputs")
+
+    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fail_setup_allen_sdk)
+    annotation = np.zeros((8, 8, 8), dtype=np.int32)
+    annotation[0, 0, 0] = 5
+    region_lookup = {
+        5: {"name": "Cached Region", "acronym": "CR"},
+    }
+
+    with caplog.at_level(logging.DEBUG, logger=parquet_module.logger.name):
+        summary = batch_convert_swc_to_parquet(
+            input_dir,
+            tmp_path / "cached.parquet",
+            annotate_regions=True,
+            annotation_volume=annotation,
+            region_lookup=region_lookup,
+            source_mode="directory",
+        )
+
+    assert summary.processed_files == 1
+    rows = _read_parquet_rows(tmp_path / "cached.parquet")
+    assert set(rows["region_id"]) == {5}
+    assert set(rows["region_acronym"]) == {"CR"}
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "swc_conversion_annotation_cached source_mode=directory" in messages
+    assert "swc_conversion_annotation_load_start" not in messages
+
+
+def test_batch_convert_requires_complete_cached_annotation_inputs(tmp_path):
+    """Partial cached annotation inputs should fail with a clear error."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_two_node_swc(input_dir / "cached.swc", soma_z=10.0, child_z=20.0)
+
+    with np.testing.assert_raises(ValueError):
+        batch_convert_swc_to_parquet(
+            input_dir,
+            tmp_path / "cached.parquet",
+            annotate_regions=True,
+            annotation_volume=np.zeros((8, 8, 8), dtype=np.int32),
+        )
+
+
+def test_directory_and_file_list_conversion_emit_comparable_timing_logs(
+    tmp_path,
+    caplog,
+):
+    """A 26-file directory run and file-list run should log comparable phases."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    swc_files: list[Path] = []
+    for index in range(1, 27):
+        swc_path = input_dir / f"cell_{index:02d}.swc"
+        _write_two_node_swc(
+            swc_path,
+            soma_z=float(index),
+            child_z=float(index + 1),
+        )
+        swc_files.append(swc_path)
+
+    directory_output = tmp_path / "directory.parquet"
+    files_output = tmp_path / "files.parquet"
+
+    with caplog.at_level(logging.DEBUG, logger=parquet_module.logger.name):
+        directory_summary = batch_convert_swc_to_parquet(
+            input_dir,
+            directory_output,
+            n_workers=1,
+            source_mode="directory",
+        )
+        files_summary = batch_convert_swc_to_parquet(
+            swc_files,
+            files_output,
+            n_workers=1,
+            source_mode="files",
+        )
+
+    assert directory_summary.discovered_files == files_summary.discovered_files == 26
+    assert directory_summary.processed_files == files_summary.processed_files == 26
+    assert directory_summary.failed_files == files_summary.failed_files == 0
+    assert directory_summary.rows_written == files_summary.rows_written == 52
+    assert _read_parquet_rows(directory_output).equals(_read_parquet_rows(files_output))
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert (
+        "swc_conversion_batch_start source_mode=directory source_kind=path"
+        in messages
+    )
+    assert (
+        "swc_conversion_batch_start source_mode=files source_kind=iterable "
+        "source_count=26"
+    ) in messages
+    assert (
+        "swc_conversion_source_resolve_ok source_mode=directory "
+        "elapsed_s="
+    ) in messages
+    assert (
+        "swc_conversion_source_resolve_ok source_mode=files elapsed_s="
+        in messages
+    )
+    assert "discovered_files=26" in messages
+    assert "cell_26.swc" in messages
+    assert "swc_conversion_serial_start source_mode=directory total_files=26" in messages
+    assert "swc_conversion_serial_start source_mode=files total_files=26" in messages
+    assert "swc_conversion_file_ok source_mode=directory index=26 total=26" in messages
+    assert "swc_conversion_file_ok source_mode=files index=26 total=26" in messages
+    assert (
+        "swc_conversion_parquet_flush_ok source_mode=directory "
+        "flush_label=serial_batch"
+    ) in messages
+    assert (
+        "swc_conversion_parquet_flush_ok source_mode=files "
+        "flush_label=serial_batch"
+    ) in messages
+
+
+def test_directory_discovery_elapsed_time_is_logged_separately(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """A slow directory discovery phase should have its own timing log."""
+
+    def fake_discover_swc_files(input_path, recursive=True):
+        assert input_path == tmp_path / "slow"
+        assert recursive is True
+        return []
+
+    counter_values = iter([10.0, 11.0, 15.25, 15.5])
+    monkeypatch.setattr(parquet_module, "discover_swc_files", fake_discover_swc_files)
+    monkeypatch.setattr(parquet_module, "perf_counter", lambda: next(counter_values))
+
+    with caplog.at_level(logging.DEBUG, logger=parquet_module.logger.name):
+        summary = batch_convert_swc_to_parquet(
+            tmp_path / "slow",
+            tmp_path / "slow.parquet",
+            source_mode="directory",
+        )
+
+    assert summary.discovered_files == 0
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert (
+        "swc_conversion_source_resolve_ok source_mode=directory "
+        "elapsed_s=4.250000 discovered_files=0"
+    ) in messages
+    assert "swc_conversion_empty_source source_mode=directory elapsed_s=5.500000" in messages
 
 
 def test_batch_convert_aligns_only_files_not_already_in_target_hemisphere(tmp_path):

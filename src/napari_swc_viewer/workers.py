@@ -151,51 +151,192 @@ class ConvertWorker(QObject):
 
     def __init__(
         self,
-        swc_paths: list[str],
+        swc_paths: str | Path | list[str | Path],
         output_path: str,
         resolution: int = 25,
         hemisphere: str | None = None,
         atlas_name: str = "allen_mouse_25um",
         coord_axis: int = 2,
+        recursive: bool = False,
+        n_workers: int = 1,
+        source_mode: str | None = None,
+        cached_atlas: BrainGlobeAtlas | None = None,
+        use_cached_annotation: bool = False,
     ):
         super().__init__()
-        self._swc_paths = [Path(p) for p in swc_paths]
+        self._swc_source = (
+            Path(swc_paths)
+            if isinstance(swc_paths, (str, Path))
+            else [Path(p) for p in swc_paths]
+        )
         self._output_path = Path(output_path)
         self._resolution = resolution
         self._hemisphere = hemisphere
         self._atlas_name = atlas_name
         self._coord_axis = coord_axis
+        self._recursive = recursive
+        self._n_workers = n_workers
+        self._source_mode = source_mode or (
+            "files"
+            if isinstance(self._swc_source, list)
+            else "directory"
+            if recursive
+            else "path"
+        )
+        self._cached_atlas = cached_atlas
+        self._use_cached_annotation = use_cached_annotation
+
+    def _source_log_value(self) -> str:
+        """Return a compact source description for conversion timing logs."""
+        if isinstance(self._swc_source, list):
+            count = len(self._swc_source)
+            if count <= 50:
+                return str([str(path) for path in self._swc_source])
+            sample = self._swc_source[:10] + self._swc_source[-10:]
+            return f"{count} files sample={[str(path) for path in sample]}"
+        return str(self._swc_source)
+
+    def _cached_atlas_conversion_inputs(self):
+        """Return optional cached atlas-derived conversion inputs."""
+        if self._cached_atlas is None:
+            return None, None, None
+
+        from .hemisphere import get_atlas_midline
+        from .region import BrainGlobeStructureTree, build_region_lookup
+
+        cached_start = perf_counter()
+        cached_midline = None
+        if self._hemisphere is not None:
+            cached_midline = get_atlas_midline(
+                self._cached_atlas,
+                self._coord_axis,
+            )
+
+        cached_annotation_volume = None
+        cached_region_lookup = None
+        if self._use_cached_annotation:
+            cached_annotation_volume = self._cached_atlas.annotation
+            cached_region_lookup = build_region_lookup(
+                BrainGlobeStructureTree(self._cached_atlas)
+            )
+
+        logger.debug(
+            (
+                "swc_conversion_worker_cached_atlas_ready source_mode=%s "
+                "atlas=%s midline=%s annotation=%s region_lookup=%s "
+                "elapsed_s=%.6f"
+            ),
+            self._source_mode,
+            getattr(self._cached_atlas, "atlas_name", None),
+            cached_midline,
+            cached_annotation_volume is not None,
+            len(cached_region_lookup) if cached_region_lookup is not None else 0,
+            perf_counter() - cached_start,
+        )
+        return cached_midline, cached_annotation_volume, cached_region_lookup
 
     def run(self) -> None:
         """Execute the conversion pipeline."""
+        run_start = perf_counter()
         try:
             from .parquet import batch_convert_swc_to_parquet
 
-            total = len(self._swc_paths)
+            total = len(self._swc_source) if isinstance(self._swc_source, list) else 0
+            logger.debug(
+                (
+                    "swc_conversion_worker_start source_mode=%s source=%s "
+                    "file_count=%s recursive=%s output=%s resolution=%s "
+                    "hemisphere=%s atlas=%s coord_axis=%d n_workers=%d "
+                    "cached_atlas=%s cached_annotation=%s"
+                ),
+                self._source_mode,
+                self._source_log_value(),
+                total if isinstance(self._swc_source, list) else "unknown",
+                self._recursive,
+                self._output_path,
+                self._resolution,
+                self._hemisphere,
+                self._atlas_name,
+                self._coord_axis,
+                self._n_workers,
+                self._cached_atlas is not None,
+                self._use_cached_annotation,
+            )
+            initial_message = (
+                "Searching for SWC files..."
+                if not isinstance(self._swc_source, list)
+                else "Preparing SWC-to-Parquet conversion..."
+            )
             self.progress.emit(
-                "Preparing SWC-to-Parquet conversion...",
+                initial_message,
                 0,
                 total,
             )
+            batch_start = perf_counter()
+            cached_midline, cached_annotation_volume, cached_region_lookup = (
+                self._cached_atlas_conversion_inputs()
+            )
             summary = batch_convert_swc_to_parquet(
-                self._swc_paths,
+                self._swc_source,
                 self._output_path,
-                recursive=False,
+                recursive=self._recursive,
                 hemisphere=self._hemisphere,
                 atlas_name=self._atlas_name,
                 coord_axis=self._coord_axis,
+                midline=cached_midline,
                 annotate_regions=True,
                 resolution=self._resolution,
+                n_workers=self._n_workers,
+                annotation_volume=cached_annotation_volume,
+                region_lookup=cached_region_lookup,
+                source_mode=self._source_mode,
                 progress_callback=self.progress.emit,
             )
+            batch_elapsed_s = perf_counter() - batch_start
+            logger.debug(
+                (
+                    "swc_conversion_worker_batch_ok source_mode=%s "
+                    "elapsed_s=%.6f discovered=%d processed=%d failed=%d "
+                    "rows=%d flipped=%d"
+                ),
+                self._source_mode,
+                batch_elapsed_s,
+                summary.discovered_files,
+                summary.processed_files,
+                summary.failed_files,
+                summary.rows_written,
+                summary.flipped_files,
+            )
+            for failed_path, failure_message in summary.failures:
+                logger.debug(
+                    (
+                        "swc_conversion_worker_file_failure source_mode=%s "
+                        "file=%s error=%s"
+                    ),
+                    self._source_mode,
+                    failed_path,
+                    failure_message,
+                )
+            if summary.discovered_files == 0:
+                raise ValueError("No SWC files found")
             if summary.processed_files == 0:
                 raise ValueError("No SWC files were successfully processed")
 
+            total = summary.discovered_files
             self.progress.emit("Finalizing Parquet...", total, total)
+            logger.debug(
+                "swc_conversion_worker_finished source_mode=%s elapsed_s=%.6f",
+                self._source_mode,
+                perf_counter() - run_start,
+            )
             self.finished.emit(str(self._output_path), summary)
 
         except Exception as e:
-            logger.exception("SWC-to-Parquet conversion failed")
+            logger.exception(
+                "SWC-to-Parquet conversion failed source_mode=%s elapsed_s=%.6f",
+                self._source_mode,
+                perf_counter() - run_start,
+            )
             self.error.emit(str(e))
 
 

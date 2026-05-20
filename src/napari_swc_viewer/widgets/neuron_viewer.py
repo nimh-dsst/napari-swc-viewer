@@ -12,6 +12,7 @@ from __future__ import annotations
 import colorsys
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -506,6 +507,8 @@ class NeuronViewerWidget(QWidget):
             self._point_convert_worker = None
             self._point_append_thread: QThread | None = None
             self._point_append_worker = None
+            self._convert_source_mode: str | None = None
+            self._convert_ui_start_time: float | None = None
             self._selected_heatmap_thread: QThread | None = None
             self._selected_heatmap_worker = None
             self._selected_heatmap_request_file_ids: tuple[str, ...] = ()
@@ -5532,21 +5535,41 @@ class NeuronViewerWidget(QWidget):
 
     def _convert_from_directory(self) -> None:
         """Pick a directory of SWC files and convert to Parquet."""
+        dialog_start = perf_counter()
+        logger.debug(
+            "swc_conversion_ui_directory_dialog_start source_mode=directory"
+        )
         directory = QFileDialog.getExistingDirectory(
             self, "Select Directory of SWC Files"
         )
         if not directory:
+            logger.debug(
+                (
+                    "swc_conversion_ui_directory_dialog_canceled "
+                    "source_mode=directory elapsed_s=%.6f"
+                ),
+                perf_counter() - dialog_start,
+            )
             return
 
-        swc_files = sorted(Path(directory).rglob("*.swc"))
-        if not swc_files:
-            self._convert_status_label.setText("No SWC files found in directory.")
-            return
-
-        self._prompt_output_and_convert([str(f) for f in swc_files])
+        logger.debug(
+            (
+                "swc_conversion_ui_directory_dialog_ok "
+                "source_mode=directory path=%s elapsed_s=%.6f"
+            ),
+            directory,
+            perf_counter() - dialog_start,
+        )
+        self._prompt_output_and_convert(
+            directory,
+            recursive=True,
+            source_mode="directory",
+        )
 
     def _convert_from_files(self) -> None:
         """Pick individual SWC files and convert to Parquet."""
+        dialog_start = perf_counter()
+        logger.debug("swc_conversion_ui_files_dialog_start source_mode=files")
         filepaths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select SWC Files",
@@ -5554,12 +5577,43 @@ class NeuronViewerWidget(QWidget):
             "SWC Files (*.swc);;All Files (*)",
         )
         if not filepaths:
+            logger.debug(
+                (
+                    "swc_conversion_ui_files_dialog_canceled "
+                    "source_mode=files elapsed_s=%.6f"
+                ),
+                perf_counter() - dialog_start,
+            )
             return
 
-        self._prompt_output_and_convert(filepaths)
+        logger.debug(
+            (
+                "swc_conversion_ui_files_dialog_ok "
+                "source_mode=files file_count=%d elapsed_s=%.6f files=%s"
+            ),
+            len(filepaths),
+            perf_counter() - dialog_start,
+            filepaths if len(filepaths) <= 50 else filepaths[:10] + filepaths[-10:],
+        )
+        self._prompt_output_and_convert(filepaths, source_mode="files")
 
-    def _prompt_output_and_convert(self, swc_paths: list[str]) -> None:
+    def _prompt_output_and_convert(
+        self,
+        swc_paths: str | list[str],
+        *,
+        recursive: bool = False,
+        source_mode: str,
+    ) -> None:
         """Ask for output path and start conversion."""
+        output_dialog_start = perf_counter()
+        logger.debug(
+            (
+                "swc_conversion_ui_output_dialog_start "
+                "source_mode=%s recursive=%s"
+            ),
+            source_mode,
+            recursive,
+        )
         output_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Parquet File",
@@ -5567,57 +5621,242 @@ class NeuronViewerWidget(QWidget):
             "Parquet Files (*.parquet)",
         )
         if not output_path:
+            logger.debug(
+                (
+                    "swc_conversion_ui_output_dialog_canceled "
+                    "source_mode=%s elapsed_s=%.6f"
+                ),
+                source_mode,
+                perf_counter() - output_dialog_start,
+            )
             return
 
-        self._start_conversion(swc_paths, output_path)
+        logger.debug(
+            (
+                "swc_conversion_ui_output_dialog_ok "
+                "source_mode=%s output=%s elapsed_s=%.6f"
+            ),
+            source_mode,
+            output_path,
+            perf_counter() - output_dialog_start,
+        )
+        self._start_conversion(
+            swc_paths,
+            output_path,
+            recursive=recursive,
+            source_mode=source_mode,
+        )
 
-    def _start_conversion(self, swc_paths: list[str], output_path: str) -> None:
+    def _conversion_cached_atlas_inputs(
+        self,
+        atlas_name: str,
+        resolution: int,
+    ) -> tuple[BrainGlobeAtlas | None, bool]:
+        """Return loaded atlas reuse options for SWC conversion."""
+        if self._atlas is None:
+            logger.debug(
+                (
+                    "swc_conversion_ui_cached_atlas_unavailable "
+                    "reason=no_loaded_atlas atlas=%s resolution=%s"
+                ),
+                atlas_name,
+                resolution,
+            )
+            return None, False
+
+        loaded_atlas_name = str(getattr(self._atlas, "atlas_name", "") or "")
+        if loaded_atlas_name and loaded_atlas_name != atlas_name:
+            logger.debug(
+                (
+                    "swc_conversion_ui_cached_atlas_unavailable "
+                    "reason=atlas_mismatch requested=%s loaded=%s "
+                    "resolution=%s"
+                ),
+                atlas_name,
+                loaded_atlas_name,
+                resolution,
+            )
+            return None, False
+
+        use_cached_annotation = False
+        atlas_resolution = None
+        try:
+            atlas_resolution = tuple(
+                float(value)
+                for value in np.asarray(self._atlas.resolution, dtype=float).tolist()
+            )
+            use_cached_annotation = bool(
+                np.allclose(
+                    np.asarray(atlas_resolution, dtype=float),
+                    float(resolution),
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Failed to inspect loaded atlas resolution for conversion cache.",
+                exc_info=True,
+            )
+
+        logger.debug(
+            (
+                "swc_conversion_ui_cached_atlas_available atlas=%s "
+                "requested_resolution=%s atlas_resolution=%s "
+                "use_cached_annotation=%s"
+            ),
+            loaded_atlas_name or atlas_name,
+            resolution,
+            atlas_resolution,
+            use_cached_annotation,
+        )
+        return self._atlas, use_cached_annotation
+
+    def _start_conversion(
+        self,
+        swc_paths: str | list[str],
+        output_path: str,
+        *,
+        recursive: bool = False,
+        source_mode: str,
+    ) -> None:
         """Launch the background conversion worker."""
         from ..workers import ConvertWorker
 
         resolution = self._convert_resolution_spin.value()
         hemisphere = self._convert_hemisphere_combo.currentData()
         atlas_name = self._atlas_combo.currentText()
+        known_count = len(swc_paths) if isinstance(swc_paths, list) else None
+        cached_atlas, use_cached_annotation = self._conversion_cached_atlas_inputs(
+            atlas_name,
+            resolution,
+        )
+        self._convert_source_mode = source_mode
+        self._convert_ui_start_time = perf_counter()
+        logger.debug(
+            (
+                "swc_conversion_ui_start source_mode=%s known_count=%s "
+                "recursive=%s output=%s resolution=%s hemisphere=%s atlas=%s "
+                "source=%s cached_atlas=%s cached_annotation=%s"
+            ),
+            source_mode,
+            known_count if known_count is not None else "unknown",
+            recursive,
+            output_path,
+            resolution,
+            hemisphere,
+            atlas_name,
+            swc_paths if isinstance(swc_paths, str) else f"{known_count} explicit files",
+            cached_atlas is not None,
+            use_cached_annotation,
+        )
 
-        status = f"Converting {len(swc_paths)} SWC files..."
+        status = (
+            f"Converting {known_count} SWC files..."
+            if known_count is not None
+            else "Searching selected directory for SWC files..."
+        )
         if hemisphere is not None:
-            status = (
-                f"Converting {len(swc_paths)} SWC files "
-                f"(aligning to {str(hemisphere).title()})..."
-            )
+            if known_count is None:
+                status = (
+                    "Searching selected directory for SWC files "
+                    f"(aligning to {str(hemisphere).title()})..."
+                )
+            else:
+                status = (
+                    f"Converting {known_count} SWC files "
+                    f"(aligning to {str(hemisphere).title()})..."
+                )
 
         self._convert_progress.setVisible(True)
-        self._convert_progress.setRange(0, len(swc_paths))
+        if known_count is None:
+            self._convert_progress.setRange(0, 0)
+        else:
+            self._convert_progress.setRange(0, known_count)
         self._convert_progress.setValue(0)
         self._convert_status_label.setText(status)
 
-        self._convert_thread = QThread()
-        self._convert_worker = ConvertWorker(
+        thread = QThread()
+        worker = ConvertWorker(
             swc_paths,
             output_path,
             resolution,
             hemisphere=hemisphere,
             atlas_name=atlas_name,
+            recursive=recursive,
+            source_mode=source_mode,
+            cached_atlas=cached_atlas,
+            use_cached_annotation=use_cached_annotation,
         )
-        self._convert_worker.moveToThread(self._convert_thread)
+        self._convert_thread = thread
+        self._convert_worker = worker
+        worker.moveToThread(thread)
+        logger.debug(
+            "swc_conversion_ui_worker_created source_mode=%s thread=%s worker=%s",
+            source_mode,
+            thread,
+            worker,
+        )
 
-        self._convert_thread.started.connect(self._convert_worker.run)
-        self._convert_worker.progress.connect(self._on_convert_progress)
-        self._convert_worker.finished.connect(self._on_convert_finished)
-        self._convert_worker.error.connect(self._on_convert_error)
-        self._convert_worker.finished.connect(self._convert_thread.quit)
-        self._convert_worker.error.connect(self._convert_thread.quit)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_convert_progress)
+        worker.finished.connect(self._on_convert_finished)
+        worker.error.connect(self._on_convert_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._cleanup_convert_thread(thread, worker))
+        logger.debug(
+            "swc_conversion_ui_worker_signals_connected source_mode=%s",
+            source_mode,
+        )
 
-        self._convert_thread.start()
+        thread.start()
+        logger.debug("swc_conversion_ui_thread_started source_mode=%s", source_mode)
 
     def _on_convert_progress(self, message: str, current: int, total: int) -> None:
         """Handle conversion progress updates."""
-        self._convert_progress.setValue(current)
+        logger.debug(
+            (
+                "swc_conversion_ui_progress source_mode=%s current=%d "
+                "total=%d message=%s"
+            ),
+            self._convert_source_mode,
+            current,
+            total,
+            message,
+        )
+        if total > 0:
+            self._convert_progress.setRange(0, total)
+            self._convert_progress.setValue(min(current, total))
+        else:
+            self._convert_progress.setRange(0, 0)
         self._convert_status_label.setText(message)
 
     def _on_convert_finished(self, output_path: str, summary: object) -> None:
         """Handle conversion completion."""
+        elapsed_s = (
+            perf_counter() - self._convert_ui_start_time
+            if self._convert_ui_start_time is not None
+            else -1.0
+        )
+        logger.debug(
+            (
+                "swc_conversion_ui_finished source_mode=%s output=%s "
+                "elapsed_s=%.6f discovered=%s processed=%s failed=%s "
+                "rows=%s flipped=%s"
+            ),
+            self._convert_source_mode,
+            output_path,
+            elapsed_s,
+            getattr(summary, "discovered_files", "unknown"),
+            getattr(summary, "processed_files", "unknown"),
+            getattr(summary, "failed_files", "unknown"),
+            getattr(summary, "rows_written", "unknown"),
+            getattr(summary, "flipped_files", "unknown"),
+        )
         self._convert_progress.setVisible(False)
+        self._convert_progress.setRange(0, 1)
+        self._convert_progress.setValue(0)
         summary_parts = [f"Converted {summary.processed_files} file(s)"]
         if summary.failed_files:
             summary_parts.append(f"skipped {summary.failed_files}")
@@ -5630,6 +5869,47 @@ class NeuronViewerWidget(QWidget):
 
     def _on_convert_error(self, error_msg: str) -> None:
         """Handle conversion error."""
+        elapsed_s = (
+            perf_counter() - self._convert_ui_start_time
+            if self._convert_ui_start_time is not None
+            else -1.0
+        )
+        logger.debug(
+            (
+                "swc_conversion_ui_error source_mode=%s elapsed_s=%.6f "
+                "error=%s"
+            ),
+            self._convert_source_mode,
+            elapsed_s,
+            error_msg,
+        )
         self._convert_progress.setVisible(False)
+        self._convert_progress.setRange(0, 1)
+        self._convert_progress.setValue(0)
         self._convert_status_label.setText(f"Error: {error_msg}")
         logger.error(f"SWC-to-Parquet conversion failed: {error_msg}")
+
+    def _cleanup_convert_thread(self, thread: QThread, worker: object) -> None:
+        """Release SWC conversion worker objects after the thread stops."""
+
+        elapsed_s = (
+            perf_counter() - self._convert_ui_start_time
+            if self._convert_ui_start_time is not None
+            else -1.0
+        )
+        logger.debug(
+            (
+                "swc_conversion_ui_cleanup source_mode=%s elapsed_s=%.6f "
+                "thread_matches=%s worker_matches=%s"
+            ),
+            self._convert_source_mode,
+            elapsed_s,
+            self._convert_thread is thread,
+            self._convert_worker is worker,
+        )
+        if self._convert_thread is thread:
+            self._convert_thread = None
+        if self._convert_worker is worker:
+            self._convert_worker = None
+        self._convert_source_mode = None
+        self._convert_ui_start_time = None
