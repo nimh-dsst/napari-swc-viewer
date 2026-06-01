@@ -90,6 +90,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SomaSelectionKey = tuple[int, frozenset[int], tuple[object, ...]]
+
 _POINT_HEATMAP_BASE_COLORS = [
     (1.0, 0.0, 0.0, 1.0),    # red
     (0.0, 0.8, 0.0, 1.0),    # green
@@ -472,7 +474,7 @@ class NeuronViewerWidget(QWidget):
             self._current_neuron_layers: list = []
             self._current_region_layers: list = []
             self._highlighted_file_ids: set[str] | None = None
-            self._last_soma_selection: set = set()  # track no-op highlights
+            self._last_soma_selection: _SomaSelectionKey | set = set()
             self._auto_center_applied_once = False
             self._region_query_source = "Atlas Regions"
             self._region_query_scope = _REGION_QUERY_SCOPE_WHOLE
@@ -5279,17 +5281,30 @@ class NeuronViewerWidget(QWidget):
         """
         layer = event.source
         current = set(layer.selected_data)
-        if current == self._last_soma_selection:
+        file_ids = layer.metadata.get("file_ids", [])
+        selected_fids = []
+        seen_fids = set()
+        for i in sorted(current):
+            if i >= len(file_ids):
+                continue
+            fid = file_ids[i]
+            if fid in seen_fids:
+                continue
+            seen_fids.add(fid)
+            selected_fids.append(fid)
+
+        current_key = (id(layer), frozenset(current), tuple(selected_fids))
+        if current_key == self._last_soma_selection:
             return
-        self._last_soma_selection = current
 
         if not current:
+            if not self._last_soma_selection:
+                return
+            self._last_soma_selection = current_key
+            self._neuron_table.select_file_ids([])
             return
 
-        file_ids = layer.metadata.get("file_ids", [])
-        selected_fids = [
-            file_ids[i] for i in current if i < len(file_ids)
-        ]
+        self._last_soma_selection = current_key
         if selected_fids:
             self._neuron_table.select_file_ids(selected_fids)
 

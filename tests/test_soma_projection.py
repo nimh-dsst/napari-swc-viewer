@@ -1613,6 +1613,83 @@ def test_on_soma_selected_uses_metadata_file_ids_for_projected_layer() -> None:
     table.select_file_ids.assert_called_once_with(["n1", "n3"])
 
 
+def test_on_soma_selected_deduplicates_projected_file_ids() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer = types.SimpleNamespace(
+        selected_data={0, 1, 2},
+        metadata={"file_ids": ["n1", "n1", "n2"]},
+    )
+    event = types.SimpleNamespace(source=layer)
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+
+    table.select_file_ids.assert_called_once_with(["n1", "n2"])
+
+
+def test_on_soma_selected_same_indices_from_different_layers_are_not_noop() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer_a = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n1"]},
+    )
+    layer_b = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n2"]},
+    )
+
+    NeuronViewerWidget._on_soma_selected(
+        widget,
+        types.SimpleNamespace(source=layer_a),
+    )
+    NeuronViewerWidget._on_soma_selected(
+        widget,
+        types.SimpleNamespace(source=layer_b),
+    )
+
+    assert [call.args[0] for call in table.select_file_ids.call_args_list] == [
+        ["n1"],
+        ["n2"],
+    ]
+
+
+def test_on_soma_selected_reprocesses_same_projected_indices_after_metadata_change() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n1"]},
+    )
+    event = types.SimpleNamespace(source=layer)
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+    table.select_file_ids.reset_mock()
+    layer.metadata = {"file_ids": ["n2"]}
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+
+    table.select_file_ids.assert_called_once_with(["n2"])
+
+
+def test_on_soma_selected_empty_selection_clears_after_soma_selection() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n1"]},
+    )
+    event = types.SimpleNamespace(source=layer)
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+    table.select_file_ids.reset_mock()
+    layer.selected_data = set()
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+
+    table.select_file_ids.assert_called_once_with([])
+
+
 @pytest.mark.parametrize(
     ("handler_name", "expected_message", "expected_soma_only"),
     [
