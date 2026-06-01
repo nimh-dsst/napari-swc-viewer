@@ -13,7 +13,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from .atlas_utils import mask_to_world_xyz_bounds, world_coords_xyz_to_atlas_voxels
+from .atlas_utils import mask_to_swc_xyz_bounds, swc_coords_xyz_to_atlas_voxels
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -439,7 +439,7 @@ class NeuronDatabase:
                 f"Mask shape {mask.shape} does not match atlas shape {atlas_shape}"
             )
 
-        bounds = mask_to_world_xyz_bounds(mask, atlas)
+        bounds = mask_to_swc_xyz_bounds(mask, atlas)
         if bounds is None:
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
@@ -477,7 +477,7 @@ class NeuronDatabase:
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
         coords = candidates[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
-        voxel_coords = world_coords_xyz_to_atlas_voxels(coords, atlas)
+        voxel_coords = swc_coords_xyz_to_atlas_voxels(coords, atlas)
         in_bounds = np.all(
             (voxel_coords >= 0) & (voxel_coords < np.asarray(mask.shape)),
             axis=1,

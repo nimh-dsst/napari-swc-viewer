@@ -1989,6 +1989,62 @@ def test_query_neurons_by_mask_uses_current_layer_data_and_excludes_sources() ->
     )
 
 
+def test_query_neurons_by_mask_soma_uses_soma_only_and_status_text() -> None:
+    result = pd.DataFrame(
+        {
+            "file_id": ["n2"],
+            "neuron_id": ["N2"],
+            "subject": ["s2"],
+        }
+    )
+    db = MagicMock()
+    db.get_neurons_by_mask.return_value = result
+    mask_data = np.zeros((2, 2, 2), dtype=np.uint8)
+    mask_data[1, 1, 0] = 1
+    layer = types.SimpleNamespace(
+        name="Mask Soma",
+        data=mask_data,
+        metadata={},
+    )
+    widget = types.SimpleNamespace(
+        _db=db,
+        _atlas=types.SimpleNamespace(annotation=np.zeros((2, 2, 2), dtype=np.uint8)),
+        _selected_mask_query_layers=lambda: [layer],
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _populate_neuron_table=MagicMock(),
+    )
+    widget._normalise_layer_file_ids = NeuronViewerWidget._normalise_layer_file_ids
+    widget._source_file_ids_for_layers = types.MethodType(
+        NeuronViewerWidget._source_file_ids_for_layers,
+        widget,
+    )
+    widget._mask_source_exclusion_enabled = types.MethodType(
+        NeuronViewerWidget._mask_source_exclusion_enabled,
+        widget,
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_mask(widget, soma_only=True)
+
+    args, kwargs = db.get_neurons_by_mask.call_args
+    np.testing.assert_array_equal(args[0], mask_data > 0)
+    assert args[1] is widget._atlas
+    assert kwargs == {
+        "soma_only": True,
+        "file_ids": None,
+        "exclude_file_ids": None,
+    }
+    widget._populate_neuron_table.assert_called_once_with(
+        result,
+        preserve_existing=False,
+    )
+    assert widget._regions_status_label.text == (
+        "Found 1 neuron(s) with soma in 1 selected mask layer(s) "
+        "within whole parquet: Mask Soma"
+    )
+
+
 def test_query_neurons_by_mask_includes_sources_when_checkbox_unchecked() -> None:
     result = pd.DataFrame(
         {

@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from napari_swc_viewer.analysis.heatmap import build_node_counts_volume
 from napari_swc_viewer.analysis.mask import (
     build_binary_mask_from_heatmap,
     build_binary_mask_from_threshold_range,
@@ -271,7 +273,7 @@ def test_get_neurons_by_mask_supports_any_node_and_soma_only(tmp_path: Path) -> 
     df.to_parquet(parquet_path, index=False)
 
     mask = np.zeros(atlas.annotation.shape, dtype=np.uint8)
-    mask[4, 3, 2] = 1
+    mask[2, 3, 4] = 1
     mask[4, 3, 4] = 1
 
     with NeuronDatabase(parquet_path) as db:
@@ -301,6 +303,61 @@ def test_get_neurons_by_mask_supports_any_node_and_soma_only(tmp_path: Path) -> 
     assert restricted_any_node["file_id"].tolist() == ["file_a"]
     assert restricted_soma_only.empty
     assert excluded_any_node["file_id"].tolist() == ["file_b"]
+
+
+def test_get_neurons_by_heatmap_mask_uses_swc_grid_for_soma_membership(
+    tmp_path: Path,
+) -> None:
+    atlas = FakeAtlas()
+    parquet_path = tmp_path / "neurons.parquet"
+    df = pd.DataFrame(
+        {
+            "file_id": [
+                "inside_soma",
+                "outside_transposed",
+                "neurite_only",
+            ],
+            "neuron_id": [
+                "inside",
+                "outside",
+                "neurite",
+            ],
+            "subject": ["s1", "s2", "s3"],
+            "node_id": [1, 1, 1],
+            "parent_id": [-1, -1, -1],
+            "x": [25.0, 75.0, 25.0],
+            "y": [25.0, 25.0, 25.0],
+            "z": [75.0, 25.0, 75.0],
+            "type": [1, 1, 2],
+            "region_id": [0, 0, 0],
+            "region_name": ["", "", ""],
+            "region_acronym": ["", "", ""],
+        }
+    )
+    df.to_parquet(parquet_path, index=False)
+
+    conn = duckdb.connect()
+    try:
+        volume = build_node_counts_volume(
+            conn,
+            str(parquet_path),
+            atlas,
+        )
+    finally:
+        conn.close()
+    mask = build_binary_mask_from_threshold_range(volume, lower_threshold=2.0)
+
+    assert float(volume[1, 1, 3]) == 2.0
+    assert float(volume[3, 1, 1]) == 1.0
+    assert int(mask[1, 1, 3]) == 1
+    assert int(mask[3, 1, 1]) == 0
+
+    with NeuronDatabase(parquet_path) as db:
+        any_node = db.get_neurons_by_mask(mask, atlas, soma_only=False)
+        soma_only = db.get_neurons_by_mask(mask, atlas, soma_only=True)
+
+    assert any_node["file_id"].tolist() == ["inside_soma", "neurite_only"]
+    assert soma_only["file_id"].tolist() == ["inside_soma"]
 
 
 def test_get_neurons_by_region_supports_any_node_and_soma_only(
