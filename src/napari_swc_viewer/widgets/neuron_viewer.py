@@ -485,6 +485,10 @@ class NeuronViewerWidget(QWidget):
             self._point_preview_counts: dict[tuple[str, str], int] = {}
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
+            self._layer_name_event_connections: dict[
+                int,
+                tuple[object, object, object],
+            ] = {}
 
             with startup_timing(
                 logger,
@@ -2448,15 +2452,86 @@ class NeuronViewerWidget(QWidget):
     def _connect_layer_events(self) -> None:
         """Refresh tool and mask selectors when viewer layers change."""
         layer_events = getattr(getattr(self.viewer, "layers", None), "events", None)
-        if layer_events is None:
+        if layer_events is not None:
+            for event_name in ("inserted", "removed", "reordered"):
+                signal = getattr(layer_events, event_name, None)
+                if signal is not None:
+                    signal.connect(self._on_viewer_layers_changed)
+        self._sync_layer_name_event_connections()
+
+    def _sync_layer_name_event_connections(self) -> None:
+        """Track layer-name events so layer renames refresh layer-dependent UI."""
+        connections = getattr(self, "_layer_name_event_connections", None)
+        if connections is None:
+            connections = {}
+            self._layer_name_event_connections = connections
+
+        layers = self._iter_viewer_layers()
+        active_layer_ids = {id(layer) for layer in layers}
+        self._disconnect_stale_layer_name_event_connections(active_layer_ids)
+
+        for layer in layers:
+            layer_id = id(layer)
+            existing = connections.get(layer_id)
+            if existing is not None and existing[0] is layer:
+                continue
+            if existing is not None:
+                self._disconnect_layer_name_event_connection(layer_id, existing)
+
+            signal = getattr(getattr(layer, "events", None), "name", None)
+            connector = getattr(signal, "connect", None)
+            if not callable(connector):
+                continue
+            callback = self._on_viewer_layer_name_changed
+            try:
+                connector(callback)
+            except Exception:
+                logger.debug(
+                    "Could not connect layer name event for %s",
+                    getattr(layer, "name", "<unnamed>"),
+                    exc_info=True,
+                )
+                continue
+            connections[layer_id] = (layer, signal, callback)
+
+    def _disconnect_stale_layer_name_event_connections(
+        self,
+        active_layer_ids: set[int],
+    ) -> None:
+        """Disconnect tracked name events for layers no longer in the viewer."""
+        connections = getattr(self, "_layer_name_event_connections", None)
+        if not connections:
             return
-        for event_name in ("inserted", "removed", "reordered"):
-            signal = getattr(layer_events, event_name, None)
-            if signal is not None:
-                signal.connect(self._on_viewer_layers_changed)
+        for layer_id, connection in list(connections.items()):
+            if layer_id not in active_layer_ids:
+                self._disconnect_layer_name_event_connection(layer_id, connection)
+
+    def _disconnect_layer_name_event_connection(
+        self,
+        layer_id: int,
+        connection: tuple[object, object, object],
+    ) -> None:
+        """Disconnect one tracked layer-name event connection."""
+        _layer, signal, callback = connection
+        disconnect = getattr(signal, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect(callback)
+            except Exception:
+                logger.debug("Could not disconnect layer name event", exc_info=True)
+        connections = getattr(self, "_layer_name_event_connections", None)
+        if connections is not None:
+            connections.pop(layer_id, None)
+
+    def _on_viewer_layer_name_changed(self, event=None) -> None:
+        """Refresh layer-dependent UI after a layer is renamed."""
+        self._on_viewer_layers_changed(event)
 
     def _on_viewer_layers_changed(self, _event=None) -> None:
         """Refresh UI that depends on viewer layers."""
+        sync_layer_names = getattr(self, "_sync_layer_name_event_connections", None)
+        if callable(sync_layer_names):
+            sync_layer_names()
         self._refresh_heatmap_layer_list()
         self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
@@ -2524,17 +2599,19 @@ class NeuronViewerWidget(QWidget):
             return
         setter(self._current_selected_neuron_heatmap_layers_by_file_id())
 
-    def _manual_heatmap_combo_options(self) -> list[tuple[str, tuple[object, ...]]]:
-        """Return manual heatmap dropdown options as layer-name/file-ID tuples."""
-        options: list[tuple[str, tuple[object, ...]]] = []
+    def _manual_heatmap_combo_options(
+        self,
+    ) -> list[tuple[str, tuple[object, ...], str]]:
+        """Return manual heatmap dropdown options as layer-name/file-ID/key tuples."""
+        options: list[tuple[str, tuple[object, ...], str]] = []
         for layer in self._manual_heatmap_layers():
             layer_name = str(getattr(layer, "name", ""))
             if not layer_name:
                 continue
-            file_ids = self._normalise_layer_file_ids(
-                _layer_metadata(layer).get("file_ids", [])
-            )
-            options.append((layer_name, file_ids))
+            metadata = _layer_metadata(layer)
+            file_ids = self._normalise_layer_file_ids(metadata.get("file_ids", []))
+            key = str(metadata.get("manual_heatmap_id") or layer_name)
+            options.append((layer_name, file_ids, key))
         return options
 
     def _manual_heatmap_combo_data(self) -> tuple[str, tuple[object, ...]] | None:
@@ -2550,6 +2627,34 @@ class NeuronViewerWidget(QWidget):
             and isinstance(data[0], str)
         ):
             return data[0], self._normalise_layer_file_ids(data[1])
+        if (
+            isinstance(data, tuple)
+            and len(data) == 3
+            and isinstance(data[0], str)
+        ):
+            return data[0], self._normalise_layer_file_ids(data[1])
+        return None
+
+    def _manual_heatmap_combo_key(self) -> str | None:
+        """Return the stable key for the selected manual heatmap, if any."""
+        combo = getattr(self, "_manual_heatmap_combo", None)
+        if combo is None:
+            return None
+        current_data = getattr(combo, "currentData", None)
+        data = current_data() if callable(current_data) else None
+        if (
+            isinstance(data, tuple)
+            and len(data) == 3
+            and isinstance(data[2], str)
+            and data[2]
+        ):
+            return data[2]
+        if (
+            isinstance(data, tuple)
+            and len(data) == 2
+            and isinstance(data[0], str)
+        ):
+            return data[0]
         return None
 
     def _refresh_manual_heatmap_combo(self) -> None:
@@ -2560,6 +2665,7 @@ class NeuronViewerWidget(QWidget):
 
         previous = self._manual_heatmap_combo_data()
         previous_name = previous[0] if previous is not None else None
+        previous_key = self._manual_heatmap_combo_key()
         options = self._manual_heatmap_combo_options()
 
         signals_blocked = combo.blockSignals(True)
@@ -2567,9 +2673,11 @@ class NeuronViewerWidget(QWidget):
             combo.clear()
             combo.addItem(_MANUAL_HEATMAP_ALL_LABEL, None)
             selected_index = 0
-            for layer_name, file_ids in options:
-                combo.addItem(layer_name, (layer_name, tuple(file_ids)))
-                if layer_name == previous_name:
+            for layer_name, file_ids, key in options:
+                combo.addItem(layer_name, (layer_name, tuple(file_ids), key))
+                if key == previous_key or (
+                    previous_key is None and layer_name == previous_name
+                ):
                     selected_index = combo.count() - 1
             combo.setCurrentIndex(selected_index)
         finally:

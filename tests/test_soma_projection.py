@@ -246,6 +246,10 @@ class _DummySignal:
         if callback in self._callbacks:
             self._callbacks.remove(callback)
 
+    def emit(self, *args, **kwargs) -> None:
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
+
 
 class _DummyDims:
     def __init__(
@@ -276,6 +280,7 @@ class _DummyBlocker:
 class _DummyLayerEvents:
     def __init__(self) -> None:
         self.highlight = _DummySignal()
+        self.name = _DummySignal()
 
     def blocker_all(self) -> _DummyBlocker:
         return _DummyBlocker()
@@ -329,6 +334,7 @@ class _DummyImageLayer:
         self.rendering = kwargs.get("rendering")
         self.contrast_limits = kwargs.get("contrast_limits")
         self.visible = kwargs.get("visible", True)
+        self.events = _DummyLayerEvents()
 
 
 class _DummyViewer:
@@ -997,8 +1003,16 @@ def _bind_manual_heatmap_helpers(widget) -> None:
         NeuronViewerWidget._current_selected_neuron_heatmap_layers_by_file_id,
         widget,
     )
+    widget._sync_neuron_table_heatmap_membership = types.MethodType(
+        NeuronViewerWidget._sync_neuron_table_heatmap_membership,
+        widget,
+    )
     widget._manual_heatmap_combo_data = types.MethodType(
         NeuronViewerWidget._manual_heatmap_combo_data,
+        widget,
+    )
+    widget._manual_heatmap_combo_key = types.MethodType(
+        NeuronViewerWidget._manual_heatmap_combo_key,
         widget,
     )
     widget._selected_manual_heatmap_file_ids = types.MethodType(
@@ -1019,6 +1033,29 @@ def _bind_manual_heatmap_helpers(widget) -> None:
     )
     widget._on_manual_heatmap_selection_changed = types.MethodType(
         NeuronViewerWidget._on_manual_heatmap_selection_changed,
+        widget,
+    )
+
+
+def _bind_layer_name_event_helpers(widget) -> None:
+    widget._sync_layer_name_event_connections = types.MethodType(
+        NeuronViewerWidget._sync_layer_name_event_connections,
+        widget,
+    )
+    widget._disconnect_stale_layer_name_event_connections = types.MethodType(
+        NeuronViewerWidget._disconnect_stale_layer_name_event_connections,
+        widget,
+    )
+    widget._disconnect_layer_name_event_connection = types.MethodType(
+        NeuronViewerWidget._disconnect_layer_name_event_connection,
+        widget,
+    )
+    widget._on_viewer_layer_name_changed = types.MethodType(
+        NeuronViewerWidget._on_viewer_layer_name_changed,
+        widget,
+    )
+    widget._on_viewer_layers_changed = types.MethodType(
+        NeuronViewerWidget._on_viewer_layers_changed,
         widget,
     )
 
@@ -2488,6 +2525,135 @@ def test_current_selected_neuron_heatmap_layers_ignores_analysis_heatmaps() -> N
         "n1": ("beta Heatmap",),
         "n2": ("alpha Heatmap", "beta Heatmap"),
     }
+
+
+def _make_layer_name_sync_widget(viewer: _DummyViewer, table) -> object:
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _neuron_table=table,
+        _manual_heatmap_combo=None,
+        _layer_name_event_connections={},
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _refresh_mask_layer_options=MagicMock(),
+        _update_tools_controls=MagicMock(),
+        _update_histogram_controls=MagicMock(),
+    )
+    _bind_manual_heatmap_helpers(widget)
+    _bind_layer_name_event_helpers(widget)
+    return widget
+
+
+def test_selected_neuron_heatmap_layer_rename_updates_table_membership() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1", "n2"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = _make_layer_name_sync_widget(viewer, table)
+
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    layer.name = "Renamed Heatmap"
+    layer.events.name.emit(types.SimpleNamespace(source=layer))
+
+    table.set_heatmap_layers_by_file_id.assert_called_once_with(
+        {
+            "n1": ("Renamed Heatmap",),
+            "n2": ("Renamed Heatmap",),
+        }
+    )
+    widget._refresh_heatmap_layer_list.assert_called_once_with()
+    widget._refresh_histogram_layer_list.assert_called_once_with()
+    widget._refresh_mask_layer_options.assert_called_once_with()
+
+
+def test_layer_name_event_sync_does_not_duplicate_callbacks() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = _make_layer_name_sync_widget(viewer, table)
+
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    layer.name = "Renamed Heatmap"
+    layer.events.name.emit(types.SimpleNamespace(source=layer))
+
+    assert len(layer.events.name._callbacks) == 1
+    table.set_heatmap_layers_by_file_id.assert_called_once_with(
+        {"n1": ("Renamed Heatmap",)}
+    )
+
+
+def test_removed_layer_name_event_disconnects_from_table_membership_sync() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = _make_layer_name_sync_widget(viewer, table)
+
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    viewer.layers.remove(layer)
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    layer.name = "Stale Heatmap"
+    layer.events.name.emit(types.SimpleNamespace(source=layer))
+
+    assert layer.events.name._callbacks == []
+    table.set_heatmap_layers_by_file_id.assert_not_called()
+
+
+def test_manual_heatmap_combo_preserves_selection_by_stable_id_after_rename() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    combo = _DummyMutableComboBox()
+    table = types.SimpleNamespace(apply_filters=MagicMock())
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _manual_heatmap_combo=combo,
+        _cluster_filter_combo=_DummyClusterFilterCombo(),
+        _neuron_table=table,
+    )
+    _bind_manual_heatmap_helpers(widget)
+
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+    combo.setCurrentIndex(1)
+    layer.name = "Renamed Heatmap"
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+
+    assert combo.currentText() == "Renamed Heatmap"
+    assert NeuronViewerWidget._manual_heatmap_combo_data(widget) == (
+        "Renamed Heatmap",
+        ("n1",),
+    )
+    table.apply_filters.assert_not_called()
 
 
 def test_manual_heatmap_combo_lists_only_manual_heatmaps_and_preserves_selection() -> None:
