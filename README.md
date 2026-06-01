@@ -152,7 +152,8 @@ copy those limits into the threshold bounds, and then create the mask. The
 of these generated mask layers, using either any-node or soma-only membership.
 Mask queries read the current mask layer voxels, so manual edits to a generated
 mask change the query volume. When a mask was created from heatmaps with tracked
-source neurons, those source neurons are excluded from the mask query results.
+source neurons, the `Regions` tab shows their count and can exclude them from
+the mask query results.
 
 ## Hemisphere Detection and Coordinate Flipping
 

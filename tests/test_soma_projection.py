@@ -1092,6 +1092,10 @@ def _bind_region_query_scope_helpers(widget) -> None:
         NeuronViewerWidget._source_file_ids_for_layers,
         widget,
     )
+    widget._mask_source_exclusion_enabled = types.MethodType(
+        NeuronViewerWidget._mask_source_exclusion_enabled,
+        widget,
+    )
     widget._selected_region_query_scope = types.MethodType(
         NeuronViewerWidget._selected_region_query_scope,
         widget,
@@ -1926,6 +1930,12 @@ def test_source_file_ids_for_layers_deduplicates_metadata_sources() -> None:
     ]
 
 
+def test_mask_source_exclusion_defaults_to_enabled_without_checkbox() -> None:
+    widget = types.SimpleNamespace()
+
+    assert NeuronViewerWidget._mask_source_exclusion_enabled(widget) is True
+
+
 def test_query_neurons_by_mask_uses_current_layer_data_and_excludes_sources() -> None:
     result = pd.DataFrame(
         {
@@ -1949,6 +1959,7 @@ def test_query_neurons_by_mask_uses_current_layer_data_and_excludes_sources() ->
         _selected_mask_query_layers=lambda: [layer],
         _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
         _regions_status_label=_DummyLabel(),
+        _mask_exclude_source_neurons_cb=_DummyCheckBox(True),
         _populate_neuron_table=MagicMock(),
     )
     widget._normalise_layer_file_ids = NeuronViewerWidget._normalise_layer_file_ids
@@ -1976,6 +1987,122 @@ def test_query_neurons_by_mask_uses_current_layer_data_and_excludes_sources() ->
         "Found 1 neuron(s) with any node in 1 selected mask layer(s) "
         "within whole parquet: Mask A; excluded 2 source neurons"
     )
+
+
+def test_query_neurons_by_mask_includes_sources_when_checkbox_unchecked() -> None:
+    result = pd.DataFrame(
+        {
+            "file_id": ["n1", "n3"],
+            "neuron_id": ["N1", "N3"],
+            "subject": ["s1", "s3"],
+        }
+    )
+    db = MagicMock()
+    db.get_neurons_by_mask.return_value = result
+    layer = types.SimpleNamespace(
+        name="Mask A",
+        data=np.ones((2, 2, 2), dtype=np.uint8),
+        metadata={"query_excluded_file_ids": ["n1", "n2"]},
+    )
+    widget = types.SimpleNamespace(
+        _db=db,
+        _atlas=types.SimpleNamespace(annotation=np.zeros((2, 2, 2), dtype=np.uint8)),
+        _selected_mask_query_layers=lambda: [layer],
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _mask_exclude_source_neurons_cb=_DummyCheckBox(False),
+        _populate_neuron_table=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_mask(widget, soma_only=False)
+
+    _args, kwargs = db.get_neurons_by_mask.call_args
+    assert kwargs["exclude_file_ids"] is None
+    assert widget._regions_status_label.text == (
+        "Found 2 neuron(s) with any node in 1 selected mask layer(s) "
+        "within whole parquet: Mask A"
+    )
+
+
+def test_update_mask_query_summary_counts_unique_selected_source_neurons() -> None:
+    layer_a = types.SimpleNamespace(
+        name="Mask A",
+        metadata={"query_excluded_file_ids": ["n1", "n2"]},
+    )
+    layer_b = types.SimpleNamespace(
+        name="Mask B",
+        metadata={"source_file_ids": ["n2", "n3"]},
+    )
+    label = _DummyLabel()
+    widget = types.SimpleNamespace(
+        _mask_query_hint_label=label,
+        _mask_exclude_source_neurons_cb=_DummyCheckBox(True),
+        _generated_mask_layers=lambda: [layer_a, layer_b],
+        _selected_mask_query_layers=lambda: [layer_a, layer_b],
+    )
+    widget._normalise_layer_file_ids = NeuronViewerWidget._normalise_layer_file_ids
+    widget._source_file_ids_for_layers = types.MethodType(
+        NeuronViewerWidget._source_file_ids_for_layers,
+        widget,
+    )
+    widget._mask_source_exclusion_enabled = types.MethodType(
+        NeuronViewerWidget._mask_source_exclusion_enabled,
+        widget,
+    )
+
+    NeuronViewerWidget._update_mask_query_summary(widget)
+
+    assert label.text == (
+        "Selected mask layer(s) were generated from 3 unique source neuron(s); "
+        "source neurons will be excluded."
+    )
+
+    widget._mask_exclude_source_neurons_cb.setChecked(False)
+    NeuronViewerWidget._update_mask_query_summary(widget)
+
+    assert label.text == (
+        "Selected mask layer(s) were generated from 3 unique source neuron(s); "
+        "source neurons will be included."
+    )
+
+
+def test_update_mask_query_summary_handles_empty_selection_and_missing_sources() -> None:
+    layer_a = types.SimpleNamespace(name="Mask A", metadata={})
+    layer_b = types.SimpleNamespace(name="Mask B", metadata={})
+    label = _DummyLabel()
+    widget = types.SimpleNamespace(
+        _mask_query_hint_label=label,
+        _mask_exclude_source_neurons_cb=_DummyCheckBox(True),
+        _generated_mask_layers=lambda: [layer_a, layer_b],
+        _selected_mask_query_layers=lambda: [],
+    )
+    widget._normalise_layer_file_ids = NeuronViewerWidget._normalise_layer_file_ids
+    widget._source_file_ids_for_layers = types.MethodType(
+        NeuronViewerWidget._source_file_ids_for_layers,
+        widget,
+    )
+    widget._mask_source_exclusion_enabled = types.MethodType(
+        NeuronViewerWidget._mask_source_exclusion_enabled,
+        widget,
+    )
+
+    NeuronViewerWidget._update_mask_query_summary(widget)
+
+    assert label.text == (
+        "2 generated mask layer(s) available. "
+        "Select mask layers to see source-neuron count."
+    )
+
+    widget._selected_mask_query_layers = lambda: [layer_a]
+    NeuronViewerWidget._update_mask_query_summary(widget)
+
+    assert label.text == "Selected mask layer(s) do not record source neurons."
+
+    widget._generated_mask_layers = lambda: []
+    NeuronViewerWidget._update_mask_query_summary(widget)
+
+    assert label.text == "No generated mask layers are available."
 
 
 def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:

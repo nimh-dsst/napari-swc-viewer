@@ -1029,6 +1029,22 @@ class NeuronViewerWidget(QWidget):
         )
         mask_layout.addWidget(self._mask_layer_selector)
 
+        self._mask_exclude_source_neurons_cb = QCheckBox(
+            "Exclude neurons used to generate selected mask layer(s)"
+        )
+        set_checked = getattr(
+            self._mask_exclude_source_neurons_cb,
+            "setChecked",
+            None,
+        )
+        if callable(set_checked):
+            set_checked(True)
+        toggled = getattr(self._mask_exclude_source_neurons_cb, "toggled", None)
+        connect = getattr(toggled, "connect", None)
+        if callable(connect):
+            connect(lambda _checked: self._update_mask_query_summary())
+        mask_layout.addWidget(self._mask_exclude_source_neurons_cb)
+
         self._mask_query_hint_label = QLabel("")
         self._mask_query_hint_label.setWordWrap(True)
         mask_layout.addWidget(self._mask_query_hint_label)
@@ -3008,19 +3024,7 @@ class NeuronViewerWidget(QWidget):
                 }
             )
         self._mask_layer_selector.set_mask_layers(mask_entries)
-        if masks:
-            with_source_ids = sum(
-                1 for layer in masks if self._source_file_ids_for_layers([layer])
-            )
-            hint = f"{len(masks)} generated mask layer(s) available."
-            if with_source_ids:
-                hint += (
-                    " Source neurons recorded in mask metadata are excluded "
-                    "from mask queries."
-                )
-        else:
-            hint = "No generated mask layers are available."
-        self._mask_query_hint_label.setText(hint)
+        self._update_mask_query_summary()
 
     def _current_tools_create_mode(self) -> str:
         """Return the active Tools create mode."""
@@ -3590,6 +3594,51 @@ class NeuronViewerWidget(QWidget):
                 )
         return NeuronViewerWidget._deduplicate_file_ids(file_ids)
 
+    def _mask_source_exclusion_enabled(self) -> bool:
+        """Return whether mask queries should exclude source neurons."""
+        checkbox = getattr(self, "_mask_exclude_source_neurons_cb", None)
+        is_checked = getattr(checkbox, "isChecked", None)
+        if callable(is_checked):
+            return bool(is_checked())
+        return True
+
+    def _update_mask_query_summary(self) -> None:
+        """Update the Regions-tab summary for selected mask source neurons."""
+        label = getattr(self, "_mask_query_hint_label", None)
+        if label is None:
+            return
+
+        masks = self._generated_mask_layers()
+        if not masks:
+            label.setText("No generated mask layers are available.")
+            return
+
+        selected_layers = self._selected_mask_query_layers()
+        if not selected_layers:
+            label.setText(
+                f"{len(masks)} generated mask layer(s) available. "
+                "Select mask layers to see source-neuron count."
+            )
+            return
+
+        source_file_ids = self._source_file_ids_for_layers(selected_layers)
+        if not source_file_ids:
+            label.setText(
+                "Selected mask layer(s) do not record source neurons."
+            )
+            return
+
+        action = (
+            "excluded"
+            if self._mask_source_exclusion_enabled()
+            else "included"
+        )
+        label.setText(
+            "Selected mask layer(s) were generated from "
+            f"{len(source_file_ids)} unique source neuron(s); "
+            f"source neurons will be {action}."
+        )
+
     def _on_mask_layer_selection_changed(self, selected_names: list[str]) -> None:
         """Update Regions status text when mask selection changes."""
         count = len(selected_names)
@@ -3601,6 +3650,7 @@ class NeuronViewerWidget(QWidget):
             self._regions_status_label.setText(
                 f"{count} mask layers selected for querying."
             )
+        self._update_mask_query_summary()
 
     def _create_blurred_layers_from_heatmaps(self) -> None:
         """Create blurred image layers from the selected heatmaps."""
@@ -4339,7 +4389,10 @@ class NeuronViewerWidget(QWidget):
             show_warning(message)
             return
 
-        exclude_file_ids = self._source_file_ids_for_layers(layers)
+        source_file_ids = self._source_file_ids_for_layers(layers)
+        exclude_file_ids = (
+            source_file_ids if self._mask_source_exclusion_enabled() else []
+        )
         try:
             proceed, base_file_ids, scope_label, input_count = (
                 self._resolve_region_query_file_scope()
