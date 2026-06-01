@@ -292,7 +292,7 @@ class _DummyPointsLayer:
         self.scale = kwargs.get("scale")
         self.metadata = kwargs.get("metadata", {})
         self.opacity = kwargs.get("opacity", 1.0)
-        self.visible = True
+        self.visible = kwargs.get("visible", True)
         self.size = kwargs.get("size")
         self.text = kwargs.get("text")
         self.mode = "pan_zoom"
@@ -1157,11 +1157,52 @@ def test_soma_slice_projector_updates_layer_and_clear_removes_it() -> None:
     assert layer.border_color == "#39ff14"
     assert layer.border_width == 0.15
     assert layer.text == {"visible": False}
+    assert layer.visible is True
 
     projector.clear()
 
     assert viewer.layers == []
     assert projector._projection_layer is None
+
+
+def test_soma_slice_projector_recreates_hidden_layer_in_3d() -> None:
+    viewer = _DummyViewer(
+        ndisplay=3,
+        not_displayed=(),
+        point=(0.0, 0.0, 0.0),
+    )
+    projector = _make_soma_projector(viewer, tolerance=1.0, point_size=9)
+    projector.add_soma_data("neuron-a", np.array([[10.0, 5.0, 5.0]]))
+
+    projector._do_update_projection()
+
+    assert len(viewer.layers) == 1
+    layer = viewer.layers[0]
+    assert layer.name == "Soma Slice Projection"
+    assert layer.metadata["file_ids"] == []
+    assert layer.visible is False
+    assert layer.data.shape == (0, 3)
+    np.testing.assert_allclose(layer.face_color, np.array([1.0, 0.0, 0.0, 1.0]))
+
+
+def test_soma_slice_projector_keeps_empty_layer_when_2d_slice_has_no_hits() -> None:
+    viewer = _DummyViewer(
+        ndisplay=2,
+        not_displayed=(0,),
+        point=(0.0, 0.0, 0.0),
+    )
+    projector = _make_soma_projector(viewer, tolerance=1.0, point_size=9)
+    projector.add_soma_data("neuron-a", np.array([[10.0, 5.0, 5.0]]))
+
+    projector._do_update_projection()
+
+    assert len(viewer.layers) == 1
+    layer = viewer.layers[0]
+    assert layer.name == "Soma Slice Projection"
+    assert layer.metadata["file_ids"] == []
+    assert layer.visible is True
+    assert layer.data.shape == (0, 3)
+    np.testing.assert_allclose(layer.face_color, np.array([1.0, 0.0, 0.0, 1.0]))
 
 
 def test_build_soma_projection_batch_uses_rendered_soma_points_when_available() -> None:
