@@ -70,6 +70,13 @@ from ..point_import import (
     summarize_standard_point_parquet_groups,
     validate_point_metadata_against_atlas,
 )
+from ..project_io import (
+    ProjectBundle,
+    export_enhanced_neuron_parquet,
+    load_project_bundle,
+    read_enhanced_parquet_metadata,
+    save_project_bundle,
+)
 from .reference_layers import (
     add_allen_template,
     add_brain_outline,
@@ -483,6 +490,7 @@ class NeuronViewerWidget(QWidget):
             self._point_parquet_path: str | None = None
             self._point_parquet_has_origin_csv = False
             self._point_preview_counts: dict[tuple[str, str], int] = {}
+            self._saved_table_state: dict[str, object] = {}
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
             self._layer_name_event_connections: dict[
@@ -692,6 +700,30 @@ class NeuronViewerWidget(QWidget):
         load_btn.clicked.connect(self._load_parquet)
         file_row.addWidget(load_btn)
         file_layout.addLayout(file_row)
+
+        project_io_row = QHBoxLayout()
+        self._save_project_btn = QPushButton("Save Project...")
+        self._save_project_btn.clicked.connect(self._save_project_bundle_dialog)
+        project_io_row.addWidget(self._save_project_btn)
+
+        self._load_project_btn = QPushButton("Load Project...")
+        self._load_project_btn.clicked.connect(self._load_project_bundle_dialog)
+        project_io_row.addWidget(self._load_project_btn)
+
+        self._export_enhanced_parquet_btn = QPushButton("Export Enhanced Parquet...")
+        self._export_enhanced_parquet_btn.clicked.connect(
+            self._export_enhanced_parquet_dialog
+        )
+        project_io_row.addWidget(self._export_enhanced_parquet_btn)
+        file_layout.addLayout(project_io_row)
+
+        self._project_progress = QProgressBar()
+        self._project_progress.setVisible(False)
+        file_layout.addWidget(self._project_progress)
+
+        self._project_status_label = QLabel("")
+        self._project_status_label.setWordWrap(True)
+        file_layout.addWidget(self._project_status_label)
 
         # Stats
         self._stats_label = QLabel("")
@@ -1544,26 +1576,440 @@ class NeuronViewerWidget(QWidget):
             return
 
         try:
-            self._db = NeuronDatabase(filepath)
-            self._file_label.setText(Path(filepath).name)
-
-            # Update stats
-            stats = self._db.get_statistics()
-            self._stats_label.setText(
-                f"Nodes: {stats['n_nodes']:,} | "
-                f"Files: {stats['n_files']:,} | "
-                f"Subjects: {stats['n_subjects']:,} | "
-                f"Regions: {stats['n_regions']:,}"
-            )
-
-            self._set_region_query_buttons_enabled(True)
-            self._analysis_tab.set_database(self._db)
-            self._regions_status_label.setText("")
+            self._load_parquet_path(filepath)
             logger.info(f"Loaded Parquet file: {filepath}")
 
         except Exception as e:
             logger.error(f"Failed to load Parquet file: {e}")
             self._file_label.setText(f"Error: {e}")
+
+    def _load_parquet_path(self, filepath: str | Path) -> None:
+        """Load a neuron Parquet path and capture optional enhanced metadata."""
+        filepath = str(filepath)
+        new_db = NeuronDatabase(filepath)
+        old_db = self._db
+        self._db = new_db
+        if old_db is not None:
+            try:
+                old_db.close()
+            except Exception:
+                logger.debug("Failed to close previous neuron database", exc_info=True)
+
+        self._file_label.setText(Path(filepath).name)
+
+        stats = self._db.get_statistics()
+        stats_text = (
+            f"Nodes: {stats['n_nodes']:,} | "
+            f"Files: {stats['n_files']:,} | "
+            f"Subjects: {stats['n_subjects']:,} | "
+            f"Regions: {stats['n_regions']:,}"
+        )
+
+        enhanced_count = self._load_enhanced_table_state(filepath)
+        if enhanced_count:
+            stats_text += f" | Enhanced labels: {enhanced_count:,}"
+        self._stats_label.setText(stats_text)
+
+        self._set_region_query_buttons_enabled(True)
+        self._analysis_tab.set_database(self._db)
+        self._regions_status_label.setText("")
+        saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
+        if callable(saved_state_applier):
+            saved_state_applier()
+
+    def _load_enhanced_table_state(self, filepath: str | Path) -> int:
+        """Read enhanced parquet table metadata without making it mandatory."""
+        self._saved_table_state = {}
+        try:
+            payload = read_enhanced_parquet_metadata(filepath)
+        except Exception:
+            logger.debug(
+                "No readable enhanced parquet metadata for %s",
+                filepath,
+                exc_info=True,
+            )
+            return 0
+
+        table_state = payload.get("table_state")
+        if not isinstance(table_state, dict):
+            return 0
+        entries = table_state.get("entries", [])
+        if not entries:
+            return 0
+        self._saved_table_state = table_state
+        return len(entries)
+
+    def _current_table_state(self) -> dict[str, object]:
+        """Return the current neuron table state for project/enhanced exports."""
+        exporter = getattr(self._neuron_table, "export_state", None)
+        if callable(exporter):
+            return exporter()
+        return {"version": 1, "entries": []}
+
+    def _analysis_project_metadata(self) -> dict[str, object]:
+        """Return compact analysis metadata for project-bundle JSON."""
+        result = getattr(self._analysis_tab, "_last_cluster_result", None)
+        if result is None:
+            return {}
+
+        run_metadata = getattr(result, "metadata", None)
+        payload: dict[str, object] = {
+            "run_metadata": (
+                run_metadata.to_dict()
+                if run_metadata is not None and hasattr(run_metadata, "to_dict")
+                else None
+            ),
+            "neuron_ids": list(getattr(result, "neuron_ids", [])),
+        }
+        labels = getattr(result, "labels", None)
+        if labels is not None:
+            payload["cluster_labels"] = [int(value) for value in np.asarray(labels).reshape(-1)]
+        reorder = getattr(result, "reorder_indices", None)
+        if reorder is not None:
+            payload["dendrogram_order"] = [int(value) for value in np.asarray(reorder).reshape(-1)]
+        return payload
+
+    def _save_project_bundle_dialog(self) -> None:
+        """Prompt for and save a lossless project bundle directory."""
+        if self._db is None:
+            message = "Load a neuron Parquet before saving a project."
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+
+        default_name = f"{Path(self._db.parquet_path).stem}.swcv"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save SWC Viewer Project",
+            default_name,
+            "SWC Viewer Project (*.swcv);;All Files (*)",
+        )
+        if not output_path:
+            return
+        bundle_path = Path(output_path)
+        if bundle_path.suffix != ".swcv":
+            bundle_path = bundle_path.with_suffix(".swcv")
+
+        self._save_project_btn.setEnabled(False)
+        self._project_progress.setVisible(True)
+        self._project_progress.setRange(0, 0)
+        self._project_progress.setValue(0)
+        self._project_status_label.setText("Saving project bundle...")
+        QApplication.processEvents()
+
+        def _on_save_progress(message: str, current: int, total: int) -> None:
+            self._project_progress.setVisible(True)
+            if total > 0:
+                self._project_progress.setRange(0, total)
+                self._project_progress.setValue(max(0, min(current, total)))
+            else:
+                self._project_progress.setRange(0, 0)
+            self._project_status_label.setText(message)
+            QApplication.processEvents()
+
+        try:
+            saved = save_project_bundle(
+                bundle_path,
+                source_parquet_path=self._db.parquet_path,
+                table_state=self._current_table_state(),
+                layers=self._iter_viewer_layers(),
+                atlas_name=self._current_atlas_name(),
+                analysis_metadata=self._analysis_project_metadata(),
+                progress_callback=_on_save_progress,
+            )
+        except Exception as exc:
+            logger.error("Failed to save project bundle: %s", exc)
+            self._save_project_btn.setEnabled(True)
+            self._project_progress.setVisible(False)
+            self._project_progress.setRange(0, 1)
+            self._project_progress.setValue(0)
+            self._project_status_label.setText(f"Failed to save project: {exc}")
+            self._regions_status_label.setText(f"Failed to save project: {exc}")
+            show_warning(f"Failed to save project: {exc}")
+            return
+
+        self._save_project_btn.setEnabled(True)
+        self._project_progress.setVisible(False)
+        self._project_progress.setRange(0, 1)
+        self._project_progress.setValue(0)
+        message = f"Saved project bundle: {saved.name}"
+        self._project_status_label.setText(message)
+        self._regions_status_label.setText(message)
+        show_info(message)
+
+    def _load_project_bundle_dialog(self) -> None:
+        """Prompt for and restore a project bundle directory."""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Open SWC Viewer Project",
+            "",
+        )
+        if not directory:
+            return
+        try:
+            bundle = load_project_bundle(directory)
+            self._restore_project_bundle(bundle)
+        except Exception as exc:
+            logger.error("Failed to load project bundle: %s", exc)
+            self._regions_status_label.setText(f"Failed to load project: {exc}")
+            show_warning(f"Failed to load project: {exc}")
+            return
+
+        message = f"Loaded project bundle: {Path(directory).name}"
+        self._regions_status_label.setText(message)
+        show_info(message)
+
+    def _export_enhanced_parquet_dialog(self) -> None:
+        """Prompt for and export the loaded neuron parquet with table metadata."""
+        if self._db is None:
+            message = "Load a neuron Parquet before exporting enhanced Parquet."
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+
+        default_name = f"{Path(self._db.parquet_path).stem}_enhanced.parquet"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Enhanced Neuron Parquet",
+            default_name,
+            "Parquet Files (*.parquet);;All Files (*)",
+        )
+        if not output_path:
+            return
+
+        try:
+            saved = export_enhanced_neuron_parquet(
+                self._db.parquet_path,
+                output_path,
+                table_state=self._current_table_state(),
+                metadata={
+                    "atlas_name": self._current_atlas_name(),
+                    "analysis": self._analysis_project_metadata(),
+                },
+            )
+        except Exception as exc:
+            logger.error("Failed to export enhanced parquet: %s", exc)
+            self._regions_status_label.setText(f"Failed to export enhanced Parquet: {exc}")
+            show_warning(f"Failed to export enhanced Parquet: {exc}")
+            return
+
+        message = f"Exported enhanced Parquet: {saved.name}"
+        self._regions_status_label.setText(message)
+        show_info(message)
+
+    def _restore_project_bundle(self, bundle: ProjectBundle) -> None:
+        """Restore a loaded project bundle into the current widget/viewer."""
+        self._load_parquet_path(bundle.source_parquet_path)
+        self._saved_table_state = dict(bundle.table_state)
+
+        importer = getattr(self._neuron_table, "import_state", None)
+        if callable(importer):
+            importer(bundle.table_state)
+            self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+
+        self._restore_project_layers(bundle)
+        self._sync_neuron_table_heatmap_membership()
+        self._refresh_manual_heatmap_combo()
+        self._refresh_heatmap_layer_list()
+        self._refresh_histogram_layer_list()
+        self._refresh_mask_layer_options()
+        self._sync_after_neuron_table_membership_change()
+
+    def _restore_project_layers(self, bundle: ProjectBundle) -> None:
+        """Recreate saved app-created image and label layers from bundle arrays."""
+        for project_layer in bundle.layers:
+            payload = project_layer.metadata
+            layer_name = str(payload.get("name") or project_layer.layer_id)
+            self._remove_existing_app_layer(layer_name)
+
+            layer_type = str(payload.get("layer_type") or "image")
+            display = payload.get("display", {})
+            if not isinstance(display, dict):
+                display = {}
+            layer_metadata = payload.get("metadata", {})
+            if not isinstance(layer_metadata, dict):
+                layer_metadata = {}
+
+            kwargs = {
+                "name": layer_name,
+                "opacity": float(display.get("opacity", 0.7)),
+                "visible": bool(display.get("visible", True)),
+                "metadata": layer_metadata,
+            }
+            for attr_name in ("scale", "translate"):
+                if attr_name in display and display[attr_name] is not None:
+                    kwargs[attr_name] = display[attr_name]
+
+            if layer_type == "labels":
+                self._restore_project_labels_layer(
+                    project_layer.data,
+                    kwargs,
+                    display,
+                    layer_metadata,
+                )
+            else:
+                self._restore_project_image_layer(
+                    project_layer.data,
+                    kwargs,
+                    display,
+                    layer_metadata,
+                )
+
+    def _remove_existing_app_layer(self, layer_name: str) -> None:
+        """Remove an existing app-created layer with the same name, if present."""
+        for layer in list(self._iter_viewer_layers()):
+            if getattr(layer, "name", None) != layer_name:
+                continue
+            metadata = _layer_metadata(layer)
+            if metadata.get("heatmap_source") or metadata.get("mask_query_source"):
+                self.viewer.layers.remove(layer)
+                return
+
+    def _restore_project_labels_layer(
+        self,
+        data: np.ndarray,
+        kwargs: dict[str, object],
+        display: dict[str, object],
+        layer_metadata: dict[str, object],
+    ) -> None:
+        """Restore one saved labels layer with a binary color when available."""
+        restored = self._apply_project_colormap_kwargs(kwargs, display)
+        if restored:
+            self.viewer.add_labels(data, **kwargs)
+            return
+
+        color = layer_metadata.get("color")
+        try:
+            from napari.utils import DirectLabelColormap
+
+            rgba = (
+                np.asarray(color, dtype=np.float32)
+                if color is not None
+                else np.asarray((0.8, 0.8, 0.8, 1.0), dtype=np.float32)
+            )
+            kwargs["colormap"] = DirectLabelColormap(
+                color_dict={
+                    None: np.asarray((0.0, 0.0, 0.0, 0.0), dtype=np.float32),
+                    0: np.asarray((0.0, 0.0, 0.0, 0.0), dtype=np.float32),
+                    1: rgba,
+                }
+            )
+        except Exception:
+            logger.debug("Could not restore project labels colormap", exc_info=True)
+        self.viewer.add_labels(data, **kwargs)
+
+    def _restore_project_image_layer(
+        self,
+        data: np.ndarray,
+        kwargs: dict[str, object],
+        display: dict[str, object],
+        layer_metadata: dict[str, object],
+    ) -> None:
+        """Restore one saved image layer with app metadata and display options."""
+        for attr_name in ("blending", "rendering"):
+            if attr_name in display and display[attr_name] is not None:
+                kwargs[attr_name] = display[attr_name]
+        limits = display.get("contrast_limits")
+        if limits is not None:
+            kwargs["contrast_limits"] = limits
+
+        color = layer_metadata.get("color")
+        restored = self._apply_project_colormap_kwargs(kwargs, display)
+        if not restored and color is not None:
+            try:
+                from napari.utils.colormaps import Colormap
+
+                rgba = np.asarray(color, dtype=float).reshape(-1)
+                if rgba.size >= 3:
+                    alpha = float(rgba[3]) if rgba.size >= 4 else 1.0
+                    kwargs["colormap"] = Colormap(
+                        colors=[
+                            [0.0, 0.0, 0.0, 0.0],
+                            [float(rgba[0]), float(rgba[1]), float(rgba[2]), alpha],
+                        ],
+                        name=f"restored_{str(kwargs['name']).lower().replace(' ', '_')}",
+                    )
+            except Exception:
+                logger.debug("Could not restore project image colormap", exc_info=True)
+
+        self.viewer.add_image(data, **kwargs)
+
+    @staticmethod
+    def _project_label_key(payload: object) -> object:
+        """Return a labels-colormap key from a saved JSON key payload."""
+        if not isinstance(payload, dict):
+            return payload
+        key_type = payload.get("type")
+        value = payload.get("value")
+        if key_type == "none":
+            return None
+        if key_type == "int":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+        return value
+
+    def _apply_project_colormap_kwargs(
+        self,
+        kwargs: dict[str, object],
+        display: dict[str, object],
+    ) -> bool:
+        """Apply a saved project colormap to layer-add kwargs when possible."""
+        payload = display.get("colormap")
+        if not isinstance(payload, dict):
+            return False
+
+        payload_type = payload.get("type")
+        try:
+            if payload_type == "direct_label_colormap":
+                from napari.utils import DirectLabelColormap
+
+                color_dict = {}
+                for item in payload.get("color_dict", []):
+                    if not isinstance(item, dict):
+                        continue
+                    color = item.get("color")
+                    if color is None:
+                        continue
+                    color_dict[self._project_label_key(item.get("label"))] = np.asarray(
+                        color,
+                        dtype=np.float32,
+                    )
+                if not color_dict:
+                    return False
+                kwargs["colormap"] = DirectLabelColormap(
+                    color_dict=color_dict,
+                    use_selection=bool(payload.get("use_selection", False)),
+                )
+                return True
+
+            if payload_type == "colormap":
+                from napari.utils.colormaps import Colormap
+
+                colors = payload.get("colors")
+                if colors is None:
+                    return False
+                colormap_kwargs = {
+                    "colors": colors,
+                    "name": str(payload.get("name") or "restored_colormap"),
+                }
+                if payload.get("controls") is not None:
+                    colormap_kwargs["controls"] = payload.get("controls")
+                if payload.get("interpolation") is not None:
+                    colormap_kwargs["interpolation"] = payload.get("interpolation")
+                for key in ("low_color", "high_color", "nan_color"):
+                    if payload.get(key) is not None:
+                        colormap_kwargs[key] = payload.get(key)
+                kwargs["colormap"] = Colormap(**colormap_kwargs)
+                return True
+
+            if payload_type == "named_colormap" and payload.get("name"):
+                kwargs["colormap"] = str(payload["name"])
+                return True
+        except Exception:
+            logger.debug("Could not restore saved project colormap", exc_info=True)
+        return False
 
     def _load_atlas(self) -> None:
         """Load the selected BrainGlobe atlas."""
@@ -4514,6 +4960,9 @@ class NeuronViewerWidget(QWidget):
             ]
             self._neuron_table.populate(neurons)
 
+        saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
+        if callable(saved_state_applier):
+            saved_state_applier()
         self._discard_scene_display_state(self._current_table_file_ids())
         self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
         sync_heatmaps = getattr(self, "_sync_neuron_table_heatmap_membership", None)
@@ -4535,6 +4984,15 @@ class NeuronViewerWidget(QWidget):
         ):
             manual_heatmap_handler()
         self._sync_after_neuron_table_membership_change()
+
+    def _apply_saved_table_state_to_table(self) -> None:
+        """Apply enhanced parquet or project table state to current table rows."""
+        table_state = getattr(self, "_saved_table_state", None)
+        if not isinstance(table_state, dict) or not table_state.get("entries"):
+            return
+        applier = getattr(self._neuron_table, "apply_state", None)
+        if callable(applier):
+            applier(table_state, preserve_membership=True)
 
     def _selected_cluster_filter(self) -> ClusterFilterSelection:
         """Return selected cluster groups from the Data tab dropdown."""

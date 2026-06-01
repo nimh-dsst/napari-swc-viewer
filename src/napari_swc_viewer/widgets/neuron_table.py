@@ -57,8 +57,18 @@ COL_ADDED = 1
 COL_HEATMAP = 2
 COL_NEURON_ID = 3
 COL_SUBJECT = 4
-COL_CLUSTER = 5
-COL_COLOR = 6
+COL_LABEL = 5
+COL_GROUP = 6
+COL_TAGS = 7
+COL_NOTES = 8
+COL_CLUSTER = 9
+COL_COLOR = 10
+_EDITABLE_METADATA_COLUMNS = {
+    COL_LABEL: "label",
+    COL_GROUP: "group",
+    COL_TAGS: "tags",
+    COL_NOTES: "notes",
+}
 
 
 class _NumericSortItem(QTableWidgetItem):
@@ -83,6 +93,83 @@ class NeuronEntry:
     visible: bool = True
     added_to_scene: bool = False
     heatmap_layer_names: tuple[str, ...] = ()
+    label: str = ""
+    group: str = ""
+    tags: tuple[str, ...] = ()
+    notes: str = ""
+
+    def to_state(self) -> dict[str, object]:
+        """Return a JSON-safe representation of this row."""
+        return {
+            "file_id": self.file_id,
+            "subject": self.subject,
+            "color": list(self.color),
+            "cluster_id": self.cluster_id,
+            "visible": self.visible,
+            "added_to_scene": self.added_to_scene,
+            "heatmap_layer_names": list(self.heatmap_layer_names),
+            "label": self.label,
+            "group": self.group,
+            "tags": list(self.tags),
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, object]) -> "NeuronEntry":
+        """Create an entry from a previously exported table-state row."""
+        file_id = state.get("file_id")
+        tags = state.get("tags", ())
+        if isinstance(tags, str):
+            normalized_tags = tuple(
+                part.strip() for part in tags.split(",") if part.strip()
+            )
+        else:
+            try:
+                normalized_tags = tuple(
+                    str(part).strip() for part in tags if str(part).strip()
+                )
+            except TypeError:
+                normalized_tags = ()
+        cluster_value = state.get("cluster_id", state.get("cluster_assignment"))
+        cluster_id: int | None
+        if cluster_value in (None, ""):
+            cluster_id = None
+        else:
+            try:
+                cluster_id = int(cluster_value)
+            except (TypeError, ValueError):
+                cluster_id = None
+        color = state.get("color", GRAY_RGBA)
+        if isinstance(color, (str, bytes)):
+            color_values = list(GRAY_RGBA)
+        else:
+            try:
+                color_values = [float(value) for value in color]  # type: ignore[union-attr]
+            except TypeError:
+                color_values = list(GRAY_RGBA)
+        while len(color_values) < 4:
+            color_values.append(1.0)
+        heatmap_names = state.get("heatmap_layer_names", ())
+        if isinstance(heatmap_names, str):
+            normalized_heatmaps = (heatmap_names,) if heatmap_names else ()
+        else:
+            try:
+                normalized_heatmaps = tuple(str(name) for name in heatmap_names)
+            except TypeError:
+                normalized_heatmaps = ()
+        return cls(
+            file_id="" if file_id is None else file_id,
+            subject=str(state.get("subject") or ""),
+            color=color_values[:4],
+            cluster_id=cluster_id,
+            visible=bool(state.get("visible", True)),
+            added_to_scene=bool(state.get("added_to_scene", False)),
+            heatmap_layer_names=normalized_heatmaps,
+            label=str(state.get("label", state.get("neuron_label", "")) or ""),
+            group=str(state.get("group", state.get("neuron_group", "")) or ""),
+            tags=normalized_tags,
+            notes=str(state.get("notes", state.get("neuron_notes", "")) or ""),
+        )
 
 
 class NeuronTableWidget(QWidget):
@@ -112,9 +199,21 @@ class NeuronTableWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 7)
+        self._table = QTableWidget(0, 11)
         self._table.setHorizontalHeaderLabels(
-            ["Vis", "Added", "Heatmap", "Neuron ID", "Subject", "Cluster", "Color"]
+            [
+                "Vis",
+                "Added",
+                "Heatmap",
+                "Neuron ID",
+                "Subject",
+                "Label",
+                "Group",
+                "Tags",
+                "Notes",
+                "Cluster",
+                "Color",
+            ]
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -126,11 +225,16 @@ class NeuronTableWidget(QWidget):
         header.setSectionResizeMode(COL_HEATMAP, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_NEURON_ID, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_LABEL, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_GROUP, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_TAGS, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_NOTES, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_CLUSTER, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_COLOR, QHeaderView.ResizeToContents)
 
         self._table.verticalHeader().setVisible(False)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.itemChanged.connect(self._on_item_changed)
         self._table.setSortingEnabled(True)
 
         layout.addWidget(self._table)
@@ -194,6 +298,11 @@ class NeuronTableWidget(QWidget):
         subj_item.setFlags(subj_item.flags() & ~Qt.ItemIsEditable)
         self._table.setItem(row, COL_SUBJECT, subj_item)
 
+        self._set_text_cell(row, COL_LABEL, entry.label, editable=True)
+        self._set_text_cell(row, COL_GROUP, entry.group, editable=True)
+        self._set_text_cell(row, COL_TAGS, self._tags_display(entry.tags), editable=True)
+        self._set_text_cell(row, COL_NOTES, entry.notes, editable=True)
+
         # Cluster
         self._set_cluster_cell(row, entry.cluster_id)
 
@@ -242,6 +351,45 @@ class NeuronTableWidget(QWidget):
         item.setText("" if cluster_id is None else str(cluster_id))
         item.setData(Qt.UserRole, cluster_sort_value(cluster_id))
 
+    def _set_text_cell(
+        self,
+        row: int,
+        column: int,
+        text: str,
+        *,
+        editable: bool,
+    ) -> None:
+        """Set a plain-text cell and its case-insensitive sort key."""
+        item = self._table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            flags = item.flags()
+            if not editable:
+                flags &= ~Qt.ItemIsEditable
+            item.setFlags(flags)
+            self._table.setItem(row, column, item)
+        item.setText(str(text))
+        item.setData(Qt.UserRole, str(text).casefold())
+
+    @staticmethod
+    def _normalise_tags(value: object) -> tuple[str, ...]:
+        """Return tags as a normalized tuple."""
+        if value is None:
+            return ()
+        if isinstance(value, (str, bytes)):
+            text = value.decode("utf-8") if isinstance(value, bytes) else value
+            return tuple(part.strip() for part in text.split(",") if part.strip())
+        try:
+            return tuple(str(part).strip() for part in value if str(part).strip())
+        except TypeError:
+            text = str(value).strip()
+            return (text,) if text else ()
+
+    @staticmethod
+    def _tags_display(tags: Iterable[object]) -> str:
+        """Return tags for display in the editable table cell."""
+        return ", ".join(str(tag) for tag in tags)
+
     def _apply_color_style(self, btn: QPushButton, color: list[float]) -> None:
         """Set the button background to the given RGBA color."""
         r, g, b, a = [int(c * 255) for c in color[:4]]
@@ -284,6 +432,32 @@ class NeuronTableWidget(QWidget):
 
         entry.visible = bool(state)
         self.visibility_changed.emit({fid: e.visible for fid, e in self._entries.items()})
+        self.state_changed.emit()
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        """Update entry metadata after an editable text cell changes."""
+        column = item.column()
+        field_name = _EDITABLE_METADATA_COLUMNS.get(column)
+        if field_name is None:
+            return
+
+        file_id = self._file_id_from_row(item.row())
+        if file_id is None:
+            return
+        entry = self._entries.get(file_id)
+        if entry is None:
+            return
+
+        text = item.text().strip()
+        if field_name == "tags":
+            entry.tags = self._normalise_tags(text)
+            display = self._tags_display(entry.tags)
+            if item.text() != display:
+                item.setText(display)
+            item.setData(Qt.UserRole, display.casefold())
+        else:
+            setattr(entry, field_name, text)
+            item.setData(Qt.UserRole, text.casefold())
         self.state_changed.emit()
 
     def _file_id_from_row(self, row: int) -> object | None:
@@ -405,6 +579,113 @@ class NeuronTableWidget(QWidget):
     def file_ids(self) -> list[object]:
         """Return the file_ids currently shown in the table row order."""
         return [file_id for _row, file_id in self._iter_rows_with_file_ids()]
+
+    def export_state(self) -> dict[str, object]:
+        """Return all table rows and per-neuron UI state as JSON-safe data."""
+        return {
+            "version": 1,
+            "entries": [
+                entry.to_state()
+                for entry in self._entries_in_table_order()
+            ],
+            "selected_file_ids": self.get_selected_file_ids(),
+        }
+
+    def import_state(self, state: Mapping[str, object]) -> None:
+        """Replace table contents from a previously exported state payload."""
+        raw_entries = state.get("entries", [])
+        if isinstance(raw_entries, Mapping):
+            iterable = raw_entries.values()
+        else:
+            try:
+                iterable = list(raw_entries)  # type: ignore[arg-type]
+            except TypeError:
+                iterable = []
+        entries = [
+            NeuronEntry.from_state(entry)
+            for entry in iterable
+            if isinstance(entry, Mapping)
+        ]
+        self._replace_entries(entries)
+        selected = state.get("selected_file_ids", [])
+        if isinstance(selected, (str, bytes)):
+            selected_file_ids = [selected]
+        else:
+            try:
+                selected_file_ids = list(selected)  # type: ignore[arg-type]
+            except TypeError:
+                selected_file_ids = []
+        self.select_file_ids(selected_file_ids)
+
+    def apply_state(
+        self,
+        state: Mapping[str, object],
+        *,
+        preserve_membership: bool = True,
+    ) -> None:
+        """Apply saved per-neuron fields to matching current table rows."""
+        raw_entries = state.get("entries", [])
+        if isinstance(raw_entries, Mapping):
+            iterable = raw_entries.values()
+        else:
+            try:
+                iterable = list(raw_entries)  # type: ignore[arg-type]
+            except TypeError:
+                iterable = []
+
+        by_string_file_id = {}
+        for raw_entry in iterable:
+            if not isinstance(raw_entry, Mapping):
+                continue
+            entry = NeuronEntry.from_state(raw_entry)
+            by_string_file_id[str(entry.file_id)] = entry
+
+        if not by_string_file_id:
+            return
+
+        row_map = self._file_id_to_row_map()
+        sorting_enabled = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
+        try:
+            for file_id, entry in list(self._entries.items()):
+                saved = by_string_file_id.get(str(file_id))
+                if saved is None:
+                    continue
+                entry.color = list(saved.color)
+                entry.cluster_id = saved.cluster_id
+                entry.visible = saved.visible
+                entry.label = saved.label
+                entry.group = saved.group
+                entry.tags = saved.tags
+                entry.notes = saved.notes
+                if not preserve_membership:
+                    entry.added_to_scene = saved.added_to_scene
+                    entry.heatmap_layer_names = saved.heatmap_layer_names
+
+                row = row_map.get(file_id)
+                if row is None:
+                    continue
+                self._update_visibility_checkbox(row, entry.visible)
+                self._update_color_swatch_for_row(row, entry.color)
+                self._set_cluster_cell(row, entry.cluster_id)
+                self._set_text_cell(row, COL_LABEL, entry.label, editable=True)
+                self._set_text_cell(row, COL_GROUP, entry.group, editable=True)
+                self._set_text_cell(
+                    row,
+                    COL_TAGS,
+                    self._tags_display(entry.tags),
+                    editable=True,
+                )
+                self._set_text_cell(row, COL_NOTES, entry.notes, editable=True)
+                if not preserve_membership:
+                    self._set_added_cell(row, entry.added_to_scene)
+                    self._set_heatmap_cell(row, entry.heatmap_layer_names)
+        finally:
+            self._table.setSortingEnabled(sorting_enabled)
+
+        self.visibility_changed.emit(self.get_visibility_map())
+        self.colors_changed.emit(self.get_full_color_map())
+        self.state_changed.emit()
 
     def summary(self) -> NeuronTableSummary:
         """Return summary counts for the current table contents."""

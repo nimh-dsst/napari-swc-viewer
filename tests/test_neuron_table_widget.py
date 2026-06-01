@@ -310,6 +310,88 @@ def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallba
     assert len(widget.state_changed.calls) == 1
 
 
+def test_neuron_table_export_state_includes_label_schema_fields() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(
+                file_id="n1",
+                subject="s1",
+                color=[0.1, 0.2, 0.3, 1.0],
+                cluster_id=4,
+                visible=False,
+                label="projection",
+                group="A",
+                tags=("axon", "reviewed"),
+                notes="keep",
+            )
+        },
+    )
+
+    state = widget.export_state()
+
+    assert state["entries"] == [
+        {
+            "file_id": "n1",
+            "subject": "s1",
+            "color": [0.1, 0.2, 0.3, 1.0],
+            "cluster_id": 4,
+            "visible": False,
+            "added_to_scene": False,
+            "heatmap_layer_names": [],
+            "label": "projection",
+            "group": "A",
+            "tags": ["axon", "reviewed"],
+            "notes": "keep",
+        }
+    ]
+
+
+def test_neuron_table_apply_state_restores_matching_label_fields() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+        },
+    )
+    widget._update_visibility_checkbox = lambda row, visible: None
+    widget._update_color_swatch_for_row = lambda row, color: None
+    widget._set_cluster_cell = lambda row, cluster_id: None
+    widget._set_text_cell = lambda row, column, text, editable: None
+    widget.colors_changed = _DummySignal()
+    widget.visibility_changed = _DummySignal()
+
+    widget.apply_state(
+        {
+            "entries": [
+                {
+                    "file_id": "n1",
+                    "label": "projection",
+                    "group": "A",
+                    "tags": ["axon"],
+                    "notes": "keep",
+                    "cluster_id": 9,
+                    "visible": False,
+                    "color": [0.9, 0.8, 0.7, 1.0],
+                }
+            ]
+        }
+    )
+
+    entry = widget._entries["n1"]
+    assert entry.label == "projection"
+    assert entry.group == "A"
+    assert entry.tags == ("axon",)
+    assert entry.notes == "keep"
+    assert entry.cluster_id == 9
+    assert entry.visible is False
+    assert entry.color == [0.9, 0.8, 0.7, 1.0]
+    assert widget._entries["n2"].label == ""
+
+
 def test_neuron_table_apply_filters_intersects_cluster_and_heatmap_filters() -> None:
     module = _import_neuron_table_module()
     widget = _make_widget(
