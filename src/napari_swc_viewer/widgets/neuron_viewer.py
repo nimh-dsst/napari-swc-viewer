@@ -717,6 +717,17 @@ class NeuronViewerWidget(QWidget):
         project_io_row.addWidget(self._export_enhanced_parquet_btn)
         file_layout.addLayout(project_io_row)
 
+        self._project_io_note_label = QLabel(
+            "Note: Enhanced Parquet exports the entire input Parquet. "
+            "Save Project stores only the current table subset and depends on "
+            "the original input Parquet for full-dataset reproduction."
+        )
+        self._project_io_note_label.setWordWrap(True)
+        self._project_io_note_label.setStyleSheet(
+            "color: #cc7700; font-style: italic;"
+        )
+        file_layout.addWidget(self._project_io_note_label)
+
         self._project_progress = QProgressBar()
         self._project_progress.setVisible(False)
         file_layout.addWidget(self._project_progress)
