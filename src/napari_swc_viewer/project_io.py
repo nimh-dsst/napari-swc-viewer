@@ -270,6 +270,155 @@ def _duckdb_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace("'", "''")
 
 
+def _quote_identifier(name: str) -> str:
+    """Return a DuckDB-safe quoted identifier."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _selected_table_rows(table_state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return current-table rows for filtered project parquet export."""
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_entry in table_state.get("entries", []):
+        if not isinstance(raw_entry, Mapping):
+            continue
+        file_id = _entry_file_id(raw_entry)
+        if file_id is None or file_id in seen:
+            continue
+        seen.add(file_id)
+        rows.append(
+            {
+                "file_id": file_id,
+                "row_order": len(rows),
+                "neuron_label": _text_or_none(
+                    raw_entry.get("label", raw_entry.get("neuron_label"))
+                ),
+                "neuron_group": _text_or_none(
+                    raw_entry.get("group", raw_entry.get("neuron_group"))
+                ),
+                "neuron_tags_json": _tags_json_from_entry(raw_entry),
+                "neuron_notes": _text_or_none(
+                    raw_entry.get("notes", raw_entry.get("neuron_notes"))
+                ),
+                "cluster_assignment": _cluster_from_entry(raw_entry),
+            }
+        )
+    return rows
+
+
+def _selected_rows_arrow_table(rows: Sequence[Mapping[str, Any]]) -> pa.Table:
+    """Build the small selected-neuron table registered with DuckDB."""
+    return pa.Table.from_pydict(
+        {
+            "file_id": [str(row["file_id"]) for row in rows],
+            "row_order": [int(row["row_order"]) for row in rows],
+            "neuron_label": [row.get("neuron_label") for row in rows],
+            "neuron_group": [row.get("neuron_group") for row in rows],
+            "neuron_tags_json": [row.get("neuron_tags_json") for row in rows],
+            "neuron_notes": [row.get("neuron_notes") for row in rows],
+            "cluster_assignment": [row.get("cluster_assignment") for row in rows],
+        },
+        schema=pa.schema(
+            [
+                ("file_id", pa.string()),
+                ("row_order", pa.int32()),
+                ("neuron_label", pa.string()),
+                ("neuron_group", pa.string()),
+                ("neuron_tags_json", pa.string()),
+                ("neuron_notes", pa.string()),
+                ("cluster_assignment", pa.int32()),
+            ]
+        ),
+    )
+
+
+def _source_parquet_provenance(path: Path) -> dict[str, Any]:
+    """Return lightweight source-file provenance without hashing large files."""
+    stat = path.stat()
+    return {
+        "original_path": str(path),
+        "original_size_bytes": int(stat.st_size),
+        "original_mtime_ns": int(stat.st_mtime_ns),
+        "original_mtime": datetime.fromtimestamp(
+            stat.st_mtime,
+            timezone.utc,
+        ).isoformat(),
+    }
+
+
+def export_filtered_project_neuron_parquet(
+    source_parquet_path: str | Path,
+    output_path: str | Path,
+    *,
+    table_state: Mapping[str, Any] | Sequence[Any] | None = None,
+) -> Path:
+    """Write only current-table neurons from a source Parquet for project bundles."""
+    source_path = Path(source_parquet_path)
+    output = Path(output_path)
+    table_state_payload = _normalise_table_state(table_state)
+    selected_rows = _selected_table_rows(table_state_payload)
+    if not selected_rows:
+        raise ValueError("Save Project requires at least one neuron in the data table.")
+
+    schema = pq.read_schema(source_path)
+    if "file_id" not in schema.names:
+        raise ValueError("Project neuron Parquet requires a file_id column.")
+
+    source_columns = [
+        name for name in schema.names if name not in ENHANCED_NEURON_COLUMNS
+    ]
+    select_parts = [
+        f"src.{_quote_identifier(name)} AS {_quote_identifier(name)}"
+        for name in source_columns
+    ]
+    select_parts.extend(
+        f"sel.{_quote_identifier(column)} AS {_quote_identifier(column)}"
+        for column in ENHANCED_NEURON_COLUMNS
+    )
+
+    order_parts = ["sel.row_order", 'CAST(src."file_id" AS VARCHAR)']
+    if "node_id" in schema.names:
+        order_parts.append(f"src.{_quote_identifier('node_id')}")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_target = output
+    replace_output = False
+    if source_path.resolve() == output.resolve():
+        write_target = output.with_name(f"{output.name}.tmp")
+        replace_output = True
+        if write_target.exists():
+            write_target.unlink()
+
+    conn = duckdb.connect()
+    try:
+        conn.register("selected_neurons", _selected_rows_arrow_table(selected_rows))
+        conn.execute(
+            f"""
+            COPY (
+                SELECT {", ".join(select_parts)}
+                FROM read_parquet('{_duckdb_path(source_path)}') AS src
+                INNER JOIN selected_neurons AS sel
+                    ON CAST(src.{_quote_identifier("file_id")} AS VARCHAR) = sel.file_id
+                ORDER BY {", ".join(order_parts)}
+            )
+            TO '{_duckdb_path(write_target)}'
+            (FORMAT PARQUET, COMPRESSION 'SNAPPY')
+            """
+        )
+    finally:
+        conn.close()
+
+    if replace_output:
+        write_target.replace(output)
+    return output
+
+
 def _table_state_from_enhanced_columns(parquet_path: Path, schema: pa.Schema) -> dict[str, Any]:
     available = [column for column in ENHANCED_NEURON_COLUMNS if column in schema.names]
     if not available or "file_id" not in schema.names:
@@ -593,40 +742,29 @@ def save_project_bundle(
     total_steps = 4 + len(app_layers)
     _emit_progress(progress_callback, "Preparing project bundle...", 0, total_steps)
 
+    source_path = Path(source_parquet_path)
+    table_state_payload = _normalise_table_state(table_state)
+    selected_rows = _selected_table_rows(table_state_payload)
+    if not selected_rows:
+        raise ValueError("Save Project requires at least one neuron in the data table.")
+
     data_dir = bundle / "data"
     layers_dir = bundle / "layers"
     data_dir.mkdir(parents=True, exist_ok=True)
     layers_dir.mkdir(parents=True, exist_ok=True)
 
-    source_path = Path(source_parquet_path)
-    table_state_payload = _normalise_table_state(table_state)
     bundled_parquet = data_dir / "source_neurons.parquet"
-    if source_path.resolve() == bundled_parquet.resolve():
-        _emit_progress(
-            progress_callback,
-            "Using existing bundled neuron Parquet...",
-            1,
-            total_steps,
-        )
-        source_for_metadata = source_path
-    else:
-        _emit_progress(
-            progress_callback,
-            "Writing bundled neuron Parquet...",
-            1,
-            total_steps,
-        )
-        export_enhanced_neuron_parquet(
-            source_path,
-            bundled_parquet,
-            table_state=table_state_payload,
-            metadata={
-                "bundle_path": str(bundle),
-                "atlas_name": atlas_name,
-                "analysis": dict(analysis_metadata or {}),
-            },
-        )
-        source_for_metadata = bundled_parquet
+    _emit_progress(
+        progress_callback,
+        "Writing filtered neuron Parquet...",
+        1,
+        total_steps,
+    )
+    export_filtered_project_neuron_parquet(
+        source_path,
+        bundled_parquet,
+        table_state=table_state_payload,
+    )
 
     table_state_path = data_dir / "table_state.json"
     _emit_progress(progress_callback, "Writing table state...", 2, total_steps)
@@ -674,8 +812,13 @@ def save_project_bundle(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_parquet": {
             "path": "data/source_neurons.parquet",
-            "original_path": str(source_path),
-            "sha256": _sha256_file(source_for_metadata),
+            "sha256": _sha256_file(bundled_parquet),
+            "is_filtered_subset": True,
+            "filter": {
+                "type": "current_table_file_ids",
+                "file_id_count": len(selected_rows),
+            },
+            **_source_parquet_provenance(source_path),
         },
         "table_state_path": "data/table_state.json",
         "atlas_name": atlas_name,

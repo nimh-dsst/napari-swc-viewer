@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import pytest
 
 from napari_swc_viewer.project_io import (
     PROJECT_BUNDLE_FORMAT,
@@ -38,6 +39,26 @@ def _write_source_parquet(path: Path) -> None:
     ).to_parquet(path, index=False)
 
 
+def _write_three_neuron_source_parquet(path: Path) -> None:
+    pd.DataFrame(
+        {
+            "file_id": ["n1", "n1", "n2", "n3", "n3"],
+            "node_id": [1, 2, 1, 1, 2],
+            "type": [1, 3, 1, 1, 3],
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "y": [6.0, 7.0, 8.0, 9.0, 10.0],
+            "z": [11.0, 12.0, 13.0, 14.0, 15.0],
+            "radius": [1.0, 1.0, 1.0, 2.0, 2.0],
+            "parent_id": [-1, 1, -1, -1, 1],
+            "region_id": [1, 1, 2, 3, 3],
+            "region_name": ["A", "A", "B", "C", "C"],
+            "region_acronym": ["A", "A", "B", "C", "C"],
+            "subject": ["s1", "s1", "s2", "s3", "s3"],
+            "neuron_id": ["neuron1", "neuron1", "neuron2", "neuron3", "neuron3"],
+        }
+    ).to_parquet(path, index=False)
+
+
 def _table_state() -> dict[str, object]:
     return {
         "version": 1,
@@ -53,6 +74,32 @@ def _table_state() -> dict[str, object]:
                 "color": [0.1, 0.2, 0.3, 1.0],
                 "visible": False,
             }
+        ],
+    }
+
+
+def _subset_table_state() -> dict[str, object]:
+    return {
+        "version": 1,
+        "entries": [
+            {
+                "file_id": "n3",
+                "subject": "s3",
+                "label": "target",
+                "group": "GPe",
+                "tags": ["filtered"],
+                "notes": "save",
+                "cluster_id": 7,
+            },
+            {
+                "file_id": "n1",
+                "subject": "s1",
+                "label": "source",
+                "group": "CTX",
+                "tags": ["reviewed"],
+                "notes": "keep",
+                "cluster_id": 2,
+            },
         ],
     }
 
@@ -125,6 +172,104 @@ def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(tmp_path: Path
     assert payload["has_project_metadata"] is False
     assert payload["enhanced_columns"] == []
     assert payload["table_state"]["entries"] == []
+
+
+def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_three_neuron_source_parquet(source)
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_subset_table_state(),
+        layers=[],
+        atlas_name="fake_atlas",
+    )
+
+    bundle = load_project_bundle(bundle_path)
+    saved = pd.read_parquet(bundle.source_parquet_path)
+    assert saved["file_id"].tolist() == ["n3", "n3", "n1", "n1"]
+    assert "n2" not in set(saved["file_id"])
+    assert saved.loc[saved["file_id"] == "n3", "neuron_label"].unique().tolist() == [
+        "target"
+    ]
+    assert saved.loc[saved["file_id"] == "n1", "cluster_assignment"].unique().tolist() == [
+        2
+    ]
+
+
+def test_save_project_bundle_replaces_existing_enhanced_columns(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_three_neuron_source_parquet(source)
+    source_df = pd.read_parquet(source)
+    source_df["neuron_label"] = "old"
+    source_df["neuron_group"] = "old_group"
+    source_df["neuron_tags_json"] = '["old"]'
+    source_df["neuron_notes"] = "old notes"
+    source_df["cluster_assignment"] = 99
+    source_df.to_parquet(source, index=False)
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_subset_table_state(),
+        layers=[],
+    )
+
+    schema = pq.read_schema(bundle_path / "data" / "source_neurons.parquet")
+    for column in ENHANCED_NEURON_COLUMNS:
+        assert schema.names.count(column) == 1
+
+    saved = pd.read_parquet(bundle_path / "data" / "source_neurons.parquet")
+    assert set(saved["neuron_label"]) == {"source", "target"}
+    assert set(saved["neuron_group"]) == {"CTX", "GPe"}
+    assert set(saved["cluster_assignment"]) == {2, 7}
+
+
+def test_save_project_bundle_manifest_records_filtered_source_provenance(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_three_neuron_source_parquet(source)
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_subset_table_state(),
+        layers=[],
+    )
+
+    bundle = load_project_bundle(bundle_path)
+    source_info = bundle.manifest["source_parquet"]
+    assert source_info["path"] == "data/source_neurons.parquet"
+    assert source_info["is_filtered_subset"] is True
+    assert source_info["filter"] == {
+        "type": "current_table_file_ids",
+        "file_id_count": 2,
+    }
+    assert source_info["original_path"] == str(source)
+    assert source_info["original_size_bytes"] == source.stat().st_size
+    assert source_info["original_mtime_ns"] == source.stat().st_mtime_ns
+    assert "sha256" in source_info
+
+
+def test_save_project_bundle_rejects_empty_table(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "empty.swcv"
+    _write_source_parquet(source)
+
+    with pytest.raises(ValueError, match="at least one neuron"):
+        save_project_bundle(
+            bundle_path,
+            source_parquet_path=source,
+            table_state={"version": 1, "entries": []},
+            layers=[],
+        )
+
+    assert not (bundle_path / "data" / "source_neurons.parquet").exists()
 
 
 def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(tmp_path: Path) -> None:
