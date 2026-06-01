@@ -90,6 +90,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SomaSelectionKey = tuple[int, frozenset[int], tuple[object, ...]]
+
 _POINT_HEATMAP_BASE_COLORS = [
     (1.0, 0.0, 0.0, 1.0),    # red
     (0.0, 0.8, 0.0, 1.0),    # green
@@ -472,7 +474,7 @@ class NeuronViewerWidget(QWidget):
             self._current_neuron_layers: list = []
             self._current_region_layers: list = []
             self._highlighted_file_ids: set[str] | None = None
-            self._last_soma_selection: set = set()  # track no-op highlights
+            self._last_soma_selection: _SomaSelectionKey | set = set()
             self._auto_center_applied_once = False
             self._region_query_source = "Atlas Regions"
             self._region_query_scope = _REGION_QUERY_SCOPE_WHOLE
@@ -483,6 +485,10 @@ class NeuronViewerWidget(QWidget):
             self._point_preview_counts: dict[tuple[str, str], int] = {}
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
+            self._layer_name_event_connections: dict[
+                int,
+                tuple[object, object, object],
+            ] = {}
 
             with startup_timing(
                 logger,
@@ -888,7 +894,7 @@ class NeuronViewerWidget(QWidget):
         neuron_btn_row.addWidget(self._remove_selected_btn)
 
         self._clear_neurons_btn = QPushButton("Clear All")
-        self._clear_neurons_btn.clicked.connect(self._clear_neuron_layers)
+        self._clear_neurons_btn.clicked.connect(self._clear_all_neuron_layers)
         neuron_btn_row.addWidget(self._clear_neurons_btn)
 
         neurons_layout.addLayout(neuron_btn_row)
@@ -905,6 +911,14 @@ class NeuronViewerWidget(QWidget):
             self._remove_selected_from_table
         )
         heatmap_btn_row.addWidget(self._remove_selected_from_table_btn)
+
+        self._remove_unselected_from_table_btn = QPushButton(
+            "Remove Unselected from Table"
+        )
+        self._remove_unselected_from_table_btn.clicked.connect(
+            self._remove_unselected_from_table
+        )
+        heatmap_btn_row.addWidget(self._remove_unselected_from_table_btn)
 
         self._clear_table_btn = QPushButton("Clear Table")
         self._clear_table_btn.clicked.connect(self._clear_neuron_table)
@@ -2446,15 +2460,86 @@ class NeuronViewerWidget(QWidget):
     def _connect_layer_events(self) -> None:
         """Refresh tool and mask selectors when viewer layers change."""
         layer_events = getattr(getattr(self.viewer, "layers", None), "events", None)
-        if layer_events is None:
+        if layer_events is not None:
+            for event_name in ("inserted", "removed", "reordered"):
+                signal = getattr(layer_events, event_name, None)
+                if signal is not None:
+                    signal.connect(self._on_viewer_layers_changed)
+        self._sync_layer_name_event_connections()
+
+    def _sync_layer_name_event_connections(self) -> None:
+        """Track layer-name events so layer renames refresh layer-dependent UI."""
+        connections = getattr(self, "_layer_name_event_connections", None)
+        if connections is None:
+            connections = {}
+            self._layer_name_event_connections = connections
+
+        layers = self._iter_viewer_layers()
+        active_layer_ids = {id(layer) for layer in layers}
+        self._disconnect_stale_layer_name_event_connections(active_layer_ids)
+
+        for layer in layers:
+            layer_id = id(layer)
+            existing = connections.get(layer_id)
+            if existing is not None and existing[0] is layer:
+                continue
+            if existing is not None:
+                self._disconnect_layer_name_event_connection(layer_id, existing)
+
+            signal = getattr(getattr(layer, "events", None), "name", None)
+            connector = getattr(signal, "connect", None)
+            if not callable(connector):
+                continue
+            callback = self._on_viewer_layer_name_changed
+            try:
+                connector(callback)
+            except Exception:
+                logger.debug(
+                    "Could not connect layer name event for %s",
+                    getattr(layer, "name", "<unnamed>"),
+                    exc_info=True,
+                )
+                continue
+            connections[layer_id] = (layer, signal, callback)
+
+    def _disconnect_stale_layer_name_event_connections(
+        self,
+        active_layer_ids: set[int],
+    ) -> None:
+        """Disconnect tracked name events for layers no longer in the viewer."""
+        connections = getattr(self, "_layer_name_event_connections", None)
+        if not connections:
             return
-        for event_name in ("inserted", "removed", "reordered"):
-            signal = getattr(layer_events, event_name, None)
-            if signal is not None:
-                signal.connect(self._on_viewer_layers_changed)
+        for layer_id, connection in list(connections.items()):
+            if layer_id not in active_layer_ids:
+                self._disconnect_layer_name_event_connection(layer_id, connection)
+
+    def _disconnect_layer_name_event_connection(
+        self,
+        layer_id: int,
+        connection: tuple[object, object, object],
+    ) -> None:
+        """Disconnect one tracked layer-name event connection."""
+        _layer, signal, callback = connection
+        disconnect = getattr(signal, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect(callback)
+            except Exception:
+                logger.debug("Could not disconnect layer name event", exc_info=True)
+        connections = getattr(self, "_layer_name_event_connections", None)
+        if connections is not None:
+            connections.pop(layer_id, None)
+
+    def _on_viewer_layer_name_changed(self, event=None) -> None:
+        """Refresh layer-dependent UI after a layer is renamed."""
+        self._on_viewer_layers_changed(event)
 
     def _on_viewer_layers_changed(self, _event=None) -> None:
         """Refresh UI that depends on viewer layers."""
+        sync_layer_names = getattr(self, "_sync_layer_name_event_connections", None)
+        if callable(sync_layer_names):
+            sync_layer_names()
         self._refresh_heatmap_layer_list()
         self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
@@ -2522,17 +2607,19 @@ class NeuronViewerWidget(QWidget):
             return
         setter(self._current_selected_neuron_heatmap_layers_by_file_id())
 
-    def _manual_heatmap_combo_options(self) -> list[tuple[str, tuple[object, ...]]]:
-        """Return manual heatmap dropdown options as layer-name/file-ID tuples."""
-        options: list[tuple[str, tuple[object, ...]]] = []
+    def _manual_heatmap_combo_options(
+        self,
+    ) -> list[tuple[str, tuple[object, ...], str]]:
+        """Return manual heatmap dropdown options as layer-name/file-ID/key tuples."""
+        options: list[tuple[str, tuple[object, ...], str]] = []
         for layer in self._manual_heatmap_layers():
             layer_name = str(getattr(layer, "name", ""))
             if not layer_name:
                 continue
-            file_ids = self._normalise_layer_file_ids(
-                _layer_metadata(layer).get("file_ids", [])
-            )
-            options.append((layer_name, file_ids))
+            metadata = _layer_metadata(layer)
+            file_ids = self._normalise_layer_file_ids(metadata.get("file_ids", []))
+            key = str(metadata.get("manual_heatmap_id") or layer_name)
+            options.append((layer_name, file_ids, key))
         return options
 
     def _manual_heatmap_combo_data(self) -> tuple[str, tuple[object, ...]] | None:
@@ -2548,6 +2635,34 @@ class NeuronViewerWidget(QWidget):
             and isinstance(data[0], str)
         ):
             return data[0], self._normalise_layer_file_ids(data[1])
+        if (
+            isinstance(data, tuple)
+            and len(data) == 3
+            and isinstance(data[0], str)
+        ):
+            return data[0], self._normalise_layer_file_ids(data[1])
+        return None
+
+    def _manual_heatmap_combo_key(self) -> str | None:
+        """Return the stable key for the selected manual heatmap, if any."""
+        combo = getattr(self, "_manual_heatmap_combo", None)
+        if combo is None:
+            return None
+        current_data = getattr(combo, "currentData", None)
+        data = current_data() if callable(current_data) else None
+        if (
+            isinstance(data, tuple)
+            and len(data) == 3
+            and isinstance(data[2], str)
+            and data[2]
+        ):
+            return data[2]
+        if (
+            isinstance(data, tuple)
+            and len(data) == 2
+            and isinstance(data[0], str)
+        ):
+            return data[0]
         return None
 
     def _refresh_manual_heatmap_combo(self) -> None:
@@ -2558,6 +2673,7 @@ class NeuronViewerWidget(QWidget):
 
         previous = self._manual_heatmap_combo_data()
         previous_name = previous[0] if previous is not None else None
+        previous_key = self._manual_heatmap_combo_key()
         options = self._manual_heatmap_combo_options()
 
         signals_blocked = combo.blockSignals(True)
@@ -2565,9 +2681,11 @@ class NeuronViewerWidget(QWidget):
             combo.clear()
             combo.addItem(_MANUAL_HEATMAP_ALL_LABEL, None)
             selected_index = 0
-            for layer_name, file_ids in options:
-                combo.addItem(layer_name, (layer_name, tuple(file_ids)))
-                if layer_name == previous_name:
+            for layer_name, file_ids, key in options:
+                combo.addItem(layer_name, (layer_name, tuple(file_ids), key))
+                if key == previous_key or (
+                    previous_key is None and layer_name == previous_name
+                ):
                     selected_index = combo.count() - 1
             combo.setCurrentIndex(selected_index)
         finally:
@@ -4471,6 +4589,45 @@ class NeuronViewerWidget(QWidget):
         self._render_status_label.setText(message)
         self._regions_status_label.setText(message)
 
+    def _remove_unselected_from_table(self) -> None:
+        """Keep selected neurons in the table and remove all other rows."""
+        selected_file_ids = self._neuron_table.get_selected_file_ids()
+        if not selected_file_ids:
+            self._render_status_label.setText(
+                "Select at least one neuron row to keep in the table."
+            )
+            return
+
+        selected_file_id_set = set(selected_file_ids)
+        current_file_ids = self._current_table_file_ids()
+        unselected_file_ids = [
+            file_id for file_id in current_file_ids
+            if file_id not in selected_file_id_set
+        ]
+        if not unselected_file_ids:
+            message = "All table neurons are selected; no unselected neurons to remove."
+            self._render_status_label.setText(message)
+            self._regions_status_label.setText(message)
+            return
+
+        scene_file_ids = self._current_scene_file_ids()
+        rendered_unselected = [
+            file_id for file_id in unselected_file_ids
+            if file_id in scene_file_ids
+        ]
+        self._cache_scene_display_state(rendered_unselected)
+        self._neuron_table.remove_file_ids(unselected_file_ids)
+        self._discard_scene_display_state(self._current_table_file_ids())
+        self._neuron_table.set_added_file_ids(scene_file_ids)
+        self._neuron_table.select_file_ids(selected_file_ids)
+        self._sync_after_neuron_table_membership_change()
+
+        message = (
+            f"Removed {len(unselected_file_ids)} unselected neuron(s) from the table."
+        )
+        self._render_status_label.setText(message)
+        self._regions_status_label.setText(message)
+
     def _clear_neuron_table(self) -> None:
         """Clear the neuron table while leaving rendered scene layers in place."""
         self._cache_scene_display_state(self._current_table_file_ids_in_scene())
@@ -4903,7 +5060,12 @@ class NeuronViewerWidget(QWidget):
                 face_color=soma_colors,
                 border_color="white",
                 border_width=0.05,
-                text={"string": labels, "size": 10, "color": "white"},
+                text={
+                    "string": labels,
+                    "size": 10,
+                    "color": "white",
+                    "visible": False,
+                },
                 name="Soma Labels",
                 opacity=0.7,
                 scale=scale,
@@ -5274,17 +5436,30 @@ class NeuronViewerWidget(QWidget):
         """
         layer = event.source
         current = set(layer.selected_data)
-        if current == self._last_soma_selection:
+        file_ids = layer.metadata.get("file_ids", [])
+        selected_fids = []
+        seen_fids = set()
+        for i in sorted(current):
+            if i >= len(file_ids):
+                continue
+            fid = file_ids[i]
+            if fid in seen_fids:
+                continue
+            seen_fids.add(fid)
+            selected_fids.append(fid)
+
+        current_key = (id(layer), frozenset(current), tuple(selected_fids))
+        if current_key == self._last_soma_selection:
             return
-        self._last_soma_selection = current
 
         if not current:
+            if not self._last_soma_selection:
+                return
+            self._last_soma_selection = current_key
+            self._neuron_table.select_file_ids([])
             return
 
-        file_ids = layer.metadata.get("file_ids", [])
-        selected_fids = [
-            file_ids[i] for i in current if i < len(file_ids)
-        ]
+        self._last_soma_selection = current_key
         if selected_fids:
             self._neuron_table.select_file_ids(selected_fids)
 
@@ -5295,6 +5470,10 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
         self._refresh_apply_existing_clusters_button()
+
+    def _clear_all_neuron_layers(self, _checked: bool = False) -> None:
+        """Clear all neuron layers from the UI button without preserving scene state."""
+        self._clear_neuron_layers(reset_render_state=True)
 
     def _clear_neuron_layers(self, reset_render_state: bool = True) -> None:
         """Remove all current neuron layers and optionally reset scene state."""

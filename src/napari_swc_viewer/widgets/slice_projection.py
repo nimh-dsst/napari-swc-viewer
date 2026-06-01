@@ -791,15 +791,14 @@ class SomaSliceProjector:
         if not self._enabled:
             return
 
-        if self._viewer.dims.ndisplay != 2:
-            if self._projection_layer is not None:
-                self._projection_layer.visible = False
-            return
-
+        visible = self._viewer.dims.ndisplay == 2
         not_displayed = self._viewer.dims.not_displayed
-        if not not_displayed:
+        if not_displayed:
+            slice_axis = not_displayed[0]
+        elif visible:
             return
-        slice_axis = not_displayed[0]
+        else:
+            slice_axis = 0
 
         slice_world = self._viewer.dims.point[slice_axis]
         if self._scale is not None:
@@ -813,10 +812,21 @@ class SomaSliceProjector:
         )
 
         if points is None:
-            self._remove_projection_layer()
+            if self._all_coords is None or self._all_file_ids is None:
+                self._remove_projection_layer()
+                return
+            color_channels = (
+                self._all_colors.shape[1]
+                if self._all_colors is not None and self._all_colors.ndim == 2
+                else 4
+            )
+            points = np.empty((0, 3), dtype=np.float64)
+            colors = np.empty((0, color_channels), dtype=np.float64)
+            file_ids = []
+            self._update_projection_layer(points, colors, file_ids, visible=visible)
             return
 
-        self._update_projection_layer(points, colors, file_ids)
+        self._update_projection_layer(points, colors, file_ids, visible=visible)
 
     def _compute_slice_projection(
         self,
@@ -865,6 +875,8 @@ class SomaSliceProjector:
         points: np.ndarray,
         colors: np.ndarray,
         file_ids: list[str],
+        *,
+        visible: bool = True,
     ) -> None:
         """Update or create the projected soma points layer."""
         layer_name = "Soma Slice Projection"
@@ -875,15 +887,24 @@ class SomaSliceProjector:
                     self._projection_layer = layer
                     break
 
+        face_color = colors
+        if len(points) == 0:
+            if self._all_colors is not None and self._all_colors.size > 0:
+                face_color = np.asarray(self._all_colors[0], dtype=float).tolist()
+            else:
+                face_color = [0.5, 0.5, 0.5, 1.0]
+
         if self._projection_layer is None:
             self._projection_layer = self._viewer.add_points(
                 points,
                 size=self._point_size,
-                face_color=colors,
+                face_color=face_color,
                 border_color=_SOMA_PROJECTION_BORDER_COLOR,
                 border_width=_SOMA_PROJECTION_BORDER_WIDTH,
+                text={"visible": False},
                 name=layer_name,
                 opacity=1.0,
+                visible=visible,
                 scale=self._scale,
                 metadata={"file_ids": file_ids},
             )
@@ -895,9 +916,9 @@ class SomaSliceProjector:
 
         with self._projection_layer.events.blocker_all():
             self._projection_layer.data = points
-            self._projection_layer.face_color = colors
+            self._projection_layer.face_color = face_color
             self._projection_layer.metadata = {"file_ids": file_ids}
-            self._projection_layer.visible = True
+            self._projection_layer.visible = visible
             self._projection_layer.size = self._point_size
             self._projection_layer.border_color = _SOMA_PROJECTION_BORDER_COLOR
             self._projection_layer.border_width = _SOMA_PROJECTION_BORDER_WIDTH

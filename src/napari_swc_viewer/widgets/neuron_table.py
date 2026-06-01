@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import QItemSelection, QItemSelectionModel, Qt, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -668,16 +668,38 @@ class NeuronTableWidget(QWidget):
         feedback loops (e.g. soma click → table select → signal → …).
         """
         row_map = self._file_id_to_row_map()
+        selected_rows: list[int] = []
+        seen_file_ids: set[object] = set()
+        for fid in file_ids:
+            if fid in seen_file_ids:
+                continue
+            seen_file_ids.add(fid)
 
-        self._table.blockSignals(True)
+            row = row_map.get(fid)
+            if row is not None and not self._table.isRowHidden(row):
+                selected_rows.append(row)
+
+        selection_model = self._table.selectionModel()
+        selection = QItemSelection()
+        model = self._table.model()
+        last_column = max(self._table.columnCount() - 1, 0)
+        for row in selected_rows:
+            selection.select(
+                model.index(row, 0),
+                model.index(row, last_column),
+            )
+
+        previous_blocked = self._table.blockSignals(True)
         try:
-            self._table.clearSelection()
-            for fid in file_ids:
-                row = row_map.get(fid)
-                if row is not None and not self._table.isRowHidden(row):
-                    self._table.selectRow(row)
+            if selection_model is None or not selected_rows:
+                self._table.clearSelection()
+            else:
+                selection_model.select(
+                    selection,
+                    QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                )
         finally:
-            self._table.blockSignals(False)
+            self._table.blockSignals(previous_blocked)
         # Emit once after all rows are selected
         self.selection_changed.emit(self.get_selected_file_ids())
 

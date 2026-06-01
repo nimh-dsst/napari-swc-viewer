@@ -57,6 +57,44 @@ class _DummyItem:
         return str(self._file_id)
 
 
+class _DummyIndex:
+    def __init__(self, row: int, column: int = 0) -> None:
+        self._row = int(row)
+        self._column = int(column)
+
+    def row(self) -> int:
+        return self._row
+
+    def column(self) -> int:
+        return self._column
+
+
+class _DummyModel:
+    def index(self, row: int, column: int) -> _DummyIndex:
+        return _DummyIndex(row, column)
+
+
+class _DummyItemSelection:
+    def __init__(self) -> None:
+        self.ranges: list[tuple[int, int]] = []
+
+    def select(self, top_left: _DummyIndex, bottom_right: _DummyIndex) -> None:
+        self.ranges.append((top_left.row(), bottom_right.row()))
+
+
+class _DummyItemSelectionModel:
+    ClearAndSelect = 1
+    Rows = 2
+
+    def __init__(self, table: "_DummyTable") -> None:
+        self._table = table
+
+    def select(self, selection: _DummyItemSelection, _flags: int) -> None:
+        self._table._selected_rows.clear()
+        for start, stop in selection.ranges:
+            self._table._selected_rows.update(range(start, stop + 1))
+
+
 class _DummyTable:
     def __init__(
         self,
@@ -71,9 +109,22 @@ class _DummyTable:
         self._signals_blocked = False
         self.sort_calls: list[tuple[int, object]] = []
         self.hidden_rows: dict[int, bool] = {}
+        self._selected_rows: set[int] = set()
 
     def rowCount(self) -> int:
         return len(self._file_ids)
+
+    def columnCount(self) -> int:
+        return 7
+
+    def model(self) -> _DummyModel:
+        return _DummyModel()
+
+    def selectionModel(self) -> _DummyItemSelectionModel:
+        return _DummyItemSelectionModel(self)
+
+    def selectedIndexes(self) -> list[_DummyIndex]:
+        return [_DummyIndex(row) for row in sorted(self._selected_rows)]
 
     def item(self, row: int, column: int):
         if column != self._neuron_id_column:
@@ -94,19 +145,24 @@ class _DummyTable:
         return previous
 
     def clearSelection(self) -> None:
-        return None
+        self._selected_rows.clear()
 
     def clearContents(self) -> None:
         self._file_ids = []
+        self._selected_rows.clear()
 
     def setRowCount(self, count: int) -> None:
         if count <= 0:
             self._file_ids = []
+            self._selected_rows.clear()
             return
         if len(self._file_ids) < count:
             self._file_ids.extend([None] * (count - len(self._file_ids)))
         else:
             self._file_ids = self._file_ids[:count]
+            self._selected_rows = {
+                row for row in self._selected_rows if row < len(self._file_ids)
+            }
 
     def set_file_id(self, row: int, file_id: object) -> None:
         self._file_ids[row] = file_id
@@ -116,6 +172,9 @@ class _DummyTable:
 
     def setRowHidden(self, row: int, hidden: bool) -> None:
         self.hidden_rows[int(row)] = bool(hidden)
+
+    def isRowHidden(self, row: int) -> bool:
+        return self.hidden_rows.get(int(row), False)
 
 
 def _make_widget(module, entries_by_file_id: dict[object, object]):
@@ -287,3 +346,23 @@ def test_neuron_table_apply_filters_manual_heatmap_uses_string_fallback() -> Non
         0: False,
         1: True,
     }
+
+
+def test_neuron_table_select_file_ids_selects_multiple_visible_rows_once() -> None:
+    module = _import_neuron_table_module()
+    module.QItemSelection = _DummyItemSelection
+    module.QItemSelectionModel = _DummyItemSelectionModel
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+            "n3": module.NeuronEntry(file_id="n3", subject="s3"),
+        },
+    )
+    widget._table.setRowHidden(1, True)
+
+    widget.select_file_ids(["n1", "n2", "n3", "n1", "missing"])
+
+    assert widget.get_selected_file_ids() == ["n1", "n3"]
+    assert widget.selection_changed.calls == [(["n1", "n3"],)]

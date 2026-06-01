@@ -246,6 +246,10 @@ class _DummySignal:
         if callback in self._callbacks:
             self._callbacks.remove(callback)
 
+    def emit(self, *args, **kwargs) -> None:
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
+
 
 class _DummyDims:
     def __init__(
@@ -276,6 +280,7 @@ class _DummyBlocker:
 class _DummyLayerEvents:
     def __init__(self) -> None:
         self.highlight = _DummySignal()
+        self.name = _DummySignal()
 
     def blocker_all(self) -> _DummyBlocker:
         return _DummyBlocker()
@@ -292,8 +297,9 @@ class _DummyPointsLayer:
         self.scale = kwargs.get("scale")
         self.metadata = kwargs.get("metadata", {})
         self.opacity = kwargs.get("opacity", 1.0)
-        self.visible = True
+        self.visible = kwargs.get("visible", True)
         self.size = kwargs.get("size")
+        self.text = kwargs.get("text")
         self.mode = "pan_zoom"
         self.border_color = kwargs.get("border_color")
         self.border_width = kwargs.get("border_width")
@@ -328,6 +334,7 @@ class _DummyImageLayer:
         self.rendering = kwargs.get("rendering")
         self.contrast_limits = kwargs.get("contrast_limits")
         self.visible = kwargs.get("visible", True)
+        self.events = _DummyLayerEvents()
 
 
 class _DummyViewer:
@@ -996,8 +1003,16 @@ def _bind_manual_heatmap_helpers(widget) -> None:
         NeuronViewerWidget._current_selected_neuron_heatmap_layers_by_file_id,
         widget,
     )
+    widget._sync_neuron_table_heatmap_membership = types.MethodType(
+        NeuronViewerWidget._sync_neuron_table_heatmap_membership,
+        widget,
+    )
     widget._manual_heatmap_combo_data = types.MethodType(
         NeuronViewerWidget._manual_heatmap_combo_data,
+        widget,
+    )
+    widget._manual_heatmap_combo_key = types.MethodType(
+        NeuronViewerWidget._manual_heatmap_combo_key,
         widget,
     )
     widget._selected_manual_heatmap_file_ids = types.MethodType(
@@ -1018,6 +1033,29 @@ def _bind_manual_heatmap_helpers(widget) -> None:
     )
     widget._on_manual_heatmap_selection_changed = types.MethodType(
         NeuronViewerWidget._on_manual_heatmap_selection_changed,
+        widget,
+    )
+
+
+def _bind_layer_name_event_helpers(widget) -> None:
+    widget._sync_layer_name_event_connections = types.MethodType(
+        NeuronViewerWidget._sync_layer_name_event_connections,
+        widget,
+    )
+    widget._disconnect_stale_layer_name_event_connections = types.MethodType(
+        NeuronViewerWidget._disconnect_stale_layer_name_event_connections,
+        widget,
+    )
+    widget._disconnect_layer_name_event_connection = types.MethodType(
+        NeuronViewerWidget._disconnect_layer_name_event_connection,
+        widget,
+    )
+    widget._on_viewer_layer_name_changed = types.MethodType(
+        NeuronViewerWidget._on_viewer_layer_name_changed,
+        widget,
+    )
+    widget._on_viewer_layers_changed = types.MethodType(
+        NeuronViewerWidget._on_viewer_layers_changed,
         widget,
     )
 
@@ -1155,11 +1193,53 @@ def test_soma_slice_projector_updates_layer_and_clear_removes_it() -> None:
     assert layer.size == 9
     assert layer.border_color == "#39ff14"
     assert layer.border_width == 0.15
+    assert layer.text == {"visible": False}
+    assert layer.visible is True
 
     projector.clear()
 
     assert viewer.layers == []
     assert projector._projection_layer is None
+
+
+def test_soma_slice_projector_recreates_hidden_layer_in_3d() -> None:
+    viewer = _DummyViewer(
+        ndisplay=3,
+        not_displayed=(),
+        point=(0.0, 0.0, 0.0),
+    )
+    projector = _make_soma_projector(viewer, tolerance=1.0, point_size=9)
+    projector.add_soma_data("neuron-a", np.array([[10.0, 5.0, 5.0]]))
+
+    projector._do_update_projection()
+
+    assert len(viewer.layers) == 1
+    layer = viewer.layers[0]
+    assert layer.name == "Soma Slice Projection"
+    assert layer.metadata["file_ids"] == []
+    assert layer.visible is False
+    assert layer.data.shape == (0, 3)
+    np.testing.assert_allclose(layer.face_color, np.array([1.0, 0.0, 0.0, 1.0]))
+
+
+def test_soma_slice_projector_keeps_empty_layer_when_2d_slice_has_no_hits() -> None:
+    viewer = _DummyViewer(
+        ndisplay=2,
+        not_displayed=(0,),
+        point=(0.0, 0.0, 0.0),
+    )
+    projector = _make_soma_projector(viewer, tolerance=1.0, point_size=9)
+    projector.add_soma_data("neuron-a", np.array([[10.0, 5.0, 5.0]]))
+
+    projector._do_update_projection()
+
+    assert len(viewer.layers) == 1
+    layer = viewer.layers[0]
+    assert layer.name == "Soma Slice Projection"
+    assert layer.metadata["file_ids"] == []
+    assert layer.visible is True
+    assert layer.data.shape == (0, 3)
+    np.testing.assert_allclose(layer.face_color, np.array([1.0, 0.0, 0.0, 1.0]))
 
 
 def test_build_soma_projection_batch_uses_rendered_soma_points_when_available() -> None:
@@ -1303,6 +1383,45 @@ def test_remove_selected_neurons_preserves_remaining_render_modes() -> None:
     widget._clear_neuron_layers.assert_not_called()
 
 
+def test_clear_all_neuron_layers_ignores_qt_checked_argument_and_resets_scene_state() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    soma_layer = _DummyPointsLayer(
+        np.array([[0.0, 0.0, 0.0]]),
+        name="Soma Labels",
+        metadata={"file_ids": ["n1"]},
+    )
+    viewer.layers.append(soma_layer)
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _current_neuron_layers=[soma_layer],
+        _scene_render_modes={"n1": "soma"},
+        _scene_display_state={
+            "n1": {"color": [1.0, 0.0, 0.0, 1.0], "visible": True}
+        },
+        _slice_projector=MagicMock(),
+        _soma_slice_projector=MagicMock(),
+        _neuron_table=types.SimpleNamespace(set_added_file_ids=MagicMock()),
+    )
+    widget._current_scene_file_ids = types.MethodType(
+        NeuronViewerWidget._current_scene_file_ids,
+        widget,
+    )
+    widget._clear_neuron_layers = types.MethodType(
+        NeuronViewerWidget._clear_neuron_layers,
+        widget,
+    )
+
+    NeuronViewerWidget._clear_all_neuron_layers(widget, False)
+
+    assert viewer.layers == []
+    assert widget._current_neuron_layers == []
+    assert widget._scene_render_modes == {}
+    assert widget._scene_display_state == {}
+    widget._slice_projector.clear.assert_called_once_with()
+    widget._soma_slice_projector.clear.assert_called_once_with()
+    widget._neuron_table.set_added_file_ids.assert_called_once_with(set())
+
+
 def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> None:
     viewer = _DummyViewer(ndisplay=3)
     widget = types.SimpleNamespace(
@@ -1379,12 +1498,25 @@ def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> No
     widget._db.get_neurons_for_rendering.assert_called_once_with(["n1"])
     widget._db.get_soma_locations.assert_called_once_with(["n1", "n2"])
     widget._db.get_soma_points.assert_called_once_with(["n2"])
+    assert widget._scene_render_modes == {"n1": "full", "n2": "soma"}
+    widget._neuron_table.set_added_file_ids.assert_called_with({"n1", "n2"})
     widget._slice_projector.add_neuron_data_batch.assert_called_once()
     widget._soma_slice_projector.add_soma_data_batch.assert_called_once()
     assert {layer.name for layer in widget._current_neuron_layers} == {
         "Neuron Lines",
         "Neuron Points",
         "Soma Labels",
+    }
+    soma_layer = next(
+        layer
+        for layer in widget._current_neuron_layers
+        if layer.name == "Soma Labels"
+    )
+    assert soma_layer.text == {
+        "string": ["N1", "N2"],
+        "size": 10,
+        "color": "white",
+        "visible": False,
     }
 
 
@@ -1516,6 +1648,83 @@ def test_on_soma_selected_uses_metadata_file_ids_for_projected_layer() -> None:
     NeuronViewerWidget._on_soma_selected(widget, event)
 
     table.select_file_ids.assert_called_once_with(["n1", "n3"])
+
+
+def test_on_soma_selected_deduplicates_projected_file_ids() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer = types.SimpleNamespace(
+        selected_data={0, 1, 2},
+        metadata={"file_ids": ["n1", "n1", "n2"]},
+    )
+    event = types.SimpleNamespace(source=layer)
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+
+    table.select_file_ids.assert_called_once_with(["n1", "n2"])
+
+
+def test_on_soma_selected_same_indices_from_different_layers_are_not_noop() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer_a = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n1"]},
+    )
+    layer_b = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n2"]},
+    )
+
+    NeuronViewerWidget._on_soma_selected(
+        widget,
+        types.SimpleNamespace(source=layer_a),
+    )
+    NeuronViewerWidget._on_soma_selected(
+        widget,
+        types.SimpleNamespace(source=layer_b),
+    )
+
+    assert [call.args[0] for call in table.select_file_ids.call_args_list] == [
+        ["n1"],
+        ["n2"],
+    ]
+
+
+def test_on_soma_selected_reprocesses_same_projected_indices_after_metadata_change() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n1"]},
+    )
+    event = types.SimpleNamespace(source=layer)
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+    table.select_file_ids.reset_mock()
+    layer.metadata = {"file_ids": ["n2"]}
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+
+    table.select_file_ids.assert_called_once_with(["n2"])
+
+
+def test_on_soma_selected_empty_selection_clears_after_soma_selection() -> None:
+    table = MagicMock()
+    widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
+    layer = types.SimpleNamespace(
+        selected_data={0},
+        metadata={"file_ids": ["n1"]},
+    )
+    event = types.SimpleNamespace(source=layer)
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+    table.select_file_ids.reset_mock()
+    layer.selected_data = set()
+
+    NeuronViewerWidget._on_soma_selected(widget, event)
+
+    table.select_file_ids.assert_called_once_with([])
 
 
 @pytest.mark.parametrize(
@@ -2063,6 +2272,126 @@ def test_apply_existing_clusters_from_analysis_no_overlap_only_refreshes_button(
     widget._refresh_apply_existing_clusters_button.assert_called_once_with()
 
 
+def test_remove_unselected_from_table_keeps_selection_and_preserves_scene_state() -> None:
+    table = types.SimpleNamespace(
+        _entries={
+            "n1": types.SimpleNamespace(
+                color=[1.0, 0.0, 0.0, 1.0],
+                visible=True,
+            ),
+            "n2": types.SimpleNamespace(
+                color=[0.2, 0.3, 0.4, 1.0],
+                visible=True,
+            ),
+            "n3": types.SimpleNamespace(
+                color=[0.5, 0.6, 0.7, 1.0],
+                visible=False,
+            ),
+        },
+    )
+
+    def _remove_file_ids(file_ids) -> None:
+        for file_id in file_ids:
+            table._entries.pop(file_id, None)
+
+    table.file_ids = lambda: list(table._entries.keys())
+    table.get_selected_file_ids = MagicMock(return_value=["n1"])
+    table.remove_file_ids = MagicMock(side_effect=_remove_file_ids)
+    table.set_added_file_ids = MagicMock()
+    table.select_file_ids = MagicMock()
+
+    widget = types.SimpleNamespace(
+        _highlighted_file_ids=None,
+        _current_neuron_layers=[object()],
+        _neuron_table=table,
+        _last_soma_selection={"n2"},
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+        _scene_render_modes={"n1": "full", "n2": "full"},
+        _scene_display_state={},
+        _update_layer_colors=MagicMock(),
+    )
+    _bind_table_membership_helpers(widget)
+
+    NeuronViewerWidget._remove_unselected_from_table(widget)
+
+    table.remove_file_ids.assert_called_once_with(["n2", "n3"])
+    table.set_added_file_ids.assert_called_once_with({"n1", "n2"})
+    table.select_file_ids.assert_called_once_with(["n1"])
+    assert list(table._entries) == ["n1"]
+    assert widget._scene_display_state == {
+        "n2": {"color": [0.2, 0.3, 0.4, 1.0], "visible": True}
+    }
+    assert widget._highlighted_file_ids == {"n1"}
+    assert widget._last_soma_selection == set()
+    assert widget._render_status_label.text == (
+        "Removed 2 unselected neuron(s) from the table."
+    )
+    assert widget._regions_status_label.text == (
+        "Removed 2 unselected neuron(s) from the table."
+    )
+
+
+def test_remove_unselected_from_table_requires_selection() -> None:
+    table = types.SimpleNamespace(
+        get_selected_file_ids=MagicMock(return_value=[]),
+        remove_file_ids=MagicMock(),
+        set_added_file_ids=MagicMock(),
+        select_file_ids=MagicMock(),
+    )
+    widget = types.SimpleNamespace(
+        _neuron_table=table,
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+    )
+
+    NeuronViewerWidget._remove_unselected_from_table(widget)
+
+    table.remove_file_ids.assert_not_called()
+    table.set_added_file_ids.assert_not_called()
+    table.select_file_ids.assert_not_called()
+    assert widget._render_status_label.text == (
+        "Select at least one neuron row to keep in the table."
+    )
+
+
+def test_remove_unselected_from_table_noops_when_all_rows_selected() -> None:
+    table = types.SimpleNamespace(
+        _entries={
+            "n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True),
+            "n2": types.SimpleNamespace(color=[0.0, 1.0, 0.0, 1.0], visible=True),
+        },
+    )
+    table.file_ids = lambda: list(table._entries.keys())
+    table.get_selected_file_ids = MagicMock(return_value=["n1", "n2"])
+    table.remove_file_ids = MagicMock()
+    table.set_added_file_ids = MagicMock()
+    table.select_file_ids = MagicMock()
+    widget = types.SimpleNamespace(
+        _neuron_table=table,
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+    )
+    widget._current_table_file_ids = types.MethodType(
+        NeuronViewerWidget._current_table_file_ids,
+        widget,
+    )
+
+    NeuronViewerWidget._remove_unselected_from_table(widget)
+
+    table.remove_file_ids.assert_not_called()
+    table.set_added_file_ids.assert_not_called()
+    table.select_file_ids.assert_not_called()
+    assert widget._render_status_label.text == (
+        "All table neurons are selected; no unselected neurons to remove."
+    )
+    assert widget._regions_status_label.text == (
+        "All table neurons are selected; no unselected neurons to remove."
+    )
+
+
 def test_clear_neuron_table_preserves_scene_render_modes() -> None:
     table = types.SimpleNamespace(
         _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},
@@ -2316,6 +2645,135 @@ def test_current_selected_neuron_heatmap_layers_ignores_analysis_heatmaps() -> N
         "n1": ("beta Heatmap",),
         "n2": ("alpha Heatmap", "beta Heatmap"),
     }
+
+
+def _make_layer_name_sync_widget(viewer: _DummyViewer, table) -> object:
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _neuron_table=table,
+        _manual_heatmap_combo=None,
+        _layer_name_event_connections={},
+        _refresh_heatmap_layer_list=MagicMock(),
+        _refresh_histogram_layer_list=MagicMock(),
+        _refresh_mask_layer_options=MagicMock(),
+        _update_tools_controls=MagicMock(),
+        _update_histogram_controls=MagicMock(),
+    )
+    _bind_manual_heatmap_helpers(widget)
+    _bind_layer_name_event_helpers(widget)
+    return widget
+
+
+def test_selected_neuron_heatmap_layer_rename_updates_table_membership() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1", "n2"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = _make_layer_name_sync_widget(viewer, table)
+
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    layer.name = "Renamed Heatmap"
+    layer.events.name.emit(types.SimpleNamespace(source=layer))
+
+    table.set_heatmap_layers_by_file_id.assert_called_once_with(
+        {
+            "n1": ("Renamed Heatmap",),
+            "n2": ("Renamed Heatmap",),
+        }
+    )
+    widget._refresh_heatmap_layer_list.assert_called_once_with()
+    widget._refresh_histogram_layer_list.assert_called_once_with()
+    widget._refresh_mask_layer_options.assert_called_once_with()
+
+
+def test_layer_name_event_sync_does_not_duplicate_callbacks() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = _make_layer_name_sync_widget(viewer, table)
+
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    layer.name = "Renamed Heatmap"
+    layer.events.name.emit(types.SimpleNamespace(source=layer))
+
+    assert len(layer.events.name._callbacks) == 1
+    table.set_heatmap_layers_by_file_id.assert_called_once_with(
+        {"n1": ("Renamed Heatmap",)}
+    )
+
+
+def test_removed_layer_name_event_disconnects_from_table_membership_sync() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    table = types.SimpleNamespace(set_heatmap_layers_by_file_id=MagicMock())
+    widget = _make_layer_name_sync_widget(viewer, table)
+
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    viewer.layers.remove(layer)
+    NeuronViewerWidget._sync_layer_name_event_connections(widget)
+    layer.name = "Stale Heatmap"
+    layer.events.name.emit(types.SimpleNamespace(source=layer))
+
+    assert layer.events.name._callbacks == []
+    table.set_heatmap_layers_by_file_id.assert_not_called()
+
+
+def test_manual_heatmap_combo_preserves_selection_by_stable_id_after_rename() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    layer = viewer.add_image(
+        np.ones((2, 2, 2), dtype=np.float32),
+        name="alpha Heatmap",
+        metadata={
+            "heatmap_kind": "selected_neurons",
+            "file_ids": ["n1"],
+            "manual_heatmap_id": "alpha",
+        },
+    )
+    combo = _DummyMutableComboBox()
+    table = types.SimpleNamespace(apply_filters=MagicMock())
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _manual_heatmap_combo=combo,
+        _cluster_filter_combo=_DummyClusterFilterCombo(),
+        _neuron_table=table,
+    )
+    _bind_manual_heatmap_helpers(widget)
+
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+    combo.setCurrentIndex(1)
+    layer.name = "Renamed Heatmap"
+    NeuronViewerWidget._refresh_manual_heatmap_combo(widget)
+
+    assert combo.currentText() == "Renamed Heatmap"
+    assert NeuronViewerWidget._manual_heatmap_combo_data(widget) == (
+        "Renamed Heatmap",
+        ("n1",),
+    )
+    table.apply_filters.assert_not_called()
 
 
 def test_manual_heatmap_combo_lists_only_manual_heatmaps_and_preserves_selection() -> None:
