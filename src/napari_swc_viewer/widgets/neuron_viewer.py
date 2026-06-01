@@ -888,7 +888,7 @@ class NeuronViewerWidget(QWidget):
         neuron_btn_row.addWidget(self._remove_selected_btn)
 
         self._clear_neurons_btn = QPushButton("Clear All")
-        self._clear_neurons_btn.clicked.connect(self._clear_neuron_layers)
+        self._clear_neurons_btn.clicked.connect(self._clear_all_neuron_layers)
         neuron_btn_row.addWidget(self._clear_neurons_btn)
 
         neurons_layout.addLayout(neuron_btn_row)
@@ -5300,6 +5300,10 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
         self._refresh_apply_existing_clusters_button()
+
+    def _clear_all_neuron_layers(self, _checked: bool = False) -> None:
+        """Clear all neuron layers from the UI button without preserving scene state."""
+        self._clear_neuron_layers(reset_render_state=True)
 
     def _clear_neuron_layers(self, reset_render_state: bool = True) -> None:
         """Remove all current neuron layers and optionally reset scene state."""

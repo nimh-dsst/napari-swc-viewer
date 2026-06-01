@@ -1305,6 +1305,45 @@ def test_remove_selected_neurons_preserves_remaining_render_modes() -> None:
     widget._clear_neuron_layers.assert_not_called()
 
 
+def test_clear_all_neuron_layers_ignores_qt_checked_argument_and_resets_scene_state() -> None:
+    viewer = _DummyViewer(ndisplay=3)
+    soma_layer = _DummyPointsLayer(
+        np.array([[0.0, 0.0, 0.0]]),
+        name="Soma Labels",
+        metadata={"file_ids": ["n1"]},
+    )
+    viewer.layers.append(soma_layer)
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _current_neuron_layers=[soma_layer],
+        _scene_render_modes={"n1": "soma"},
+        _scene_display_state={
+            "n1": {"color": [1.0, 0.0, 0.0, 1.0], "visible": True}
+        },
+        _slice_projector=MagicMock(),
+        _soma_slice_projector=MagicMock(),
+        _neuron_table=types.SimpleNamespace(set_added_file_ids=MagicMock()),
+    )
+    widget._current_scene_file_ids = types.MethodType(
+        NeuronViewerWidget._current_scene_file_ids,
+        widget,
+    )
+    widget._clear_neuron_layers = types.MethodType(
+        NeuronViewerWidget._clear_neuron_layers,
+        widget,
+    )
+
+    NeuronViewerWidget._clear_all_neuron_layers(widget, False)
+
+    assert viewer.layers == []
+    assert widget._current_neuron_layers == []
+    assert widget._scene_render_modes == {}
+    assert widget._scene_display_state == {}
+    widget._slice_projector.clear.assert_called_once_with()
+    widget._soma_slice_projector.clear.assert_called_once_with()
+    widget._neuron_table.set_added_file_ids.assert_called_once_with(set())
+
+
 def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> None:
     viewer = _DummyViewer(ndisplay=3)
     widget = types.SimpleNamespace(
@@ -1381,6 +1420,8 @@ def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> No
     widget._db.get_neurons_for_rendering.assert_called_once_with(["n1"])
     widget._db.get_soma_locations.assert_called_once_with(["n1", "n2"])
     widget._db.get_soma_points.assert_called_once_with(["n2"])
+    assert widget._scene_render_modes == {"n1": "full", "n2": "soma"}
+    widget._neuron_table.set_added_file_ids.assert_called_with({"n1", "n2"})
     widget._slice_projector.add_neuron_data_batch.assert_called_once()
     widget._soma_slice_projector.add_soma_data_batch.assert_called_once()
     assert {layer.name for layer in widget._current_neuron_layers} == {
