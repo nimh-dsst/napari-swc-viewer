@@ -912,6 +912,14 @@ class NeuronViewerWidget(QWidget):
         )
         heatmap_btn_row.addWidget(self._remove_selected_from_table_btn)
 
+        self._remove_unselected_from_table_btn = QPushButton(
+            "Remove Unselected from Table"
+        )
+        self._remove_unselected_from_table_btn.clicked.connect(
+            self._remove_unselected_from_table
+        )
+        heatmap_btn_row.addWidget(self._remove_unselected_from_table_btn)
+
         self._clear_table_btn = QPushButton("Clear Table")
         self._clear_table_btn.clicked.connect(self._clear_neuron_table)
         heatmap_btn_row.addWidget(self._clear_table_btn)
@@ -4578,6 +4586,45 @@ class NeuronViewerWidget(QWidget):
         self._sync_after_neuron_table_membership_change()
 
         message = f"Removed {len(selected_file_ids)} neuron(s) from the table."
+        self._render_status_label.setText(message)
+        self._regions_status_label.setText(message)
+
+    def _remove_unselected_from_table(self) -> None:
+        """Keep selected neurons in the table and remove all other rows."""
+        selected_file_ids = self._neuron_table.get_selected_file_ids()
+        if not selected_file_ids:
+            self._render_status_label.setText(
+                "Select at least one neuron row to keep in the table."
+            )
+            return
+
+        selected_file_id_set = set(selected_file_ids)
+        current_file_ids = self._current_table_file_ids()
+        unselected_file_ids = [
+            file_id for file_id in current_file_ids
+            if file_id not in selected_file_id_set
+        ]
+        if not unselected_file_ids:
+            message = "All table neurons are selected; no unselected neurons to remove."
+            self._render_status_label.setText(message)
+            self._regions_status_label.setText(message)
+            return
+
+        scene_file_ids = self._current_scene_file_ids()
+        rendered_unselected = [
+            file_id for file_id in unselected_file_ids
+            if file_id in scene_file_ids
+        ]
+        self._cache_scene_display_state(rendered_unselected)
+        self._neuron_table.remove_file_ids(unselected_file_ids)
+        self._discard_scene_display_state(self._current_table_file_ids())
+        self._neuron_table.set_added_file_ids(scene_file_ids)
+        self._neuron_table.select_file_ids(selected_file_ids)
+        self._sync_after_neuron_table_membership_change()
+
+        message = (
+            f"Removed {len(unselected_file_ids)} unselected neuron(s) from the table."
+        )
         self._render_status_label.setText(message)
         self._regions_status_label.setText(message)
 

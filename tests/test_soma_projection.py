@@ -2272,6 +2272,126 @@ def test_apply_existing_clusters_from_analysis_no_overlap_only_refreshes_button(
     widget._refresh_apply_existing_clusters_button.assert_called_once_with()
 
 
+def test_remove_unselected_from_table_keeps_selection_and_preserves_scene_state() -> None:
+    table = types.SimpleNamespace(
+        _entries={
+            "n1": types.SimpleNamespace(
+                color=[1.0, 0.0, 0.0, 1.0],
+                visible=True,
+            ),
+            "n2": types.SimpleNamespace(
+                color=[0.2, 0.3, 0.4, 1.0],
+                visible=True,
+            ),
+            "n3": types.SimpleNamespace(
+                color=[0.5, 0.6, 0.7, 1.0],
+                visible=False,
+            ),
+        },
+    )
+
+    def _remove_file_ids(file_ids) -> None:
+        for file_id in file_ids:
+            table._entries.pop(file_id, None)
+
+    table.file_ids = lambda: list(table._entries.keys())
+    table.get_selected_file_ids = MagicMock(return_value=["n1"])
+    table.remove_file_ids = MagicMock(side_effect=_remove_file_ids)
+    table.set_added_file_ids = MagicMock()
+    table.select_file_ids = MagicMock()
+
+    widget = types.SimpleNamespace(
+        _highlighted_file_ids=None,
+        _current_neuron_layers=[object()],
+        _neuron_table=table,
+        _last_soma_selection={"n2"},
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+        _scene_render_modes={"n1": "full", "n2": "full"},
+        _scene_display_state={},
+        _update_layer_colors=MagicMock(),
+    )
+    _bind_table_membership_helpers(widget)
+
+    NeuronViewerWidget._remove_unselected_from_table(widget)
+
+    table.remove_file_ids.assert_called_once_with(["n2", "n3"])
+    table.set_added_file_ids.assert_called_once_with({"n1", "n2"})
+    table.select_file_ids.assert_called_once_with(["n1"])
+    assert list(table._entries) == ["n1"]
+    assert widget._scene_display_state == {
+        "n2": {"color": [0.2, 0.3, 0.4, 1.0], "visible": True}
+    }
+    assert widget._highlighted_file_ids == {"n1"}
+    assert widget._last_soma_selection == set()
+    assert widget._render_status_label.text == (
+        "Removed 2 unselected neuron(s) from the table."
+    )
+    assert widget._regions_status_label.text == (
+        "Removed 2 unselected neuron(s) from the table."
+    )
+
+
+def test_remove_unselected_from_table_requires_selection() -> None:
+    table = types.SimpleNamespace(
+        get_selected_file_ids=MagicMock(return_value=[]),
+        remove_file_ids=MagicMock(),
+        set_added_file_ids=MagicMock(),
+        select_file_ids=MagicMock(),
+    )
+    widget = types.SimpleNamespace(
+        _neuron_table=table,
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+    )
+
+    NeuronViewerWidget._remove_unselected_from_table(widget)
+
+    table.remove_file_ids.assert_not_called()
+    table.set_added_file_ids.assert_not_called()
+    table.select_file_ids.assert_not_called()
+    assert widget._render_status_label.text == (
+        "Select at least one neuron row to keep in the table."
+    )
+
+
+def test_remove_unselected_from_table_noops_when_all_rows_selected() -> None:
+    table = types.SimpleNamespace(
+        _entries={
+            "n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True),
+            "n2": types.SimpleNamespace(color=[0.0, 1.0, 0.0, 1.0], visible=True),
+        },
+    )
+    table.file_ids = lambda: list(table._entries.keys())
+    table.get_selected_file_ids = MagicMock(return_value=["n1", "n2"])
+    table.remove_file_ids = MagicMock()
+    table.set_added_file_ids = MagicMock()
+    table.select_file_ids = MagicMock()
+    widget = types.SimpleNamespace(
+        _neuron_table=table,
+        _render_status_label=_DummyLabel(),
+        _regions_status_label=_DummyLabel(),
+    )
+    widget._current_table_file_ids = types.MethodType(
+        NeuronViewerWidget._current_table_file_ids,
+        widget,
+    )
+
+    NeuronViewerWidget._remove_unselected_from_table(widget)
+
+    table.remove_file_ids.assert_not_called()
+    table.set_added_file_ids.assert_not_called()
+    table.select_file_ids.assert_not_called()
+    assert widget._render_status_label.text == (
+        "All table neurons are selected; no unselected neurons to remove."
+    )
+    assert widget._regions_status_label.text == (
+        "All table neurons are selected; no unselected neurons to remove."
+    )
+
+
 def test_clear_neuron_table_preserves_scene_render_modes() -> None:
     table = types.SimpleNamespace(
         _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},

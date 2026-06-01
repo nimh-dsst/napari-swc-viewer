@@ -189,10 +189,14 @@ In the table you can:
 
 Buttons:
 
-- `Add Selected`: add currently selected neurons to the scene while keeping neurons already added.
+- `Add Full Neurons`: add currently selected neurons to the scene while keeping neurons already added.
 - `Add Soma Only`: add currently selected neurons to the scene as soma-only, reusing the shared soma layers without full trace geometry.
 - `Remove Selected`: remove only currently selected neurons from the scene.
 - `Clear All`: remove all neuron layers.
+- `Add Heatmap`: create a heatmap from the currently selected table neurons.
+- `Remove Selected From Table`: remove currently selected neuron rows from the table while keeping rendered scene layers.
+- `Remove Unselected from Table`: keep selected table rows and remove all other table rows, including rows hidden by active filters.
+- `Clear Table`: clear the table while keeping rendered scene layers.
 - Centering mode (`Same` | `Auto`): `Same` keeps the current depth slice after add/remove. `Auto` auto-centers once on first add/remove in the widget session.
 
 ### 7. Configure rendering (Visualization tab)
