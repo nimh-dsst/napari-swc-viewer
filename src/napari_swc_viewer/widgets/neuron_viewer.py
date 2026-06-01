@@ -3008,11 +3008,18 @@ class NeuronViewerWidget(QWidget):
                 }
             )
         self._mask_layer_selector.set_mask_layers(mask_entries)
-        hint = (
-            f"{len(masks)} generated mask layer(s) available."
-            if masks
-            else "No generated mask layers are available."
-        )
+        if masks:
+            with_source_ids = sum(
+                1 for layer in masks if self._source_file_ids_for_layers([layer])
+            )
+            hint = f"{len(masks)} generated mask layer(s) available."
+            if with_source_ids:
+                hint += (
+                    " Source neurons recorded in mask metadata are excluded "
+                    "from mask queries."
+                )
+        else:
+            hint = "No generated mask layers are available."
         self._mask_query_hint_label.setText(hint)
 
     def _current_tools_create_mode(self) -> str:
@@ -3555,6 +3562,34 @@ class NeuronViewerWidget(QWidget):
             if layer.name in names
         ]
 
+    @staticmethod
+    def _deduplicate_file_ids(file_ids: list[object]) -> list[object]:
+        """Return file IDs in first-seen order using string-equivalent identity."""
+        deduplicated: list[object] = []
+        seen: set[str] = set()
+        for file_id in file_ids:
+            key = str(file_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduplicated.append(file_id)
+        return deduplicated
+
+    def _source_file_ids_for_layers(self, layers: list) -> list[object]:
+        """Return source neuron IDs carried by one or more heatmap/mask layers."""
+        file_ids: list[object] = []
+        for layer in layers:
+            metadata = _layer_metadata(layer)
+            for key in (
+                "query_excluded_file_ids",
+                "source_file_ids",
+                "file_ids",
+            ):
+                file_ids.extend(
+                    self._normalise_layer_file_ids(metadata.get(key, ()))
+                )
+        return NeuronViewerWidget._deduplicate_file_ids(file_ids)
+
     def _on_mask_layer_selection_changed(self, selected_names: list[str]) -> None:
         """Update Regions status text when mask selection changes."""
         count = len(selected_names)
@@ -3814,6 +3849,7 @@ class NeuronViewerWidget(QWidget):
         blurred = smooth_heatmap_volume(volume, sigma=sigma)
         first_layer = source_layers[0]
         rgba = _mask_layer_color(source_layers)
+        source_file_ids = self._source_file_ids_for_layers(source_layers)
 
         colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
         if colormap is None and rgba is not None:
@@ -3832,6 +3868,8 @@ class NeuronViewerWidget(QWidget):
                 "heatmap_kind": "blurred",
                 "blur_sigma": float(sigma),
                 "source_heatmap_layers": [layer.name for layer in source_layers],
+                "file_ids": source_file_ids or None,
+                "source_file_ids": source_file_ids or None,
                 "atlas_name": self._current_atlas_name(),
                 "color": rgba,
                 "merge_mode": merge_mode,
@@ -3874,6 +3912,7 @@ class NeuronViewerWidget(QWidget):
 
         first_layer = source_layers[0]
         rgba = _mask_layer_color(source_layers)
+        source_file_ids = self._source_file_ids_for_layers(source_layers)
 
         colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
         if colormap is None and rgba is not None:
@@ -3898,6 +3937,8 @@ class NeuronViewerWidget(QWidget):
                 "heatmap_native_grid": True,
                 "heatmap_kind": "region_isolated",
                 "source_heatmap_layers": [layer.name for layer in source_layers],
+                "file_ids": source_file_ids or None,
+                "source_file_ids": source_file_ids or None,
                 "heatmap_selected_region_ids": [
                     int(region_id) for region_id in selected_region_ids
                 ],
@@ -3953,6 +3994,7 @@ class NeuronViewerWidget(QWidget):
 
         labels = np.asarray(mask, dtype=np.uint8)
         rgba = _mask_layer_color(source_layers)
+        source_file_ids = self._source_file_ids_for_layers(source_layers)
         color_dict = {
             None: np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
             0: np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
@@ -3971,6 +4013,9 @@ class NeuronViewerWidget(QWidget):
             metadata={
                 "mask_query_source": True,
                 "source_heatmap_layers": [layer.name for layer in source_layers],
+                "file_ids": source_file_ids or None,
+                "source_file_ids": source_file_ids or None,
+                "query_excluded_file_ids": source_file_ids or None,
                 "sigma": _shared_blur_sigma(source_layers),
                 "threshold_mode": "range",
                 "threshold_value": float(lower_threshold),
@@ -4294,6 +4339,7 @@ class NeuronViewerWidget(QWidget):
             show_warning(message)
             return
 
+        exclude_file_ids = self._source_file_ids_for_layers(layers)
         try:
             proceed, base_file_ids, scope_label, input_count = (
                 self._resolve_region_query_file_scope()
@@ -4306,6 +4352,7 @@ class NeuronViewerWidget(QWidget):
                 self._atlas,
                 soma_only=soma_only,
                 file_ids=base_file_ids,
+                exclude_file_ids=exclude_file_ids or None,
             )
             self._populate_neuron_table(
                 result,
@@ -4315,19 +4362,31 @@ class NeuronViewerWidget(QWidget):
             selected_names = ", ".join(layer.name for layer in layers[:3])
             if len(layers) > 3:
                 selected_names += ", ..."
+            exclusion_text = ""
+            if exclude_file_ids:
+                excluded_word = (
+                    "neuron" if len(exclude_file_ids) == 1 else "neurons"
+                )
+                exclusion_text = (
+                    f"; excluded {len(exclude_file_ids)} source {excluded_word}"
+                )
             self._regions_status_label.setText(
                 "Found "
                 f"{len(result)} neuron(s) with {membership} in "
                 f"{len(layers)} selected mask layer(s)"
                 f"{self._query_scope_status_suffix(scope_label, input_count)}: "
-                f"{selected_names}"
+                f"{selected_names}{exclusion_text}"
             )
             logger.info(
-                "Found %d neurons with %s in %d selected mask layers within %s",
+                (
+                    "Found %d neurons with %s in %d selected mask layers "
+                    "within %s after excluding %d source neurons"
+                ),
                 len(result),
                 membership,
                 len(layers),
                 scope_label,
+                len(exclude_file_ids),
             )
         except Exception as e:
             logger.error(f"Mask query failed: {e}")

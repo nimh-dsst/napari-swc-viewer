@@ -1415,6 +1415,8 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.metadata["heatmap_selected_region_id"] == 567
     assert layer.metadata["heatmap_selected_region_acronym"] == "CH"
     assert layer.metadata["heatmap_region_ids"] == [567, 568]
+    assert layer.metadata["file_ids"] == ["n1", "n2"]
+    assert layer.metadata["source_file_ids"] == ["n1", "n2"]
     assert (
         layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
     )
