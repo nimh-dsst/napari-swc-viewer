@@ -4903,7 +4903,12 @@ class NeuronViewerWidget(QWidget):
                 face_color=soma_colors,
                 border_color="white",
                 border_width=0.05,
-                text={"string": labels, "size": 10, "color": "white"},
+                text={
+                    "string": labels,
+                    "size": 10,
+                    "color": "white",
+                    "visible": False,
+                },
                 name="Soma Labels",
                 opacity=0.7,
                 scale=scale,

@@ -882,6 +882,7 @@ class SomaSliceProjector:
                 face_color=colors,
                 border_color=_SOMA_PROJECTION_BORDER_COLOR,
                 border_width=_SOMA_PROJECTION_BORDER_WIDTH,
+                text={"visible": False},
                 name=layer_name,
                 opacity=1.0,
                 scale=self._scale,

@@ -294,6 +294,7 @@ class _DummyPointsLayer:
         self.opacity = kwargs.get("opacity", 1.0)
         self.visible = True
         self.size = kwargs.get("size")
+        self.text = kwargs.get("text")
         self.mode = "pan_zoom"
         self.border_color = kwargs.get("border_color")
         self.border_width = kwargs.get("border_width")
@@ -1155,6 +1156,7 @@ def test_soma_slice_projector_updates_layer_and_clear_removes_it() -> None:
     assert layer.size == 9
     assert layer.border_color == "#39ff14"
     assert layer.border_width == 0.15
+    assert layer.text == {"visible": False}
 
     projector.clear()
 
@@ -1385,6 +1387,17 @@ def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> No
         "Neuron Lines",
         "Neuron Points",
         "Soma Labels",
+    }
+    soma_layer = next(
+        layer
+        for layer in widget._current_neuron_layers
+        if layer.name == "Soma Labels"
+    )
+    assert soma_layer.text == {
+        "string": ["N1", "N2"],
+        "size": 10,
+        "color": "white",
+        "visible": False,
     }
 
 
