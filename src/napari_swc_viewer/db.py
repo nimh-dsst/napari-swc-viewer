@@ -13,7 +13,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from .atlas_utils import mask_to_world_xyz_bounds, world_coords_xyz_to_atlas_voxels
+from .atlas_utils import mask_to_swc_xyz_bounds, swc_coords_xyz_to_atlas_voxels
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -78,12 +78,27 @@ class NeuronDatabase:
         params.extend(file_ids)
         return True
 
+    @staticmethod
+    def _append_file_id_exclusion(
+        where_parts: list[str],
+        params: list[object],
+        exclude_file_ids: list[object] | tuple[object, ...] | None,
+    ) -> None:
+        """Append an optional ``file_id`` exclusion to a WHERE clause."""
+        if not exclude_file_ids:
+            return
+
+        placeholders = ", ".join(["?"] * len(exclude_file_ids))
+        where_parts.append(f"file_id NOT IN ({placeholders})")
+        params.extend(exclude_file_ids)
+
     def get_neurons_by_region(
         self,
         region_acronyms: list[str],
         include_children: bool = False,
         soma_only: bool = False,
         file_ids: list[object] | tuple[object, ...] | None = None,
+        exclude_file_ids: list[object] | tuple[object, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified regions.
 
@@ -111,6 +126,7 @@ class NeuronDatabase:
             where_parts.append("type = 1")
         if not self._append_file_id_filter(where_parts, params, file_ids):
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+        self._append_file_id_exclusion(where_parts, params, exclude_file_ids)
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
@@ -124,6 +140,7 @@ class NeuronDatabase:
         region_ids: list[int],
         soma_only: bool = False,
         file_ids: list[object] | tuple[object, ...] | None = None,
+        exclude_file_ids: list[object] | tuple[object, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified region IDs.
 
@@ -149,6 +166,7 @@ class NeuronDatabase:
             where_parts.append("type = 1")
         if not self._append_file_id_filter(where_parts, params, file_ids):
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+        self._append_file_id_exclusion(where_parts, params, exclude_file_ids)
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
@@ -408,6 +426,7 @@ class NeuronDatabase:
         atlas: Any,
         soma_only: bool = False,
         file_ids: list[object] | tuple[object, ...] | None = None,
+        exclude_file_ids: list[object] | tuple[object, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons whose nodes fall inside a binary atlas-space mask."""
         mask = np.asarray(mask_volume) > 0
@@ -420,7 +439,7 @@ class NeuronDatabase:
                 f"Mask shape {mask.shape} does not match atlas shape {atlas_shape}"
             )
 
-        bounds = mask_to_world_xyz_bounds(mask, atlas)
+        bounds = mask_to_swc_xyz_bounds(mask, atlas)
         if bounds is None:
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
@@ -445,6 +464,7 @@ class NeuronDatabase:
             where_parts.append("type = 1")
         if not self._append_file_id_filter(where_parts, params, file_ids):
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+        self._append_file_id_exclusion(where_parts, params, exclude_file_ids)
 
         query = f"""
             SELECT file_id, neuron_id, subject, x, y, z
@@ -457,7 +477,7 @@ class NeuronDatabase:
             return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
 
         coords = candidates[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
-        voxel_coords = world_coords_xyz_to_atlas_voxels(coords, atlas)
+        voxel_coords = swc_coords_xyz_to_atlas_voxels(coords, atlas)
         in_bounds = np.all(
             (voxel_coords >= 0) & (voxel_coords < np.asarray(mask.shape)),
             axis=1,

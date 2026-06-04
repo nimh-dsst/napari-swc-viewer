@@ -174,6 +174,8 @@ Notes:
 Notes:
 
 - Generated masks are added as binary `Labels` layers and can be used from the `Regions` tab
+- Mask-layer queries use the current nonzero voxels in the mask, including manual edits made after creation
+- If the mask came from a heatmap with tracked source neurons, the `Regions` tab shows their count and can exclude them from mask-layer query results
 - `Use Layer Contrast` requires exactly one selected heatmap or blurred heatmap layer
 - Zero-valued background voxels are hidden from the histogram by default
 - The histogram plot supports zooming and panning for tighter threshold inspection

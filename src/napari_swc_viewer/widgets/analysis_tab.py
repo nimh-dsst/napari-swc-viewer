@@ -1693,6 +1693,9 @@ class AnalysisTabWidget(QWidget):
 
         scale = [1.0, 1.0, 1.0]
         scale[request.depth_axis] = float(request.depth_bin_factor)
+        source_file_ids = (
+            list(request.file_ids) if request.file_ids is not None else None
+        )
         metadata = {
             "heatmap_source": True,
             "heatmap_native_grid": request.depth_bin_factor == 1,
@@ -1707,6 +1710,8 @@ class AnalysisTabWidget(QWidget):
                 else None
             ),
             "heatmap_cluster": request.cluster_label,
+            "file_ids": source_file_ids,
+            "source_file_ids": source_file_ids,
             "depth_bin_factor": request.depth_bin_factor,
             "depth_axis": request.depth_axis,
             "heatmap_contrast_limits": contrast_limits,
