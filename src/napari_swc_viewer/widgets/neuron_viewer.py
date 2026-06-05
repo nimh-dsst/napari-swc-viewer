@@ -119,6 +119,14 @@ _SCENE_RENDER_MODE_FULL = "full"
 _SCENE_RENDER_MODE_SOMA = "soma"
 _REGION_QUERY_SCOPE_WHOLE = "whole"
 _REGION_QUERY_SCOPE_CURRENT = "current"
+_REFERENCE_ACTION_TEMPLATE = "template"
+_REFERENCE_ACTION_OUTLINE = "outline"
+_REFERENCE_ACTION_MESHES = "meshes"
+_REFERENCE_ACTION_SEGMENTATION = "segmentation"
+_ATLAS_REFERENCE_PROMPT = (
+    "Atlas loaded. Go to the Reference tab to show the template, outline, "
+    "or selected region meshes."
+)
 _DEFAULT_NEURON_RGBA = (0.5, 0.5, 0.5, 1.0)
 _CLUSTER_FILTER_ALL = "all"
 _CLUSTER_FILTER_UNCLUSTERED = "unclustered"
@@ -528,6 +536,9 @@ class NeuronViewerWidget(QWidget):
             self._selected_heatmap_request_file_ids: tuple[str, ...] = ()
             self._cached_atlas_thread: QThread | None = None
             self._cached_atlas_worker = None
+            self._atlas_load_thread: QThread | None = None
+            self._atlas_load_worker = None
+            self._pending_reference_action: str | None = None
             self._show_template_after_cached_atlas_load = False
 
             with startup_timing(
@@ -760,15 +771,22 @@ class NeuronViewerWidget(QWidget):
         self._atlas_combo.setCurrentText("allen_mouse_25um")
         atlas_row.addWidget(self._atlas_combo)
 
-        load_atlas_btn = QPushButton("Load Atlas")
-        load_atlas_btn.clicked.connect(self._load_atlas)
-        atlas_row.addWidget(load_atlas_btn)
+        self._load_atlas_btn = QPushButton("Load Atlas")
+        self._load_atlas_btn.clicked.connect(self._load_atlas)
+        atlas_row.addWidget(self._load_atlas_btn)
 
         atlas_layout.addLayout(atlas_row)
 
         # Atlas status label
         self._atlas_status_label = QLabel("Atlas: Not loaded")
+        self._atlas_status_label.setWordWrap(True)
         atlas_layout.addWidget(self._atlas_status_label)
+
+        self._atlas_progress = QProgressBar()
+        self._atlas_progress.setRange(0, 100)
+        self._atlas_progress.setValue(0)
+        self._atlas_progress.setVisible(False)
+        atlas_layout.addWidget(self._atlas_progress)
         layout.addWidget(atlas_section)
 
         # Standardized point Parquet import
@@ -2022,8 +2040,13 @@ class NeuronViewerWidget(QWidget):
             logger.debug("Could not restore saved project colormap", exc_info=True)
         return False
 
-    def _load_atlas(self) -> None:
-        """Load the selected BrainGlobe atlas."""
+    def _load_atlas(
+        self,
+        _checked: bool = False,
+        *,
+        pending_reference_action: str | None = None,
+    ) -> None:
+        """Load the selected BrainGlobe atlas in the background."""
         atlas_name = self._atlas_combo.currentText()
 
         if self._cached_atlas_autoload_running():
@@ -2032,34 +2055,144 @@ class NeuronViewerWidget(QWidget):
             )
             return
 
-        self._atlas_status_label.setText(f"Atlas: Loading {atlas_name}...")
-        # Force UI update
+        if self._atlas_load_running():
+            if pending_reference_action is not None:
+                self._pending_reference_action = pending_reference_action
+            self._atlas_status_label.setText(
+                f"Atlas: Loading {atlas_name} in background..."
+            )
+            self._show_atlas_progress()
+            return
+
+        from ..workers import AtlasLoadWorker
+
+        self._pending_reference_action = pending_reference_action
+        self._atlas_status_label.setText(f"Atlas: Preparing to load {atlas_name}...")
         self._atlas_status_label.repaint()
+        self._set_atlas_load_controls_enabled(False)
+        self._on_atlas_load_progress(0, 0, 0)
+
+        thread = QThread()
+        worker = AtlasLoadWorker(atlas_name)
+        self._atlas_load_thread = thread
+        self._atlas_load_worker = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.status.connect(self._on_atlas_load_status)
+        worker.progress.connect(self._on_atlas_load_progress)
+        worker.finished.connect(self._on_atlas_load_finished)
+        worker.error.connect(self._on_atlas_load_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._cleanup_atlas_load_thread(thread, worker))
+        thread.start()
+
+    def _atlas_load_running(self) -> bool:
+        """Return whether an explicit atlas load worker is active."""
+        thread = getattr(self, "_atlas_load_thread", None)
+        is_running = getattr(thread, "isRunning", None)
+        return bool(thread is not None and callable(is_running) and is_running())
+
+    def _show_atlas_progress(self) -> None:
+        """Show the atlas progress bar when the Data tab controls exist."""
+        progress = getattr(self, "_atlas_progress", None)
+        if progress is not None and hasattr(progress, "setVisible"):
+            progress.setVisible(True)
+
+    def _hide_atlas_progress(self) -> None:
+        """Hide and reset the atlas progress bar."""
+        progress = getattr(self, "_atlas_progress", None)
+        if progress is None:
+            return
+        if hasattr(progress, "setRange"):
+            progress.setRange(0, 100)
+        if hasattr(progress, "setValue"):
+            progress.setValue(0)
+        if hasattr(progress, "setVisible"):
+            progress.setVisible(False)
+
+    def _set_atlas_load_controls_enabled(self, enabled: bool) -> None:
+        """Enable or disable atlas controls while a load is running."""
+        for attr_name in ("_atlas_combo", "_load_atlas_btn"):
+            widget = getattr(self, attr_name, None)
+            set_enabled = getattr(widget, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(enabled)
+
+    def _on_atlas_load_status(self, message: str) -> None:
+        """Display atlas worker status text."""
+        self._atlas_status_label.setText(message)
+
+    def _on_atlas_load_progress(
+        self,
+        minimum: int,
+        maximum: int,
+        value: int,
+    ) -> None:
+        """Display atlas worker progress."""
+        progress = getattr(self, "_atlas_progress", None)
+        if progress is None:
+            return
+        if hasattr(progress, "setVisible"):
+            progress.setVisible(True)
+        if hasattr(progress, "setRange"):
+            progress.setRange(int(minimum), int(maximum))
+        if hasattr(progress, "setValue"):
+            progress.setValue(int(value))
+
+    def _on_atlas_load_finished(self, atlas) -> None:
+        """Apply a background-loaded atlas and complete pending UI actions."""
+        atlas_name = str(
+            getattr(atlas, "atlas_name", None) or self._atlas_combo.currentText()
+        )
+        pending_action = self._pending_reference_action
+        self._pending_reference_action = None
+        self._set_atlas_load_controls_enabled(True)
+        self._hide_atlas_progress()
 
         try:
-            with startup_timing(logger, "load_atlas", atlas=atlas_name) as timing:
-                with startup_timing(
-                    logger,
-                    "load_atlas_phase",
-                    phase="BrainGlobeAtlas",
-                    atlas=atlas_name,
-                ) as atlas_timing:
-                    self._atlas = BrainGlobeAtlas(
-                        atlas_name,
-                        check_latest=False,
-                    )
-                    structure_count = len(self._atlas.structures)
-                    atlas_timing.set(structures=structure_count)
-                    timing.set(structures=structure_count)
+            with startup_timing(
+                logger,
+                "atlas_load_apply",
+                atlas=atlas_name,
+            ) as timing:
+                self._apply_loaded_atlas(atlas, atlas_name)
+                timing.set(structures=len(getattr(atlas, "structures", {})))
+            logger.info(f"Loaded atlas: {atlas_name}")
 
-                self._apply_loaded_atlas(self._atlas, atlas_name)
-                logger.info(f"Loaded atlas: {atlas_name}")
-
+            if pending_action is not None:
+                self._complete_pending_reference_action(pending_action)
+            else:
+                self._atlas_status_label.setText(
+                    f"Atlas: {atlas_name} "
+                    f"({len(getattr(atlas, 'structures', {}))} structures). "
+                    f"{_ATLAS_REFERENCE_PROMPT}"
+                )
+                show_info(_ATLAS_REFERENCE_PROMPT)
         except Exception as e:
-            logger.error(f"Failed to load atlas: {e}")
-            self._atlas_status_label.setText(f"Atlas: Error - {e}")
-            self._update_mask_sigma_units_label()
-            self._update_point_import_controls()
+            logger.exception("Failed to apply loaded atlas")
+            self._pending_reference_action = pending_action
+            self._on_atlas_load_error(str(e))
+
+    def _on_atlas_load_error(self, error_msg: str) -> None:
+        """Handle explicit atlas load failure."""
+        logger.error("Atlas load failed: %s", error_msg)
+        pending_action = self._pending_reference_action
+        self._pending_reference_action = None
+        self._set_atlas_load_controls_enabled(True)
+        self._hide_atlas_progress()
+        if pending_action is not None:
+            self._set_reference_action_checked(
+                pending_action,
+                False,
+                emit_signal=False,
+            )
+        self._atlas_status_label.setText(f"Atlas: Error - {error_msg}")
+        self._update_mask_sigma_units_label()
+        self._update_point_import_controls()
 
     def _apply_loaded_atlas(self, atlas, atlas_name: str) -> None:
         """Store a loaded atlas and refresh atlas-dependent UI."""
@@ -2172,6 +2305,56 @@ class NeuronViewerWidget(QWidget):
         if checkbox is not None and hasattr(checkbox, "setEnabled"):
             checkbox.setEnabled(enabled)
 
+    def _reference_action_checkbox(self, action: str):
+        """Return the checkbox associated with a pending reference action."""
+        attr_name = {
+            _REFERENCE_ACTION_TEMPLATE: "_show_template_cb",
+            _REFERENCE_ACTION_OUTLINE: "_show_outline_cb",
+            _REFERENCE_ACTION_MESHES: "_show_region_meshes_cb",
+            _REFERENCE_ACTION_SEGMENTATION: "_show_region_seg_cb",
+        }.get(action)
+        if attr_name is None:
+            return None
+        return getattr(self, attr_name, None)
+
+    def _set_reference_action_checked(
+        self,
+        action: str,
+        checked: bool,
+        *,
+        emit_signal: bool,
+    ) -> None:
+        """Set a reference action checkbox without optionally emitting signals."""
+        checkbox = self._reference_action_checkbox(action)
+        if checkbox is None or not hasattr(checkbox, "setChecked"):
+            return
+
+        if emit_signal or not hasattr(checkbox, "blockSignals"):
+            checkbox.setChecked(checked)
+            return
+
+        previous = checkbox.blockSignals(True)
+        try:
+            checkbox.setChecked(checked)
+        finally:
+            checkbox.blockSignals(previous)
+
+    def _complete_pending_reference_action(self, action: str) -> None:
+        """Run the reference action that requested an atlas load."""
+        checkbox = self._reference_action_checkbox(action)
+        is_checked = getattr(checkbox, "isChecked", None)
+        if callable(is_checked) and not is_checked():
+            return
+
+        if action == _REFERENCE_ACTION_TEMPLATE:
+            self._toggle_template(True)
+        elif action == _REFERENCE_ACTION_OUTLINE:
+            self._toggle_outline(True)
+        elif action == _REFERENCE_ACTION_MESHES:
+            self._update_region_meshes(self._active_region_preview_acronyms())
+        elif action == _REFERENCE_ACTION_SEGMENTATION:
+            self._update_region_segmentation(self._active_region_preview_acronyms())
+
     def _start_cached_template_autoload(self) -> None:
         """Auto-load and show the reference template only when the atlas is cached."""
         if self._atlas is not None or self._cached_atlas_autoload_running():
@@ -2268,6 +2451,17 @@ class NeuronViewerWidget(QWidget):
             self._cached_atlas_thread = None
         if self._cached_atlas_worker is worker:
             self._cached_atlas_worker = None
+
+    def _cleanup_atlas_load_thread(
+        self,
+        thread: QThread,
+        worker: object,
+    ) -> None:
+        """Release explicit atlas load worker objects after the thread stops."""
+        if self._atlas_load_thread is thread:
+            self._atlas_load_thread = None
+        if self._atlas_load_worker is worker:
+            self._atlas_load_worker = None
 
     def _open_point_parquet(self) -> None:
         """Open file dialog and preview a standardized point Parquet."""
@@ -6094,16 +6288,20 @@ class NeuronViewerWidget(QWidget):
                     self._show_template_after_cached_atlas_load = True
                     timing.set(result="cached_atlas_loading")
                     return
+                if self._atlas_load_running():
+                    self._pending_reference_action = _REFERENCE_ACTION_TEMPLATE
+                    timing.set(result="atlas_loading")
+                    return
                 with startup_timing(
                     logger,
                     "toggle_template_phase",
                     phase="load_atlas",
                 ):
-                    self._load_atlas()
-                if self._atlas is None:
-                    self._show_template_cb.setChecked(False)
-                    timing.set(result="atlas_unavailable")
-                    return
+                    self._load_atlas(
+                        pending_reference_action=_REFERENCE_ACTION_TEMPLATE
+                    )
+                timing.set(result="atlas_load_started")
+                return
 
             layer_name = "Allen Template"
 
@@ -6146,10 +6344,13 @@ class NeuronViewerWidget(QWidget):
     def _toggle_outline(self, state: int) -> None:
         """Toggle the brain outline visibility."""
         if self._atlas is None:
-            self._load_atlas()
-            if self._atlas is None:
-                self._show_outline_cb.setChecked(False)
+            if not bool(state):
                 return
+            if self._atlas_load_running():
+                self._pending_reference_action = _REFERENCE_ACTION_OUTLINE
+                return
+            self._load_atlas(pending_reference_action=_REFERENCE_ACTION_OUTLINE)
+            return
 
         layer_name = "Brain Outline"
 
@@ -6179,9 +6380,11 @@ class NeuronViewerWidget(QWidget):
     def _update_region_meshes(self, acronyms: list[str]) -> None:
         """Update displayed region meshes."""
         if self._atlas is None:
-            self._load_atlas()
-            if self._atlas is None:
+            if self._atlas_load_running():
+                self._pending_reference_action = _REFERENCE_ACTION_MESHES
                 return
+            self._load_atlas(pending_reference_action=_REFERENCE_ACTION_MESHES)
+            return
 
         # Remove existing region meshes
         remove_region_layers(self.viewer)
@@ -6212,9 +6415,11 @@ class NeuronViewerWidget(QWidget):
     def _update_region_segmentation(self, acronyms: list[str]) -> None:
         """Update the region segmentation layer for selected regions."""
         if self._atlas is None:
-            self._load_atlas()
-            if self._atlas is None:
+            if self._atlas_load_running():
+                self._pending_reference_action = _REFERENCE_ACTION_SEGMENTATION
                 return
+            self._load_atlas(pending_reference_action=_REFERENCE_ACTION_SEGMENTATION)
+            return
 
         remove_region_segmentation(self.viewer)
 
