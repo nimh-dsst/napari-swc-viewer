@@ -54,6 +54,47 @@ def cached_brainglobe_atlas_dir(
     return candidates[0]
 
 
+def resolve_brainglobe_dirs(
+    *,
+    brainglobe_dir: str | Path | None = None,
+    interm_download_dir: str | Path | None = None,
+    config_dir: str | Path | None = None,
+) -> tuple[Path, Path]:
+    """Return BrainGlobe atlas and intermediate download directories."""
+    if brainglobe_dir is None or interm_download_dir is None:
+        from brainglobe_atlasapi import config
+
+        conf = config.read_config(config_dir)
+        default_dirs = conf["default_dirs"]
+        if brainglobe_dir is None:
+            brainglobe_dir = default_dirs["brainglobe_dir"]
+        if interm_download_dir is None:
+            interm_download_dir = default_dirs.get("interm_download_dir", brainglobe_dir)
+
+    return Path(brainglobe_dir).expanduser(), Path(interm_download_dir).expanduser()
+
+
+def load_brainglobe_atlas(
+    atlas_name: str,
+    *,
+    brainglobe_dir: str | Path,
+    interm_download_dir: str | Path,
+    config_dir: str | Path | None = None,
+    fn_update=None,
+):
+    """Load a BrainGlobe atlas with explicit dirs and no latest-version check."""
+    from brainglobe_atlasapi import BrainGlobeAtlas
+
+    return BrainGlobeAtlas(
+        atlas_name,
+        brainglobe_dir=brainglobe_dir,
+        interm_download_dir=interm_download_dir,
+        check_latest=False,
+        config_dir=config_dir,
+        fn_update=fn_update,
+    )
+
+
 def load_cached_brainglobe_atlas(atlas_name: str, atlas_dir: str | Path):
     """Load an already-cached BrainGlobe atlas without remote checks/downloads."""
     from brainglobe_atlasapi.core import Atlas
@@ -90,6 +131,116 @@ class CachedAtlasLoadWorker(QObject):
             self.finished.emit(atlas)
         except Exception as e:
             logger.exception("Cached atlas load failed")
+            self.error.emit(str(e))
+
+
+class AtlasLoadWorker(QObject):
+    """Load a BrainGlobe atlas in the background, downloading it if missing."""
+
+    status = Signal(str)
+    progress = Signal(int, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        atlas_name: str,
+        *,
+        brainglobe_dir: str | Path | None = None,
+        interm_download_dir: str | Path | None = None,
+        config_dir: str | Path | None = None,
+    ):
+        super().__init__()
+        self._atlas_name = str(atlas_name)
+        self._brainglobe_dir = brainglobe_dir
+        self._interm_download_dir = interm_download_dir
+        self._config_dir = config_dir
+        self._installing_status_emitted = False
+
+    def _emit_busy_progress(self) -> None:
+        """Emit an indeterminate progress state."""
+        self.progress.emit(0, 0, 0)
+
+    def _emit_download_progress(self, completed: int, total: int) -> None:
+        """Forward BrainGlobe byte progress as a 0-100 progress value."""
+        if total <= 0:
+            self._emit_busy_progress()
+            return
+
+        percentage = int(min(max(completed / total, 0.0), 1.0) * 100)
+        self.progress.emit(0, 100, percentage)
+        if completed >= total and not self._installing_status_emitted:
+            self._installing_status_emitted = True
+            self.status.emit(
+                f"Atlas: Download complete. Installing {self._atlas_name} "
+                f"into {self._resolved_brainglobe_dir}..."
+            )
+            self._emit_busy_progress()
+
+    def run(self) -> None:
+        """Load the atlas and emit progress/status updates."""
+        try:
+            with startup_timing(
+                logger,
+                "atlas_load_worker",
+                atlas=self._atlas_name,
+            ) as timing:
+                self.status.emit(
+                    f"Atlas: Checking BrainGlobe cache for {self._atlas_name}..."
+                )
+                self._emit_busy_progress()
+                brainglobe_dir, interm_download_dir = resolve_brainglobe_dirs(
+                    brainglobe_dir=self._brainglobe_dir,
+                    interm_download_dir=self._interm_download_dir,
+                    config_dir=self._config_dir,
+                )
+                self._resolved_brainglobe_dir = brainglobe_dir
+
+                candidates = sorted(
+                    path
+                    for path in brainglobe_dir.glob(f"{self._atlas_name}_v*")
+                    if path.is_dir()
+                )
+                timing.set(
+                    cached_candidates=len(candidates),
+                    brainglobe_dir=brainglobe_dir,
+                    interm_download_dir=interm_download_dir,
+                )
+
+                if len(candidates) == 1:
+                    self.status.emit(
+                        f"Atlas: Found cached {self._atlas_name} in "
+                        f"{candidates[0]}. Loading..."
+                    )
+                elif not candidates:
+                    self.status.emit(
+                        f"Atlas: {self._atlas_name} was not found in the "
+                        "local BrainGlobe cache. Downloading via BrainGlobe "
+                        f"to {brainglobe_dir}..."
+                    )
+                else:
+                    self.status.emit(
+                        f"Atlas: Found multiple cached versions of "
+                        f"{self._atlas_name} in {brainglobe_dir}. "
+                        "BrainGlobe will choose or report an error..."
+                    )
+
+                atlas = load_brainglobe_atlas(
+                    self._atlas_name,
+                    brainglobe_dir=brainglobe_dir,
+                    interm_download_dir=interm_download_dir,
+                    config_dir=self._config_dir,
+                    fn_update=self._emit_download_progress,
+                )
+                structure_count = len(getattr(atlas, "structures", {}))
+                timing.set(structures=structure_count)
+                self.progress.emit(0, 100, 100)
+                self.status.emit(
+                    f"Atlas: Loaded {self._atlas_name} ({structure_count} structures)."
+                )
+            self.finished.emit(atlas)
+        except Exception as e:
+            logger.exception("Atlas load failed")
             self.error.emit(str(e))
 
 

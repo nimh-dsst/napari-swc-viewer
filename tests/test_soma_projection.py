@@ -393,12 +393,16 @@ class _DummyComboBox:
     def __init__(self, text: str, data=None) -> None:
         self._text = text
         self._data = text if data is None else data
+        self.enabled = True
 
     def currentText(self) -> str:
         return self._text
 
     def currentData(self):
         return self._data
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
 
 
 class _DummyMutableComboBox:
@@ -737,56 +741,191 @@ def test_reference_template_checkbox_defaults_to_lazy_load(
     assert "on demand" in widget._show_template_cb.tooltip
 
 
-def test_load_atlas_skips_remote_latest_check(
+def test_load_atlas_starts_background_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit atlas loads should avoid BrainGlobe's remote latest check."""
-    calls = []
+    """Explicit atlas loads should start a background worker and busy UI."""
+    workers = []
+    threads = []
 
-    class _FakeAtlas:
-        def __init__(self, atlas_name: str, **kwargs) -> None:
-            calls.append((atlas_name, kwargs))
-            self.structures = {1: {"acronym": "R1"}}
+    class _FakeThread:
+        def __init__(self) -> None:
+            self.started = _DummyAnalysisSignal()
+            self.finished = _DummyAnalysisSignal()
+            self.started_called = False
+            self.running = False
+            threads.append(self)
+
+        def start(self) -> None:
+            self.started_called = True
+            self.running = True
+
+        def quit(self) -> None:
+            self.running = False
+
+        def isRunning(self) -> bool:
+            return self.running
+
+        def deleteLater(self) -> None:
+            return None
+
+    class _FakeAtlasLoadWorker:
+        def __init__(self, atlas_name: str) -> None:
+            self.atlas_name = atlas_name
+            self.status = _DummyAnalysisSignal()
+            self.progress = _DummyAnalysisSignal()
+            self.finished = _DummyAnalysisSignal()
+            self.error = _DummyAnalysisSignal()
+            self.thread = None
+            workers.append(self)
+
+        def moveToThread(self, thread) -> None:
+            self.thread = thread
+
+        def run(self) -> None:
+            return None
+
+        def deleteLater(self) -> None:
+            return None
+
+    fake_workers = types.ModuleType("napari_swc_viewer.workers")
+    fake_workers.AtlasLoadWorker = _FakeAtlasLoadWorker
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", fake_workers)
+    monkeypatch.setitem(
+        NeuronViewerWidget._load_atlas.__globals__,
+        "QThread",
+        _FakeThread,
+    )
 
     widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
     widget._atlas_combo = _DummyComboBox("allen_mouse_25um")
+    widget._load_atlas_btn = _DummyButton("Load Atlas")
     widget._atlas_status_label = _DummyStatusLabel()
-    widget._analysis_tab = types.SimpleNamespace(set_atlas=lambda _atlas: None)
-    widget._update_mask_sigma_units_label = lambda: None
-    widget._refresh_heatmap_layer_list = lambda: None
-    widget._refresh_histogram_layer_list = lambda: None
-    widget._refresh_mask_layer_options = lambda: None
-    widget._update_point_import_controls = lambda: None
-
-    monkeypatch.setitem(
-        NeuronViewerWidget._load_atlas.__globals__,
-        "BrainGlobeAtlas",
-        _FakeAtlas,
-    )
+    widget._atlas_progress = _DummyProgressBar()
+    widget._cached_atlas_thread = None
+    widget._atlas_load_thread = None
+    widget._atlas_load_worker = None
+    widget._pending_reference_action = None
 
     NeuronViewerWidget._load_atlas(widget)
 
-    assert calls == [("allen_mouse_25um", {"check_latest": False})]
-    assert widget._atlas_status_label.text == "Atlas: allen_mouse_25um (1 structures)"
+    assert len(workers) == 1
+    assert workers[0].atlas_name == "allen_mouse_25um"
+    assert workers[0].thread is threads[0]
+    assert threads[0].started_called is True
+    assert widget._atlas_load_worker is workers[0]
+    assert widget._atlas_load_thread is threads[0]
+    assert widget._atlas_combo.enabled is False
+    assert widget._load_atlas_btn.enabled is False
+    assert widget._atlas_progress.visible is True
+    assert widget._atlas_progress.range == (0, 0)
+    assert (
+        widget._atlas_status_label.text
+        == "Atlas: Preparing to load allen_mouse_25um..."
+    )
+
+
+def test_atlas_load_progress_updates_progress_bar() -> None:
+    """Atlas worker progress should update the Data-tab progress bar."""
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas_progress = _DummyProgressBar()
+
+    NeuronViewerWidget._on_atlas_load_progress(widget, 0, 100, 42)
+
+    assert widget._atlas_progress.visible is True
+    assert widget._atlas_progress.range == (0, 100)
+    assert widget._atlas_progress.value == 42
+
+
+def test_atlas_load_finished_applies_atlas_and_prompts_reference_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual atlas loads should apply the atlas and show the Reference prompt."""
+    atlas = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        structures={1: {"acronym": "R1"}},
+    )
+    prompts = []
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas_combo = _DummyComboBox("allen_mouse_25um")
+    widget._load_atlas_btn = _DummyButton("Load Atlas")
+    widget._atlas_status_label = _DummyStatusLabel()
+    widget._atlas_progress = _DummyProgressBar()
+    widget._atlas_progress.setVisible(True)
+    widget._pending_reference_action = None
+    widget._apply_loaded_atlas = MagicMock()
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._on_atlas_load_finished.__globals__,
+        "show_info",
+        prompts.append,
+    )
+
+    NeuronViewerWidget._on_atlas_load_finished(widget, atlas)
+
+    widget._apply_loaded_atlas.assert_called_once_with(atlas, "allen_mouse_25um")
+    assert widget._atlas_combo.enabled is True
+    assert widget._load_atlas_btn.enabled is True
+    assert widget._atlas_progress.visible is False
+    assert "Reference tab" in widget._atlas_status_label.text
+    assert prompts == [
+        "Atlas loaded. Go to the Reference tab to show the template, outline, "
+        "or selected region meshes."
+    ]
+
+
+def test_atlas_load_finished_completes_pending_reference_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reference-tab initiated loads should complete the requested action."""
+    atlas = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        structures={1: {"acronym": "R1"}},
+    )
+    prompts = []
+    actions = []
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._atlas_combo = _DummyComboBox("allen_mouse_25um")
+    widget._load_atlas_btn = _DummyButton("Load Atlas")
+    widget._atlas_status_label = _DummyStatusLabel()
+    widget._atlas_progress = _DummyProgressBar()
+    widget._pending_reference_action = "template"
+    widget._show_template_cb = _DummyCheckBox(True)
+    widget._apply_loaded_atlas = MagicMock()
+    widget._toggle_template = lambda state: actions.append(("template", state))
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._on_atlas_load_finished.__globals__,
+        "show_info",
+        prompts.append,
+    )
+
+    NeuronViewerWidget._on_atlas_load_finished(widget, atlas)
+
+    widget._apply_loaded_atlas.assert_called_once_with(atlas, "allen_mouse_25um")
+    assert widget._pending_reference_action is None
+    assert actions == [("template", True)]
+    assert prompts == []
 
 
 def test_toggle_template_loads_atlas_on_demand(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Checking the template box should still load the atlas when needed."""
+    """Checking the template box should queue an atlas load when needed."""
     load_calls = []
     template_calls = []
-    atlas = object()
 
     widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
     widget._atlas = None
+    widget._cached_atlas_thread = None
+    widget._atlas_load_thread = None
+    widget._pending_reference_action = None
     widget.viewer = _DummyViewer()
     widget._show_template_cb = _DummyCheckBox(True)
     widget._template_opacity_slider = _DummyValueControl(30)
 
-    def _load_atlas() -> None:
-        load_calls.append(True)
-        widget._atlas = atlas
+    def _load_atlas(*, pending_reference_action=None) -> None:
+        load_calls.append(pending_reference_action)
 
     widget._load_atlas = _load_atlas
 
@@ -801,8 +940,8 @@ def test_toggle_template_loads_atlas_on_demand(
 
     NeuronViewerWidget._toggle_template(widget, True)
 
-    assert load_calls == [True]
-    assert template_calls == [(widget.viewer, atlas, {"opacity": 0.3})]
+    assert load_calls == ["template"]
+    assert template_calls == []
 
 
 def test_toggle_template_hide_without_atlas_does_not_load() -> None:

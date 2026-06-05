@@ -146,6 +146,160 @@ def test_cached_atlas_load_worker_uses_local_loader(monkeypatch, tmp_path):
     assert errors == []
 
 
+def test_atlas_load_worker_reports_cached_load(monkeypatch, tmp_path):
+    """AtlasLoadWorker should report and load an existing BrainGlobe cache."""
+    workers = _import_workers_module()
+    atlas_dir = tmp_path / "allen_mouse_25um_v1.2"
+    atlas_dir.mkdir()
+    atlas = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        structures={1: {"acronym": "R1"}},
+    )
+    calls = []
+
+    def fake_load(atlas_name, **kwargs):
+        calls.append((atlas_name, kwargs))
+        return atlas
+
+    monkeypatch.setattr(workers, "load_brainglobe_atlas", fake_load)
+    worker = workers.AtlasLoadWorker(
+        "allen_mouse_25um",
+        brainglobe_dir=tmp_path,
+        interm_download_dir=tmp_path,
+    )
+    statuses = []
+    progress = []
+    finished = []
+    errors = []
+    worker.status.connect(statuses.append)
+    worker.progress.connect(lambda *args: progress.append(args))
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert calls
+    assert calls[0][0] == "allen_mouse_25um"
+    assert calls[0][1]["brainglobe_dir"] == tmp_path
+    assert "fn_update" in calls[0][1]
+    assert any("Found cached allen_mouse_25um" in status for status in statuses)
+    assert progress[0] == (0, 0, 0)
+    assert progress[-1] == (0, 100, 100)
+    assert finished == [atlas]
+    assert errors == []
+
+
+def test_atlas_load_worker_reports_cache_miss_and_download_progress(
+    monkeypatch,
+    tmp_path,
+):
+    """Cache misses should show download destination and byte progress."""
+    workers = _import_workers_module()
+    atlas = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        structures={1: {"acronym": "R1"}},
+    )
+    calls = []
+
+    def fake_load(atlas_name, **kwargs):
+        calls.append((atlas_name, kwargs))
+        kwargs["fn_update"](25, 100)
+        kwargs["fn_update"](100, 100)
+        return atlas
+
+    monkeypatch.setattr(workers, "load_brainglobe_atlas", fake_load)
+    worker = workers.AtlasLoadWorker(
+        "allen_mouse_25um",
+        brainglobe_dir=tmp_path,
+        interm_download_dir=tmp_path,
+    )
+    statuses = []
+    progress = []
+    finished = []
+    errors = []
+    worker.status.connect(statuses.append)
+    worker.progress.connect(lambda *args: progress.append(args))
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert calls
+    assert any(
+        "was not found in the local BrainGlobe cache" in status
+        and f"to {tmp_path}" in status
+        for status in statuses
+    )
+    assert any("Installing allen_mouse_25um" in status for status in statuses)
+    assert (0, 100, 25) in progress
+    assert (0, 100, 100) in progress
+    assert (0, 0, 0) in progress
+    assert finished == [atlas]
+    assert errors == []
+
+
+def test_load_brainglobe_atlas_disables_latest_check(monkeypatch, tmp_path):
+    """BrainGlobe loads should avoid the remote latest-version check."""
+    workers = _import_workers_module()
+    calls = []
+    atlas = object()
+
+    class FakeBrainGlobeAtlas:
+        def __new__(cls, *args, **kwargs):
+            calls.append((args, kwargs))
+            return atlas
+
+    fake_module = types.ModuleType("brainglobe_atlasapi")
+    fake_module.BrainGlobeAtlas = FakeBrainGlobeAtlas
+    monkeypatch.setitem(sys.modules, "brainglobe_atlasapi", fake_module)
+
+    result = workers.load_brainglobe_atlas(
+        "allen_mouse_25um",
+        brainglobe_dir=tmp_path,
+        interm_download_dir=tmp_path,
+        config_dir=tmp_path / "config.conf",
+        fn_update=lambda *_args: None,
+    )
+
+    assert result is atlas
+    assert calls == [
+        (
+            ("allen_mouse_25um",),
+            {
+                "brainglobe_dir": tmp_path,
+                "interm_download_dir": tmp_path,
+                "check_latest": False,
+                "config_dir": tmp_path / "config.conf",
+                "fn_update": calls[0][1]["fn_update"],
+            },
+        )
+    ]
+
+
+def test_atlas_load_worker_emits_error_without_finished(monkeypatch, tmp_path):
+    """AtlasLoadWorker should emit errors without reporting success."""
+    workers = _import_workers_module()
+
+    def fake_load(_atlas_name, **_kwargs):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(workers, "load_brainglobe_atlas", fake_load)
+    worker = workers.AtlasLoadWorker(
+        "allen_mouse_25um",
+        brainglobe_dir=tmp_path,
+        interm_download_dir=tmp_path,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert finished == []
+    assert errors == ["download failed"]
+
+
 class _FakeDuckConnection:
     """Very small DuckDB connection stub used for worker tests."""
 
