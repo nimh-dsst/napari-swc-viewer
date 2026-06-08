@@ -43,6 +43,11 @@ To write the debug trace to a custom file:
 NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
 ```
 
+For a complete CPD2 walkthrough covering clone/install, `pixi run napari`,
+left-hemisphere SWC-to-Parquet conversion, atlas loading, region queries, soma
+clustering, and GPe-limited cluster heatmaps, see
+[docs/cpd2_workflow.md](docs/cpd2_workflow.md).
+
 ### Running Tests
 
 To run the test suite:
