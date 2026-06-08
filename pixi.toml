@@ -40,6 +40,15 @@ mesalib = ">=21.0"
 pre-commit = ">=3.0"
 ruff = ">=0.1"
 
+[feature.docs.dependencies]
+weasyprint = "*"
+pygments = "*"
+markdown-it-py = ">=4.2.0,<5"
+
+[feature.docs.tasks]
+cpd2-pdf = { cmd = "python scripts/markdown_to_pdf.py docs/cpd2_workflow.md docs/_build/cpd2_workflow.pdf", default-environment = "docs" }
+
 [environments]
 default = ["dev"]
 ci = { features = [], solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
