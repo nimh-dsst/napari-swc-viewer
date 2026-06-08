@@ -9,6 +9,13 @@ The `cpd2_data` folder is expected to live in the repository root and contain
 77 SWC files. These neurons have somas in the caudoputamen/striatum (`CP`) and
 axonal projections into the globus pallidus, external segment (`GPe`).
 
+The 77 CPD2 source files are registered SWC files from the Brain Image Library
+dataset [Morphological diversity of single neurons in molecularly defined cell
+types](https://doi.brainimagelibrary.org/doi/10.35077/g.73), DOI
+`10.35077/g.73`. That dataset contains paired original and Allen CCF-registered
+SWC reconstructions. The CPD2 workflow uses the registered files ending in
+`_reg.swc`.
+
 ## Clone, install, and run napari
 
 1. Clone the repository.
@@ -28,7 +35,7 @@ axonal projections into the globus pallidus, external segment (`GPe`).
 2. Install Pixi if it is not already installed.
 
    Follow the Pixi installation instructions at:
-   https://pixi.sh/latest/#installation
+   <https://pixi.sh/latest/#installation>
 
 3. Launch napari with the plugin available.
 
@@ -51,6 +58,30 @@ axonal projections into the globus pallidus, external segment (`GPe`).
 4. In napari, open the plugin from the menu:
 
    `Plugins` -> `napari-swc-viewer` -> `Neuron Viewer`
+
+## Download CPD2 source SWCs
+
+Download the 77 registered CPD2 SWC files before creating `cpd2.parquet`:
+
+```bash
+pixi run download-cpd2
+```
+
+This writes the source files to `cpd2_data` in the repository root. The script
+uses a built-in target list generated from the 77 CPD2 `cpd2.parquet`
+filenames, with the local `_reg_right.swc` suffix corrected back to the BIL
+source `_reg.swc` suffix. It parses the Brain Image Library DOI page for the
+actual download URLs and downloads the matched registered SWCs. The BIL download
+URLs include mouse-specific directory paths, so they should be resolved from the
+DOI page rather than constructed from filenames.
+
+To check the matched URLs without downloading files:
+
+```bash
+pixi run python scripts/download_cpd2.py --dry-run
+```
+
+Existing files are skipped by default. Use `--force` to redownload them.
 
 ## Create left-aligned `cpd2.parquet`
 
