@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 import warnings
 
 import numpy as np
@@ -25,6 +25,48 @@ class NodeType:
     CUSTOM = 5
     UNSPECIFIED_NEURITE = 6
     GLIA = 7
+
+
+STANDARD_NODE_TYPE_OPTIONS = (
+    (NodeType.SOMA, "Soma"),
+    (NodeType.AXON, "Axon"),
+    (NodeType.BASAL_DENDRITE, "Basal dendrite"),
+    (NodeType.APICAL_DENDRITE, "Apical dendrite"),
+)
+
+NODE_TYPE_LABELS = {
+    NodeType.UNDEFINED: "Undefined",
+    NodeType.SOMA: "Soma",
+    NodeType.AXON: "Axon",
+    NodeType.BASAL_DENDRITE: "Basal dendrite",
+    NodeType.APICAL_DENDRITE: "Apical dendrite",
+    NodeType.CUSTOM: "Custom",
+    NodeType.UNSPECIFIED_NEURITE: "Unspecified neurite",
+    NodeType.GLIA: "Glia processes",
+}
+
+
+def normalize_node_types(
+    node_types: Iterable[int] | None,
+) -> tuple[int, ...] | None:
+    """Return sorted unique SWC node type IDs, or ``None`` for no filter."""
+    if node_types is None:
+        return None
+    return tuple(sorted({int(node_type) for node_type in node_types}))
+
+
+def node_type_label(node_type: int) -> str:
+    """Return a display label for one SWC node type ID."""
+    value = int(node_type)
+    return NODE_TYPE_LABELS.get(value, f"Type {value}")
+
+
+def node_type_labels(node_types: Iterable[int]) -> list[str]:
+    """Return display labels for SWC node type IDs."""
+    normalized = normalize_node_types(node_types)
+    if normalized is None:
+        return []
+    return [node_type_label(node_type) for node_type in normalized]
 
 
 @dataclass

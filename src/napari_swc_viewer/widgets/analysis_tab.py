@@ -40,6 +40,7 @@ from qtpy.QtWidgets import (
 )
 
 from .collapsible_section import CollapsibleSection
+from .node_type_selector import NodeTypeSelectorComboBox
 from .region_selector import RegionSelectorWidget
 
 if TYPE_CHECKING:
@@ -64,6 +65,8 @@ class _HeatmapRequest:
     region_ids: tuple[int, ...] | None
     cluster_label: int | None
     file_ids: tuple[str, ...] | None
+    node_types: tuple[int, ...] | None
+    soma_radius_um: float | None
     depth_bin_factor: int
     depth_axis: int
 
@@ -670,6 +673,25 @@ class AnalysisTabWidget(QWidget):
         self._heat_cluster_combo.setEnabled(False)
         cluster_filter_row.addWidget(self._heat_cluster_combo)
         heat_layout.addLayout(cluster_filter_row)
+
+        node_type_row = QHBoxLayout()
+        node_type_row.addWidget(QLabel("Node types:"))
+        self._heat_node_type_combo = NodeTypeSelectorComboBox()
+        node_type_row.addWidget(self._heat_node_type_combo)
+        heat_layout.addLayout(node_type_row)
+
+        soma_radius_row = QHBoxLayout()
+        soma_radius_row.addWidget(QLabel("Soma radius:"))
+        self._heat_soma_radius_spin = QDoubleSpinBox()
+        self._heat_soma_radius_spin.setRange(0.0, 100000.0)
+        self._heat_soma_radius_spin.setValue(0.0)
+        self._heat_soma_radius_spin.setSuffix(" μm")
+        self._heat_soma_radius_spin.setDecimals(1)
+        self._heat_soma_radius_spin.setToolTip(
+            "0 disables soma-distance filtering"
+        )
+        soma_radius_row.addWidget(self._heat_soma_radius_spin)
+        heat_layout.addLayout(soma_radius_row)
 
         # Depth bin factor
         depth_bin_row = QHBoxLayout()
@@ -1357,6 +1379,25 @@ class AnalysisTabWidget(QWidget):
             if matched
         )
 
+    def _selected_heatmap_node_types(self) -> tuple[int, ...] | None:
+        """Return the Analysis heatmap node-type filter."""
+        combo = getattr(self, "_heat_node_type_combo", None)
+        getter = getattr(combo, "selected_node_types", None)
+        if callable(getter):
+            return getter()
+        return None
+
+    def _selected_heatmap_soma_radius_um(self) -> float | None:
+        """Return the Analysis heatmap soma-radius filter."""
+        spin = getattr(self, "_heat_soma_radius_spin", None)
+        value_getter = getattr(spin, "value", None)
+        if not callable(value_getter):
+            return None
+        radius = float(value_getter())
+        if radius <= 0.0:
+            return None
+        return radius
+
     def _build_heatmap_request(
         self,
         cluster_label: int | None,
@@ -1399,6 +1440,8 @@ class AnalysisTabWidget(QWidget):
             region_ids=region_ids,
             cluster_label=request_cluster,
             file_ids=file_ids,
+            node_types=self._selected_heatmap_node_types(),
+            soma_radius_um=self._selected_heatmap_soma_radius_um(),
             depth_bin_factor=resolved_depth_bin,
             depth_axis=resolved_depth_axis,
         )
@@ -1492,6 +1535,12 @@ class AnalysisTabWidget(QWidget):
             file_ids=(
                 list(request.file_ids) if request.file_ids is not None else None
             ),
+            node_types=(
+                list(request.node_types)
+                if request.node_types is not None
+                else None
+            ),
+            soma_radius_um=request.soma_radius_um,
             depth_bin_factor=request.depth_bin_factor,
             depth_axis=request.depth_axis,
         )
@@ -1661,9 +1710,17 @@ class AnalysisTabWidget(QWidget):
             if request.selected_region_acronym
             else ""
         )
+        filter_parts: list[str] = []
+        if request.node_types is not None:
+            filter_parts.append(
+                NodeTypeSelectorComboBox.selection_text(request.node_types)
+            )
+        if request.soma_radius_um is not None:
+            filter_parts.append(f"{request.soma_radius_um:g} μm soma radius")
+        filter_part = f" ({', '.join(filter_parts)})" if filter_parts else ""
         if request.cluster_label is None:
-            return f"Node Count{region_part} Heatmap"
-        return f"Cluster {request.cluster_label}{region_part} Heatmap"
+            return f"Node Count{region_part}{filter_part} Heatmap"
+        return f"Cluster {request.cluster_label}{region_part}{filter_part} Heatmap"
 
     def _add_analysis_heatmap_layer(
         self,
@@ -1709,6 +1766,15 @@ class AnalysisTabWidget(QWidget):
                 if request.region_ids is not None
                 else None
             ),
+            "heatmap_node_types": (
+                list(request.node_types)
+                if request.node_types is not None
+                else None
+            ),
+            "heatmap_node_type_labels": (
+                NodeTypeSelectorComboBox.metadata_labels(request.node_types)
+            ),
+            "heatmap_soma_radius_um": request.soma_radius_um,
             "heatmap_cluster": request.cluster_label,
             "file_ids": source_file_ids,
             "source_file_ids": source_file_ids,

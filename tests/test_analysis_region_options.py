@@ -619,7 +619,6 @@ def _import_analysis_tab_module():
         "QProgressBar": _DummyProgressBar,
         "QPushButton": _DummyButton,
         "QScrollArea": _DummyScrollArea,
-        "QScrollArea": _DummyScrollArea,
         "QSpinBox": _DummySpinBox,
         "QStackedWidget": _DummyStack,
         "QVBoxLayout": _DummyLayout,
@@ -742,7 +741,7 @@ def test_analysis_region_sections_are_collapsed_by_default():
     _DummyCollapsibleSection.instances = []
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
 
-    widget = AnalysisTabWidget(_DummyViewer())
+    _widget = AnalysisTabWidget(_DummyViewer())
 
     titles = [section.title for section in _DummyCollapsibleSection.instances]
     expanded = [
@@ -1392,6 +1391,8 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
         region_ids=(567, 568),
         cluster_label=1,
         file_ids=("n1", "n2"),
+        node_types=(3, 4),
+        soma_radius_um=100.0,
         depth_bin_factor=3,
         depth_axis=1,
     )
@@ -1406,7 +1407,10 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
         _restore_modules(previous)
 
     layer = widget._heatmap_layer
-    assert layer.name == "Cluster 1 CH Heatmap"
+    assert layer.name == (
+        "Cluster 1 CH (Basal dendrite + Apical dendrite, "
+        "100 μm soma radius) Heatmap"
+    )
     assert layer.contrast_limits == (0.0, 7.0)
     assert layer.contrast_limits_range == (0.0, 7.0)
     assert layer.scale == [1.0, 3.0, 1.0]
@@ -1415,6 +1419,12 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.metadata["heatmap_selected_region_id"] == 567
     assert layer.metadata["heatmap_selected_region_acronym"] == "CH"
     assert layer.metadata["heatmap_region_ids"] == [567, 568]
+    assert layer.metadata["heatmap_node_types"] == [3, 4]
+    assert layer.metadata["heatmap_node_type_labels"] == [
+        "Basal dendrite",
+        "Apical dendrite",
+    ]
+    assert layer.metadata["heatmap_soma_radius_um"] == 100.0
     assert layer.metadata["file_ids"] == ["n1", "n2"]
     assert layer.metadata["source_file_ids"] == ["n1", "n2"]
     assert (
@@ -1461,6 +1471,8 @@ def test_bulk_heatmap_queue_advances_and_summarizes_completion():
         region_ids=(10,),
         cluster_label=1,
         file_ids=("n1",),
+        node_types=None,
+        soma_radius_um=None,
         depth_bin_factor=2,
         depth_axis=1,
     )
@@ -1470,6 +1482,8 @@ def test_bulk_heatmap_queue_advances_and_summarizes_completion():
         region_ids=(10,),
         cluster_label=2,
         file_ids=("n2",),
+        node_types=None,
+        soma_radius_um=None,
         depth_bin_factor=2,
         depth_axis=1,
     )
@@ -1538,6 +1552,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
             region_ids=(10,),
             cluster_label=5,
             file_ids=("n5",),
+            node_types=(2,),
+            soma_radius_um=50.0,
             depth_bin_factor=3,
             depth_axis=0,
         ),
@@ -1547,6 +1563,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
             region_ids=None,
             cluster_label=None,
             file_ids=None,
+            node_types=None,
+            soma_radius_um=None,
             depth_bin_factor=1,
             depth_axis=1,
         ),
@@ -1563,6 +1581,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
     assert batch_mode is True
     assert [request.cluster_label for request in requests] == [5, None]
     assert [request.file_ids for request in requests] == [("n5",), None]
+    assert [request.node_types for request in requests] == [(2,), None]
+    assert [request.soma_radius_um for request in requests] == [50.0, None]
     assert [request.depth_axis for request in requests] == [2, 2]
 
 

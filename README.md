@@ -154,7 +154,8 @@ create a blurred layer, open `Histogram`, inspect the distribution, optionally
 tune the blurred layer's `contrast_limits` in napari,
 copy those limits into the threshold bounds, and then create the mask. The
 `Regions` tab can then query neurons either by Allen regions or by one or more
-of these generated mask layers, using either any-node or soma-only membership.
+of these generated mask layers, using all node types or a selected combination
+of SWC node types (`soma`, `axon`, `basal dendrite`, `apical dendrite`).
 Mask queries read the current mask layer voxels, so manual edits to a generated
 mask change the query volume. When a mask was created from heatmaps with tracked
 source neurons, the `Regions` tab shows their count and can exclude them from

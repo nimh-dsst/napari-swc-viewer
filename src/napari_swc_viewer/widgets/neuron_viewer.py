@@ -89,6 +89,7 @@ from .analysis_tab import AnalysisTabWidget
 from .collapsible_section import CollapsibleSection
 from .mask_layer_selector import MaskLayerSelectorWidget
 from .neuron_table import NeuronTableWidget
+from .node_type_selector import NodeTypeSelectorComboBox
 from .region_selector import RegionSelectorWidget
 from .slice_projection import NeuronSliceProjector, SomaSliceProjector
 
@@ -233,6 +234,58 @@ def _shared_blur_sigma(source_layers: list) -> float | None:
     if all(np.isclose(first, value) for value in values[1:]):
         return first
     return None
+
+
+def _shared_metadata_value(source_layers: list, key: str):
+    """Return a common metadata value if all source layers agree."""
+    values = []
+    for layer in source_layers:
+        metadata = _layer_metadata(layer)
+        if key not in metadata:
+            continue
+        values.append(metadata.get(key))
+
+    if not values:
+        return None
+    first = values[0]
+    if all(value == first for value in values[1:]):
+        return first
+    return None
+
+
+def _source_heatmap_filter_metadata(source_layers: list) -> dict[str, object]:
+    """Return compact node-type/radius provenance for derived layers."""
+    filters = []
+    for layer in source_layers:
+        metadata = _layer_metadata(layer)
+        filters.append(
+            {
+                "layer": getattr(layer, "name", None),
+                "heatmap_node_types": metadata.get("heatmap_node_types"),
+                "heatmap_node_type_labels": metadata.get(
+                    "heatmap_node_type_labels"
+                ),
+                "heatmap_soma_radius_um": metadata.get(
+                    "heatmap_soma_radius_um"
+                ),
+            }
+        )
+
+    return {
+        "heatmap_node_types": _shared_metadata_value(
+            source_layers,
+            "heatmap_node_types",
+        ),
+        "heatmap_node_type_labels": _shared_metadata_value(
+            source_layers,
+            "heatmap_node_type_labels",
+        ),
+        "heatmap_soma_radius_um": _shared_metadata_value(
+            source_layers,
+            "heatmap_soma_radius_um",
+        ),
+        "source_heatmap_filters": filters,
+    }
 
 
 def _heatmap_contrast_limits(volume: np.ndarray) -> tuple[float, float]:
@@ -1049,6 +1102,12 @@ class NeuronViewerWidget(QWidget):
         scope_row.addWidget(self._region_query_scope_combo)
         layout.addLayout(scope_row)
 
+        node_type_row = QHBoxLayout()
+        node_type_row.addWidget(QLabel("Node types:"))
+        self._region_node_type_combo = NodeTypeSelectorComboBox()
+        node_type_row.addWidget(self._region_node_type_combo)
+        layout.addLayout(node_type_row)
+
         self._region_query_stack = QStackedWidget()
 
         atlas_page = QWidget()
@@ -1114,41 +1173,14 @@ class NeuronViewerWidget(QWidget):
 
         layout.addWidget(self._region_query_stack)
 
-        atlas_btn_row = QHBoxLayout()
-        self._atlas_query_any_node_btn = QPushButton(
-            "Find Neurons with Any Node in Selected Regions"
+        query_btn_row = QHBoxLayout()
+        self._region_query_find_btn = QPushButton("Find Neurons")
+        self._region_query_find_btn.clicked.connect(
+            self._query_neurons_for_active_region_source
         )
-        self._atlas_query_any_node_btn.clicked.connect(
-            self._query_atlas_neurons_any_node
-        )
-        self._atlas_query_any_node_btn.setEnabled(False)
-        atlas_btn_row.addWidget(self._atlas_query_any_node_btn)
-
-        self._atlas_query_soma_btn = QPushButton(
-            "Find Neurons with Soma in Selected Regions"
-        )
-        self._atlas_query_soma_btn.clicked.connect(self._query_atlas_neurons_soma)
-        self._atlas_query_soma_btn.setEnabled(False)
-        atlas_btn_row.addWidget(self._atlas_query_soma_btn)
-        layout.addLayout(atlas_btn_row)
-
-        mask_btn_row = QHBoxLayout()
-        self._mask_query_any_node_btn = QPushButton(
-            "Find Neurons with Any Node in Selected Mask Layers"
-        )
-        self._mask_query_any_node_btn.clicked.connect(
-            self._query_mask_neurons_any_node
-        )
-        self._mask_query_any_node_btn.setEnabled(False)
-        mask_btn_row.addWidget(self._mask_query_any_node_btn)
-
-        self._mask_query_soma_btn = QPushButton(
-            "Find Neurons with Soma in Selected Mask Layers"
-        )
-        self._mask_query_soma_btn.clicked.connect(self._query_mask_neurons_soma)
-        self._mask_query_soma_btn.setEnabled(False)
-        mask_btn_row.addWidget(self._mask_query_soma_btn)
-        layout.addLayout(mask_btn_row)
+        self._region_query_find_btn.setEnabled(False)
+        query_btn_row.addWidget(self._region_query_find_btn)
+        layout.addLayout(query_btn_row)
 
         clear_table_row = QHBoxLayout()
         self._regions_clear_table_btn = QPushButton("Clear Table")
@@ -4576,6 +4608,7 @@ class NeuronViewerWidget(QWidget):
                 "merge_mode": merge_mode,
             }
         )
+        metadata.update(_source_heatmap_filter_metadata(source_layers))
 
         add_kwargs = {
             "name": layer_name,
@@ -4655,6 +4688,7 @@ class NeuronViewerWidget(QWidget):
                 "heatmap_autocontrast_policy": "stable_full_volume",
             }
         )
+        metadata.update(_source_heatmap_filter_metadata(source_layers))
 
         add_kwargs = {
             "name": self._unique_layer_name(layer_name),
@@ -4728,6 +4762,7 @@ class NeuronViewerWidget(QWidget):
                 "merge_mode": merge_mode,
                 "atlas_name": self._current_atlas_name(),
                 "color": rgba,
+                **_source_heatmap_filter_metadata(source_layers),
             },
         )
         return layer
@@ -4741,10 +4776,17 @@ class NeuronViewerWidget(QWidget):
         show_mask_buttons = text == "Mask Layer"
         self._region_query_stack.setCurrentIndex(1 if show_mask_buttons else 0)
         self._sync_region_query_scope_selector()
-        for button in self._atlas_region_query_buttons():
-            button.setVisible(not show_mask_buttons)
-        for button in self._mask_layer_query_buttons():
-            button.setVisible(show_mask_buttons)
+        find_button = getattr(self, "_region_query_find_btn", None)
+        if find_button is not None:
+            if show_mask_buttons:
+                find_button.setText("Find Neurons in Selected Mask Layers")
+            else:
+                find_button.setText("Find Neurons in Selected Regions")
+        else:
+            for button in self._atlas_region_query_buttons():
+                button.setVisible(not show_mask_buttons)
+            for button in self._mask_layer_query_buttons():
+                button.setVisible(show_mask_buttons)
         self._regions_status_label.setText("")
         if not show_mask_buttons:
             self._sync_active_region_reference_layers()
@@ -4894,27 +4936,87 @@ class NeuronViewerWidget(QWidget):
         descendants = "on" if include_children else "off"
         return f"Query: {selection}; descendants: {descendants}."
 
-    def _atlas_region_query_buttons(self) -> tuple[QPushButton, QPushButton]:
-        """Return the atlas-region query buttons."""
-        return (
-            self._atlas_query_any_node_btn,
-            self._atlas_query_soma_btn,
-        )
+    def _selected_region_query_node_types(self) -> tuple[int, ...] | None:
+        """Return the active Regions-tab node-type filter."""
+        combo = getattr(self, "_region_node_type_combo", None)
+        getter = getattr(combo, "selected_node_types", None)
+        if callable(getter):
+            return getter()
+        return None
 
-    def _mask_layer_query_buttons(self) -> tuple[QPushButton, QPushButton]:
+    @staticmethod
+    def _effective_query_node_types(
+        node_types: tuple[int, ...] | list[int] | None,
+        soma_only: bool,
+    ) -> tuple[int, ...] | None:
+        """Resolve explicit node types and old soma-only calls."""
+        if node_types is None and soma_only:
+            return (1,)
+        return None if node_types is None else tuple(int(value) for value in node_types)
+
+    def _atlas_region_query_buttons(self) -> tuple[QPushButton, ...]:
+        """Return the atlas-region query buttons."""
+        find_button = getattr(self, "_region_query_find_btn", None)
+        if find_button is not None:
+            return (find_button,)
+        buttons = []
+        for name in ("_atlas_query_any_node_btn", "_atlas_query_soma_btn"):
+            button = getattr(self, name, None)
+            if button is not None:
+                buttons.append(button)
+        return tuple(buttons)
+
+    def _mask_layer_query_buttons(self) -> tuple[QPushButton, ...]:
         """Return the mask-layer query buttons."""
-        return (
-            self._mask_query_any_node_btn,
-            self._mask_query_soma_btn,
-        )
+        find_button = getattr(self, "_region_query_find_btn", None)
+        if find_button is not None:
+            return (find_button,)
+        buttons = []
+        for name in ("_mask_query_any_node_btn", "_mask_query_soma_btn"):
+            button = getattr(self, name, None)
+            if button is not None:
+                buttons.append(button)
+        return tuple(buttons)
 
     def _set_region_query_buttons_enabled(self, enabled: bool) -> None:
         """Enable or disable all Regions-tab query buttons."""
+        buttons: list[QPushButton] = []
+        seen: set[int] = set()
         for button in (
             *self._atlas_region_query_buttons(),
             *self._mask_layer_query_buttons(),
         ):
+            key = id(button)
+            if key in seen:
+                continue
+            seen.add(key)
+            buttons.append(button)
+        for button in buttons:
             button.setEnabled(enabled)
+
+    def _query_neurons_for_active_region_source(self) -> None:
+        """Query neurons from the active Regions-tab source."""
+        selector = getattr(self, "_selected_region_query_node_types", None)
+        if callable(selector):
+            node_types = selector()
+        else:
+            combo = getattr(self, "_region_node_type_combo", None)
+            getter = getattr(combo, "selected_node_types", None)
+            node_types = getter() if callable(getter) else None
+        membership = NodeTypeSelectorComboBox.query_text(node_types)
+        if getattr(self, "_region_query_source", "Atlas Regions") == "Mask Layer":
+            self._regions_status_label.setText(
+                f"Searching for neurons with {membership} in selected mask layers. Please wait..."
+            )
+            QApplication.processEvents()
+            self._query_neurons_by_mask(node_types=node_types)
+            return
+
+        self._regions_status_label.setText(
+            f"Searching for neurons with {membership} in selected atlas regions. Please wait..."
+        )
+        QApplication.processEvents()
+        self._query_neurons_by_region(node_types=node_types)
 
     def _query_atlas_neurons_any_node(self) -> None:
         """Query neurons with any node in the selected atlas regions."""
@@ -4961,7 +5063,11 @@ class NeuronViewerWidget(QWidget):
         if self._show_region_seg_cb.isChecked():
             self._update_region_segmentation(preview_acronyms)
 
-    def _query_neurons_by_region(self, soma_only: bool = False) -> None:
+    def _query_neurons_by_region(
+        self,
+        soma_only: bool = False,
+        node_types: tuple[int, ...] | list[int] | None = None,
+    ) -> None:
         """Query neurons in selected regions."""
         if self._db is None:
             return
@@ -4984,16 +5090,21 @@ class NeuronViewerWidget(QWidget):
             if not proceed:
                 return
 
+            effective_node_types = self._effective_query_node_types(
+                node_types,
+                soma_only,
+            )
             result = self._db.get_neurons_by_region(
                 acronyms,
                 soma_only=soma_only,
                 file_ids=base_file_ids,
+                node_types=effective_node_types,
             )
             self._populate_neuron_table(
                 result,
                 preserve_existing=base_file_ids is not None,
             )
-            membership = "soma" if soma_only else "any node"
+            membership = NodeTypeSelectorComboBox.query_text(effective_node_types)
             include_children = False
             include_children_enabled = getattr(
                 selector,
@@ -5023,7 +5134,11 @@ class NeuronViewerWidget(QWidget):
             logger.error(f"Query failed: {e}")
             self._regions_status_label.setText(f"Region query failed: {e}")
 
-    def _query_neurons_by_mask(self, soma_only: bool = False) -> None:
+    def _query_neurons_by_mask(
+        self,
+        soma_only: bool = False,
+        node_types: tuple[int, ...] | list[int] | None = None,
+    ) -> None:
         """Query neurons using a generated mask layer."""
         if self._db is None or self._atlas is None:
             return
@@ -5051,18 +5166,23 @@ class NeuronViewerWidget(QWidget):
             if not proceed:
                 return
 
+            effective_node_types = self._effective_query_node_types(
+                node_types,
+                soma_only,
+            )
             result = self._db.get_neurons_by_mask(
                 mask,
                 self._atlas,
                 soma_only=soma_only,
                 file_ids=base_file_ids,
                 exclude_file_ids=exclude_file_ids or None,
+                node_types=effective_node_types,
             )
             self._populate_neuron_table(
                 result,
                 preserve_existing=base_file_ids is not None,
             )
-            membership = "soma" if soma_only else "any node"
+            membership = NodeTypeSelectorComboBox.query_text(effective_node_types)
             selected_names = ", ".join(layer.name for layer in layers[:3])
             if len(layers) > 3:
                 selected_names += ", ..."
