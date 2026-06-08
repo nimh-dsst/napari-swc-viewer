@@ -265,3 +265,62 @@ Each cluster heatmap is a napari image layer with independent contrast controls.
 
 If a layer becomes hard to interpret, use napari's reset contrast control for
 that image layer, then tune the upper contrast limit again.
+
+## Visualize the GPe reference region
+
+The `GPe` heatmaps are easier to interpret when the Allen reference region is
+visible. The plugin can show `GPe` as a 3D mesh, a 2D segmentation overlay, or
+both.
+
+The important detail is that **Reference** tab region layers are linked to the
+active atlas-region selection in the **Regions** tab. They are not linked to the
+Analysis tab's `Select Heatmap Region` control. If you want the `GPe` mesh or
+segmentation, select `GPe` in the **Regions** tab first.
+
+1. Go to the **Regions** tab.
+
+2. Set:
+
+   - `Query source`: `Atlas Regions`
+   - `Search scope`: `Whole Parquet`
+
+3. Click `Clear Selection` if `root` or another region is still selected.
+
+4. Search for `GPe`.
+
+5. Select the `GPe` region.
+
+   You do not need to click a neuron-query button for this reference-layer
+   step. The already populated **Selected Neurons** table remains in place
+   unless you click `Find Neurons with Any Node in Selected Regions`,
+   `Find Neurons with Soma in Selected Regions`, or `Clear Table`.
+
+6. Go to the **Reference** tab.
+
+7. To show `GPe` as a 3D surface, enable `Show selected region meshes` under
+   **Region Meshes**.
+
+   The viewer switches to 3D automatically if it is currently in 2D. A new
+   `Region: GPe` surface layer appears in the napari layer list. Use the
+   **Region Meshes** `Opacity` slider to make the mesh transparent enough to see
+   cluster heatmaps and soma markers inside or around it.
+
+8. Optional: enable `Show brain outline` under **Brain Outline** for whole-brain
+   spatial context.
+
+9. To show the selected region as a 2D atlas overlay, enable
+   `Show selected region segmentation` under **Region Segmentation (2D)**.
+
+   This adds a `Region Segmentation` labels layer for the currently selected
+   region or regions. Use this in 2D slice view when you want to inspect where
+   heatmap signal falls relative to `GPe` on individual planes. Use the
+   **Region Segmentation (2D)** `Opacity` slider to tune the overlay.
+
+10. Return to the **Regions** tab and select a different atlas region whenever
+    you want the mesh or segmentation to change.
+
+    If `Show selected region meshes` or `Show selected region segmentation` is
+    still enabled, the reference layers update when the active region selection
+    changes. The layers follow the regions you directly select in the tree; the
+    `Include child regions` checkbox controls query descendants, but the preview
+    mesh/segmentation is based on the selected region acronyms.
