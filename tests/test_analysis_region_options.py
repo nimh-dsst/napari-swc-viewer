@@ -111,6 +111,30 @@ class _DummyButton(_DummyWidget):
         self.clicked = _BoundSignal()
 
 
+class _DummyCheckBox(_DummyWidget):
+    """Small QCheckBox stand-in."""
+
+    def __init__(self, text: str = "", *_args, **_kwargs) -> None:
+        super().__init__()
+        self._text = text
+        self._checked = False
+        self.toggled = _BoundSignal()
+        self._tooltip = ""
+
+    def setChecked(self, checked: bool) -> None:
+        checked = bool(checked)
+        changed = checked != self._checked
+        self._checked = checked
+        if changed:
+            self.toggled.emit(checked)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setToolTip(self, text: str) -> None:
+        self._tooltip = str(text)
+
+
 class _DummyLineEdit(_DummyWidget):
     """Small QLineEdit stand-in."""
 
@@ -609,6 +633,7 @@ def _import_analysis_tab_module():
 
     qtwidgets_module = types.ModuleType("qtpy.QtWidgets")
     for name, value in {
+        "QCheckBox": _DummyCheckBox,
         "QComboBox": _DummyCombo,
         "QDoubleSpinBox": _DummySpinBox,
         "QFileDialog": _DummyFileDialog,
@@ -804,6 +829,28 @@ def test_analysis_tab_exposes_bulk_cluster_heatmap_button():
 
     assert widget._add_all_cluster_heatmaps_btn._text == "Add All Cluster Heatmaps"
     assert not widget._add_all_cluster_heatmaps_btn.isEnabled()
+
+
+def test_analysis_tab_defaults_soma_distance_filter_off():
+    """Soma-distance heatmap filtering should require an explicit opt-in."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert widget._heat_soma_radius_enabled_cb._text == (
+        "Filter by soma distance"
+    )
+    assert widget._heat_soma_radius_enabled_cb.isChecked() is False
+    assert not widget._heat_soma_radius_spin.isEnabled()
+
+    widget._heat_soma_radius_spin.setValue(50.0)
+    assert widget._selected_heatmap_soma_radius_um() is None
+
+    widget._heat_soma_radius_enabled_cb.setChecked(True)
+    assert widget._heat_soma_radius_spin.isEnabled()
+    assert widget._selected_heatmap_soma_radius_um() == 50.0
+
+    widget._heat_soma_radius_spin.setValue(0.0)
+    assert widget._selected_heatmap_soma_radius_um() is None
 
 
 def test_analysis_tab_export_section_omits_y_label_field():

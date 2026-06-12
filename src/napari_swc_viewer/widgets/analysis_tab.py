@@ -24,6 +24,7 @@ from matplotlib.figure import Figure
 from qtpy.QtCore import QThread, Signal
 from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -681,6 +682,14 @@ class AnalysisTabWidget(QWidget):
         heat_layout.addLayout(node_type_row)
 
         soma_radius_row = QHBoxLayout()
+        self._heat_soma_radius_enabled_cb = QCheckBox(
+            "Filter by soma distance"
+        )
+        self._heat_soma_radius_enabled_cb.setChecked(False)
+        self._heat_soma_radius_enabled_cb.setToolTip(
+            "Restrict heatmap nodes to a radius around each neuron's soma"
+        )
+        soma_radius_row.addWidget(self._heat_soma_radius_enabled_cb)
         soma_radius_row.addWidget(QLabel("Soma radius:"))
         self._heat_soma_radius_spin = QDoubleSpinBox()
         self._heat_soma_radius_spin.setRange(0.0, 100000.0)
@@ -688,7 +697,11 @@ class AnalysisTabWidget(QWidget):
         self._heat_soma_radius_spin.setSuffix(" μm")
         self._heat_soma_radius_spin.setDecimals(1)
         self._heat_soma_radius_spin.setToolTip(
-            "0 disables soma-distance filtering"
+            "Maximum node distance from each neuron's soma when enabled"
+        )
+        self._heat_soma_radius_spin.setEnabled(False)
+        self._heat_soma_radius_enabled_cb.toggled.connect(
+            self._heat_soma_radius_spin.setEnabled
         )
         soma_radius_row.addWidget(self._heat_soma_radius_spin)
         heat_layout.addLayout(soma_radius_row)
@@ -1389,6 +1402,11 @@ class AnalysisTabWidget(QWidget):
 
     def _selected_heatmap_soma_radius_um(self) -> float | None:
         """Return the Analysis heatmap soma-radius filter."""
+        checkbox = getattr(self, "_heat_soma_radius_enabled_cb", None)
+        is_checked = getattr(checkbox, "isChecked", None)
+        if not callable(is_checked) or not is_checked():
+            return None
+
         spin = getattr(self, "_heat_soma_radius_spin", None)
         value_getter = getattr(spin, "value", None)
         if not callable(value_getter):
