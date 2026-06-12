@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .atlas_utils import mask_to_swc_xyz_bounds, swc_coords_xyz_to_atlas_voxels
+from .swc import NodeType, normalize_node_types
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -92,6 +93,38 @@ class NeuronDatabase:
         where_parts.append(f"file_id NOT IN ({placeholders})")
         params.extend(exclude_file_ids)
 
+    @staticmethod
+    def _empty_neuron_result() -> pd.DataFrame:
+        """Return an empty query result with the standard neuron columns."""
+        return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+
+    @staticmethod
+    def _resolve_node_type_filter(
+        node_types: list[int] | tuple[int, ...] | None,
+        soma_only: bool,
+    ) -> tuple[int, ...] | None:
+        """Return the effective node-type filter for compatibility callers."""
+        if node_types is None and soma_only:
+            return (NodeType.SOMA,)
+        return normalize_node_types(node_types)
+
+    @staticmethod
+    def _append_node_type_filter(
+        where_parts: list[str],
+        params: list[object],
+        node_types: tuple[int, ...] | None,
+    ) -> bool:
+        """Append an optional SWC ``type`` filter to a WHERE clause."""
+        if node_types is None:
+            return True
+        if not node_types:
+            return False
+
+        placeholders = ", ".join(["?"] * len(node_types))
+        where_parts.append(f"type IN ({placeholders})")
+        params.extend(int(node_type) for node_type in node_types)
+        return True
+
     def get_neurons_by_region(
         self,
         region_acronyms: list[str],
@@ -99,6 +132,7 @@ class NeuronDatabase:
         soma_only: bool = False,
         file_ids: list[object] | tuple[object, ...] | None = None,
         exclude_file_ids: list[object] | tuple[object, ...] | None = None,
+        node_types: list[int] | tuple[int, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified regions.
 
@@ -110,6 +144,9 @@ class NeuronDatabase:
             If True, include child regions in the query.
         soma_only : bool, default=False
             If True, only match soma/body rows (``type = 1``).
+        node_types : list[int], optional
+            Explicit SWC node type IDs to match. If provided, this takes
+            precedence over ``soma_only``.
 
         Returns
         -------
@@ -117,15 +154,23 @@ class NeuronDatabase:
             DataFrame with columns: file_id, neuron_id, subject
         """
         if not region_acronyms:
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
 
         placeholders = ", ".join(["?"] * len(region_acronyms))
         where_parts = [f"region_acronym IN ({placeholders})"]
         params: list[object] = list(region_acronyms)
-        if soma_only:
-            where_parts.append("type = 1")
+        effective_node_types = self._resolve_node_type_filter(
+            node_types,
+            soma_only,
+        )
+        if not self._append_node_type_filter(
+            where_parts,
+            params,
+            effective_node_types,
+        ):
+            return self._empty_neuron_result()
         if not self._append_file_id_filter(where_parts, params, file_ids):
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
         self._append_file_id_exclusion(where_parts, params, exclude_file_ids)
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
@@ -141,6 +186,7 @@ class NeuronDatabase:
         soma_only: bool = False,
         file_ids: list[object] | tuple[object, ...] | None = None,
         exclude_file_ids: list[object] | tuple[object, ...] | None = None,
+        node_types: list[int] | tuple[int, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons that have nodes in the specified region IDs.
 
@@ -150,6 +196,9 @@ class NeuronDatabase:
             List of Allen CCF region IDs.
         soma_only : bool, default=False
             If True, only match soma/body rows (``type = 1``).
+        node_types : list[int], optional
+            Explicit SWC node type IDs to match. If provided, this takes
+            precedence over ``soma_only``.
 
         Returns
         -------
@@ -157,15 +206,23 @@ class NeuronDatabase:
             DataFrame with columns: file_id, neuron_id, subject
         """
         if not region_ids:
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
 
         placeholders = ", ".join(["?"] * len(region_ids))
         where_parts = [f"region_id IN ({placeholders})"]
         params: list[object] = [int(region_id) for region_id in region_ids]
-        if soma_only:
-            where_parts.append("type = 1")
+        effective_node_types = self._resolve_node_type_filter(
+            node_types,
+            soma_only,
+        )
+        if not self._append_node_type_filter(
+            where_parts,
+            params,
+            effective_node_types,
+        ):
+            return self._empty_neuron_result()
         if not self._append_file_id_filter(where_parts, params, file_ids):
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
         self._append_file_id_exclusion(where_parts, params, exclude_file_ids)
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
@@ -427,6 +484,7 @@ class NeuronDatabase:
         soma_only: bool = False,
         file_ids: list[object] | tuple[object, ...] | None = None,
         exclude_file_ids: list[object] | tuple[object, ...] | None = None,
+        node_types: list[int] | tuple[int, ...] | None = None,
     ) -> pd.DataFrame:
         """Get neurons whose nodes fall inside a binary atlas-space mask."""
         mask = np.asarray(mask_volume) > 0
@@ -441,7 +499,7 @@ class NeuronDatabase:
 
         bounds = mask_to_swc_xyz_bounds(mask, atlas)
         if bounds is None:
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
 
         lower_xyz, upper_xyz = bounds
         where_parts = [
@@ -460,10 +518,18 @@ class NeuronDatabase:
             float(lower_xyz[2]),
             float(upper_xyz[2]),
         ]
-        if soma_only:
-            where_parts.append("type = 1")
+        effective_node_types = self._resolve_node_type_filter(
+            node_types,
+            soma_only,
+        )
+        if not self._append_node_type_filter(
+            where_parts,
+            params,
+            effective_node_types,
+        ):
+            return self._empty_neuron_result()
         if not self._append_file_id_filter(where_parts, params, file_ids):
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
         self._append_file_id_exclusion(where_parts, params, exclude_file_ids)
 
         query = f"""
@@ -474,7 +540,7 @@ class NeuronDatabase:
         """
         candidates = self.conn.execute(query, params).fetchdf()
         if candidates.empty:
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
 
         coords = candidates[["x", "y", "z"]].to_numpy(dtype=float, copy=False)
         voxel_coords = swc_coords_xyz_to_atlas_voxels(coords, atlas)
@@ -489,7 +555,7 @@ class NeuronDatabase:
 
         matched = candidates.loc[hits, ["file_id", "neuron_id", "subject"]]
         if matched.empty:
-            return pd.DataFrame(columns=["file_id", "neuron_id", "subject"])
+            return self._empty_neuron_result()
         return matched.drop_duplicates().sort_values("file_id").reset_index(drop=True)
 
     def get_region_neuron_counts(self) -> pd.DataFrame:

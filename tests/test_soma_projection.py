@@ -1248,6 +1248,7 @@ def _bind_region_query_scope_helpers(widget) -> None:
         widget,
     )
     widget._query_scope_status_suffix = NeuronViewerWidget._query_scope_status_suffix
+    widget._effective_query_node_types = NeuronViewerWidget._effective_query_node_types
     widget._region_selector_for_scope = types.MethodType(
         NeuronViewerWidget._region_selector_for_scope,
         widget,
@@ -1953,6 +1954,60 @@ def test_mask_query_handlers_set_wait_message_before_dispatch(
     assert observed["soma_only"] is expected_soma_only
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_status", "expected_target"),
+    [
+        (
+            "Atlas Regions",
+            "Searching for neurons with basal dendrite or apical dendrite nodes "
+            "in selected atlas regions. Please wait...",
+            "atlas",
+        ),
+        (
+            "Mask Layer",
+            "Searching for neurons with basal dendrite or apical dendrite nodes "
+            "in selected mask layers. Please wait...",
+            "mask",
+        ),
+    ],
+)
+def test_active_region_query_dispatches_selected_node_types(
+    source: str,
+    expected_status: str,
+    expected_target: str,
+) -> None:
+    observed: dict[str, object] = {}
+    widget = types.SimpleNamespace(
+        _region_query_source=source,
+        _regions_status_label=_DummyLabel(),
+        _region_node_type_combo=types.SimpleNamespace(
+            selected_node_types=lambda: (3, 4)
+        ),
+    )
+
+    def _record_atlas(*, soma_only: bool = False, node_types=None) -> None:
+        observed["target"] = "atlas"
+        observed["soma_only"] = soma_only
+        observed["node_types"] = node_types
+
+    def _record_mask(*, soma_only: bool = False, node_types=None) -> None:
+        observed["target"] = "mask"
+        observed["soma_only"] = soma_only
+        observed["node_types"] = node_types
+
+    widget._query_neurons_by_region = _record_atlas
+    widget._query_neurons_by_mask = _record_mask
+
+    NeuronViewerWidget._query_neurons_for_active_region_source(widget)
+
+    assert widget._regions_status_label.text == expected_status
+    assert observed == {
+        "target": expected_target,
+        "soma_only": False,
+        "node_types": (3, 4),
+    }
+
+
 def test_resolve_region_query_file_scope_defaults_to_whole_parquet() -> None:
     widget = types.SimpleNamespace(
         _region_query_scope="whole",
@@ -2005,6 +2060,7 @@ def test_query_neurons_by_region_uses_current_table_scope_without_inheriting_who
         ["R1"],
         soma_only=True,
         file_ids=["n1", "n2"],
+        node_types=(1,),
     )
     widget._populate_neuron_table.assert_called_once_with(
         result,
@@ -2014,6 +2070,49 @@ def test_query_neurons_by_region_uses_current_table_scope_without_inheriting_who
         "Found 1 neuron(s) with soma in selected atlas regions "
         "within current table (from 2 input neurons). "
         "Query: R1; descendants: off."
+    )
+
+
+def test_query_neurons_by_region_passes_explicit_node_type_filter() -> None:
+    result = pd.DataFrame(
+        {
+            "file_id": ["n2"],
+            "neuron_id": ["N2"],
+            "subject": ["s2"],
+        }
+    )
+    widget = types.SimpleNamespace(
+        _db=MagicMock(),
+        _whole_parquet_region_selector=_DummyRegionSelector(
+            direct_acronyms=["R1"],
+            query_acronyms=["R1"],
+            include_children=True,
+        ),
+        _current_table_region_selector=_DummyRegionSelector(),
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: []),
+        _populate_neuron_table=MagicMock(),
+    )
+    widget._db.get_neurons_by_region.return_value = result
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_region(widget, node_types=(3, 4))
+
+    widget._db.get_neurons_by_region.assert_called_once_with(
+        ["R1"],
+        soma_only=False,
+        file_ids=None,
+        node_types=(3, 4),
+    )
+    widget._populate_neuron_table.assert_called_once_with(
+        result,
+        preserve_existing=False,
+    )
+    assert widget._regions_status_label.text == (
+        "Found 1 neuron(s) with basal dendrite or apical dendrite nodes "
+        "in selected atlas regions within whole parquet. "
+        "Query: R1; descendants: on."
     )
 
 
@@ -2117,6 +2216,7 @@ def test_query_neurons_by_mask_uses_current_layer_data_and_excludes_sources() ->
         "soma_only": False,
         "file_ids": None,
         "exclude_file_ids": ["n1", "n2"],
+        "node_types": None,
     }
     widget._populate_neuron_table.assert_called_once_with(
         result,
@@ -2173,6 +2273,7 @@ def test_query_neurons_by_mask_soma_uses_soma_only_and_status_text() -> None:
         "soma_only": True,
         "file_ids": None,
         "exclude_file_ids": None,
+        "node_types": (1,),
     }
     widget._populate_neuron_table.assert_called_once_with(
         result,
@@ -2214,6 +2315,7 @@ def test_query_neurons_by_mask_includes_sources_when_checkbox_unchecked() -> Non
 
     _args, kwargs = db.get_neurons_by_mask.call_args
     assert kwargs["exclude_file_ids"] is None
+    assert kwargs["node_types"] is None
     assert widget._regions_status_label.text == (
         "Found 2 neuron(s) with any node in 1 selected mask layer(s) "
         "within whole parquet: Mask A"
@@ -2417,6 +2519,7 @@ def test_query_neurons_by_region_reports_union_details() -> None:
         ["R1", "R2"],
         soma_only=False,
         file_ids=None,
+        node_types=None,
     )
     widget._populate_neuron_table.assert_called_once_with(
         result,

@@ -139,8 +139,9 @@ Notes:
 
 1. Choose `Query source`
 2. For `Atlas Regions`, use search to find structures, check regions in the tree, and optionally enable/disable `Include child regions`
-3. For `Mask Layer`, check one or more generated mask layers and select either `Any node in mask` or `Soma in mask`
-4. Click the query button for the active source
+3. Choose `Node types`; leave `All node types` selected for the previous any-node behavior, or select one or more of `Soma`, `Axon`, `Basal dendrite`, and `Apical dendrite`
+4. For `Mask Layer`, check one or more generated mask layers
+5. Click the query button for the active source
 
 This fills the **Selected Neurons** table in the Data tab.
 
@@ -270,6 +271,8 @@ Controls:
 
 - Region filter (optional)
 - Cluster filter (enabled after clustering)
+- Node types (`All node types`, or any combination of soma, axon, basal dendrite, and apical dendrite)
+- Soma radius (`0 µm` disables this filter; positive values count only selected node types within that distance of each neuron's soma centroid)
 - Depth bin factor
 
 Run:

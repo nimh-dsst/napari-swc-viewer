@@ -111,6 +111,30 @@ class _DummyButton(_DummyWidget):
         self.clicked = _BoundSignal()
 
 
+class _DummyCheckBox(_DummyWidget):
+    """Small QCheckBox stand-in."""
+
+    def __init__(self, text: str = "", *_args, **_kwargs) -> None:
+        super().__init__()
+        self._text = text
+        self._checked = False
+        self.toggled = _BoundSignal()
+        self._tooltip = ""
+
+    def setChecked(self, checked: bool) -> None:
+        checked = bool(checked)
+        changed = checked != self._checked
+        self._checked = checked
+        if changed:
+            self.toggled.emit(checked)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setToolTip(self, text: str) -> None:
+        self._tooltip = str(text)
+
+
 class _DummyLineEdit(_DummyWidget):
     """Small QLineEdit stand-in."""
 
@@ -609,6 +633,7 @@ def _import_analysis_tab_module():
 
     qtwidgets_module = types.ModuleType("qtpy.QtWidgets")
     for name, value in {
+        "QCheckBox": _DummyCheckBox,
         "QComboBox": _DummyCombo,
         "QDoubleSpinBox": _DummySpinBox,
         "QFileDialog": _DummyFileDialog,
@@ -618,7 +643,6 @@ def _import_analysis_tab_module():
         "QLineEdit": _DummyLineEdit,
         "QProgressBar": _DummyProgressBar,
         "QPushButton": _DummyButton,
-        "QScrollArea": _DummyScrollArea,
         "QScrollArea": _DummyScrollArea,
         "QSpinBox": _DummySpinBox,
         "QStackedWidget": _DummyStack,
@@ -742,7 +766,7 @@ def test_analysis_region_sections_are_collapsed_by_default():
     _DummyCollapsibleSection.instances = []
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
 
-    widget = AnalysisTabWidget(_DummyViewer())
+    _widget = AnalysisTabWidget(_DummyViewer())
 
     titles = [section.title for section in _DummyCollapsibleSection.instances]
     expanded = [
@@ -805,6 +829,28 @@ def test_analysis_tab_exposes_bulk_cluster_heatmap_button():
 
     assert widget._add_all_cluster_heatmaps_btn._text == "Add All Cluster Heatmaps"
     assert not widget._add_all_cluster_heatmaps_btn.isEnabled()
+
+
+def test_analysis_tab_defaults_soma_distance_filter_off():
+    """Soma-distance heatmap filtering should require an explicit opt-in."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert widget._heat_soma_radius_enabled_cb._text == (
+        "Filter by soma distance"
+    )
+    assert widget._heat_soma_radius_enabled_cb.isChecked() is False
+    assert not widget._heat_soma_radius_spin.isEnabled()
+
+    widget._heat_soma_radius_spin.setValue(50.0)
+    assert widget._selected_heatmap_soma_radius_um() is None
+
+    widget._heat_soma_radius_enabled_cb.setChecked(True)
+    assert widget._heat_soma_radius_spin.isEnabled()
+    assert widget._selected_heatmap_soma_radius_um() == 50.0
+
+    widget._heat_soma_radius_spin.setValue(0.0)
+    assert widget._selected_heatmap_soma_radius_um() is None
 
 
 def test_analysis_tab_export_section_omits_y_label_field():
@@ -1392,6 +1438,8 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
         region_ids=(567, 568),
         cluster_label=1,
         file_ids=("n1", "n2"),
+        node_types=(3, 4),
+        soma_radius_um=100.0,
         depth_bin_factor=3,
         depth_axis=1,
     )
@@ -1406,7 +1454,10 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
         _restore_modules(previous)
 
     layer = widget._heatmap_layer
-    assert layer.name == "Cluster 1 CH Heatmap"
+    assert layer.name == (
+        "Cluster 1 CH (Basal dendrite + Apical dendrite, "
+        "100 μm soma radius) Heatmap"
+    )
     assert layer.contrast_limits == (0.0, 7.0)
     assert layer.contrast_limits_range == (0.0, 7.0)
     assert layer.scale == [1.0, 3.0, 1.0]
@@ -1415,6 +1466,12 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.metadata["heatmap_selected_region_id"] == 567
     assert layer.metadata["heatmap_selected_region_acronym"] == "CH"
     assert layer.metadata["heatmap_region_ids"] == [567, 568]
+    assert layer.metadata["heatmap_node_types"] == [3, 4]
+    assert layer.metadata["heatmap_node_type_labels"] == [
+        "Basal dendrite",
+        "Apical dendrite",
+    ]
+    assert layer.metadata["heatmap_soma_radius_um"] == 100.0
     assert layer.metadata["file_ids"] == ["n1", "n2"]
     assert layer.metadata["source_file_ids"] == ["n1", "n2"]
     assert (
@@ -1461,6 +1518,8 @@ def test_bulk_heatmap_queue_advances_and_summarizes_completion():
         region_ids=(10,),
         cluster_label=1,
         file_ids=("n1",),
+        node_types=None,
+        soma_radius_um=None,
         depth_bin_factor=2,
         depth_axis=1,
     )
@@ -1470,6 +1529,8 @@ def test_bulk_heatmap_queue_advances_and_summarizes_completion():
         region_ids=(10,),
         cluster_label=2,
         file_ids=("n2",),
+        node_types=None,
+        soma_radius_um=None,
         depth_bin_factor=2,
         depth_axis=1,
     )
@@ -1538,6 +1599,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
             region_ids=(10,),
             cluster_label=5,
             file_ids=("n5",),
+            node_types=(2,),
+            soma_radius_um=50.0,
             depth_bin_factor=3,
             depth_axis=0,
         ),
@@ -1547,6 +1610,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
             region_ids=None,
             cluster_label=None,
             file_ids=None,
+            node_types=None,
+            soma_radius_um=None,
             depth_bin_factor=1,
             depth_axis=1,
         ),
@@ -1563,6 +1628,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
     assert batch_mode is True
     assert [request.cluster_label for request in requests] == [5, None]
     assert [request.file_ids for request in requests] == [("n5",), None]
+    assert [request.node_types for request in requests] == [(2,), None]
+    assert [request.soma_radius_um for request in requests] == [50.0, None]
     assert [request.depth_axis for request in requests] == [2, 2]
 
 

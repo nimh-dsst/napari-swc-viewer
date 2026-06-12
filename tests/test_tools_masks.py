@@ -428,3 +428,78 @@ def test_get_neurons_by_region_supports_any_node_and_soma_only(
     assert restricted_soma_only_by_id.empty
     assert excluded_any_node["file_id"].tolist() == ["file_b"]
     assert excluded_any_node_by_id["file_id"].tolist() == ["file_a"]
+
+
+def test_get_neurons_by_mask_supports_explicit_node_type_filters(
+    tmp_path: Path,
+) -> None:
+    atlas = FakeAtlas()
+    parquet_path = tmp_path / "neurons.parquet"
+    df = pd.DataFrame(
+        {
+            "file_id": ["axon_file", "basal_file", "apical_file", "outside_file"],
+            "neuron_id": ["n1", "n2", "n3", "n4"],
+            "subject": ["s1", "s2", "s3", "s4"],
+            "node_id": [1, 1, 1, 1],
+            "parent_id": [-1, -1, -1, -1],
+            "x": [25.0, 25.0, 50.0, 100.0],
+            "y": [0.0, 0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0, 0.0],
+            "type": [2, 3, 4, 3],
+            "region_id": [0, 0, 0, 0],
+            "region_name": ["", "", "", ""],
+            "region_acronym": ["", "", "", ""],
+        }
+    )
+    df.to_parquet(parquet_path, index=False)
+
+    mask = np.zeros(atlas.annotation.shape, dtype=np.uint8)
+    mask[1, 0, 0] = 1
+    mask[2, 0, 0] = 1
+
+    with NeuronDatabase(parquet_path) as db:
+        axons = db.get_neurons_by_mask(mask, atlas, node_types=[2])
+        dendrites = db.get_neurons_by_mask(mask, atlas, node_types=[3, 4])
+
+    assert axons["file_id"].tolist() == ["axon_file"]
+    assert dendrites["file_id"].tolist() == ["apical_file", "basal_file"]
+
+
+def test_get_neurons_by_region_supports_explicit_node_type_filters(
+    tmp_path: Path,
+) -> None:
+    parquet_path = tmp_path / "neurons.parquet"
+    df = pd.DataFrame(
+        {
+            "file_id": ["axon_file", "basal_file", "apical_file", "other_region"],
+            "neuron_id": ["n1", "n2", "n3", "n4"],
+            "subject": ["s1", "s2", "s3", "s4"],
+            "node_id": [1, 1, 1, 1],
+            "parent_id": [-1, -1, -1, -1],
+            "x": [0.0, 0.0, 0.0, 0.0],
+            "y": [0.0, 0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0, 0.0],
+            "type": [2, 3, 4, 4],
+            "region_id": [101, 101, 101, 202],
+            "region_name": [
+                "Region One",
+                "Region One",
+                "Region One",
+                "Region Two",
+            ],
+            "region_acronym": ["R1", "R1", "R1", "R2"],
+        }
+    )
+    df.to_parquet(parquet_path, index=False)
+
+    with NeuronDatabase(parquet_path) as db:
+        axons = db.get_neurons_by_region(["R1"], node_types=[2])
+        dendrites = db.get_neurons_by_region(["R1"], node_types=[3, 4])
+        dendrites_by_id = db.get_neurons_by_region_id([101], node_types=[3, 4])
+
+    assert axons["file_id"].tolist() == ["axon_file"]
+    assert dendrites["file_id"].tolist() == ["apical_file", "basal_file"]
+    assert dendrites_by_id["file_id"].tolist() == [
+        "apical_file",
+        "basal_file",
+    ]

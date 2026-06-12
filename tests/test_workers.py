@@ -481,6 +481,60 @@ def test_convert_worker_passes_cached_atlas_inputs(monkeypatch, tmp_path):
     assert finished[0][1].processed_files == 1
 
 
+def test_heatmap_worker_forwards_node_type_and_radius_filters(monkeypatch):
+    """HeatmapWorker should pass node-type and soma-radius filters through."""
+    workers = _import_workers_module()
+    HeatmapWorker = workers.HeatmapWorker
+    calls: dict[str, object] = {}
+
+    class _FakeConn:
+        def close(self) -> None:
+            calls["closed"] = True
+
+    def fake_build_node_counts_volume(conn, parquet_path, atlas, **kwargs):
+        calls["conn"] = conn
+        calls["parquet_path"] = parquet_path
+        calls["atlas"] = atlas
+        calls.update(kwargs)
+        return np.ones((2, 2, 2), dtype=np.float32)
+
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeConn())
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.heatmap.build_node_counts_volume",
+        fake_build_node_counts_volume,
+    )
+
+    atlas = types.SimpleNamespace(annotation=np.zeros((2, 2, 2)), resolution=(25.0,))
+    worker = HeatmapWorker(
+        parquet_path="neurons.parquet",
+        atlas=atlas,
+        region_ids=[101],
+        file_ids=["n1"],
+        node_types=[3, 4],
+        soma_radius_um=100.0,
+        depth_bin_factor=2,
+        depth_axis=1,
+    )
+    finished: list[np.ndarray] = []
+    errors: list[str] = []
+    worker.finished.connect(lambda volume: finished.append(volume))
+    worker.error.connect(lambda message: errors.append(message))
+
+    worker.run()
+
+    assert not errors
+    assert finished and finished[0].shape == (2, 2, 2)
+    assert calls["parquet_path"] == "neurons.parquet"
+    assert calls["atlas"] is atlas
+    assert calls["region_ids"] == [101]
+    assert calls["file_ids"] == ["n1"]
+    assert calls["node_types"] == [3, 4]
+    assert calls["soma_radius_um"] == 100.0
+    assert calls["depth_bin_factor"] == 2
+    assert calls["depth_axis"] == 1
+    assert calls["closed"] is True
+
+
 def test_convert_worker_accepts_directory_source(monkeypatch, tmp_path):
     """Directory conversion should be discovered inside the worker, not the UI."""
     workers = _import_workers_module()

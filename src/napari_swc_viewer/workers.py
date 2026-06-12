@@ -951,6 +951,8 @@ class HeatmapWorker(QObject):
         atlas: BrainGlobeAtlas,
         region_ids: list[int] | None = None,
         file_ids: list[str] | None = None,
+        node_types: list[int] | None = None,
+        soma_radius_um: float | None = None,
         depth_bin_factor: int = 1,
         depth_axis: int = 0,
     ):
@@ -959,6 +961,8 @@ class HeatmapWorker(QObject):
         self._atlas = atlas
         self._region_ids = region_ids
         self._file_ids = file_ids
+        self._node_types = node_types
+        self._soma_radius_um = soma_radius_um
         self._depth_bin_factor = depth_bin_factor
         self._depth_axis = depth_axis
 
@@ -978,6 +982,8 @@ class HeatmapWorker(QObject):
                     self._atlas,
                     region_ids=self._region_ids,
                     file_ids=self._file_ids,
+                    node_types=self._node_types,
+                    soma_radius_um=self._soma_radius_um,
                     depth_bin_factor=self._depth_bin_factor,
                     depth_axis=self._depth_axis,
                 )
