@@ -668,6 +668,18 @@ class NeuronViewerWidget(QWidget):
             tabs.addTab(viz_tab, "Visualization")
             self._setup_viz_tab(viz_tab)
 
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Flatmap"):
+            from .flatmap import FlatmapProjectionWidget
+
+            self._flatmap_tab = FlatmapProjectionWidget(
+                self.viewer,
+                database_provider=lambda: self._db,
+                selected_file_ids_provider=self._neuron_table.get_selected_file_ids,
+                table_file_ids_provider=self._neuron_table.file_ids,
+                color_map_provider=self._neuron_table.get_full_color_map,
+            )
+            tabs.addTab(self._flatmap_tab, "Flatmap")
+
         with startup_timing(logger, "neuron_viewer_setup_tab", tab="Reference"):
             ref_tab = QWidget()
             tabs.addTab(ref_tab, "Reference")

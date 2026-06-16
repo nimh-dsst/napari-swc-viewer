@@ -33,6 +33,7 @@ dependencies = [
     "xlsxwriter>=3.2",
     "qtpy>=2.0",
     "pyqtgraph>=0.13",
+    "pynrrd>=1.0",
     "scikit-learn>=1.2",
     "scipy>=1.10",
     "seaborn>=0.13",
