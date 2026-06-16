@@ -28,8 +28,8 @@ def test_load_flatmap_volume_set_normalizes_last_axis_channels(tmp_path) -> None
 
     assert loaded.flatmap.shape == (2, 3, 4, 2)
     assert loaded.depth.shape == (2, 3, 4)
-    assert loaded.flatmap.dtype == np.float64
-    assert loaded.depth.dtype == np.float64
+    assert loaded.flatmap.dtype == np.float32
+    assert loaded.depth.dtype == np.float32
     assert loaded.flatmap_path == flatmap_path
     assert loaded.depth_path == depth_path
 
@@ -46,6 +46,47 @@ def test_load_flatmap_volume_set_normalizes_first_axis_channels(tmp_path) -> Non
 
     assert loaded.flatmap.shape == (3, 4, 5, 2)
     assert loaded.depth.shape == (3, 4, 5)
+
+
+def test_load_flatmap_volume_set_creates_and_uses_npy_cache(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    flatmap_path = tmp_path / "flatmap_both_shaped.nrrd"
+    depth_path = tmp_path / "depth.nrrd"
+    flatmap = np.zeros((2, 3, 4, 2), dtype=np.float32)
+    flatmap[..., 0] = 3
+    depth = np.ones((2, 3, 4), dtype=np.float32)
+    _write_nrrd(flatmap_path, flatmap)
+    _write_nrrd(depth_path, depth)
+
+    first = load_flatmap_volume_set(flatmap_path, depth_path)
+
+    assert first.flatmap_loaded_from_cache is False
+    assert first.depth_loaded_from_cache is False
+    assert first.flatmap_npy_path == tmp_path / "flatmap_both_shaped.float32.npy"
+    assert first.depth_npy_path == tmp_path / "depth.float32.npy"
+    assert first.flatmap_npy_path.exists()
+    assert first.depth_npy_path.exists()
+    assert first.flatmap_npy_path.with_suffix(".npy.json").exists()
+    assert first.depth_npy_path.with_suffix(".npy.json").exists()
+
+    def _fail_read_nrrd(path):
+        raise AssertionError(f"cache miss for {path}")
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.flatmap_loader._read_nrrd",
+        _fail_read_nrrd,
+    )
+
+    second = load_flatmap_volume_set(flatmap_path, depth_path)
+
+    assert second.flatmap_loaded_from_cache is True
+    assert second.depth_loaded_from_cache is True
+    assert isinstance(second.flatmap, np.memmap)
+    assert isinstance(second.depth, np.memmap)
+    np.testing.assert_array_equal(second.flatmap, flatmap)
+    np.testing.assert_array_equal(second.depth, depth)
 
 
 def test_spatial_transform_from_header_omits_flatmap_vector_axis() -> None:

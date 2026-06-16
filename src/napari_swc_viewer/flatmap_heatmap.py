@@ -10,6 +10,45 @@ import pandas as pd
 DEFAULT_FLATMAP_XY_BINS = 256
 DEFAULT_FLATMAP_DEPTH_BIN_UM = 25.0
 MAX_FLATMAP_HEATMAP_VOXELS = 100_000_000
+DEFAULT_LOOKUP_STATS_CHUNK_VOXELS = 10_000_000
+
+
+@dataclass(frozen=True)
+class FlatmapLookupStats:
+    """Reusable full-lookup statistics for flatmap heatmap rendering."""
+
+    x_bounds: tuple[float, float]
+    y_bounds: tuple[float, float]
+    depth_range_um: tuple[float, float]
+    flatmap_valid_voxels: int
+    depth_valid_voxels: int
+    flatmap_shape: tuple[int, int, int, int]
+    depth_shape: tuple[int, int, int]
+    flatmap_dtype: str
+    depth_dtype: str
+    invalid_zero_sentinel: bool
+    invalid_negative_one_sentinel: bool
+
+    def to_dict(self) -> dict[str, int | float | bool | str | list[int] | list[float]]:
+        """Return a JSON-safe dictionary."""
+        return {
+            "x_bounds": [float(self.x_bounds[0]), float(self.x_bounds[1])],
+            "y_bounds": [float(self.y_bounds[0]), float(self.y_bounds[1])],
+            "depth_range_um": [
+                float(self.depth_range_um[0]),
+                float(self.depth_range_um[1]),
+            ],
+            "flatmap_valid_voxels": int(self.flatmap_valid_voxels),
+            "depth_valid_voxels": int(self.depth_valid_voxels),
+            "flatmap_shape": [int(size) for size in self.flatmap_shape],
+            "depth_shape": [int(size) for size in self.depth_shape],
+            "flatmap_dtype": self.flatmap_dtype,
+            "depth_dtype": self.depth_dtype,
+            "invalid_zero_sentinel": bool(self.invalid_zero_sentinel),
+            "invalid_negative_one_sentinel": bool(
+                self.invalid_negative_one_sentinel
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -108,56 +147,172 @@ def _flatmap_valid_mask(
     return valid
 
 
-def compute_flatmap_xy_bounds(
-    flatmap_volume: np.ndarray,
+def _spatial_chunk_slices(
+    shape: tuple[int, int, int],
     *,
-    invalid_zero_sentinel: bool = False,
-    invalid_negative_one_sentinel: bool = True,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return finite x/y flatmap coordinate bounds from a lookup volume."""
-    flatmap = np.asarray(flatmap_volume, dtype=float)
+    chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+) -> list[slice]:
+    chunk_voxels = max(1, int(chunk_voxels))
+    plane_voxels = max(1, int(shape[1]) * int(shape[2]))
+    chunk_size = max(1, chunk_voxels // plane_voxels)
+    return [
+        slice(start, min(start + chunk_size, shape[0]))
+        for start in range(0, shape[0], chunk_size)
+    ]
+
+
+def _validate_flatmap_volume(flatmap_volume: np.ndarray) -> np.ndarray:
+    flatmap = np.asarray(flatmap_volume)
     if flatmap.ndim != 4 or flatmap.shape[-1] != 2:
         raise ValueError(
             "flatmap_volume must have shape (nx, ny, nz, 2); "
             f"got {flatmap.shape}."
         )
+    return flatmap
 
-    flat_xy = flatmap.reshape(-1, 2)
-    valid = _flatmap_valid_mask(
-        flat_xy,
+
+def _validate_depth_volume(depth_volume: np.ndarray) -> np.ndarray:
+    depth = np.asarray(depth_volume)
+    if depth.ndim != 3:
+        raise ValueError(f"depth_volume must be 3D; got {depth.shape}.")
+    return depth
+
+
+def _compute_flatmap_xy_bounds_and_count(
+    flatmap_volume: np.ndarray,
+    *,
+    invalid_zero_sentinel: bool = False,
+    invalid_negative_one_sentinel: bool = True,
+    chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+) -> tuple[tuple[float, float], tuple[float, float], int]:
+    flatmap = _validate_flatmap_volume(flatmap_volume)
+    x_min = np.inf
+    x_max = -np.inf
+    y_min = np.inf
+    y_max = -np.inf
+    valid_count = 0
+
+    for chunk_slice in _spatial_chunk_slices(
+        flatmap.shape[:3],
+        chunk_voxels=chunk_voxels,
+    ):
+        chunk = flatmap[chunk_slice]
+        x_values = chunk[..., 0]
+        y_values = chunk[..., 1]
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
+        if invalid_negative_one_sentinel:
+            valid &= ~((x_values == -1.0) & (y_values == -1.0))
+        if invalid_zero_sentinel:
+            valid &= ~((x_values == 0.0) & (y_values == 0.0))
+        if not valid.any():
+            continue
+
+        valid_count += int(valid.sum())
+        x_valid = x_values[valid]
+        y_valid = y_values[valid]
+        x_min = min(x_min, float(np.min(x_valid)))
+        x_max = max(x_max, float(np.max(x_valid)))
+        y_min = min(y_min, float(np.min(y_valid)))
+        y_max = max(y_max, float(np.max(y_valid)))
+
+    if valid_count <= 0:
+        raise ValueError("Flatmap volume does not contain valid x/y lookup values.")
+    return _nondegenerate_bounds(x_min, x_max), _nondegenerate_bounds(y_min, y_max), valid_count
+
+
+def compute_flatmap_xy_bounds(
+    flatmap_volume: np.ndarray,
+    *,
+    invalid_zero_sentinel: bool = False,
+    invalid_negative_one_sentinel: bool = True,
+    chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return finite x/y flatmap coordinate bounds from a lookup volume."""
+    x_bounds, y_bounds, _valid_count = _compute_flatmap_xy_bounds_and_count(
+        flatmap_volume,
         invalid_zero_sentinel=invalid_zero_sentinel,
         invalid_negative_one_sentinel=invalid_negative_one_sentinel,
-    )
-    if not valid.any():
-        raise ValueError("Flatmap volume does not contain valid x/y lookup values.")
-
-    valid_xy = flat_xy[valid]
-    x_bounds = _nondegenerate_bounds(
-        float(np.min(valid_xy[:, 0])),
-        float(np.max(valid_xy[:, 0])),
-    )
-    y_bounds = _nondegenerate_bounds(
-        float(np.min(valid_xy[:, 1])),
-        float(np.max(valid_xy[:, 1])),
+        chunk_voxels=chunk_voxels,
     )
     return x_bounds, y_bounds
 
 
-def compute_depth_range(depth_volume: np.ndarray) -> tuple[float, float]:
-    """Return the finite non-negative depth range from a depth lookup volume."""
-    depth = np.asarray(depth_volume, dtype=float)
-    if depth.ndim != 3:
-        raise ValueError(f"depth_volume must be 3D; got {depth.shape}.")
+def _compute_depth_range_and_count(
+    depth_volume: np.ndarray,
+    *,
+    chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+) -> tuple[tuple[float, float], int]:
+    depth = _validate_depth_volume(depth_volume)
+    lower = np.inf
+    upper = -np.inf
+    valid_count = 0
 
-    valid = np.isfinite(depth) & (depth >= 0.0)
-    if not valid.any():
+    for chunk_slice in _spatial_chunk_slices(
+        depth.shape,
+        chunk_voxels=chunk_voxels,
+    ):
+        chunk = depth[chunk_slice]
+        valid = np.isfinite(chunk) & (chunk >= 0.0)
+        if not valid.any():
+            continue
+        valid_count += int(valid.sum())
+        values = chunk[valid]
+        lower = min(lower, float(np.min(values)))
+        upper = max(upper, float(np.max(values)))
+
+    if valid_count <= 0:
         raise ValueError("Depth volume does not contain valid non-negative depths.")
-    values = depth[valid]
-    lower = float(np.min(values))
-    upper = float(np.max(values))
     if upper <= lower:
         upper = lower + 1.0
-    return lower, upper
+    return (float(lower), float(upper)), valid_count
+
+
+def compute_depth_range(depth_volume: np.ndarray) -> tuple[float, float]:
+    """Return the finite non-negative depth range from a depth lookup volume."""
+    depth_range, _valid_count = _compute_depth_range_and_count(depth_volume)
+    return depth_range
+
+
+def compute_flatmap_lookup_stats(
+    flatmap_volume: np.ndarray,
+    depth_volume: np.ndarray,
+    *,
+    invalid_zero_sentinel: bool = False,
+    invalid_negative_one_sentinel: bool = True,
+    chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+) -> FlatmapLookupStats:
+    """Return reusable lookup bounds and depth range using bounded chunks."""
+    flatmap = _validate_flatmap_volume(flatmap_volume)
+    depth = _validate_depth_volume(depth_volume)
+    if depth.shape != flatmap.shape[:3]:
+        raise ValueError(
+            "depth_volume shape must match the flatmap lookup grid; "
+            f"got depth {depth.shape} and flatmap grid {flatmap.shape[:3]}."
+        )
+
+    x_bounds, y_bounds, flatmap_valid_voxels = _compute_flatmap_xy_bounds_and_count(
+        flatmap,
+        invalid_zero_sentinel=invalid_zero_sentinel,
+        invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+        chunk_voxels=chunk_voxels,
+    )
+    depth_range, depth_valid_voxels = _compute_depth_range_and_count(
+        depth,
+        chunk_voxels=chunk_voxels,
+    )
+    return FlatmapLookupStats(
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range,
+        flatmap_valid_voxels=flatmap_valid_voxels,
+        depth_valid_voxels=depth_valid_voxels,
+        flatmap_shape=tuple(int(size) for size in flatmap.shape),
+        depth_shape=tuple(int(size) for size in depth.shape),
+        flatmap_dtype=str(flatmap.dtype),
+        depth_dtype=str(depth.dtype),
+        invalid_zero_sentinel=bool(invalid_zero_sentinel),
+        invalid_negative_one_sentinel=bool(invalid_negative_one_sentinel),
+    )
 
 
 def _bin_flat_values(
@@ -177,6 +332,34 @@ def _depth_bin_count(
 ) -> int:
     lower, upper = depth_range_um
     return max(1, int(np.floor((upper - lower) / depth_bin_um)) + 1)
+
+
+def _validate_lookup_stats(
+    lookup_stats: FlatmapLookupStats,
+    flatmap: np.ndarray,
+    depth: np.ndarray,
+    *,
+    invalid_zero_sentinel: bool,
+    invalid_negative_one_sentinel: bool,
+) -> None:
+    if tuple(lookup_stats.flatmap_shape) != tuple(flatmap.shape):
+        raise ValueError(
+            "lookup_stats flatmap shape does not match flatmap_volume; "
+            f"got stats {lookup_stats.flatmap_shape} and volume {flatmap.shape}."
+        )
+    if tuple(lookup_stats.depth_shape) != tuple(depth.shape):
+        raise ValueError(
+            "lookup_stats depth shape does not match depth_volume; "
+            f"got stats {lookup_stats.depth_shape} and volume {depth.shape}."
+        )
+    if lookup_stats.invalid_zero_sentinel != bool(invalid_zero_sentinel):
+        raise ValueError("lookup_stats were computed with different zero-sentinel settings.")
+    if lookup_stats.invalid_negative_one_sentinel != bool(
+        invalid_negative_one_sentinel
+    ):
+        raise ValueError(
+            "lookup_stats were computed with different negative-one sentinel settings."
+        )
 
 
 def _depth_labels(
@@ -211,15 +394,37 @@ def build_flatmap_render_data(
     include_depth_minus_one: bool = True,
     invalid_zero_sentinel: bool = False,
     invalid_negative_one_sentinel: bool = True,
+    lookup_stats: FlatmapLookupStats | None = None,
+    lookup_stats_chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
 ) -> FlatmapRenderResult:
     """Build a depth-aware flatmap node-count volume and point coordinates."""
     xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
-    x_bounds, y_bounds = compute_flatmap_xy_bounds(
-        flatmap_volume,
-        invalid_zero_sentinel=invalid_zero_sentinel,
-        invalid_negative_one_sentinel=invalid_negative_one_sentinel,
-    )
-    depth_range = compute_depth_range(depth_volume)
+    flatmap = _validate_flatmap_volume(flatmap_volume)
+    depth = _validate_depth_volume(depth_volume)
+    if depth.shape != flatmap.shape[:3]:
+        raise ValueError(
+            "depth_volume shape must match the flatmap lookup grid; "
+            f"got depth {depth.shape} and flatmap grid {flatmap.shape[:3]}."
+        )
+    if lookup_stats is None:
+        lookup_stats = compute_flatmap_lookup_stats(
+            flatmap,
+            depth,
+            invalid_zero_sentinel=invalid_zero_sentinel,
+            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+            chunk_voxels=lookup_stats_chunk_voxels,
+        )
+    else:
+        _validate_lookup_stats(
+            lookup_stats,
+            flatmap,
+            depth,
+            invalid_zero_sentinel=invalid_zero_sentinel,
+            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+        )
+    x_bounds = lookup_stats.x_bounds
+    y_bounds = lookup_stats.y_bounds
+    depth_range = lookup_stats.depth_range_um
     valid_depth_bins = _depth_bin_count(depth_range, depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset

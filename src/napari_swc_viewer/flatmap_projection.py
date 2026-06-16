@@ -155,8 +155,8 @@ def project_neuron_nodes_to_flatmap(
 ) -> pd.DataFrame:
     """Project neuron nodes into flatmap coordinates with validity metadata."""
     _require_columns(nodes, REQUIRED_NODE_COLUMNS)
-    flatmap = np.asarray(flatmap_volume, dtype=float)
-    depth = np.asarray(depth_volume, dtype=float)
+    flatmap = np.asarray(flatmap_volume)
+    depth = np.asarray(depth_volume)
     if flatmap.ndim != 4 or flatmap.shape[-1] != 2:
         raise ValueError(f"flatmap_volume must have shape (nx, ny, nz, 2); got {flatmap.shape}.")
     if depth.shape != flatmap.shape[:3]:
@@ -243,41 +243,47 @@ def build_projected_segments(projected_nodes: pd.DataFrame) -> ProjectedSegments
         ("file_id", "node_id", "parent_id", "x_flat", "y_flat", "valid"),
     )
 
-    segments: list[np.ndarray] = []
+    segment_arrays: list[np.ndarray] = []
     file_ids: list[object] = []
     source_node_ids: list[object] = []
     target_node_ids: list[object] = []
 
     for file_id, group in projected_nodes.groupby("file_id", sort=False):
-        node_to_index = {
-            row["node_id"]: idx
-            for idx, row in group.iterrows()
-        }
-        for idx, row in group.iterrows():
-            parent_id = row["parent_id"]
-            parent_idx = node_to_index.get(parent_id)
-            if parent_idx is None:
-                continue
-            parent = projected_nodes.loc[parent_idx]
-            if not bool(row["valid"]) or not bool(parent["valid"]):
-                continue
+        child = group.reset_index(drop=True).loc[
+            :,
+            ["node_id", "parent_id", "x_flat", "y_flat", "valid"],
+        ]
+        parent = group.reset_index(drop=True).loc[
+            :,
+            ["node_id", "x_flat", "y_flat", "valid"],
+        ]
+        parent = parent.rename(
+            columns={
+                "node_id": "parent_id",
+                "x_flat": "parent_x_flat",
+                "y_flat": "parent_y_flat",
+                "valid": "parent_valid",
+            }
+        )
+        merged = child.merge(parent, on="parent_id", how="left", sort=False)
+        valid_edges = merged["valid"].eq(True) & merged["parent_valid"].eq(True)
+        if not bool(valid_edges.any()):
+            continue
 
-            segments.append(
-                np.asarray(
-                    [
-                        [float(parent["x_flat"]), float(parent["y_flat"])],
-                        [float(row["x_flat"]), float(row["y_flat"])],
-                    ],
-                    dtype=np.float64,
-                )
-            )
-            file_ids.append(file_id)
-            source_node_ids.append(parent["node_id"])
-            target_node_ids.append(row["node_id"])
+        edges = merged.loc[valid_edges]
+        data = np.empty((len(edges), 2, 2), dtype=np.float64)
+        data[:, 0, 0] = edges["parent_x_flat"].to_numpy(dtype=np.float64)
+        data[:, 0, 1] = edges["parent_y_flat"].to_numpy(dtype=np.float64)
+        data[:, 1, 0] = edges["x_flat"].to_numpy(dtype=np.float64)
+        data[:, 1, 1] = edges["y_flat"].to_numpy(dtype=np.float64)
+        segment_arrays.append(data)
+        file_ids.extend([file_id] * len(edges))
+        source_node_ids.extend(edges["parent_id"].tolist())
+        target_node_ids.extend(edges["node_id"].tolist())
 
     data = (
-        np.stack(segments, axis=0)
-        if segments
+        np.concatenate(segment_arrays, axis=0)
+        if segment_arrays
         else np.empty((0, 2, 2), dtype=np.float64)
     )
     return ProjectedSegments(

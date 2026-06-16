@@ -27,9 +27,11 @@ from ..flatmap_export import export_projected_nodes_csv
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_XY_BINS,
+    FlatmapLookupStats,
     FlatmapRenderResult,
     FlatmapRenderSummary,
     build_flatmap_render_data,
+    compute_flatmap_lookup_stats,
 )
 from ..flatmap_loader import FLATMAP_STYLE_FILENAMES, load_flatmap_volume_set
 from ..flatmap_projection import (
@@ -84,6 +86,8 @@ class FlatmapProjectionWidget(QWidget):
         self._last_projected_nodes: pd.DataFrame | None = None
         self._last_summary: ProjectionSummary | None = None
         self._last_render_summary: FlatmapRenderSummary | None = None
+        self._lookup_stats_cache_key: tuple[object, ...] | None = None
+        self._lookup_stats_cache: FlatmapLookupStats | None = None
 
         self._setup_ui()
 
@@ -373,6 +377,13 @@ class FlatmapProjectionWidget(QWidget):
                 invalid_negative_one_sentinel=(
                     self._negative_one_sentinel_cb.isChecked()
                 ),
+                lookup_stats=self._lookup_stats_for_volume_set(
+                    volume_set,
+                    invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+                    invalid_negative_one_sentinel=(
+                        self._negative_one_sentinel_cb.isChecked()
+                    ),
+                ),
             )
             self._apply_projection_result(result, render_result)
             self._status_label.setText(
@@ -384,6 +395,59 @@ class FlatmapProjectionWidget(QWidget):
             logger.exception("Flatmap projection failed")
             self._status_label.setText(f"Flatmap projection failed: {exc}")
             show_warning(f"Flatmap projection failed: {exc}")
+
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[str, int | None, int | None]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return (str(path), None, None)
+        return (str(path), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _lookup_stats_cache_key_for(
+        self,
+        volume_set,
+        *,
+        invalid_zero_sentinel: bool,
+        invalid_negative_one_sentinel: bool,
+    ) -> tuple[object, ...]:
+        return (
+            self._path_signature(Path(volume_set.flatmap_path)),
+            self._path_signature(Path(volume_set.depth_path)),
+            bool(invalid_zero_sentinel),
+            bool(invalid_negative_one_sentinel),
+            tuple(volume_set.flatmap.shape),
+            str(volume_set.flatmap.dtype),
+            tuple(volume_set.depth.shape),
+            str(volume_set.depth.dtype),
+        )
+
+    def _lookup_stats_for_volume_set(
+        self,
+        volume_set,
+        *,
+        invalid_zero_sentinel: bool,
+        invalid_negative_one_sentinel: bool,
+    ) -> FlatmapLookupStats:
+        key = self._lookup_stats_cache_key_for(
+            volume_set,
+            invalid_zero_sentinel=invalid_zero_sentinel,
+            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+        )
+        cached_key = getattr(self, "_lookup_stats_cache_key", None)
+        cached_stats = getattr(self, "_lookup_stats_cache", None)
+        if cached_key == key and cached_stats is not None:
+            return cached_stats
+
+        stats = compute_flatmap_lookup_stats(
+            volume_set.flatmap,
+            volume_set.depth,
+            invalid_zero_sentinel=invalid_zero_sentinel,
+            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+        )
+        self._lookup_stats_cache_key = key
+        self._lookup_stats_cache = stats
+        return stats
 
     def _apply_projection_result(
         self,

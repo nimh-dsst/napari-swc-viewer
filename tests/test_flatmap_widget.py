@@ -142,6 +142,63 @@ def _widget(module):
     return widget
 
 
+def test_lookup_stats_cache_reuses_matching_file_and_sentinel_settings(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    flatmap_path = tmp_path / "flatmap.nrrd"
+    depth_path = tmp_path / "depth.nrrd"
+    flatmap_path.write_text("flatmap")
+    depth_path.write_text("depth")
+    volume_set = types.SimpleNamespace(
+        flatmap=np.zeros((2, 2, 2, 2), dtype=np.float32),
+        depth=np.ones((2, 2, 2), dtype=np.float32),
+        flatmap_path=flatmap_path,
+        depth_path=depth_path,
+    )
+    calls = []
+
+    def fake_compute(flatmap, depth, **kwargs):
+        calls.append(kwargs)
+        return module.FlatmapLookupStats(
+            x_bounds=(0.0, 1.0),
+            y_bounds=(0.0, 1.0),
+            depth_range_um=(0.0, 1.0),
+            flatmap_valid_voxels=1,
+            depth_valid_voxels=1,
+            flatmap_shape=tuple(flatmap.shape),
+            depth_shape=tuple(depth.shape),
+            flatmap_dtype=str(flatmap.dtype),
+            depth_dtype=str(depth.dtype),
+            invalid_zero_sentinel=kwargs["invalid_zero_sentinel"],
+            invalid_negative_one_sentinel=kwargs["invalid_negative_one_sentinel"],
+        )
+
+    monkeypatch.setattr(module, "compute_flatmap_lookup_stats", fake_compute)
+
+    first = widget._lookup_stats_for_volume_set(
+        volume_set,
+        invalid_zero_sentinel=False,
+        invalid_negative_one_sentinel=True,
+    )
+    second = widget._lookup_stats_for_volume_set(
+        volume_set,
+        invalid_zero_sentinel=False,
+        invalid_negative_one_sentinel=True,
+    )
+    third = widget._lookup_stats_for_volume_set(
+        volume_set,
+        invalid_zero_sentinel=True,
+        invalid_negative_one_sentinel=True,
+    )
+
+    assert first is second
+    assert third is not first
+    assert len(calls) == 2
+
+
 def test_file_ids_for_source_uses_selected_then_all_fallback(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
