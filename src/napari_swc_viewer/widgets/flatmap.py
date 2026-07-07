@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import MethodType
 from typing import Callable
 
 import numpy as np
@@ -641,8 +642,10 @@ class FlatmapProjectionWidget(QWidget):
     ):
         volume = render_result.volume
         contrast_limits = self._heatmap_contrast_limits(volume)
+        metadata = dict(metadata)
+        metadata["flatmap_heatmap_contrast_limits"] = contrast_limits
         if layer is None:
-            return self._viewer.add_image(
+            layer = self._viewer.add_image(
                 volume,
                 name=_HEATMAP_LAYER_NAME,
                 colormap="hot",
@@ -652,23 +655,271 @@ class FlatmapProjectionWidget(QWidget):
                 contrast_limits=contrast_limits,
                 metadata=metadata,
             )
+            self._install_heatmap_layer_workarounds(layer)
+            self._store_heatmap_contrast_limits(layer, contrast_limits)
+            return layer
 
+        self._install_heatmap_layer_workarounds(layer)
         blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
         if callable(blocker):
             with blocker():
                 layer.data = volume
                 layer.metadata = metadata
-                layer.contrast_limits = contrast_limits
+                self._apply_heatmap_contrast_limits(layer, contrast_limits)
                 layer.visible = True
         else:
             layer.data = volume
             layer.metadata = metadata
-            layer.contrast_limits = contrast_limits
+            self._apply_heatmap_contrast_limits(layer, contrast_limits)
             layer.visible = True
         refresh = getattr(layer, "refresh", None)
         if callable(refresh):
             refresh()
+        self._store_heatmap_contrast_limits(layer, contrast_limits)
         return layer
+
+    def _install_heatmap_layer_workarounds(self, layer) -> None:
+        self._install_heatmap_status_guard(layer)
+        self._install_heatmap_thumbnail_workarounds(layer)
+
+    def _install_heatmap_status_guard(self, layer) -> None:
+        """Avoid napari status errors while a heatmap slice catches up to 3D."""
+        if getattr(layer, "_napari_swc_flatmap_status_guard_installed", False):
+            return
+
+        original_get_status = getattr(layer, "get_status", None)
+        if not callable(original_get_status):
+            return
+
+        def guarded_get_status(
+            position=None,
+            *,
+            view_direction=None,
+            dims_displayed=None,
+            world=False,
+            value=None,
+        ):
+            try:
+                return original_get_status(
+                    position,
+                    view_direction=view_direction,
+                    dims_displayed=dims_displayed,
+                    world=world,
+                    value=value,
+                )
+            except IndexError as exc:
+                if not self._is_stale_3d_status_slice(layer, dims_displayed, exc):
+                    raise
+                return self._status_without_sampled_value(layer, position)
+
+        setattr(layer, "_napari_swc_flatmap_original_get_status", original_get_status)
+        setattr(layer, "get_status", guarded_get_status)
+        setattr(layer, "_napari_swc_flatmap_status_guard_installed", True)
+
+    def _install_heatmap_thumbnail_workarounds(self, layer) -> None:
+        """Keep generated heatmap thumbnails stable across 2D/3D axis changes."""
+        if getattr(layer, "_napari_swc_flatmap_thumbnail_workarounds_installed", False):
+            return
+
+        widget = self
+        original_update_thumbnail = getattr(layer, "_update_thumbnail", None)
+        if callable(original_update_thumbnail):
+
+            def safe_update_thumbnail(bound_layer) -> None:
+                try:
+                    original_update_thumbnail()
+                except RuntimeError as error:
+                    if not widget._is_thumbnail_rank_mismatch_error(error):
+                        raise
+                    if not getattr(
+                        bound_layer,
+                        "_napari_swc_flatmap_thumbnail_warning_logged",
+                        False,
+                    ):
+                        logger.warning(
+                            "Suppressed napari thumbnail update failure for "
+                            "flatmap heatmap '%s': %s",
+                            getattr(bound_layer, "name", "<unnamed>"),
+                            error,
+                        )
+                        bound_layer._napari_swc_flatmap_thumbnail_warning_logged = True
+
+            layer._update_thumbnail = MethodType(safe_update_thumbnail, layer)
+
+        original_reset_contrast_limits = getattr(layer, "reset_contrast_limits", None)
+        if callable(original_reset_contrast_limits):
+
+            def stable_reset_contrast_limits(bound_layer, mode=None) -> None:
+                if not widget._heatmap_requires_stable_limits(bound_layer):
+                    original_reset_contrast_limits(mode)
+                    return
+                limits = widget._heatmap_stored_contrast_limits(bound_layer)
+                if limits is None:
+                    original_reset_contrast_limits(mode)
+                    return
+                widget._apply_heatmap_contrast_limits(bound_layer, limits)
+
+            layer.reset_contrast_limits = MethodType(stable_reset_contrast_limits, layer)
+
+        original_reset_contrast_limits_range = getattr(
+            layer,
+            "reset_contrast_limits_range",
+            None,
+        )
+        if callable(original_reset_contrast_limits_range):
+
+            def stable_reset_contrast_limits_range(bound_layer, mode=None) -> None:
+                if not widget._heatmap_requires_stable_limits(bound_layer):
+                    original_reset_contrast_limits_range(mode)
+                    return
+                limits = widget._heatmap_stored_contrast_limits(bound_layer)
+                if limits is None:
+                    original_reset_contrast_limits_range(mode)
+                    return
+                bound_layer.contrast_limits_range = limits
+
+            layer.reset_contrast_limits_range = MethodType(
+                stable_reset_contrast_limits_range,
+                layer,
+            )
+
+        original_update_slice_response = getattr(layer, "_update_slice_response", None)
+        if callable(original_update_slice_response):
+
+            def stable_update_slice_response(bound_layer, response):
+                keep_auto = bool(getattr(bound_layer, "_keep_auto_contrast", False))
+                if not keep_auto or not widget._heatmap_requires_stable_limits(
+                    bound_layer,
+                    response,
+                ):
+                    return original_update_slice_response(response)
+
+                bound_layer._keep_auto_contrast = False
+                try:
+                    result = original_update_slice_response(response)
+                finally:
+                    bound_layer._keep_auto_contrast = True
+
+                limits = widget._heatmap_stored_contrast_limits(bound_layer)
+                if limits is not None:
+                    widget._apply_heatmap_contrast_limits(bound_layer, limits)
+                return result
+
+            layer._update_slice_response = MethodType(
+                stable_update_slice_response,
+                layer,
+            )
+
+        setattr(layer, "_napari_swc_flatmap_thumbnail_workarounds_installed", True)
+
+    @staticmethod
+    def _is_thumbnail_rank_mismatch_error(error: RuntimeError) -> bool:
+        return "sequence argument must have length equal to input rank" in str(error)
+
+    @staticmethod
+    def _heatmap_ndisplay(layer, response=None) -> int | None:
+        slice_input = getattr(response, "slice_input", None)
+        ndisplay = getattr(slice_input, "ndisplay", None)
+        if isinstance(ndisplay, (int, np.integer)):
+            return int(ndisplay)
+
+        slice_input = getattr(layer, "_slice_input", None)
+        ndisplay = getattr(slice_input, "ndisplay", None)
+        if isinstance(ndisplay, (int, np.integer)):
+            return int(ndisplay)
+        return None
+
+    def _heatmap_requires_stable_limits(self, layer, response=None) -> bool:
+        return self._heatmap_ndisplay(layer, response) == 3
+
+    @staticmethod
+    def _heatmap_stored_contrast_limits(layer) -> tuple[float, float] | None:
+        raw_limits = getattr(
+            layer,
+            "_napari_swc_flatmap_heatmap_contrast_limits",
+            None,
+        )
+        if raw_limits is None:
+            metadata = getattr(layer, "metadata", None)
+            if isinstance(metadata, dict):
+                raw_limits = metadata.get("flatmap_heatmap_contrast_limits")
+        if raw_limits is None:
+            return None
+
+        try:
+            values = np.asarray(raw_limits, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if values.size < 2:
+            return None
+
+        lower = float(values[0])
+        upper = float(values[1])
+        if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+            return None
+        return (lower, upper)
+
+    @staticmethod
+    def _store_heatmap_contrast_limits(layer, limits: tuple[float, float]) -> None:
+        setattr(layer, "_napari_swc_flatmap_heatmap_contrast_limits", limits)
+        metadata = getattr(layer, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["flatmap_heatmap_contrast_limits"] = limits
+
+    @staticmethod
+    def _apply_heatmap_contrast_limits(layer, limits: tuple[float, float]) -> None:
+        keep_auto = bool(getattr(layer, "_keep_auto_contrast", False))
+        if keep_auto:
+            layer._keep_auto_contrast = False
+        try:
+            layer.contrast_limits_range = limits
+            layer.contrast_limits = limits
+        finally:
+            if hasattr(layer, "_keep_auto_contrast"):
+                layer._keep_auto_contrast = keep_auto
+
+    @staticmethod
+    def _is_stale_3d_status_slice(layer, dims_displayed, exc: IndexError) -> bool:
+        if dims_displayed is None or len(dims_displayed) != 3:
+            return False
+
+        raw = getattr(
+            getattr(getattr(layer, "_slice", None), "image", None),
+            "raw",
+            None,
+        )
+        if raw is not None and np.asarray(raw).ndim < len(dims_displayed):
+            return True
+
+        return "too many indices for array" in str(exc)
+
+    @staticmethod
+    def _status_without_sampled_value(layer, position) -> dict[str, str]:
+        source_info = getattr(layer, "_get_source_info", None)
+        if callable(source_info):
+            status = source_info().copy()
+        else:
+            name = str(getattr(layer, "name", ""))
+            status = {
+                "layer_name": name,
+                "layer_base": name,
+                "source_type": "",
+                "plugin": "",
+            }
+
+        coords_str = ""
+        if position is not None:
+            ndim = int(getattr(layer, "ndim", 0) or 0)
+            coords = np.asarray(position)
+            if ndim > 0:
+                coords = coords[-ndim:]
+            rounded = np.round(coords).astype(int)
+            coords_str = f' [{" ".join(map(str, rounded))}]'
+
+        status["coordinates"] = ": ".join((coords_str, ""))
+        status["coords"] = coords_str
+        status["value"] = ""
+        return status
 
     def _create_or_update_points_layer(
         self,
@@ -719,6 +970,7 @@ class FlatmapProjectionWidget(QWidget):
                 dims.ndisplay = 3
             except Exception:
                 logger.debug("Failed to switch viewer to 3D display.", exc_info=True)
+        self._reslice_layer_for_current_dims(layer)
 
         layers = getattr(self._viewer, "layers", None)
         selection = getattr(layers, "selection", None)
@@ -765,6 +1017,18 @@ class FlatmapProjectionWidget(QWidget):
                 camera.zoom = float(np.clip(600.0 / span, 0.01, 10_000.0))
             except Exception:
                 logger.debug("Failed to zoom camera to flatmap layer.", exc_info=True)
+
+    def _reslice_layer_for_current_dims(self, layer) -> None:
+        dims = getattr(self._viewer, "dims", None)
+        if dims is None:
+            return
+        slice_dims = getattr(layer, "_slice_dims", None)
+        if not callable(slice_dims):
+            return
+        try:
+            slice_dims(dims, force=True)
+        except Exception:
+            logger.debug("Failed to refresh flatmap layer slice.", exc_info=True)
 
     def _export_csv(self) -> None:
         if self._last_projected_nodes is None or self._last_projected_nodes.empty:

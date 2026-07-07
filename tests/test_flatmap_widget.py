@@ -99,11 +99,73 @@ class _DummyLayer:
         self.blending = kwargs.get("blending")
         self.rendering = kwargs.get("rendering")
         self.opacity = kwargs.get("opacity")
+        self.ndim = self.data.ndim if self.data.ndim else 0
+        self.contrast_limits_range = kwargs.get(
+            "contrast_limits_range",
+            self.contrast_limits,
+        )
+        self._keep_auto_contrast = False
+        self._slice_input = types.SimpleNamespace(ndisplay=2)
         self.visible = True
         self.refresh_count = 0
+        self.thumbnail_updates = 0
+        self.slice_updates: list[object] = []
+        self.slice_dims_calls = []
+        self.raise_status_error = False
+        self.status_error_message = (
+            "too many indices for array: array is 2-dimensional, "
+            "but 3 were indexed"
+        )
 
     def refresh(self) -> None:
         self.refresh_count += 1
+
+    def _update_thumbnail(self) -> None:
+        self.thumbnail_updates += 1
+
+    def reset_contrast_limits(self, mode=None) -> None:
+        self.contrast_limits = (-1.0, float(mode or -1.0))
+
+    def reset_contrast_limits_range(self, mode=None) -> None:
+        self.contrast_limits_range = (-2.0, float(mode or -2.0))
+
+    def _update_slice_response(self, response) -> object:
+        self.slice_updates.append(response)
+        self.contrast_limits = (4.0, 5.0)
+        self.contrast_limits_range = (4.0, 5.0)
+        return response
+
+    def _slice_dims(self, dims, force: bool = False) -> None:
+        self.slice_dims_calls.append((dims, force))
+
+    def _get_source_info(self) -> dict[str, str]:
+        return {
+            "layer_name": self.name,
+            "layer_base": self.name,
+            "source_type": "",
+            "plugin": "",
+        }
+
+    def get_status(
+        self,
+        position=None,
+        *,
+        view_direction=None,
+        dims_displayed=None,
+        world=False,
+        value=None,
+    ) -> dict[str, str]:
+        if self.raise_status_error:
+            raise IndexError(self.status_error_message)
+        return {
+            "layer_name": self.name,
+            "layer_base": self.name,
+            "source_type": "",
+            "plugin": "",
+            "coordinates": "",
+            "coords": "",
+            "value": "",
+        }
 
 
 class _DummyViewer:
@@ -344,14 +406,136 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     assert layer.metadata["projection_kind"] == "isocortex_flatmap"
     assert layer.metadata["flatmap_render_mode"] == "heatmap"
     assert layer.metadata["render_summary"]["rendered_nodes"] == 3
+    assert layer.metadata["flatmap_heatmap_contrast_limits"] == (0.0, 2.0)
     assert layer.contrast_limits == (0.0, 2.0)
     assert layer._napari_swc_flatmap_projected_nodes is projected
     assert layer._napari_swc_flatmap_summary is summary
     assert layer._napari_swc_flatmap_render_summary is render_summary
     assert old_layer not in widget._viewer.layers
     assert widget._viewer.dims.ndisplay == 3
+    assert layer.slice_dims_calls[-1] == (widget._viewer.dims, True)
     assert widget._viewer.camera.center == (0.5, 2.0, 1.0)
     assert widget._viewer.camera.zoom == 300.0
+
+
+def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    class _CrashLayer(_DummyLayer):
+        def _update_thumbnail(self) -> None:
+            raise RuntimeError(
+                "sequence argument must have length equal to input rank"
+            )
+
+    layer = _CrashLayer(
+        np.zeros((2, 4, 4), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        metadata={"flatmap_heatmap_contrast_limits": (0.0, 5.0)},
+        contrast_limits=(0.0, 5.0),
+    )
+
+    widget._install_heatmap_layer_workarounds(layer)
+
+    layer._update_thumbnail()
+    assert layer._napari_swc_flatmap_thumbnail_warning_logged is True
+
+
+def test_heatmap_workaround_keeps_stable_limits_during_3d_slice_update(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _DummyLayer(
+        np.zeros((2, 4, 4), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        metadata={"flatmap_heatmap_contrast_limits": (0.0, 11.0)},
+        contrast_limits=(0.0, 11.0),
+    )
+    layer._keep_auto_contrast = True
+    layer._slice_input = types.SimpleNamespace(ndisplay=3)
+
+    widget._install_heatmap_layer_workarounds(layer)
+    response = types.SimpleNamespace(
+        slice_input=types.SimpleNamespace(ndisplay=3),
+        payload={"slice": 1},
+    )
+    result = layer._update_slice_response(response)
+
+    assert result is response
+    assert layer.slice_updates == [response]
+    assert layer._keep_auto_contrast is True
+    assert layer.contrast_limits == (0.0, 11.0)
+    assert layer.contrast_limits_range == (0.0, 11.0)
+
+
+def test_heatmap_workaround_preserves_2d_auto_contrast(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _DummyLayer(
+        np.zeros((2, 4, 4), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        metadata={"flatmap_heatmap_contrast_limits": (0.0, 11.0)},
+        contrast_limits=(0.0, 11.0),
+    )
+    layer._keep_auto_contrast = True
+    layer._slice_input = types.SimpleNamespace(ndisplay=2)
+
+    widget._install_heatmap_layer_workarounds(layer)
+    response = types.SimpleNamespace(
+        slice_input=types.SimpleNamespace(ndisplay=2),
+        payload={"slice": 2},
+    )
+    result = layer._update_slice_response(response)
+
+    assert result is response
+    assert layer.slice_updates == [response]
+    assert layer.contrast_limits == (4.0, 5.0)
+    assert layer.contrast_limits_range == (4.0, 5.0)
+
+
+def test_heatmap_status_guard_handles_stale_2d_slice(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _DummyLayer(np.zeros((2, 4, 4)), name="Isocortex Flatmap Heatmap")
+    layer._slice = types.SimpleNamespace(
+        image=types.SimpleNamespace(raw=np.zeros((4, 4), dtype=np.float32))
+    )
+    layer.raise_status_error = True
+
+    widget._install_heatmap_status_guard(layer)
+
+    status = layer.get_status(
+        np.asarray([1.2, 2.5, 3.6]),
+        view_direction=np.asarray([1.0, 0.0, 0.0]),
+        dims_displayed=[0, 1, 2],
+        world=True,
+    )
+
+    assert status["coords"] == " [1 2 4]"
+    assert status["coordinates"] == " [1 2 4]: "
+    assert status["value"] == ""
+
+
+def test_heatmap_status_guard_reraises_unrelated_index_errors(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _DummyLayer(np.zeros((2, 4, 4)), name="Isocortex Flatmap Heatmap")
+    layer._slice = types.SimpleNamespace(
+        image=types.SimpleNamespace(raw=np.zeros((2, 4, 4), dtype=np.float32))
+    )
+    layer.raise_status_error = True
+    layer.status_error_message = "index 99 is out of bounds for axis 0"
+
+    widget._install_heatmap_status_guard(layer)
+
+    with np.testing.assert_raises(IndexError):
+        layer.get_status(
+            np.asarray([1.2, 2.5, 3.6]),
+            view_direction=np.asarray([1.0, 0.0, 0.0]),
+            dims_displayed=[0, 1, 2],
+            world=True,
+        )
 
 
 def test_create_points_layer_uses_table_colors(monkeypatch) -> None:
