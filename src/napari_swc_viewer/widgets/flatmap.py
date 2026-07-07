@@ -34,6 +34,10 @@ from ..flatmap_heatmap import (
     build_flatmap_render_data,
     compute_flatmap_lookup_stats,
 )
+from ..flatmap_labels import (
+    FlatmapRegionLabelsResult,
+    build_flatmap_region_label_volume,
+)
 from ..flatmap_loader import FLATMAP_STYLE_FILENAMES, load_flatmap_volume_set
 from ..flatmap_parquet import augment_neuron_parquet_with_flatmap
 from ..flatmap_projection import (
@@ -54,6 +58,13 @@ _RENDER_POINTS = "points"
 _OLD_SHAPES_LAYER_NAME = "Isocortex Flatmap Traces"
 _HEATMAP_LAYER_NAME = "Isocortex Flatmap Heatmap"
 _POINTS_LAYER_NAME = "Isocortex Flatmap Points"
+_REGION_LABELS_LAYER_NAME = "Flatmap Region Labels"
+_REGION_LABEL_ATLAS_DEFAULT = "allen_mouse_10um"
+_REGION_LABEL_ATLAS_OPTIONS = (
+    "allen_mouse_10um",
+    "allen_mouse_25um",
+    "allen_mouse_50um",
+)
 _FLATMAP_RENDER_LAYER_NAMES = {
     _OLD_SHAPES_LAYER_NAME,
     _HEATMAP_LAYER_NAME,
@@ -73,6 +84,9 @@ class FlatmapProjectionWidget(QWidget):
         selected_file_ids_provider: Callable[[], list[object]],
         table_file_ids_provider: Callable[[], list[object]],
         color_map_provider: Callable[[], dict[object, list[float]]],
+        atlas_provider: Callable[[], object | None] | None = None,
+        selected_region_ids_provider: Callable[[], list[int]] | None = None,
+        selected_region_acronyms_provider: Callable[[], list[str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -81,10 +95,20 @@ class FlatmapProjectionWidget(QWidget):
         self._selected_file_ids_provider = selected_file_ids_provider
         self._table_file_ids_provider = table_file_ids_provider
         self._color_map_provider = color_map_provider
+        self._atlas_provider = atlas_provider or (lambda: None)
+        self._selected_region_ids_provider = selected_region_ids_provider or (lambda: [])
+        self._selected_region_acronyms_provider = (
+            selected_region_acronyms_provider or (lambda: [])
+        )
 
         self._flatmap_path: Path | None = None
         self._depth_path: Path | None = None
         self._projection_layer = None
+        self._region_labels_layer = None
+        self._region_label_atlas_cache: dict[str, object] = {}
+        self._region_label_atlas_load_thread = None
+        self._region_label_atlas_load_worker = None
+        self._pending_region_label_request = False
         self._last_projected_nodes: pd.DataFrame | None = None
         self._last_summary: ProjectionSummary | None = None
         self._last_render_summary: FlatmapRenderSummary | None = None
@@ -218,6 +242,29 @@ class FlatmapProjectionWidget(QWidget):
         actions_row.addWidget(self._augment_parquet_btn)
         layout.addLayout(actions_row)
 
+        labels_group = QGroupBox("Region Labels")
+        labels_layout = QVBoxLayout(labels_group)
+        atlas_row = QHBoxLayout()
+        atlas_row.addWidget(QLabel("Atlas:"))
+        self._region_label_atlas_combo = QComboBox()
+        for atlas_name in _REGION_LABEL_ATLAS_OPTIONS:
+            self._region_label_atlas_combo.addItem(atlas_name, atlas_name)
+        self._region_label_atlas_combo.setCurrentText(_REGION_LABEL_ATLAS_DEFAULT)
+        atlas_row.addWidget(self._region_label_atlas_combo)
+        labels_layout.addLayout(atlas_row)
+        labels_actions_row = QHBoxLayout()
+        self._region_labels_btn = QPushButton("Create Region Labels")
+        self._region_labels_btn.clicked.connect(self._create_region_labels)
+        labels_actions_row.addWidget(self._region_labels_btn)
+        self._clear_region_labels_btn = QPushButton("Clear Region Labels")
+        self._clear_region_labels_btn.clicked.connect(self._clear_region_labels)
+        labels_actions_row.addWidget(self._clear_region_labels_btn)
+        labels_layout.addLayout(labels_actions_row)
+        self._region_labels_status_label = QLabel("No flatmap region labels created.")
+        self._region_labels_status_label.setWordWrap(True)
+        labels_layout.addWidget(self._region_labels_status_label)
+        layout.addWidget(labels_group)
+
         summary_group = QGroupBox("Projection Summary")
         summary_layout = QVBoxLayout(summary_group)
         self._summary_label = QLabel("No projection run yet.")
@@ -278,6 +325,15 @@ class FlatmapProjectionWidget(QWidget):
     def _current_source_mode(self) -> str:
         mode = self._source_combo.currentData()
         return str(mode or _SOURCE_SELECTED)
+
+    def _current_region_label_atlas_name(self) -> str:
+        combo = getattr(self, "_region_label_atlas_combo", None)
+        current_text = getattr(combo, "currentText", None)
+        if callable(current_text):
+            atlas_name = str(current_text() or "").strip()
+            if atlas_name:
+                return atlas_name
+        return _REGION_LABEL_ATLAS_DEFAULT
 
     def _update_expected_filename_label(self) -> None:
         filename = self._current_style_filename()
@@ -473,6 +529,327 @@ class FlatmapProjectionWidget(QWidget):
             render_mode=self._current_render_mode(),
         )
         self._export_btn.setEnabled(not render_result.projected_nodes.empty)
+
+    def _create_region_labels(self) -> None:
+        """Create or update the selected-region flatmap labels layer."""
+        try:
+            result = self._create_region_labels_from_current_state()
+            if result is not None:
+                show_info("Flatmap region labels complete.")
+        except Exception as exc:
+            logger.exception("Flatmap region label creation failed")
+            message = f"Flatmap region labels failed: {exc}"
+            self._set_region_labels_status(message)
+            show_warning(message)
+
+    def _create_region_labels_from_current_state(self):
+        """Build a flatmap region-label volume and show it as a Labels layer."""
+        self._projection_request_ready()
+        selected_region_ids = self._selected_region_ids_for_labels()
+        atlas_name = self._current_region_label_atlas_name()
+        atlas = self._region_label_atlas_for_name(atlas_name)
+        if atlas is None:
+            self._start_region_label_atlas_load(atlas_name)
+            return None
+        return self._create_region_labels_for_atlas(
+            atlas,
+            selected_region_ids,
+        )
+
+    def _selected_region_ids_for_labels(self) -> list[int]:
+        selected_region_ids = sorted(
+            {
+                int(region_id)
+                for region_id in (self._selected_region_ids_provider() or [])
+                if int(region_id) > 0
+            }
+        )
+        if not selected_region_ids:
+            raise RuntimeError("Select at least one atlas region before creating labels.")
+        return selected_region_ids
+
+    def _create_region_labels_for_atlas(
+        self,
+        atlas,
+        selected_region_ids: list[int],
+    ):
+        volume_set = load_flatmap_volume_set(self._flatmap_path, self._depth_path)
+        lookup_stats = self._lookup_stats_for_volume_set(
+            volume_set,
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
+        )
+        result = build_flatmap_region_label_volume(
+            np.asarray(atlas.annotation),
+            volume_set.flatmap,
+            volume_set.depth,
+            selected_region_ids=selected_region_ids,
+            xy_bins=self._current_xy_bins(),
+            depth_bin_um=self._current_depth_bin_um(),
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
+            lookup_stats=lookup_stats,
+        )
+        metadata = self._region_labels_metadata(result, atlas)
+        layer = self._create_or_update_region_labels_layer(
+            result,
+            metadata,
+            atlas=atlas,
+        )
+        self._region_labels_layer = layer
+        self._focus_projection_view(layer, result.labels)
+
+        message = (
+            "Created flatmap region labels: "
+            f"{result.summary.labeled_voxels:,} labeled voxel(s) from "
+            f"{len(result.selected_region_ids):,} selected region ID(s)."
+        )
+        self._status_label.setText(message)
+        label = getattr(self, "_region_labels_status_label", None)
+        if label is not None:
+            label.setText(message)
+        return result
+
+    def _region_label_atlas_for_name(self, atlas_name: str):
+        cached = self._region_label_atlas_cache.get(atlas_name)
+        if cached is not None:
+            return cached
+
+        provider_atlas = self._atlas_provider()
+        provider_name = str(getattr(provider_atlas, "atlas_name", "") or "")
+        if provider_atlas is not None and provider_name == atlas_name:
+            self._region_label_atlas_cache[atlas_name] = provider_atlas
+            return provider_atlas
+        return None
+
+    def _start_region_label_atlas_load(self, atlas_name: str) -> None:
+        self._pending_region_label_request = True
+        if self._region_label_atlas_load_running():
+            self._set_region_labels_status(
+                f"Loading region-label atlas {atlas_name}..."
+            )
+            return
+
+        from qtpy.QtCore import QThread
+
+        from ..workers import AtlasLoadWorker
+
+        self._set_region_label_controls_enabled(False)
+        self._set_region_labels_status(
+            f"Loading region-label atlas {atlas_name}..."
+        )
+
+        thread = QThread()
+        worker = AtlasLoadWorker(atlas_name)
+        self._region_label_atlas_load_thread = thread
+        self._region_label_atlas_load_worker = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.status.connect(self._on_region_label_atlas_load_status)
+        worker.finished.connect(
+            lambda atlas, expected=atlas_name: self._on_region_label_atlas_load_finished(
+                atlas,
+                expected,
+            )
+        )
+        worker.error.connect(self._on_region_label_atlas_load_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._cleanup_region_label_atlas_load_thread(thread, worker)
+        )
+        thread.start()
+
+    def _region_label_atlas_load_running(self) -> bool:
+        thread = getattr(self, "_region_label_atlas_load_thread", None)
+        is_running = getattr(thread, "isRunning", None)
+        return bool(thread is not None and callable(is_running) and is_running())
+
+    def _on_region_label_atlas_load_status(self, message: str) -> None:
+        self._set_region_labels_status(str(message))
+
+    def _on_region_label_atlas_load_finished(self, atlas, atlas_name: str) -> None:
+        resolved_name = str(getattr(atlas, "atlas_name", "") or atlas_name)
+        self._region_label_atlas_cache[atlas_name] = atlas
+        self._region_label_atlas_cache[resolved_name] = atlas
+        self._set_region_label_controls_enabled(True)
+        self._set_region_labels_status(
+            f"Loaded region-label atlas {resolved_name}."
+        )
+
+        if self._pending_region_label_request:
+            self._pending_region_label_request = False
+            self._create_region_labels()
+
+    def _on_region_label_atlas_load_error(self, error_msg: str) -> None:
+        self._pending_region_label_request = False
+        self._set_region_label_controls_enabled(True)
+        message = f"Region-label atlas load failed: {error_msg}"
+        logger.error(message)
+        self._set_region_labels_status(message)
+        show_warning(message)
+
+    def _cleanup_region_label_atlas_load_thread(self, thread, worker) -> None:
+        if getattr(self, "_region_label_atlas_load_thread", None) is thread:
+            self._region_label_atlas_load_thread = None
+        if getattr(self, "_region_label_atlas_load_worker", None) is worker:
+            self._region_label_atlas_load_worker = None
+
+    def _set_region_label_controls_enabled(self, enabled: bool) -> None:
+        for widget_name in (
+            "_region_label_atlas_combo",
+            "_region_labels_btn",
+            "_clear_region_labels_btn",
+        ):
+            widget = getattr(self, widget_name, None)
+            set_enabled = getattr(widget, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
+
+    def _set_region_labels_status(self, message: str) -> None:
+        status_label = getattr(self, "_status_label", None)
+        if status_label is not None:
+            status_label.setText(message)
+        region_status_label = getattr(self, "_region_labels_status_label", None)
+        if region_status_label is not None:
+            region_status_label.setText(message)
+
+    def _region_labels_metadata(
+        self,
+        result: FlatmapRegionLabelsResult,
+        atlas,
+    ) -> dict[str, object]:
+        acronyms = [
+            str(acronym)
+            for acronym in (self._selected_region_acronyms_provider() or [])
+        ]
+        return {
+            "projection_kind": "flatmap_region_labels",
+            "flatmap_style": self._current_style_filename(),
+            "flatmap_path": str(self._flatmap_path) if self._flatmap_path else "",
+            "depth_path": str(self._depth_path) if self._depth_path else "",
+            "atlas_name": str(getattr(atlas, "atlas_name", "")),
+            "selected_region_ids": [
+                int(region_id) for region_id in result.selected_region_ids
+            ],
+            "selected_region_acronyms": acronyms,
+            "represented_region_ids": [
+                int(region_id) for region_id in result.represented_region_ids
+            ],
+            "summary": result.summary.to_dict(),
+        }
+
+    def _create_or_update_region_labels_layer(
+        self,
+        result: FlatmapRegionLabelsResult,
+        metadata: dict[str, object],
+        *,
+        atlas=None,
+    ):
+        layer = self._region_labels_layer or self._find_layer_by_name(
+            _REGION_LABELS_LAYER_NAME
+        )
+        colormap = self._region_label_colormap(atlas, result.represented_region_ids)
+        kwargs: dict[str, object] = {
+            "name": _REGION_LABELS_LAYER_NAME,
+            "opacity": 0.35,
+            "visible": True,
+            "metadata": metadata,
+        }
+        if colormap is not None:
+            kwargs["colormap"] = colormap
+
+        if layer is None:
+            layer = self._viewer.add_labels(result.labels, **kwargs)
+        else:
+            blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
+            if callable(blocker):
+                with blocker():
+                    self._set_region_labels_layer_data(layer, result, metadata, colormap)
+            else:
+                self._set_region_labels_layer_data(layer, result, metadata, colormap)
+            refresh = getattr(layer, "refresh", None)
+            if callable(refresh):
+                refresh()
+
+        setattr(layer, "_napari_swc_flatmap_region_labels_result", result)
+        return layer
+
+    @staticmethod
+    def _set_region_labels_layer_data(
+        layer,
+        result: FlatmapRegionLabelsResult,
+        metadata: dict[str, object],
+        colormap,
+    ) -> None:
+        layer.data = result.labels
+        layer.metadata = metadata
+        layer.opacity = 0.35
+        layer.visible = True
+        if colormap is not None:
+            layer.colormap = colormap
+
+    @staticmethod
+    def _atlas_structure_for_region_id(atlas, region_id: int):
+        structures = getattr(atlas, "structures", None)
+        if structures is None:
+            return None
+        try:
+            return structures[int(region_id)]
+        except (KeyError, TypeError):
+            return None
+
+    @classmethod
+    def _region_label_colormap(cls, atlas, region_ids: list[int]):
+        if atlas is None:
+            return None
+        try:
+            from napari.utils import DirectLabelColormap
+        except Exception:
+            return None
+
+        color_dict: dict[int | None, np.ndarray] = {
+            None: np.array([0, 0, 0, 0], dtype=np.float32),
+            0: np.array([0, 0, 0, 0], dtype=np.float32),
+        }
+        for region_id in region_ids:
+            structure = cls._atlas_structure_for_region_id(atlas, int(region_id))
+            if structure is None:
+                rgb = [128, 128, 128]
+            else:
+                rgb = structure.get("rgb_triplet", [128, 128, 128])
+            rgba = np.asarray(
+                [
+                    float(rgb[0]) / 255.0,
+                    float(rgb[1]) / 255.0,
+                    float(rgb[2]) / 255.0,
+                    1.0,
+                ],
+                dtype=np.float32,
+            )
+            color_dict[int(region_id)] = rgba
+        return DirectLabelColormap(color_dict=color_dict)
+
+    def _clear_region_labels(self) -> None:
+        """Remove the flatmap region labels layer if present."""
+        layer = self._region_labels_layer or self._find_layer_by_name(
+            _REGION_LABELS_LAYER_NAME
+        )
+        layers = getattr(self._viewer, "layers", None)
+        if layer is not None and layers is not None:
+            try:
+                layers.remove(layer)
+            except ValueError:
+                pass
+        self._region_labels_layer = None
+        message = "Cleared flatmap region labels."
+        self._status_label.setText(message)
+        label = getattr(self, "_region_labels_status_label", None)
+        if label is not None:
+            label.setText("No flatmap region labels created.")
 
     def _color_for_file_id(
         self,

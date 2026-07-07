@@ -677,6 +677,9 @@ class NeuronViewerWidget(QWidget):
                 selected_file_ids_provider=self._neuron_table.get_selected_file_ids,
                 table_file_ids_provider=self._neuron_table.file_ids,
                 color_map_provider=self._neuron_table.get_full_color_map,
+                atlas_provider=lambda: self._atlas,
+                selected_region_ids_provider=self._active_flatmap_region_ids,
+                selected_region_acronyms_provider=self._active_flatmap_region_acronyms,
             )
             tabs.addTab(self._flatmap_tab, "Flatmap")
 
@@ -4908,6 +4911,49 @@ class NeuronViewerWidget(QWidget):
         if not callable(get_selected):
             return []
         return list(get_selected(include_children=False))
+
+    def _active_region_include_children(self) -> bool:
+        """Return the active atlas selector's include-children state."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return True
+
+        include_children = getattr(selector, "include_children_enabled", None)
+        if callable(include_children):
+            return bool(include_children())
+        return True
+
+    def _active_flatmap_region_ids(self) -> list[int]:
+        """Return selected atlas IDs for flatmap region-label overlays."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+
+        get_selected = getattr(selector, "get_selected_ids", None)
+        if not callable(get_selected):
+            return []
+        return [
+            int(region_id)
+            for region_id in get_selected(
+                include_children=self._active_region_include_children()
+            )
+        ]
+
+    def _active_flatmap_region_acronyms(self) -> list[str]:
+        """Return selected atlas acronyms for flatmap region-label metadata."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+
+        get_selected = getattr(selector, "get_selected_acronyms", None)
+        if not callable(get_selected):
+            return []
+        return [
+            str(acronym)
+            for acronym in get_selected(
+                include_children=self._active_region_include_children()
+            )
+        ]
 
     def _sync_region_query_scope_selector(self) -> None:
         """Show the atlas selector that matches the active query scope."""

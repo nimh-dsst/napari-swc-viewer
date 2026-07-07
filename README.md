@@ -101,6 +101,12 @@ The output preserves the original CCFv3 `x`, `y`, and `z` columns and appends
 `x_flat`, `y_flat`, `depth_um`, validity flags, and a lookup mode showing
 whether the direct or mirrored coordinate was used.
 
+The Flatmap tab can also convert selected atlas regions into a
+`Flatmap Region Labels` layer. Load an atlas, select regions in the Regions tab,
+choose matching flatmap/depth NRRDs, choose the Flatmap tab atlas for label
+conversion, then click `Create Region Labels`. Use `allen_mouse_10um` for
+10 µm flatmap/depth NRRDs.
+
 ## Standard Point Parquet Workflow
 
 This repo now supports atlas-registered point datasets via a standardized

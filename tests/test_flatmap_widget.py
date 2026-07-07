@@ -8,6 +8,11 @@ import types
 import numpy as np
 import pandas as pd
 
+from napari_swc_viewer.flatmap_labels import (
+    FlatmapRegionLabelsResult,
+    FlatmapRegionLabelsSummary,
+)
+
 
 class _FakeWidget:
     def __init__(self, *_args, **_kwargs) -> None:
@@ -22,6 +27,18 @@ class _FakeFileDialog:
     @staticmethod
     def getSaveFileName(*_args, **_kwargs):
         return "", ""
+
+
+class _DummySignal:
+    def __init__(self) -> None:
+        self._callbacks = []
+
+    def connect(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def emit(self, *args, **kwargs) -> None:
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
 
 
 def _load_flatmap_widget_module(monkeypatch):
@@ -40,8 +57,11 @@ def _load_flatmap_widget_module(monkeypatch):
     ):
         setattr(fake_qtwidgets, name, _FakeWidget)
     fake_qtwidgets.QFileDialog = _FakeFileDialog
+    fake_qtcore = types.ModuleType("qtpy.QtCore")
+    fake_qtcore.QThread = _FakeWidget
     fake_qtpy = types.ModuleType("qtpy")
     fake_qtpy.QtWidgets = fake_qtwidgets
+    fake_qtpy.QtCore = fake_qtcore
     fake_notifications = types.ModuleType("napari.utils.notifications")
     fake_notifications.show_info = lambda *_args, **_kwargs: None
     fake_notifications.show_warning = lambda *_args, **_kwargs: None
@@ -52,6 +72,7 @@ def _load_flatmap_widget_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "qtpy", fake_qtpy)
     monkeypatch.setitem(sys.modules, "qtpy.QtWidgets", fake_qtwidgets)
+    monkeypatch.setitem(sys.modules, "qtpy.QtCore", fake_qtcore)
     monkeypatch.setitem(sys.modules, "napari", fake_napari)
     monkeypatch.setitem(sys.modules, "napari.utils", fake_utils)
     monkeypatch.setitem(
@@ -83,6 +104,29 @@ class _DummyLabel:
 
     def setText(self, text: str) -> None:
         self.text = text
+
+
+class _DummyButton:
+    def __init__(self) -> None:
+        self.enabled = True
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+
+class _DummyCombo:
+    def __init__(self, text: str = "allen_mouse_10um") -> None:
+        self.text = text
+        self.enabled = True
+
+    def currentText(self) -> str:
+        return self.text
+
+    def setCurrentText(self, text: str) -> None:
+        self.text = str(text)
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
 
 
 class _DummyLayer:
@@ -189,18 +233,34 @@ class _DummyViewer:
         self.layers.append(layer)
         return layer
 
+    def add_labels(self, data, **kwargs) -> _DummyLayer:
+        layer = _DummyLayer(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
 
 def _widget(module):
     widget = module.FlatmapProjectionWidget.__new__(module.FlatmapProjectionWidget)
     widget._viewer = _DummyViewer()
     widget._projection_layer = None
+    widget._region_labels_layer = None
     widget._flatmap_path = Path("flatmap_both_shaped.nrrd")
     widget._depth_path = Path("depth.nrrd")
     widget._status_label = _DummyLabel()
+    widget._region_labels_status_label = _DummyLabel()
+    widget._region_label_atlas_combo = _DummyCombo("allen_mouse_10um")
+    widget._region_labels_btn = _DummyButton()
+    widget._clear_region_labels_btn = _DummyButton()
+    widget._region_label_atlas_cache = {}
+    widget._region_label_atlas_load_thread = None
+    widget._region_label_atlas_load_worker = None
+    widget._pending_region_label_request = False
     widget._color_map_provider = lambda: {
         "a.swc": [1.0, 0.0, 0.0, 1.0],
         "b.swc": [0.0, 1.0, 0.0, 0.5],
     }
+    widget._atlas_provider = lambda: None
+    widget._selected_region_acronyms_provider = lambda: ["VISp"]
     return widget
 
 
@@ -272,6 +332,203 @@ def test_file_ids_for_source_uses_selected_then_all_fallback(monkeypatch) -> Non
 
     widget._selected_file_ids_provider = lambda: []
     assert widget._file_ids_for_source("selected") == ["a.swc", "b.swc"]
+
+
+def test_region_label_atlas_defaults_to_10um(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    assert widget._current_region_label_atlas_name() == "allen_mouse_10um"
+
+
+def _label_result(region_id: int = 7) -> FlatmapRegionLabelsResult:
+    summary = FlatmapRegionLabelsSummary(
+        input_voxels=1,
+        selected_region_count=1,
+        selected_source_voxels=1,
+        valid_source_voxels=1,
+        labeled_voxels=1,
+        collision_voxels=0,
+        xy_bins=1,
+        depth_bins=1,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+    )
+    return FlatmapRegionLabelsResult(
+        labels=np.asarray([[[region_id]]], dtype=np.int32),
+        summary=summary,
+        selected_region_ids=[region_id],
+        represented_region_ids=[region_id],
+    )
+
+
+def _configure_region_label_creation_widget(widget) -> None:
+    widget._selected_region_ids_provider = lambda: [7]
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._zero_sentinel_cb = types.SimpleNamespace(isChecked=lambda: False)
+    widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
+    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 1)
+    widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
+    widget._focus_projection_view = lambda *_args, **_kwargs: None
+    widget._lookup_stats_for_volume_set = lambda *_args, **_kwargs: object()
+
+
+def test_create_region_labels_uses_flatmap_selected_atlas_not_main_loaded_atlas(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_region_label_creation_widget(widget)
+    atlas10 = types.SimpleNamespace(
+        atlas_name="allen_mouse_10um",
+        annotation=np.asarray([[[10]]], dtype=np.int32),
+        structures={7: {"rgb_triplet": [255, 0, 0]}},
+    )
+    atlas25 = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        annotation=np.asarray([[[25]]], dtype=np.int32),
+        structures={7: {"rgb_triplet": [0, 255, 0]}},
+    )
+    widget._region_label_atlas_cache = {"allen_mouse_10um": atlas10}
+    widget._atlas_provider = lambda: atlas25
+    captured = {}
+
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            flatmap=np.zeros((1, 1, 1, 2), dtype=np.float32),
+            depth=np.zeros((1, 1, 1), dtype=np.float32),
+            flatmap_path=Path("flatmap.nrrd"),
+            depth_path=Path("depth.nrrd"),
+        ),
+    )
+
+    def fake_build(annotation, *_args, **_kwargs):
+        captured["annotation"] = np.asarray(annotation).copy()
+        return _label_result(7)
+
+    monkeypatch.setattr(module, "build_flatmap_region_label_volume", fake_build)
+
+    widget._create_region_labels_from_current_state()
+
+    np.testing.assert_array_equal(captured["annotation"], atlas10.annotation)
+    assert widget._viewer.layers[-1].metadata["atlas_name"] == "allen_mouse_10um"
+
+
+def _install_fake_region_label_atlas_worker(monkeypatch, module):
+    workers = []
+    threads = []
+
+    class _FakeThread:
+        def __init__(self) -> None:
+            self.started = _DummySignal()
+            self.finished = _DummySignal()
+            self.running = False
+            self.started_called = False
+            threads.append(self)
+
+        def start(self) -> None:
+            self.running = True
+            self.started_called = True
+            self.started.emit()
+
+        def quit(self, *_args) -> None:
+            self.running = False
+            self.finished.emit()
+
+        def isRunning(self) -> bool:
+            return self.running
+
+        def deleteLater(self) -> None:
+            return None
+
+    class _FakeAtlasLoadWorker:
+        def __init__(self, atlas_name: str) -> None:
+            self.atlas_name = atlas_name
+            self.status = _DummySignal()
+            self.progress = _DummySignal()
+            self.finished = _DummySignal()
+            self.error = _DummySignal()
+            self.thread = None
+            workers.append(self)
+
+        def moveToThread(self, thread) -> None:
+            self.thread = thread
+
+        def run(self) -> None:
+            return None
+
+        def deleteLater(self) -> None:
+            return None
+
+    fake_qtcore = sys.modules["qtpy.QtCore"]
+    fake_qtcore.QThread = _FakeThread
+    fake_workers = types.ModuleType("napari_swc_viewer.workers")
+    fake_workers.AtlasLoadWorker = _FakeAtlasLoadWorker
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", fake_workers)
+    return workers, threads
+
+
+def test_unloaded_region_label_atlas_loads_then_creates_labels(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    workers, threads = _install_fake_region_label_atlas_worker(monkeypatch, module)
+    widget = _widget(module)
+    _configure_region_label_creation_widget(widget)
+    calls = []
+
+    def fake_create_for_atlas(atlas, selected_region_ids):
+        calls.append((atlas, selected_region_ids))
+        return _label_result(7)
+
+    widget._create_region_labels_for_atlas = fake_create_for_atlas
+
+    widget._create_region_labels()
+
+    assert len(workers) == 1
+    assert workers[0].atlas_name == "allen_mouse_10um"
+    assert workers[0].thread is threads[0]
+    assert threads[0].started_called is True
+    assert widget._region_label_atlas_combo.enabled is False
+    assert widget._region_labels_btn.enabled is False
+    assert "Loading region-label atlas allen_mouse_10um" in widget._status_label.text
+    atlas10 = types.SimpleNamespace(
+        atlas_name="allen_mouse_10um",
+        annotation=np.zeros((1, 1, 1), dtype=np.int32),
+        structures={},
+    )
+
+    workers[0].finished.emit(atlas10)
+
+    assert widget._region_label_atlas_cache["allen_mouse_10um"] is atlas10
+    assert calls == [(atlas10, [7])]
+    assert widget._region_label_atlas_combo.enabled is True
+    assert widget._region_labels_btn.enabled is True
+    assert widget._region_label_atlas_load_thread is None
+    assert widget._region_label_atlas_load_worker is None
+
+
+def test_region_label_atlas_load_error_restores_controls(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    workers, _threads = _install_fake_region_label_atlas_worker(monkeypatch, module)
+    widget = _widget(module)
+    _configure_region_label_creation_widget(widget)
+    calls = []
+    widget._create_region_labels_for_atlas = lambda *_args: calls.append("created")
+
+    widget._create_region_labels()
+    workers[0].error.emit("download failed")
+
+    assert calls == []
+    assert widget._pending_region_label_request is False
+    assert widget._region_label_atlas_combo.enabled is True
+    assert widget._region_labels_btn.enabled is True
+    assert "download failed" in widget._status_label.text
 
 
 def _configure_augmentation_widget(widget, source_mode: str, source_path: Path) -> None:
@@ -416,6 +673,60 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     assert layer.slice_dims_calls[-1] == (widget._viewer.dims, True)
     assert widget._viewer.camera.center == (0.5, 2.0, 1.0)
     assert widget._viewer.camera.zoom == 300.0
+
+
+def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    summary = FlatmapRegionLabelsSummary(
+        input_voxels=4,
+        selected_region_count=1,
+        selected_source_voxels=2,
+        valid_source_voxels=2,
+        labeled_voxels=1,
+        collision_voxels=1,
+        xy_bins=2,
+        depth_bins=1,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+    )
+    first = FlatmapRegionLabelsResult(
+        labels=np.asarray([[[0, 7], [0, 0]]], dtype=np.int32),
+        summary=summary,
+        selected_region_ids=[7],
+        represented_region_ids=[7],
+    )
+    metadata = {
+        "projection_kind": "flatmap_region_labels",
+        "selected_region_ids": [7],
+        "summary": summary.to_dict(),
+    }
+
+    layer = widget._create_or_update_region_labels_layer(first, metadata)
+
+    assert layer.name == "Flatmap Region Labels"
+    np.testing.assert_array_equal(layer.data, first.labels)
+    assert layer.metadata["projection_kind"] == "flatmap_region_labels"
+    assert layer._napari_swc_flatmap_region_labels_result is first
+    assert widget._viewer.layers == [layer]
+
+    second = FlatmapRegionLabelsResult(
+        labels=np.asarray([[[8, 0], [0, 0]]], dtype=np.int32),
+        summary=summary,
+        selected_region_ids=[8],
+        represented_region_ids=[8],
+    )
+    updated = widget._create_or_update_region_labels_layer(second, metadata)
+
+    assert updated is layer
+    np.testing.assert_array_equal(layer.data, second.labels)
+    assert layer._napari_swc_flatmap_region_labels_result is second
+    assert layer.refresh_count == 1
 
 
 def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> None:

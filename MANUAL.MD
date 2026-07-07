@@ -116,6 +116,18 @@ pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neuron
 Add repeatable `--file-id <id>` arguments to restrict the command-line
 conversion to specific neurons.
 
+### Flatmap region labels
+
+- Load an atlas, choose one or more atlas regions in the **Regions** tab, then
+  choose matching flatmap/depth NRRDs in the **Flatmap** tab
+- Choose the **Flatmap** tab `Atlas` value for label conversion; use
+  `allen_mouse_10um` for 10 µm flatmap/depth NRRDs
+- Click `Create Region Labels` to add a `Flatmap Region Labels` labels layer
+  aligned to the current Flatmap tab XY/depth bin settings
+- The layer uses the selected regions and the Regions tab `Include child
+  regions` setting; the atlas annotation grid must match the flatmap/depth
+  lookup grid resolution
+
 ### Standard point Parquet files
 
 - Produced from raw CSVs using `scripts/convert_point_csv.py`
