@@ -334,6 +334,66 @@ def _depth_bin_count(
     return max(1, int(np.floor((upper - lower) / depth_bin_um)) + 1)
 
 
+def _projected_nodes_with_validity_flags(projected_nodes: pd.DataFrame) -> pd.DataFrame:
+    """Return projected nodes with inferred validity flags when absent."""
+    required = ("x_flat", "y_flat", "depth_um")
+    missing = [column for column in required if column not in projected_nodes.columns]
+    if missing:
+        raise ValueError(f"Projected nodes are missing required column(s): {missing}")
+
+    table = projected_nodes.copy()
+    x_values = pd.to_numeric(table["x_flat"], errors="coerce").to_numpy(dtype=float)
+    y_values = pd.to_numeric(table["y_flat"], errors="coerce").to_numpy(dtype=float)
+    depth_values = pd.to_numeric(table["depth_um"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    if "flatmap_valid" not in table.columns:
+        table.loc[:, "flatmap_valid"] = np.isfinite(x_values) & np.isfinite(y_values)
+    if "depth_valid" not in table.columns:
+        table.loc[:, "depth_valid"] = np.isfinite(depth_values) & (depth_values >= 0.0)
+    return table
+
+
+def _projected_nodes_bounds(
+    projected_nodes: pd.DataFrame,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    table = _projected_nodes_with_validity_flags(projected_nodes)
+    flatmap_valid = table["flatmap_valid"].fillna(False).astype(bool).to_numpy()
+    depth_valid = table["depth_valid"].fillna(False).astype(bool).to_numpy()
+    x_values = pd.to_numeric(table["x_flat"], errors="coerce").to_numpy(dtype=float)
+    y_values = pd.to_numeric(table["y_flat"], errors="coerce").to_numpy(dtype=float)
+    depth_values = pd.to_numeric(table["depth_um"], errors="coerce").to_numpy(
+        dtype=float
+    )
+
+    flatmap_mask = flatmap_valid & np.isfinite(x_values) & np.isfinite(y_values)
+    if not flatmap_mask.any():
+        raise ValueError("Projected nodes do not contain valid flatmap coordinates.")
+    depth_mask = (
+        flatmap_valid
+        & depth_valid
+        & np.isfinite(depth_values)
+        & (depth_values >= 0.0)
+    )
+    if not depth_mask.any():
+        raise ValueError("Projected nodes do not contain valid non-negative depths.")
+
+    return (
+        _nondegenerate_bounds(
+            float(np.min(x_values[flatmap_mask])),
+            float(np.max(x_values[flatmap_mask])),
+        ),
+        _nondegenerate_bounds(
+            float(np.min(y_values[flatmap_mask])),
+            float(np.max(y_values[flatmap_mask])),
+        ),
+        _nondegenerate_bounds(
+            float(np.min(depth_values[depth_mask])),
+            float(np.max(depth_values[depth_mask])),
+        ),
+    )
+
+
 def _validate_lookup_stats(
     lookup_stats: FlatmapLookupStats,
     flatmap: np.ndarray,
@@ -422,9 +482,50 @@ def build_flatmap_render_data(
             invalid_zero_sentinel=invalid_zero_sentinel,
             invalid_negative_one_sentinel=invalid_negative_one_sentinel,
         )
-    x_bounds = lookup_stats.x_bounds
-    y_bounds = lookup_stats.y_bounds
-    depth_range = lookup_stats.depth_range_um
+
+    return _build_flatmap_render_data_for_bounds(
+        projected_nodes,
+        x_bounds=lookup_stats.x_bounds,
+        y_bounds=lookup_stats.y_bounds,
+        depth_range=lookup_stats.depth_range_um,
+        xy_bins=xy_bins,
+        depth_bin_um=depth_bin_um,
+        include_depth_minus_one=include_depth_minus_one,
+    )
+
+
+def build_flatmap_render_data_from_projected_nodes(
+    projected_nodes: pd.DataFrame,
+    *,
+    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
+    include_depth_minus_one: bool = True,
+) -> FlatmapRenderResult:
+    """Build a depth-aware render using flatmap/depth columns already in a table."""
+    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
+    projected = _projected_nodes_with_validity_flags(projected_nodes)
+    x_bounds, y_bounds, depth_range = _projected_nodes_bounds(projected)
+    return _build_flatmap_render_data_for_bounds(
+        projected,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range=depth_range,
+        xy_bins=xy_bins,
+        depth_bin_um=depth_bin_um,
+        include_depth_minus_one=include_depth_minus_one,
+    )
+
+
+def _build_flatmap_render_data_for_bounds(
+    projected_nodes: pd.DataFrame,
+    *,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    depth_range: tuple[float, float],
+    xy_bins: int,
+    depth_bin_um: float,
+    include_depth_minus_one: bool,
+) -> FlatmapRenderResult:
     valid_depth_bins = _depth_bin_count(depth_range, depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset

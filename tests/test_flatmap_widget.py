@@ -613,6 +613,118 @@ def test_augment_current_parquet_to_path_passes_all_table_file_ids(
     assert "3 rows from 2 file ID" in widget._status_label.text
 
 
+def _augmented_nodes() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "b.swc"],
+            "neuron_id": ["a", "a", "b"],
+            "subject": ["s", "s", "s"],
+            "node_id": [1, 2, 1],
+            "parent_id": [-1, 1, -1],
+            "type": [1, 3, 1],
+            "x": [10.0, 20.0, 30.0],
+            "y": [10.0, 20.0, 30.0],
+            "z": [10.0, 20.0, 30.0],
+            "region_id": [1, 1, 2],
+            "region_acronym": ["R1", "R1", "R2"],
+            "x_flat": [0.0, 1.0, np.nan],
+            "y_flat": [0.0, 1.0, 2.0],
+            "depth_um": [0.0, 25.0, 10.0],
+            "flatmap_valid": [True, True, False],
+            "depth_valid": [True, True, True],
+            "flatmap_projection_valid": [True, True, False],
+            "flatmap_invalid_code": [0, 0, 3],
+            "flatmap_lookup_mode": ["direct", "direct", "unmapped"],
+        }
+    )
+
+
+def _configure_projection_widget(widget, module, nodes: pd.DataFrame) -> None:
+    widget._database_provider = lambda: types.SimpleNamespace(
+        get_neurons_for_rendering=lambda file_ids: nodes[
+            nodes["file_id"].isin(file_ids)
+        ].reset_index(drop=True),
+    )
+    widget._table_file_ids_provider = lambda: ["a.swc", "b.swc"]
+    widget._selected_file_ids_provider = lambda: []
+    widget._source_combo = types.SimpleNamespace(currentData=lambda: module._SOURCE_ALL)
+    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 4)
+    widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
+    widget._exclude_depth_minus_one_cb = types.SimpleNamespace(isChecked=lambda: False)
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._coordinate_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "microns"
+    )
+
+
+def test_project_without_nrrds_uses_augmented_parquet_columns(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._flatmap_path = None
+    widget._depth_path = None
+    _configure_projection_widget(widget, module, _augmented_nodes())
+    captured = {}
+
+    def fake_apply(result, render_result, **kwargs):
+        captured["result"] = result
+        captured["render_result"] = render_result
+        captured["kwargs"] = kwargs
+
+    widget._apply_projection_result = fake_apply
+
+    widget._project()
+
+    assert captured["kwargs"]["flatmap_style"] == "precomputed_parquet"
+    assert captured["kwargs"]["coordinate_mode"] == "parquet_columns"
+    projected = captured["result"].projected_nodes
+    assert projected["valid"].tolist() == [True, True, False]
+    assert projected["invalid_reason"].tolist() == ["", "", "invalid_flatmap"]
+    assert captured["render_result"].summary.rendered_nodes == 2
+    assert "Parquet flatmap/depth columns" in widget._status_label.text
+
+
+def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_projection_widget(widget, module, _augmented_nodes())
+    calls = {"lookup": 0, "parquet": 0}
+
+    def fake_lookup(self, nodes):
+        calls["lookup"] += 1
+        result = types.SimpleNamespace(projected_nodes=nodes, summary=object())
+        render = types.SimpleNamespace(
+            projected_nodes=nodes,
+            summary=types.SimpleNamespace(rendered_nodes=1, total_nodes=1),
+        )
+        return result, render
+
+    def fake_parquet(self, _nodes):
+        calls["parquet"] += 1
+        raise AssertionError("Parquet branch should not run when both NRRDs are set")
+
+    widget._project_from_lookup_files = types.MethodType(fake_lookup, widget)
+    widget._project_from_parquet_columns = types.MethodType(fake_parquet, widget)
+    widget._apply_projection_result = lambda *_args, **_kwargs: None
+
+    widget._project()
+
+    assert calls == {"lookup": 1, "parquet": 0}
+    assert "lookup NRRDs" in widget._status_label.text
+
+
+def test_project_without_nrrds_requires_augmented_parquet_columns(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._flatmap_path = None
+    widget._depth_path = None
+    nodes = _augmented_nodes().drop(columns=["x_flat", "y_flat", "depth_um"])
+    _configure_projection_widget(widget, module, nodes)
+
+    widget._project()
+
+    assert "augmented Parquet with x_flat, y_flat, and depth_um" in widget._status_label.text
+
+
 def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -673,6 +785,76 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     assert layer.slice_dims_calls[-1] == (widget._viewer.dims, True)
     assert widget._viewer.camera.center == (0.5, 2.0, 1.0)
     assert widget._viewer.camera.zoom == 300.0
+
+
+def _simple_projection_summary(module, total_nodes: int = 1):
+    return module.ProjectionSummary(total_nodes, total_nodes, 0, 0, 0, 0, 0, 1, 0)
+
+
+def _simple_render_summary(module, total_nodes: int = 1):
+    return module.FlatmapRenderSummary(
+        total_nodes,
+        total_nodes,
+        total_nodes,
+        0,
+        total_nodes,
+        0,
+        total_nodes,
+        1,
+        4,
+        1,
+        25.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        25.0,
+        True,
+    )
+
+
+def test_deleted_heatmap_layer_is_recreated_from_stale_cache(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    summary = _simple_projection_summary(module)
+    first_render = module.FlatmapRenderResult(
+        projected_nodes=pd.DataFrame({"file_id": ["a.swc"]}),
+        volume=np.ones((1, 4, 4), dtype=np.float32),
+        points=np.asarray([[0.0, 0.0, 0.0]]),
+        point_file_ids=["a.swc"],
+        summary=_simple_render_summary(module),
+    )
+    second_render = module.FlatmapRenderResult(
+        projected_nodes=pd.DataFrame({"file_id": ["a.swc"]}),
+        volume=np.full((1, 4, 4), 2.0, dtype=np.float32),
+        points=np.asarray([[0.0, 1.0, 1.0]]),
+        point_file_ids=["a.swc"],
+        summary=_simple_render_summary(module),
+    )
+
+    first = widget._create_or_update_render_layer(
+        first_render,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+    widget._viewer.layers.remove(first)
+    assert widget._projection_layer is first
+
+    second = widget._create_or_update_render_layer(
+        second_render,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+
+    assert second is not first
+    assert widget._projection_layer is second
+    assert widget._viewer.layers == [second]
+    np.testing.assert_array_equal(second.data, second_render.volume)
 
 
 def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None:
@@ -896,6 +1078,49 @@ def test_create_points_layer_uses_table_colors(monkeypatch) -> None:
     )
     np.testing.assert_allclose(layer.data, render_result.points)
     assert layer.metadata["flatmap_render_mode"] == "points"
+
+
+def test_deleted_points_layer_is_recreated_from_stale_cache(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    summary = _simple_projection_summary(module)
+    first_render = module.FlatmapRenderResult(
+        projected_nodes=pd.DataFrame({"file_id": ["a.swc"]}),
+        volume=np.zeros((1, 4, 4), dtype=np.float32),
+        points=np.asarray([[0.0, 0.0, 0.0]]),
+        point_file_ids=["a.swc"],
+        summary=_simple_render_summary(module),
+    )
+    second_render = module.FlatmapRenderResult(
+        projected_nodes=pd.DataFrame({"file_id": ["b.swc"]}),
+        volume=np.zeros((1, 4, 4), dtype=np.float32),
+        points=np.asarray([[0.0, 1.0, 1.0]]),
+        point_file_ids=["b.swc"],
+        summary=_simple_render_summary(module),
+    )
+
+    first = widget._create_or_update_render_layer(
+        first_render,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="points",
+    )
+    widget._viewer.layers.remove(first)
+    assert widget._projection_layer is first
+
+    second = widget._create_or_update_render_layer(
+        second_render,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="points",
+    )
+
+    assert second is not first
+    assert widget._projection_layer is second
+    assert widget._viewer.layers == [second]
+    np.testing.assert_array_equal(second.data, second_render.points)
 
 
 def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> None:

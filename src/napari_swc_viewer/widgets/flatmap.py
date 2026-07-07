@@ -32,6 +32,7 @@ from ..flatmap_heatmap import (
     FlatmapRenderResult,
     FlatmapRenderSummary,
     build_flatmap_render_data,
+    build_flatmap_render_data_from_projected_nodes,
     compute_flatmap_lookup_stats,
 )
 from ..flatmap_labels import (
@@ -39,14 +40,19 @@ from ..flatmap_labels import (
     build_flatmap_region_label_volume,
 )
 from ..flatmap_loader import FLATMAP_STYLE_FILENAMES, load_flatmap_volume_set
-from ..flatmap_parquet import augment_neuron_parquet_with_flatmap
+from ..flatmap_parquet import (
+    augment_neuron_parquet_with_flatmap,
+    flatmap_invalid_code_to_reason,
+)
 from ..flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
     DEFAULT_CCF_RESOLUTION_UM,
     FlatmapProjectionResult,
     ProjectionSummary,
+    build_projected_segments,
     project_and_build_segments,
+    summarize_projection,
 )
 
 logger = logging.getLogger(__name__)
@@ -398,64 +404,245 @@ class FlatmapProjectionWidget(QWidget):
             raise RuntimeError("No neuron rows matched the requested file IDs.")
         return nodes
 
+    def _lookup_files_ready(self) -> bool:
+        return self._flatmap_path is not None and self._depth_path is not None
+
     def _projection_request_ready(self) -> None:
         if self._flatmap_path is None:
-            raise RuntimeError("Choose a flatmap NRRD file before projecting.")
+            raise RuntimeError("Choose a flatmap NRRD file before this action.")
         if self._depth_path is None:
-            raise RuntimeError("Choose depth.nrrd before projecting.")
+            raise RuntimeError("Choose depth.nrrd before this action.")
+
+    @staticmethod
+    def _has_parquet_flatmap_depth_columns(nodes: pd.DataFrame) -> bool:
+        return {"x_flat", "y_flat", "depth_um"}.issubset(nodes.columns)
 
     def _project(self) -> None:
         """Run projection from the current UI state and render the layer."""
         try:
-            self._projection_request_ready()
             file_ids = self._file_ids_for_source()
             nodes = self._query_nodes(file_ids)
-            volume_set = load_flatmap_volume_set(self._flatmap_path, self._depth_path)
-            result = project_and_build_segments(
-                nodes,
-                volume_set.flatmap,
-                volume_set.depth,
-                flatmap_style=self._current_style_filename(),
-                coordinate_mode=self._current_coordinate_mode(),
-                invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-                invalid_negative_one_sentinel=(
-                    self._negative_one_sentinel_cb.isChecked()
-                ),
-                resolution_um=DEFAULT_CCF_RESOLUTION_UM,
-                space_directions=volume_set.space_directions,
-                space_origin=volume_set.space_origin,
+            if self._lookup_files_ready():
+                result, render_result = self._project_from_lookup_files(nodes)
+                flatmap_style = self._current_style_filename()
+                coordinate_mode = self._current_coordinate_mode()
+                source_note = "lookup NRRDs"
+            else:
+                if not self._has_parquet_flatmap_depth_columns(nodes):
+                    raise RuntimeError(
+                        "Choose both flatmap and depth NRRD files, or load an "
+                        "augmented Parquet with x_flat, y_flat, and depth_um columns."
+                    )
+                result, render_result = self._project_from_parquet_columns(nodes)
+                flatmap_style = "precomputed_parquet"
+                coordinate_mode = "parquet_columns"
+                source_note = "Parquet flatmap/depth columns"
+
+            self._apply_projection_result(
+                result,
+                render_result,
+                flatmap_style=flatmap_style,
+                coordinate_mode=coordinate_mode,
             )
-            render_result = build_flatmap_render_data(
-                result.projected_nodes,
-                volume_set.flatmap,
-                volume_set.depth,
-                xy_bins=self._current_xy_bins(),
-                depth_bin_um=self._current_depth_bin_um(),
-                include_depth_minus_one=(
-                    not self._exclude_depth_minus_one_cb.isChecked()
-                ),
-                invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-                invalid_negative_one_sentinel=(
-                    self._negative_one_sentinel_cb.isChecked()
-                ),
-                lookup_stats=self._lookup_stats_for_volume_set(
-                    volume_set,
-                    invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-                    invalid_negative_one_sentinel=(
-                        self._negative_one_sentinel_cb.isChecked()
-                    ),
-                ),
-            )
-            self._apply_projection_result(result, render_result)
             self._status_label.setText(
                 f"Rendered {render_result.summary.rendered_nodes:,} of "
-                f"{render_result.summary.total_nodes:,} projected node(s)."
+                f"{render_result.summary.total_nodes:,} projected node(s) using "
+                f"{source_note}."
             )
             show_info("Flatmap projection complete.")
         except Exception as exc:
             logger.exception("Flatmap projection failed")
             self._status_label.setText(f"Flatmap projection failed: {exc}")
             show_warning(f"Flatmap projection failed: {exc}")
+
+    def _project_from_lookup_files(
+        self,
+        nodes: pd.DataFrame,
+    ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult]:
+        volume_set = load_flatmap_volume_set(self._flatmap_path, self._depth_path)
+        result = project_and_build_segments(
+            nodes,
+            volume_set.flatmap,
+            volume_set.depth,
+            flatmap_style=self._current_style_filename(),
+            coordinate_mode=self._current_coordinate_mode(),
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=(
+                self._negative_one_sentinel_cb.isChecked()
+            ),
+            resolution_um=DEFAULT_CCF_RESOLUTION_UM,
+            space_directions=volume_set.space_directions,
+            space_origin=volume_set.space_origin,
+        )
+        render_result = build_flatmap_render_data(
+            result.projected_nodes,
+            volume_set.flatmap,
+            volume_set.depth,
+            xy_bins=self._current_xy_bins(),
+            depth_bin_um=self._current_depth_bin_um(),
+            include_depth_minus_one=(
+                not self._exclude_depth_minus_one_cb.isChecked()
+            ),
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=(
+                self._negative_one_sentinel_cb.isChecked()
+            ),
+            lookup_stats=self._lookup_stats_for_volume_set(
+                volume_set,
+                invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+                invalid_negative_one_sentinel=(
+                    self._negative_one_sentinel_cb.isChecked()
+                ),
+            ),
+        )
+        return result, render_result
+
+    def _project_from_parquet_columns(
+        self,
+        nodes: pd.DataFrame,
+    ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult]:
+        result = self._projection_result_from_parquet_columns(nodes)
+        render_result = build_flatmap_render_data_from_projected_nodes(
+            result.projected_nodes,
+            xy_bins=self._current_xy_bins(),
+            depth_bin_um=self._current_depth_bin_um(),
+            include_depth_minus_one=(
+                not self._exclude_depth_minus_one_cb.isChecked()
+            ),
+        )
+        return result, render_result
+
+    def _projection_result_from_parquet_columns(
+        self,
+        nodes: pd.DataFrame,
+    ) -> FlatmapProjectionResult:
+        source = nodes.reset_index(drop=True)
+        missing = [
+            column
+            for column in ("x_flat", "y_flat", "depth_um")
+            if column not in source.columns
+        ]
+        if missing:
+            raise RuntimeError(
+                "Loaded Parquet is missing reusable flatmap/depth column(s): "
+                f"{missing}"
+            )
+
+        x_flat = pd.to_numeric(source["x_flat"], errors="coerce").to_numpy(dtype=float)
+        y_flat = pd.to_numeric(source["y_flat"], errors="coerce").to_numpy(dtype=float)
+        depth_um = pd.to_numeric(source["depth_um"], errors="coerce").to_numpy(
+            dtype=float
+        )
+        flatmap_valid = self._bool_column_or_default(
+            source,
+            "flatmap_valid",
+            np.isfinite(x_flat) & np.isfinite(y_flat),
+        )
+        depth_valid = self._bool_column_or_default(
+            source,
+            "depth_valid",
+            np.isfinite(depth_um) & (depth_um >= 0.0),
+        )
+        if "valid" in source.columns:
+            valid = source["valid"].fillna(False).astype(bool).to_numpy()
+        elif "flatmap_projection_valid" in source.columns:
+            valid = (
+                source["flatmap_projection_valid"]
+                .fillna(False)
+                .astype(bool)
+                .to_numpy()
+            )
+        else:
+            valid = flatmap_valid & depth_valid
+
+        invalid_reason = self._parquet_invalid_reasons(
+            source,
+            flatmap_valid=flatmap_valid,
+            depth_valid=depth_valid,
+            valid=valid,
+        )
+        projected = pd.DataFrame(
+            {
+                "file_id": source["file_id"].reset_index(drop=True),
+                "neuron_id": self._column_or_default(source, "neuron_id", ""),
+                "subject": self._column_or_default(source, "subject", ""),
+                "node_id": source["node_id"].reset_index(drop=True),
+                "parent_id": source["parent_id"].reset_index(drop=True),
+                "type": source["type"].reset_index(drop=True),
+                "x_um": pd.to_numeric(source["x"], errors="coerce"),
+                "y_um": pd.to_numeric(source["y"], errors="coerce"),
+                "z_um": pd.to_numeric(source["z"], errors="coerce"),
+                "voxel_i": self._column_or_default(source, "voxel_i", pd.NA),
+                "voxel_j": self._column_or_default(source, "voxel_j", pd.NA),
+                "voxel_k": self._column_or_default(source, "voxel_k", pd.NA),
+                "x_flat": x_flat,
+                "y_flat": y_flat,
+                "depth_um": depth_um,
+                "flatmap_valid": flatmap_valid,
+                "depth_valid": depth_valid,
+                "valid": valid,
+                "invalid_reason": invalid_reason,
+                "region_id": self._column_or_default(source, "region_id", pd.NA),
+                "region_acronym": self._column_or_default(
+                    source,
+                    "region_acronym",
+                    "",
+                ),
+                "flatmap_style": "precomputed_parquet",
+                "coordinate_mode": "parquet_columns",
+            }
+        )
+        if "flatmap_lookup_mode" in source.columns:
+            projected.loc[:, "flatmap_lookup_mode"] = source[
+                "flatmap_lookup_mode"
+            ].reset_index(drop=True)
+
+        segments = build_projected_segments(projected)
+        summary = summarize_projection(projected, segments)
+        return FlatmapProjectionResult(projected, segments, summary)
+
+    @staticmethod
+    def _column_or_default(
+        table: pd.DataFrame,
+        column: str,
+        default: object,
+    ) -> pd.Series:
+        if column in table.columns:
+            return table[column].reset_index(drop=True)
+        return pd.Series([default] * len(table), index=range(len(table)))
+
+    @staticmethod
+    def _bool_column_or_default(
+        table: pd.DataFrame,
+        column: str,
+        default: np.ndarray,
+    ) -> np.ndarray:
+        if column in table.columns:
+            return table[column].fillna(False).astype(bool).to_numpy()
+        return np.asarray(default, dtype=bool)
+
+    @staticmethod
+    def _parquet_invalid_reasons(
+        table: pd.DataFrame,
+        *,
+        flatmap_valid: np.ndarray,
+        depth_valid: np.ndarray,
+        valid: np.ndarray,
+    ) -> np.ndarray:
+        if "invalid_reason" in table.columns:
+            return table["invalid_reason"].fillna("").astype(str).to_numpy()
+        if "flatmap_invalid_code" in table.columns:
+            reasons = [
+                flatmap_invalid_code_to_reason(code)
+                for code in table["flatmap_invalid_code"].tolist()
+            ]
+            return np.asarray(reasons, dtype=object)
+
+        reasons = np.full(len(table), "", dtype=object)
+        reasons[~flatmap_valid] = "invalid_flatmap"
+        reasons[flatmap_valid & ~depth_valid] = "invalid_depth"
+        reasons[valid] = ""
+        return reasons
 
     @staticmethod
     def _path_signature(path: Path) -> tuple[str, int | None, int | None]:
@@ -514,6 +701,9 @@ class FlatmapProjectionWidget(QWidget):
         self,
         result: FlatmapProjectionResult,
         render_result: FlatmapRenderResult,
+        *,
+        flatmap_style: str | None = None,
+        coordinate_mode: str | None = None,
     ) -> None:
         self._last_projected_nodes = render_result.projected_nodes
         self._last_summary = result.summary
@@ -524,8 +714,8 @@ class FlatmapProjectionWidget(QWidget):
         self._create_or_update_render_layer(
             render_result,
             result.summary,
-            flatmap_style=self._current_style_filename(),
-            coordinate_mode=self._current_coordinate_mode(),
+            flatmap_style=flatmap_style or self._current_style_filename(),
+            coordinate_mode=coordinate_mode or self._current_coordinate_mode(),
             render_mode=self._current_render_mode(),
         )
         self._export_btn.setEnabled(not render_result.projected_nodes.empty)
@@ -893,6 +1083,21 @@ class FlatmapProjectionWidget(QWidget):
                 return layer
         return None
 
+    def _layer_is_in_viewer(self, layer) -> bool:
+        layers = getattr(self._viewer, "layers", None)
+        if layer is None or layers is None:
+            return False
+        return any(existing is layer for existing in layers)
+
+    def _cached_projection_layer_for_name(self, name: str):
+        layer = getattr(self, "_projection_layer", None)
+        if layer is None:
+            return None
+        if getattr(layer, "name", None) != name or not self._layer_is_in_viewer(layer):
+            self._projection_layer = None
+            return None
+        return layer
+
     def _remove_projection_layer(self, *, except_name: str | None = None) -> None:
         layers = getattr(self._viewer, "layers", None)
         if layers is None:
@@ -910,7 +1115,10 @@ class FlatmapProjectionWidget(QWidget):
                 self._projection_layer = None
         if (
             self._projection_layer is not None
-            and getattr(self._projection_layer, "name", None) != except_name
+            and (
+                getattr(self._projection_layer, "name", None) != except_name
+                or not self._layer_is_in_viewer(self._projection_layer)
+            )
         ):
             self._projection_layer = None
 
@@ -993,7 +1201,9 @@ class FlatmapProjectionWidget(QWidget):
             coordinate_mode=coordinate_mode,
             render_mode=render_mode,
         )
-        layer = self._projection_layer or self._find_layer_by_name(layer_name)
+        layer = self._cached_projection_layer_for_name(
+            layer_name
+        ) or self._find_layer_by_name(layer_name)
 
         if render_mode == _RENDER_POINTS:
             layer = self._create_or_update_points_layer(layer, render_result, metadata)

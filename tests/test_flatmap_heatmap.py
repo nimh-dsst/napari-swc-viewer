@@ -6,6 +6,7 @@ import pytest
 
 from napari_swc_viewer.flatmap_heatmap import (
     build_flatmap_render_data,
+    build_flatmap_render_data_from_projected_nodes,
     compute_flatmap_lookup_stats,
     compute_depth_range,
     compute_flatmap_xy_bounds,
@@ -196,3 +197,56 @@ def test_flatmap_heatmap_reuses_precomputed_lookup_stats() -> None:
     assert actual.point_file_ids == expected.point_file_ids
     assert actual.summary.to_dict() == expected.summary.to_dict()
     pd.testing.assert_frame_equal(actual.projected_nodes, expected.projected_nodes)
+
+
+def test_flatmap_heatmap_from_projected_nodes_uses_projected_bounds() -> None:
+    result = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        xy_bins=4,
+        depth_bin_um=25.0,
+        include_depth_minus_one=True,
+    )
+
+    assert result.volume.shape == (4, 4, 4)
+    assert result.summary.x_flat_min == 0.0
+    assert result.summary.x_flat_max == 6.0
+    assert result.summary.depth_min_um == 0.0
+    assert result.summary.depth_max_um == 50.0
+    assert result.summary.rendered_nodes == 4
+    assert result.summary.depth_minus_one_nodes == 1
+    assert result.projected_nodes["render_valid"].tolist() == [
+        True,
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert result.projected_nodes["depth_bin"].tolist() == [1, 1, 0, 3, -1]
+    assert result.volume[1, 0, 0] == 2.0
+    assert result.volume[0, 3, 3] == 1.0
+    assert result.volume[3, 1, 1] == 1.0
+
+
+def test_flatmap_heatmap_from_projected_nodes_infers_validity_flags() -> None:
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc", "c.swc"],
+            "x_flat": [0.0, np.nan, 2.0],
+            "y_flat": [0.0, 1.0, 2.0],
+            "depth_um": [0.0, 10.0, -1.0],
+        }
+    )
+
+    result = build_flatmap_render_data_from_projected_nodes(
+        projected,
+        xy_bins=2,
+        depth_bin_um=25.0,
+        include_depth_minus_one=True,
+    )
+
+    assert result.summary.rendered_nodes == 2
+    assert result.summary.flatmap_valid_nodes == 2
+    assert result.summary.depth_valid_nodes == 1
+    assert result.projected_nodes["flatmap_valid"].tolist() == [True, False, True]
+    assert result.projected_nodes["depth_valid"].tolist() == [True, True, False]
+    assert result.projected_nodes["render_valid"].tolist() == [True, False, True]

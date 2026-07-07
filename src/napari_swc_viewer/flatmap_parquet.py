@@ -36,6 +36,9 @@ FLATMAP_AUGMENTED_COLUMNS = (
     "flatmap_lookup_mode",
 )
 
+FLATMAP_COORDINATE_COLUMNS = ("x_flat", "y_flat")
+DEPTH_COORDINATE_COLUMNS = ("depth_um",)
+
 FLATMAP_INVALID_CODE_VALID = 0
 FLATMAP_INVALID_CODE_MISSING_INPUT = 1
 FLATMAP_INVALID_CODE_OUT_OF_BOUNDS = 2
@@ -49,6 +52,7 @@ _INVALID_REASON_CODES = {
     "invalid_flatmap": FLATMAP_INVALID_CODE_INVALID_FLATMAP,
     "invalid_depth": FLATMAP_INVALID_CODE_INVALID_DEPTH,
 }
+_INVALID_CODE_REASONS = {code: reason for reason, code in _INVALID_REASON_CODES.items()}
 
 _ProgressCallback = Callable[[str, int, int], None]
 
@@ -65,6 +69,81 @@ class FlatmapParquetAugmentationSummary:
     direct_rows: int
     mirrored_rows: int
     unmapped_rows: int
+
+
+@dataclass(frozen=True)
+class FlatmapParquetTransformInfo:
+    """Flatmap/depth transform columns detected in a neuron Parquet schema."""
+
+    path: Path
+    has_flatmap: bool
+    has_depth: bool
+    metadata: dict[str, Any] | None
+
+    @property
+    def has_full_transform(self) -> bool:
+        """Return True when the parquet can render flatmap/depth without NRRDs."""
+        return bool(self.has_flatmap and self.has_depth)
+
+    @property
+    def present_transform_text(self) -> str:
+        """Return a compact human-readable description of present transforms."""
+        return format_flatmap_parquet_transform_presence(
+            has_flatmap=self.has_flatmap,
+            has_depth=self.has_depth,
+        )
+
+
+def format_flatmap_parquet_transform_presence(
+    *,
+    has_flatmap: bool,
+    has_depth: bool,
+) -> str:
+    """Return display text for detected flatmap/depth transform columns."""
+    if has_flatmap and has_depth:
+        return "flatmap and depth"
+    if has_flatmap:
+        return "flatmap"
+    if has_depth:
+        return "depth"
+    return ""
+
+
+def flatmap_invalid_code_to_reason(code: object) -> str:
+    """Return the projection invalid reason represented by an augmented code."""
+    try:
+        normalized = int(code)
+    except (TypeError, ValueError):
+        return "out_of_bounds"
+    return _INVALID_CODE_REASONS.get(normalized, "out_of_bounds")
+
+
+def _decode_flatmap_projection_metadata(
+    metadata: dict[bytes, bytes],
+) -> dict[str, Any] | None:
+    raw = metadata.get(FLATMAP_PARQUET_METADATA_KEY)
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"raw": raw.hex()}
+    return payload if isinstance(payload, dict) else {"value": payload}
+
+
+def read_flatmap_parquet_transform_info(
+    parquet_path: str | Path,
+) -> FlatmapParquetTransformInfo:
+    """Inspect a neuron Parquet for reusable flatmap/depth coordinate columns."""
+    path = Path(parquet_path)
+    schema = pq.read_schema(path)
+    names = set(schema.names)
+    return FlatmapParquetTransformInfo(
+        path=path,
+        has_flatmap=set(FLATMAP_COORDINATE_COLUMNS).issubset(names),
+        has_depth=set(DEPTH_COORDINATE_COLUMNS).issubset(names),
+        metadata=_decode_flatmap_projection_metadata(dict(schema.metadata or {})),
+    )
 
 
 def _source_signature(path: Path) -> dict[str, Any]:

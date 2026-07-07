@@ -60,6 +60,7 @@ from ..auto_center import (
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
 from ..neuron_table_ops import ClusterFilterSelection
+from ..flatmap_parquet import read_flatmap_parquet_transform_info
 from ..point_import import (
     POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
@@ -818,6 +819,10 @@ class NeuronViewerWidget(QWidget):
         # Stats
         self._stats_label = QLabel("")
         file_layout.addWidget(self._stats_label)
+
+        self._flatmap_transform_status_label = QLabel("")
+        self._flatmap_transform_status_label.setWordWrap(True)
+        file_layout.addWidget(self._flatmap_transform_status_label)
 
         layout.addWidget(file_section)
 
@@ -1684,6 +1689,9 @@ class NeuronViewerWidget(QWidget):
         enhanced_count = self._load_enhanced_table_state(filepath)
         if enhanced_count:
             stats_text += f" | Enhanced labels: {enhanced_count:,}"
+        transform_info = self._load_flatmap_transform_status(filepath)
+        if transform_info:
+            stats_text += f" | Transform: {transform_info}"
         self._stats_label.setText(stats_text)
 
         self._set_region_query_buttons_enabled(True)
@@ -1692,6 +1700,44 @@ class NeuronViewerWidget(QWidget):
         saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
         if callable(saved_state_applier):
             saved_state_applier()
+
+    def _load_flatmap_transform_status(self, filepath: str | Path) -> str:
+        """Display whether the loaded parquet has reusable flatmap/depth columns."""
+        label = getattr(self, "_flatmap_transform_status_label", None)
+        try:
+            info = read_flatmap_parquet_transform_info(filepath)
+        except Exception:
+            logger.debug(
+                "No readable flatmap transform metadata for %s",
+                filepath,
+                exc_info=True,
+            )
+            if label is not None:
+                label.setText("")
+            return ""
+
+        transform_text = info.present_transform_text
+        if not transform_text:
+            if label is not None:
+                label.setText("")
+            return ""
+
+        if info.has_full_transform:
+            message = (
+                f"Loaded Parquet contains {transform_text} transform columns. "
+                "The Flatmap tab can render it without loading NRRD files; "
+                "choosing flatmap and depth NRRDs will recompute and overwrite "
+                "those coordinates for the current projection/export."
+            )
+        else:
+            message = (
+                f"Loaded Parquet contains {transform_text} transform columns. "
+                "Flatmap rendering without NRRDs requires x_flat, y_flat, and "
+                "depth_um columns."
+            )
+        if label is not None:
+            label.setText(message)
+        return transform_text
 
     def _load_enhanced_table_state(self, filepath: str | Path) -> int:
         """Read enhanced parquet table metadata without making it mandatory."""

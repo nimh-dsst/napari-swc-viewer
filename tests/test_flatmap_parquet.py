@@ -15,6 +15,7 @@ from napari_swc_viewer.flatmap_parquet import (
     FLATMAP_INVALID_CODE_VALID,
     FLATMAP_PARQUET_METADATA_KEY,
     augment_neuron_parquet_with_flatmap,
+    read_flatmap_parquet_transform_info,
 )
 
 nrrd = pytest.importorskip("nrrd")
@@ -51,6 +52,47 @@ def _write_source_parquet(path: Path) -> None:
         }
     )
     pq.write_table(table, path)
+
+
+def test_read_flatmap_parquet_transform_info_detects_no_transform(tmp_path) -> None:
+    source = tmp_path / "neurons.parquet"
+    _write_source_parquet(source)
+
+    info = read_flatmap_parquet_transform_info(source)
+
+    assert info.has_flatmap is False
+    assert info.has_depth is False
+    assert info.has_full_transform is False
+    assert info.present_transform_text == ""
+    assert info.metadata is None
+
+
+def test_read_flatmap_parquet_transform_info_detects_partial_transforms(tmp_path) -> None:
+    source = tmp_path / "neurons.parquet"
+    _write_source_parquet(source)
+    table = pq.read_table(source)
+
+    flatmap_only = tmp_path / "flatmap_only.parquet"
+    pq.write_table(
+        table.append_column("x_flat", pa.array([1.0, 2.0, 3.0], type=pa.float32()))
+        .append_column("y_flat", pa.array([4.0, 5.0, 6.0], type=pa.float32())),
+        flatmap_only,
+    )
+    depth_only = tmp_path / "depth_only.parquet"
+    pq.write_table(
+        table.append_column("depth_um", pa.array([7.0, 8.0, 9.0], type=pa.float32())),
+        depth_only,
+    )
+
+    flatmap_info = read_flatmap_parquet_transform_info(flatmap_only)
+    depth_info = read_flatmap_parquet_transform_info(depth_only)
+
+    assert flatmap_info.has_flatmap is True
+    assert flatmap_info.has_depth is False
+    assert flatmap_info.present_transform_text == "flatmap"
+    assert depth_info.has_flatmap is False
+    assert depth_info.has_depth is True
+    assert depth_info.present_transform_text == "depth"
 
 
 def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
@@ -108,6 +150,12 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     assert payload["mirror_fallback"] is True
     assert payload["mirror_coord_axis"] == 2
     assert payload["mirror_midline"] == 15.0
+    info = read_flatmap_parquet_transform_info(output)
+    assert info.has_flatmap is True
+    assert info.has_depth is True
+    assert info.has_full_transform is True
+    assert info.present_transform_text == "flatmap and depth"
+    assert info.metadata == payload
 
     db = NeuronDatabase(output)
     try:
