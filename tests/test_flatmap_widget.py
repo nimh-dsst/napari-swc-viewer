@@ -259,6 +259,7 @@ def _widget(module):
         "a.swc": [1.0, 0.0, 0.0, 1.0],
         "b.swc": [0.0, 1.0, 0.0, 0.5],
     }
+    widget._cluster_map_provider = lambda: {}
     widget._atlas_provider = lambda: None
     widget._selected_region_acronyms_provider = lambda: ["VISp"]
     return widget
@@ -774,8 +775,10 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     assert layer.name == "Isocortex Flatmap Heatmap"
     assert layer.metadata["projection_kind"] == "isocortex_flatmap"
     assert layer.metadata["flatmap_render_mode"] == "heatmap"
+    assert layer.metadata["flatmap_heatmap_color_mode"] == "single"
     assert layer.metadata["render_summary"]["rendered_nodes"] == 3
     assert layer.metadata["flatmap_heatmap_contrast_limits"] == (0.0, 2.0)
+    assert layer.colormap == "hot"
     assert layer.contrast_limits == (0.0, 2.0)
     assert layer._napari_swc_flatmap_projected_nodes is projected
     assert layer._napari_swc_flatmap_summary is summary
@@ -812,6 +815,151 @@ def _simple_render_summary(module, total_nodes: int = 1):
         25.0,
         True,
     )
+
+
+def _binned_render_result(module):
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "b.swc", "c.swc"],
+            "render_valid": [True, True, True, True],
+            "depth_bin": [0, 0, 1, 1],
+            "y_flat_bin": [1, 1, 2, 0],
+            "x_flat_bin": [2, 2, 0, 1],
+        }
+    )
+    volume = np.zeros((2, 3, 3), dtype=np.float32)
+    volume[0, 1, 2] = 2.0
+    volume[1, 2, 0] = 1.0
+    volume[1, 0, 1] = 1.0
+    return module.FlatmapRenderResult(
+        projected_nodes=projected,
+        volume=volume,
+        points=np.asarray(
+            [
+                [0.0, 1.0, 2.0],
+                [0.0, 1.0, 2.0],
+                [1.0, 2.0, 0.0],
+                [1.0, 0.0, 1.0],
+            ]
+        ),
+        point_file_ids=["a.swc", "a.swc", "b.swc", "c.swc"],
+        summary=_simple_render_summary(module, total_nodes=4),
+    )
+
+
+def test_individual_heatmap_color_mode_creates_one_layer_per_file_id(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "individual"
+    )
+    summary = _simple_projection_summary(module, total_nodes=4)
+
+    layer = widget._create_or_update_render_layer(
+        _binned_render_result(module),
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+
+    assert layer.name == "Isocortex Flatmap Heatmap: a.swc"
+    assert [layer.name for layer in widget._viewer.layers] == [
+        "Isocortex Flatmap Heatmap: a.swc",
+        "Isocortex Flatmap Heatmap: b.swc",
+        "Isocortex Flatmap Heatmap: c.swc",
+    ]
+    first, second, third = widget._viewer.layers
+    assert first.data[0, 1, 2] == 2.0
+    assert second.data[1, 2, 0] == 1.0
+    assert third.data[1, 0, 1] == 1.0
+    assert first.metadata["flatmap_heatmap_color_mode"] == "individual"
+    assert first.metadata["flatmap_heatmap_group_label"] == "a.swc"
+    assert first.metadata["source_file_ids"] == ["a.swc"]
+    assert first.metadata["flatmap_heatmap_group_color"] == [1.0, 0.0, 0.0, 1.0]
+    assert second.metadata["flatmap_heatmap_group_color"] == [0.0, 1.0, 0.0, 0.5]
+
+
+def test_cluster_heatmap_color_mode_creates_cluster_and_unclustered_layers(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "cluster"
+    )
+    widget._cluster_map_provider = lambda: {"a.swc": 2, "b.swc": 1}
+    summary = _simple_projection_summary(module, total_nodes=4)
+
+    widget._create_or_update_render_layer(
+        _binned_render_result(module),
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+
+    assert [layer.name for layer in widget._viewer.layers] == [
+        "Isocortex Flatmap Heatmap: Cluster 1",
+        "Isocortex Flatmap Heatmap: Cluster 2",
+        "Isocortex Flatmap Heatmap: Unclustered",
+    ]
+    cluster_1, cluster_2, unclustered = widget._viewer.layers
+    assert cluster_1.data[1, 2, 0] == 1.0
+    assert cluster_2.data[0, 1, 2] == 2.0
+    assert unclustered.data[1, 0, 1] == 1.0
+    assert cluster_1.metadata["flatmap_heatmap_group_key"] == 1
+    assert cluster_1.metadata["source_file_ids"] == ["b.swc"]
+    assert cluster_1.metadata["flatmap_heatmap_group_color"] == [
+        0.0,
+        1.0,
+        0.0,
+        0.5,
+    ]
+    assert unclustered.metadata["flatmap_heatmap_group_key"] is None
+    assert unclustered.metadata["flatmap_heatmap_group_color"] == [
+        0.5,
+        0.5,
+        0.5,
+        1.0,
+    ]
+
+
+def test_switching_heatmap_color_modes_removes_stale_group_layers(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    summary = _simple_projection_summary(module, total_nodes=4)
+    render_result = _binned_render_result(module)
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "individual"
+    )
+    widget._create_or_update_render_layer(
+        render_result,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+    assert len(widget._viewer.layers) == 3
+
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "single"
+    )
+    single = widget._create_or_update_render_layer(
+        render_result,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+
+    assert widget._viewer.layers == [single]
+    assert single.name == "Isocortex Flatmap Heatmap"
+    assert single.metadata["flatmap_heatmap_color_mode"] == "single"
 
 
 def test_deleted_heatmap_layer_is_recreated_from_stale_cache(monkeypatch) -> None:

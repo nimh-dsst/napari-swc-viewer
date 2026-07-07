@@ -113,6 +113,18 @@ class FlatmapRenderResult:
     summary: FlatmapRenderSummary
 
 
+@dataclass(frozen=True)
+class FlatmapGroupedVolume:
+    """One scalar flatmap heatmap volume for a rendered neuron group."""
+
+    group_key: object
+    label: str
+    source_file_ids: tuple[object, ...]
+    volume: np.ndarray
+    rendered_nodes: int
+    nonzero_voxels: int
+
+
 def _validate_resolution(xy_bins: int, depth_bin_um: float) -> tuple[int, float]:
     xy_bins = int(xy_bins)
     depth_bin_um = float(depth_bin_um)
@@ -514,6 +526,164 @@ def build_flatmap_render_data_from_projected_nodes(
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include_depth_minus_one,
     )
+
+
+def _rendered_binned_nodes(
+    projected_nodes: pd.DataFrame,
+    volume_shape: tuple[int, int, int],
+) -> pd.DataFrame:
+    required = ("render_valid", "depth_bin", "y_flat_bin", "x_flat_bin", "file_id")
+    missing = [column for column in required if column not in projected_nodes.columns]
+    if missing:
+        raise ValueError(f"Projected nodes are missing render column(s): {missing}")
+
+    if len(volume_shape) != 3:
+        raise ValueError(f"volume_shape must be 3D; got {volume_shape}.")
+    depth_size, y_size, x_size = (int(size) for size in volume_shape)
+
+    table = projected_nodes.copy()
+    render_valid = table["render_valid"].fillna(False).astype(bool).to_numpy()
+    depth_bins = pd.to_numeric(table["depth_bin"], errors="coerce").to_numpy(dtype=float)
+    y_bins = pd.to_numeric(table["y_flat_bin"], errors="coerce").to_numpy(dtype=float)
+    x_bins = pd.to_numeric(table["x_flat_bin"], errors="coerce").to_numpy(dtype=float)
+    finite_bins = (
+        np.isfinite(depth_bins)
+        & np.isfinite(y_bins)
+        & np.isfinite(x_bins)
+    )
+    in_bounds = (
+        finite_bins
+        & (depth_bins >= 0)
+        & (depth_bins < depth_size)
+        & (y_bins >= 0)
+        & (y_bins < y_size)
+        & (x_bins >= 0)
+        & (x_bins < x_size)
+    )
+    filtered = table.loc[render_valid & in_bounds].copy()
+    for column in ("depth_bin", "y_flat_bin", "x_flat_bin"):
+        filtered.loc[:, column] = (
+            pd.to_numeric(filtered[column], errors="coerce").astype(np.int64)
+        )
+    return filtered
+
+
+def _unique_in_order(values) -> tuple[object, ...]:
+    unique: list[object] = []
+    seen: set[object] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return tuple(unique)
+
+
+def _volume_for_node_group(
+    group: pd.DataFrame,
+    volume_shape: tuple[int, int, int],
+) -> np.ndarray:
+    volume = np.zeros(volume_shape, dtype=np.float32)
+    if group.empty:
+        return volume
+    np.add.at(
+        volume,
+        (
+            group["depth_bin"].to_numpy(dtype=np.int64),
+            group["y_flat_bin"].to_numpy(dtype=np.int64),
+            group["x_flat_bin"].to_numpy(dtype=np.int64),
+        ),
+        1.0,
+    )
+    return volume
+
+
+def build_flatmap_file_id_volumes(
+    projected_nodes: pd.DataFrame,
+    volume_shape: tuple[int, int, int],
+) -> list[FlatmapGroupedVolume]:
+    """Split rendered flatmap nodes into one scalar heatmap volume per file ID."""
+    rendered = _rendered_binned_nodes(projected_nodes, volume_shape)
+    groups: list[FlatmapGroupedVolume] = []
+    for file_id in _unique_in_order(rendered["file_id"].tolist()):
+        group = rendered[rendered["file_id"] == file_id]
+        volume = _volume_for_node_group(group, volume_shape)
+        groups.append(
+            FlatmapGroupedVolume(
+                group_key=file_id,
+                label=str(file_id),
+                source_file_ids=(file_id,),
+                volume=volume,
+                rendered_nodes=int(len(group)),
+                nonzero_voxels=int(np.count_nonzero(volume)),
+            )
+        )
+    return groups
+
+
+def _cluster_for_file_id(
+    file_id: object,
+    cluster_map: dict[object, int | None],
+) -> int | None:
+    value = cluster_map.get(file_id)
+    if value is None and str(file_id) in cluster_map:
+        value = cluster_map.get(str(file_id))
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_flatmap_cluster_volumes(
+    projected_nodes: pd.DataFrame,
+    volume_shape: tuple[int, int, int],
+    cluster_map: dict[object, int | None],
+) -> list[FlatmapGroupedVolume]:
+    """Split rendered flatmap nodes into scalar heatmap volumes by cluster ID."""
+    rendered = _rendered_binned_nodes(projected_nodes, volume_shape)
+    if rendered.empty:
+        return []
+
+    table = rendered.copy()
+    table.loc[:, "_flatmap_cluster_id"] = [
+        _cluster_for_file_id(file_id, cluster_map)
+        for file_id in table["file_id"].tolist()
+    ]
+
+    cluster_ids = sorted(
+        {
+            int(cluster_id)
+            for cluster_id in table["_flatmap_cluster_id"].tolist()
+            if pd.notna(cluster_id)
+        }
+    )
+    group_keys: list[int | None] = list(cluster_ids)
+    if table["_flatmap_cluster_id"].isna().any():
+        group_keys.append(None)
+
+    groups: list[FlatmapGroupedVolume] = []
+    for group_key in group_keys:
+        if group_key is None:
+            group = table[table["_flatmap_cluster_id"].isna()]
+            label = "Unclustered"
+        else:
+            group = table[table["_flatmap_cluster_id"] == group_key]
+            label = f"Cluster {group_key}"
+        volume = _volume_for_node_group(group, volume_shape)
+        source_file_ids = _unique_in_order(group["file_id"].tolist())
+        groups.append(
+            FlatmapGroupedVolume(
+                group_key=group_key,
+                label=label,
+                source_file_ids=source_file_ids,
+                volume=volume,
+                rendered_nodes=int(len(group)),
+                nonzero_voxels=int(np.count_nonzero(volume)),
+            )
+        )
+    return groups
 
 
 def _build_flatmap_render_data_for_bounds(

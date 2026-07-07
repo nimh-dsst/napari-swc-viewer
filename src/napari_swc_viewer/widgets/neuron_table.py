@@ -572,6 +572,10 @@ class NeuronTableWidget(QWidget):
         """Return a mapping of all file_ids to their current RGBA colors."""
         return {fid: list(e.color) for fid, e in self._entries.items()}
 
+    def get_cluster_map(self) -> dict[object, int | None]:
+        """Return a mapping of all file_ids to their current cluster assignment."""
+        return {fid: e.cluster_id for fid, e in self._entries.items()}
+
     def get_visibility_map(self) -> dict[str, bool]:
         """Return a mapping of all file_ids to their visibility state."""
         return {fid: e.visible for fid, e in self._entries.items()}

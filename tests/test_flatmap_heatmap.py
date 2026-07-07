@@ -5,6 +5,8 @@ import pandas as pd
 import pytest
 
 from napari_swc_viewer.flatmap_heatmap import (
+    build_flatmap_cluster_volumes,
+    build_flatmap_file_id_volumes,
     build_flatmap_render_data,
     build_flatmap_render_data_from_projected_nodes,
     compute_flatmap_lookup_stats,
@@ -250,3 +252,57 @@ def test_flatmap_heatmap_from_projected_nodes_infers_validity_flags() -> None:
     assert result.projected_nodes["flatmap_valid"].tolist() == [True, False, True]
     assert result.projected_nodes["depth_valid"].tolist() == [True, True, False]
     assert result.projected_nodes["render_valid"].tolist() == [True, False, True]
+
+
+def _binned_projected_nodes() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "b.swc", "c.swc", "skip.swc"],
+            "render_valid": [True, True, True, True, False],
+            "depth_bin": [0, 0, 1, 1, 0],
+            "y_flat_bin": [1, 1, 2, 0, 0],
+            "x_flat_bin": [2, 2, 0, 1, 0],
+        }
+    )
+
+
+def test_build_flatmap_file_id_volumes_splits_rendered_node_counts() -> None:
+    groups = build_flatmap_file_id_volumes(
+        _binned_projected_nodes(),
+        (2, 3, 3),
+    )
+
+    assert [group.label for group in groups] == ["a.swc", "b.swc", "c.swc"]
+    assert [group.source_file_ids for group in groups] == [
+        ("a.swc",),
+        ("b.swc",),
+        ("c.swc",),
+    ]
+    assert [group.rendered_nodes for group in groups] == [2, 1, 1]
+    assert groups[0].volume[0, 1, 2] == 2.0
+    assert groups[1].volume[1, 2, 0] == 1.0
+    assert groups[2].volume[1, 0, 1] == 1.0
+    assert sum(float(group.volume.sum()) for group in groups) == 4.0
+
+
+def test_build_flatmap_cluster_volumes_groups_by_cluster_with_unclustered_last() -> None:
+    groups = build_flatmap_cluster_volumes(
+        _binned_projected_nodes(),
+        (2, 3, 3),
+        {"a.swc": 2, "b.swc": 1},
+    )
+
+    assert [group.group_key for group in groups] == [1, 2, None]
+    assert [group.label for group in groups] == [
+        "Cluster 1",
+        "Cluster 2",
+        "Unclustered",
+    ]
+    assert [group.source_file_ids for group in groups] == [
+        ("b.swc",),
+        ("a.swc",),
+        ("c.swc",),
+    ]
+    assert groups[0].volume[1, 2, 0] == 1.0
+    assert groups[1].volume[0, 1, 2] == 2.0
+    assert groups[2].volume[1, 0, 1] == 1.0

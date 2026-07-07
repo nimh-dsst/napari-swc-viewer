@@ -221,6 +221,7 @@ def test_neuron_table_retain_file_ids_preserves_survivor_state() -> None:
 
     assert widget.file_ids() == ["n1", "n3"]
     assert widget.get_color("n1") == [0.1, 0.2, 0.3, 1.0]
+    assert widget.get_cluster_map() == {"n1": 7, "n3": 3}
     assert widget.get_visibility_map() == {"n1": False, "n3": True}
     assert widget.summary().table_count == 2
     assert widget.summary().added_count == 1

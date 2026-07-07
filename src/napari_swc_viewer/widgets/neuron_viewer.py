@@ -678,6 +678,7 @@ class NeuronViewerWidget(QWidget):
                 selected_file_ids_provider=self._neuron_table.get_selected_file_ids,
                 table_file_ids_provider=self._neuron_table.file_ids,
                 color_map_provider=self._neuron_table.get_full_color_map,
+                cluster_map_provider=self._neuron_table.get_cluster_map,
                 atlas_provider=lambda: self._atlas,
                 selected_region_ids_provider=self._active_flatmap_region_ids,
                 selected_region_acronyms_provider=self._active_flatmap_region_acronyms,

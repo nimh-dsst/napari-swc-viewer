@@ -28,9 +28,12 @@ from ..flatmap_export import export_projected_nodes_csv
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_XY_BINS,
+    FlatmapGroupedVolume,
     FlatmapLookupStats,
     FlatmapRenderResult,
     FlatmapRenderSummary,
+    build_flatmap_cluster_volumes,
+    build_flatmap_file_id_volumes,
     build_flatmap_render_data,
     build_flatmap_render_data_from_projected_nodes,
     compute_flatmap_lookup_stats,
@@ -61,8 +64,12 @@ _SOURCE_SELECTED = "selected"
 _SOURCE_ALL = "all"
 _RENDER_HEATMAP = "heatmap"
 _RENDER_POINTS = "points"
+_HEATMAP_COLOR_SINGLE = "single"
+_HEATMAP_COLOR_INDIVIDUAL = "individual"
+_HEATMAP_COLOR_CLUSTER = "cluster"
 _OLD_SHAPES_LAYER_NAME = "Isocortex Flatmap Traces"
 _HEATMAP_LAYER_NAME = "Isocortex Flatmap Heatmap"
+_GROUPED_HEATMAP_LAYER_PREFIX = f"{_HEATMAP_LAYER_NAME}: "
 _POINTS_LAYER_NAME = "Isocortex Flatmap Points"
 _REGION_LABELS_LAYER_NAME = "Flatmap Region Labels"
 _REGION_LABEL_ATLAS_DEFAULT = "allen_mouse_10um"
@@ -90,6 +97,7 @@ class FlatmapProjectionWidget(QWidget):
         selected_file_ids_provider: Callable[[], list[object]],
         table_file_ids_provider: Callable[[], list[object]],
         color_map_provider: Callable[[], dict[object, list[float]]],
+        cluster_map_provider: Callable[[], dict[object, int | None]] | None = None,
         atlas_provider: Callable[[], object | None] | None = None,
         selected_region_ids_provider: Callable[[], list[int]] | None = None,
         selected_region_acronyms_provider: Callable[[], list[str]] | None = None,
@@ -101,6 +109,7 @@ class FlatmapProjectionWidget(QWidget):
         self._selected_file_ids_provider = selected_file_ids_provider
         self._table_file_ids_provider = table_file_ids_provider
         self._color_map_provider = color_map_provider
+        self._cluster_map_provider = cluster_map_provider or (lambda: {})
         self._atlas_provider = atlas_provider or (lambda: None)
         self._selected_region_ids_provider = selected_region_ids_provider or (lambda: [])
         self._selected_region_acronyms_provider = (
@@ -204,6 +213,15 @@ class FlatmapProjectionWidget(QWidget):
         self._render_mode_combo.addItem("3D Heatmap", _RENDER_HEATMAP)
         self._render_mode_combo.addItem("3D Points", _RENDER_POINTS)
         render_row.addWidget(self._render_mode_combo)
+        render_row.addWidget(QLabel("Heatmap colors:"))
+        self._heatmap_color_mode_combo = QComboBox()
+        self._heatmap_color_mode_combo.addItem("Single color", _HEATMAP_COLOR_SINGLE)
+        self._heatmap_color_mode_combo.addItem(
+            "Individual neurons",
+            _HEATMAP_COLOR_INDIVIDUAL,
+        )
+        self._heatmap_color_mode_combo.addItem("Cluster", _HEATMAP_COLOR_CLUSTER)
+        render_row.addWidget(self._heatmap_color_mode_combo)
         options_layout.addLayout(render_row)
 
         xy_bins_row = QHBoxLayout()
@@ -321,6 +339,18 @@ class FlatmapProjectionWidget(QWidget):
     def _current_render_mode(self) -> str:
         mode = self._render_mode_combo.currentData()
         return str(mode or _RENDER_HEATMAP)
+
+    def _current_heatmap_color_mode(self) -> str:
+        combo = getattr(self, "_heatmap_color_mode_combo", None)
+        current_data = getattr(combo, "currentData", None)
+        mode = current_data() if callable(current_data) else None
+        if mode in {
+            _HEATMAP_COLOR_SINGLE,
+            _HEATMAP_COLOR_INDIVIDUAL,
+            _HEATMAP_COLOR_CLUSTER,
+        }:
+            return str(mode)
+        return _HEATMAP_COLOR_SINGLE
 
     def _current_xy_bins(self) -> int:
         return int(self._xy_bins_spin.value())
@@ -1076,6 +1106,16 @@ class FlatmapProjectionWidget(QWidget):
     def _render_layer_name(render_mode: str) -> str:
         return _POINTS_LAYER_NAME if render_mode == _RENDER_POINTS else _HEATMAP_LAYER_NAME
 
+    @staticmethod
+    def _is_flatmap_render_layer_name(name: object) -> bool:
+        return (
+            name in _FLATMAP_RENDER_LAYER_NAMES
+            or (
+                isinstance(name, str)
+                and name.startswith(_GROUPED_HEATMAP_LAYER_PREFIX)
+            )
+        )
+
     def _find_layer_by_name(self, name: str):
         layers = getattr(self._viewer, "layers", ())
         for layer in layers:
@@ -1105,7 +1145,7 @@ class FlatmapProjectionWidget(QWidget):
             return
         for layer in list(layers):
             name = getattr(layer, "name", None)
-            if name not in _FLATMAP_RENDER_LAYER_NAMES or name == except_name:
+            if not self._is_flatmap_render_layer_name(name) or name == except_name:
                 continue
             try:
                 layers.remove(layer)
@@ -1130,8 +1170,9 @@ class FlatmapProjectionWidget(QWidget):
         flatmap_style: str,
         coordinate_mode: str,
         render_mode: str,
+        heatmap_color_mode: str | None = None,
     ) -> dict[str, object]:
-        return {
+        metadata = {
             "projection_kind": "isocortex_flatmap",
             "flatmap_render_mode": render_mode,
             "flatmap_style": flatmap_style,
@@ -1141,6 +1182,11 @@ class FlatmapProjectionWidget(QWidget):
             "flatmap_path": str(self._flatmap_path) if self._flatmap_path else "",
             "depth_path": str(self._depth_path) if self._depth_path else "",
         }
+        if render_mode == _RENDER_HEATMAP:
+            metadata["flatmap_heatmap_color_mode"] = (
+                heatmap_color_mode or _HEATMAP_COLOR_SINGLE
+            )
+        return metadata
 
     def _set_layer_state(
         self,
@@ -1192,14 +1238,23 @@ class FlatmapProjectionWidget(QWidget):
             self._remove_projection_layer()
             return None
 
+        heatmap_color_mode = (
+            self._current_heatmap_color_mode()
+            if render_mode == _RENDER_HEATMAP
+            else _HEATMAP_COLOR_SINGLE
+        )
         layer_name = self._render_layer_name(render_mode)
-        self._remove_projection_layer(except_name=layer_name)
+        if render_mode == _RENDER_HEATMAP and heatmap_color_mode != _HEATMAP_COLOR_SINGLE:
+            self._remove_projection_layer()
+        else:
+            self._remove_projection_layer(except_name=layer_name)
         metadata = self._render_metadata(
             projection_summary,
             render_result.summary,
             flatmap_style=flatmap_style,
             coordinate_mode=coordinate_mode,
             render_mode=render_mode,
+            heatmap_color_mode=heatmap_color_mode,
         )
         layer = self._cached_projection_layer_for_name(
             layer_name
@@ -1207,17 +1262,31 @@ class FlatmapProjectionWidget(QWidget):
 
         if render_mode == _RENDER_POINTS:
             layer = self._create_or_update_points_layer(layer, render_result, metadata)
-        else:
+        elif heatmap_color_mode == _HEATMAP_COLOR_SINGLE:
             layer = self._create_or_update_heatmap_layer(layer, render_result, metadata)
+        else:
+            layers = self._create_grouped_heatmap_layers(
+                render_result,
+                projection_summary,
+                metadata,
+                heatmap_color_mode=heatmap_color_mode,
+            )
+            layer = layers[0] if layers else None
 
         self._projection_layer = layer
+        if layer is None:
+            return None
         self._set_layer_state(
             layer,
             render_result.projected_nodes,
             projection_summary,
             render_result.summary,
         )
-        data = render_result.points if render_mode == _RENDER_POINTS else render_result.volume
+        data = (
+            render_result.points
+            if render_mode == _RENDER_POINTS
+            else render_result.volume
+        )
         self._focus_projection_view(layer, data)
         return layer
 
@@ -1262,6 +1331,144 @@ class FlatmapProjectionWidget(QWidget):
         refresh = getattr(layer, "refresh", None)
         if callable(refresh):
             refresh()
+        self._store_heatmap_contrast_limits(layer, contrast_limits)
+        return layer
+
+    def _create_grouped_heatmap_layers(
+        self,
+        render_result: FlatmapRenderResult,
+        projection_summary: ProjectionSummary,
+        metadata: dict[str, object],
+        *,
+        heatmap_color_mode: str,
+    ) -> list[object]:
+        groups = self._grouped_heatmap_volumes(
+            render_result,
+            heatmap_color_mode=heatmap_color_mode,
+        )
+        layers = []
+        for group in groups:
+            color = self._color_for_heatmap_group(
+                group,
+                heatmap_color_mode=heatmap_color_mode,
+            )
+            layer = self._add_grouped_heatmap_layer(
+                group,
+                metadata,
+                color,
+                heatmap_color_mode=heatmap_color_mode,
+            )
+            self._set_layer_state(
+                layer,
+                render_result.projected_nodes,
+                projection_summary,
+                render_result.summary,
+            )
+            layers.append(layer)
+        return layers
+
+    def _grouped_heatmap_volumes(
+        self,
+        render_result: FlatmapRenderResult,
+        *,
+        heatmap_color_mode: str,
+    ) -> list[FlatmapGroupedVolume]:
+        if heatmap_color_mode == _HEATMAP_COLOR_INDIVIDUAL:
+            return build_flatmap_file_id_volumes(
+                render_result.projected_nodes,
+                tuple(render_result.volume.shape),
+            )
+        if heatmap_color_mode == _HEATMAP_COLOR_CLUSTER:
+            return build_flatmap_cluster_volumes(
+                render_result.projected_nodes,
+                tuple(render_result.volume.shape),
+                self._cluster_map_provider() or {},
+            )
+        return []
+
+    @staticmethod
+    def _grouped_heatmap_layer_name(
+        group: FlatmapGroupedVolume,
+        *,
+        heatmap_color_mode: str,
+    ) -> str:
+        if heatmap_color_mode == _HEATMAP_COLOR_CLUSTER:
+            return f"{_GROUPED_HEATMAP_LAYER_PREFIX}{group.label}"
+        return f"{_GROUPED_HEATMAP_LAYER_PREFIX}{group.label}"
+
+    def _color_for_heatmap_group(
+        self,
+        group: FlatmapGroupedVolume,
+        *,
+        heatmap_color_mode: str,
+    ) -> np.ndarray:
+        if heatmap_color_mode == _HEATMAP_COLOR_CLUSTER and group.group_key is None:
+            return _DEFAULT_TRACE_COLOR.copy()
+        color_map = self._color_map_provider() or {}
+        for file_id in group.source_file_ids:
+            if file_id in color_map or str(file_id) in color_map:
+                return self._color_for_file_id(file_id, color_map)
+        return _DEFAULT_TRACE_COLOR.copy()
+
+    @staticmethod
+    def _solid_tint_colormap(color: np.ndarray, name: str):
+        rgba = np.asarray(color, dtype=float).reshape(-1)
+        if rgba.size < 4:
+            rgba = np.pad(rgba, (0, 4 - rgba.size), constant_values=1.0)
+        rgba = np.clip(rgba[:4], 0.0, 1.0)
+        try:
+            from napari.utils.colormaps import Colormap
+        except Exception:
+            return "hot"
+        return Colormap(
+            colors=[
+                [0.0, 0.0, 0.0, 0.0],
+                [float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])],
+            ],
+            name=name,
+        )
+
+    def _add_grouped_heatmap_layer(
+        self,
+        group: FlatmapGroupedVolume,
+        metadata: dict[str, object],
+        color: np.ndarray,
+        *,
+        heatmap_color_mode: str,
+    ):
+        volume = group.volume
+        contrast_limits = self._heatmap_contrast_limits(volume)
+        group_metadata = dict(metadata)
+        color_values = [float(value) for value in np.asarray(color)[:4]]
+        group_metadata.update(
+            {
+                "flatmap_heatmap_color_mode": heatmap_color_mode,
+                "flatmap_heatmap_group_key": group.group_key,
+                "flatmap_heatmap_group_label": group.label,
+                "flatmap_heatmap_group_color": color_values,
+                "flatmap_heatmap_group_rendered_nodes": group.rendered_nodes,
+                "flatmap_heatmap_group_nonzero_voxels": group.nonzero_voxels,
+                "source_file_ids": list(group.source_file_ids),
+                "file_ids": list(group.source_file_ids),
+                "color": color_values,
+                "flatmap_heatmap_contrast_limits": contrast_limits,
+            }
+        )
+        layer_name = self._grouped_heatmap_layer_name(
+            group,
+            heatmap_color_mode=heatmap_color_mode,
+        )
+        layer = self._viewer.add_image(
+            volume,
+            name=layer_name,
+            colormap=self._solid_tint_colormap(color, layer_name),
+            blending="additive",
+            rendering="mip",
+            opacity=0.8,
+            contrast_limits=contrast_limits,
+            metadata=group_metadata,
+        )
+        self._install_heatmap_layer_workarounds(layer)
         self._store_heatmap_contrast_limits(layer, contrast_limits)
         return layer
 
