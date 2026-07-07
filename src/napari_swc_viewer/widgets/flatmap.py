@@ -34,6 +34,7 @@ from ..flatmap_heatmap import (
     compute_flatmap_lookup_stats,
 )
 from ..flatmap_loader import FLATMAP_STYLE_FILENAMES, load_flatmap_volume_set
+from ..flatmap_parquet import augment_neuron_parquet_with_flatmap
 from ..flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
@@ -211,6 +212,9 @@ class FlatmapProjectionWidget(QWidget):
         self._export_btn.setEnabled(False)
         self._export_btn.clicked.connect(self._export_csv)
         actions_row.addWidget(self._export_btn)
+        self._augment_parquet_btn = QPushButton("Save Augmented Parquet...")
+        self._augment_parquet_btn.clicked.connect(self._augment_parquet)
+        actions_row.addWidget(self._augment_parquet_btn)
         layout.addLayout(actions_row)
 
         summary_group = QGroupBox("Projection Summary")
@@ -784,3 +788,65 @@ class FlatmapProjectionWidget(QWidget):
         self._status_label.setText(f"Exported flatmap projection to {saved}.")
         show_info(f"Exported flatmap projection to {saved}")
         return saved
+
+    def _current_source_parquet_path(self) -> Path:
+        db = self._database_provider()
+        if db is None:
+            raise RuntimeError("Load a neuron Parquet before saving augmented Parquet.")
+        parquet_path = getattr(db, "parquet_path", None)
+        if parquet_path is None:
+            raise RuntimeError("Loaded neuron database does not expose a Parquet path.")
+        return Path(parquet_path)
+
+    def _augment_parquet(self) -> None:
+        try:
+            self._projection_request_ready()
+            source_path = self._current_source_parquet_path()
+        except Exception as exc:
+            show_warning(str(exc))
+            return
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Augmented Flatmap Parquet",
+            str(source_path.with_name(f"{source_path.stem}_flatmap.parquet")),
+            "Parquet Files (*.parquet);;All Files (*)",
+        )
+        if not output_path:
+            return
+
+        try:
+            self._augment_current_parquet_to_path(output_path)
+        except Exception as exc:
+            logger.exception("Flatmap Parquet augmentation failed")
+            self._status_label.setText(f"Flatmap Parquet augmentation failed: {exc}")
+            show_warning(f"Flatmap Parquet augmentation failed: {exc}")
+
+    def _augment_current_parquet_to_path(self, output_path: str | Path):
+        """Save a Parquet file augmented with NRRD-derived flatmap columns."""
+        self._projection_request_ready()
+        source_path = self._current_source_parquet_path()
+        file_ids = self._file_ids_for_source()
+        if not file_ids:
+            raise RuntimeError("No neurons are available to save.")
+        summary = augment_neuron_parquet_with_flatmap(
+            source_path,
+            output_path,
+            self._flatmap_path,
+            self._depth_path,
+            file_ids=file_ids,
+            flatmap_style=self._current_style_filename(),
+            coordinate_mode=self._current_coordinate_mode(),
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
+        )
+        self._status_label.setText(
+            "Saved augmented Parquet to "
+            f"{summary.output_parquet} "
+            f"({summary.rows:,} rows from {len(file_ids):,} file ID(s); "
+            f"{summary.direct_rows:,} direct, "
+            f"{summary.mirrored_rows:,} mirrored, "
+            f"{summary.unmapped_rows:,} unmapped)."
+        )
+        show_info(f"Saved augmented Parquet to {summary.output_parquet}")
+        return summary

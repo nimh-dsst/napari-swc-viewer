@@ -70,6 +70,37 @@ Brain Image Library. The committed fixture files live under
 
 Source dataset DOI: https://doi.org/10.35077/g.73
 
+## Direct Flatmap/Depth NRRD Loading
+
+Flatmap and depth lookup NRRD files can be opened directly through napari's
+File Open dialog or drag-and-drop. Shape-based detection is used:
+
+- A 4D flatmap volume with a length-2 coordinate axis is split into two scalar
+  image layers: `Flatmap X: <stem>` and `Flatmap Y: <stem>`.
+- A 3D depth volume is loaded as one scalar image layer: `Depth: <stem>`.
+
+Unsupported NRRD shapes are rejected with a clear error. Direct NRRD image
+layers are displayed in voxel/pixel space, matching the plugin's reference
+image layers.
+
+To write NRRD-derived flatmap/depth coordinates back into a neuron Parquet,
+use the Flatmap tab's `Save Augmented Parquet...` action after loading a source
+Parquet and choosing flatmap/depth NRRDs. The save action follows the Flatmap
+tab's `Input` dropdown: selected table rows when available, otherwise the
+current table rows, or all current table rows when that mode is selected. The
+same conversion is available from the command line:
+
+```bash
+pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neurons_flatmap.parquet --flatmap flatmap.nrrd --depth depth.nrrd
+```
+
+Use repeatable `--file-id <id>` arguments to restrict the command-line
+conversion to specific neurons.
+
+The output preserves the original CCFv3 `x`, `y`, and `z` columns and appends
+`x_flat`, `y_flat`, `depth_um`, validity flags, and a lookup mode showing
+whether the direct or mirrored coordinate was used.
+
 ## Standard Point Parquet Workflow
 
 This repo now supports atlas-registered point datasets via a standardized

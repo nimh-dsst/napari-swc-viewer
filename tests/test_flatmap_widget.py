@@ -212,6 +212,88 @@ def test_file_ids_for_source_uses_selected_then_all_fallback(monkeypatch) -> Non
     assert widget._file_ids_for_source("selected") == ["a.swc", "b.swc"]
 
 
+def _configure_augmentation_widget(widget, source_mode: str, source_path: Path) -> None:
+    widget._database_provider = lambda: types.SimpleNamespace(parquet_path=source_path)
+    widget._table_file_ids_provider = lambda: ["a.swc", "b.swc", "a.swc"]
+    widget._selected_file_ids_provider = lambda: ["b.swc", "b.swc"]
+    widget._source_combo = types.SimpleNamespace(currentData=lambda: source_mode)
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._coordinate_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "microns"
+    )
+    widget._zero_sentinel_cb = types.SimpleNamespace(isChecked=lambda: False)
+    widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
+
+
+def test_augment_current_parquet_to_path_passes_selected_file_ids(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "augmented.parquet"
+    _configure_augmentation_widget(widget, module._SOURCE_SELECTED, source)
+    captured = {}
+
+    def fake_augment(source_path, output_path, flatmap_path, depth_path, **kwargs):
+        captured.update(
+            {
+                "source_path": source_path,
+                "output_path": output_path,
+                "flatmap_path": flatmap_path,
+                "depth_path": depth_path,
+                "kwargs": kwargs,
+            }
+        )
+        return types.SimpleNamespace(
+            output_parquet=Path(output_path),
+            rows=2,
+            direct_rows=1,
+            mirrored_rows=1,
+            unmapped_rows=0,
+        )
+
+    monkeypatch.setattr(module, "augment_neuron_parquet_with_flatmap", fake_augment)
+
+    summary = widget._augment_current_parquet_to_path(output)
+
+    assert summary.rows == 2
+    assert captured["source_path"] == source
+    assert captured["output_path"] == output
+    assert captured["kwargs"]["file_ids"] == ["b.swc"]
+    assert "2 rows from 1 file ID" in widget._status_label.text
+
+
+def test_augment_current_parquet_to_path_passes_all_table_file_ids(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "augmented.parquet"
+    _configure_augmentation_widget(widget, module._SOURCE_ALL, source)
+    captured = {}
+
+    def fake_augment(_source_path, _output_path, _flatmap_path, _depth_path, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(
+            output_parquet=output,
+            rows=3,
+            direct_rows=2,
+            mirrored_rows=0,
+            unmapped_rows=1,
+        )
+
+    monkeypatch.setattr(module, "augment_neuron_parquet_with_flatmap", fake_augment)
+
+    widget._augment_current_parquet_to_path(output)
+
+    assert captured["file_ids"] == ["a.swc", "b.swc"]
+    assert "3 rows from 2 file ID" in widget._status_label.text
+
+
 def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)

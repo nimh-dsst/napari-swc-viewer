@@ -6,6 +6,7 @@
 
 - Opening `.swc` neuron morphology files directly
 - Opening annotated `.parquet` neuron datasets
+- Opening flatmap/depth `.nrrd` lookup files directly
 - Filtering neurons by Allen brain regions
 - Rendering neurons as lines, points, or both
 - Showing Allen reference layers (template, outline, region meshes, segmentation)
@@ -13,7 +14,7 @@
 
 The plugin adds:
 
-- A file reader for `*.swc` and `*.parquet`
+- A file reader for `*.swc`, `*.parquet`, and flatmap/depth `*.nrrd`
 - A dock widget named **Neuron Viewer**
 
 ## Prerequisites
@@ -83,6 +84,37 @@ Recommended Parquet schema columns:
 - `file_id`, `node_id`, `type`, `x`, `y`, `z`, `radius`, `parent_id`
 - `region_id`, `region_name`, `region_acronym`
 - `subject`, `neuron_id`
+
+### Flatmap and depth NRRD files
+
+- Open through napari File Open dialog (`.nrrd`) or drag-and-drop
+- 4D flatmap lookup volumes with a length-2 coordinate axis are split into
+  `Flatmap X: <stem>` and `Flatmap Y: <stem>` image layers
+- 3D depth lookup volumes are loaded as `Depth: <stem>` image layers
+- Direct NRRD image layers use voxel/pixel space to match the plugin's reference
+  image layers
+- Unsupported NRRD shapes are rejected instead of being guessed
+
+### Augmented flatmap Parquet files
+
+- In the **Flatmap** tab, load/select a source neuron Parquet, flatmap NRRD, and
+  depth NRRD, then use `Save Augmented Parquet...`
+- The save action follows the Flatmap tab **Input** dropdown: selected table
+  rows when available, otherwise current table rows; in `All table rows` mode,
+  only the current table rows are written
+- The output Parquet preserves original CCFv3 `x`, `y`, and `z` columns and adds
+  `x_flat`, `y_flat`, `depth_um`, validity flags, `flatmap_invalid_code`, and
+  `flatmap_lookup_mode`
+- Coordinate lookup tries the direct CCFv3 coordinate first, then mirrors across
+  the CCFv3 left-right midline when direct lookup fails
+- Command-line equivalent:
+
+```bash
+pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neurons_flatmap.parquet --flatmap flatmap.nrrd --depth depth.nrrd
+```
+
+Add repeatable `--file-id <id>` arguments to restrict the command-line
+conversion to specific neurons.
 
 ### Standard point Parquet files
 
