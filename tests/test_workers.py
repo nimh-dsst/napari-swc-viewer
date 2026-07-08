@@ -12,6 +12,9 @@ import numpy as np
 import pandas as pd
 
 from napari_swc_viewer.analysis.clustering import ClusterRegionSelection, ClusterResult
+from napari_swc_viewer.analysis.flatmap_correlation import (
+    FlatmapVoxelCorrelationSource,
+)
 from napari_swc_viewer.point_import import PointParquetAppendSummary
 from napari_swc_viewer.parquet import BatchParquetConversionSummary
 
@@ -809,6 +812,75 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
     assert metadata.actual_cluster_count == 2
     assert metadata.atlas_name == "fake_atlas"
     assert metadata.dendrogram_leaf_order == [1, 0]
+
+
+def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
+    monkeypatch,
+) -> None:
+    """Flatmap region filters should align with heatmaps that include depth -1."""
+    workers = _import_workers_module()
+    source = FlatmapVoxelCorrelationSource(
+        projected_nodes=pd.DataFrame(),
+        volume_shape=(2, 2, 2),
+        input_file_ids=("n1", "n2"),
+        xy_bins=2,
+        depth_bin_um=25.0,
+        include_depth_minus_one=True,
+        flatmap_path="flatmap.nrrd",
+        depth_path="depth.nrrd",
+    )
+    atlas = types.SimpleNamespace(annotation=np.zeros((1, 1, 1), dtype=np.int32))
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+
+    import napari_swc_viewer.flatmap_labels as labels_module
+    import napari_swc_viewer.flatmap_loader as loader_module
+
+    monkeypatch.setattr(
+        loader_module,
+        "load_flatmap_volume_set",
+        lambda _flatmap_path, _depth_path: types.SimpleNamespace(
+            flatmap=np.zeros((1, 1, 1, 2), dtype=np.float32),
+            depth=np.zeros((1, 1, 1), dtype=np.float32),
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_build_labels(*_args, **kwargs):
+        captured["selected_region_ids"] = kwargs["selected_region_ids"]
+        return types.SimpleNamespace(
+            labels=np.array([[[1, 0], [0, 1]]], dtype=np.int32),
+            summary=types.SimpleNamespace(
+                labeled_voxels=2,
+                valid_source_voxels=2,
+                collision_voxels=0,
+            ),
+            represented_region_ids=[68],
+        )
+
+    monkeypatch.setattr(
+        labels_module,
+        "build_flatmap_region_label_volume",
+        fake_build_labels,
+    )
+    worker = workers.FlatmapCorrelationWorker(
+        source=source,
+        atlas=atlas,
+        parquet_path="neurons.parquet",
+        region_selection=selection,
+    )
+
+    mask, metadata = worker._build_region_mask()
+
+    assert captured["selected_region_ids"] == [68]
+    assert mask.shape == (2, 2, 2)
+    assert mask[0].sum() == 0
+    assert bool(mask[1, 0, 0]) is True
+    assert metadata["flatmap_region_labeled_voxels"] == 2
 
 
 def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):

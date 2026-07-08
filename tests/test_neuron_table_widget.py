@@ -5,6 +5,10 @@ from pathlib import Path
 import sys
 import types
 
+import numpy as np
+
+from napari_swc_viewer.analysis.clustering import ClusterResult
+
 
 def _import_neuron_table_module():
     module_path = (
@@ -277,6 +281,39 @@ def test_neuron_table_sort_by_cluster_delegates_to_cluster_column_sort() -> None
     assert widget._table.sort_calls == [
         (module.COL_CLUSTER, module.Qt.AscendingOrder)
     ]
+
+
+def test_update_cluster_assignments_clears_unassigned_rows() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1", cluster_id=9),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2", cluster_id=8),
+            "n3": module.NeuronEntry(file_id="n3", subject="s3", cluster_id=7),
+        },
+    )
+    cluster_cells: list[tuple[int, int | None]] = []
+    widget._set_cluster_cell = (
+        lambda row, cluster_id: cluster_cells.append((row, cluster_id))
+    )
+    result = ClusterResult(
+        correlation_matrix=np.eye(1, dtype=np.float32),
+        distance_matrix=np.zeros((1, 1), dtype=np.float32),
+        linkage_matrix=np.empty((0, 4), dtype=np.float64),
+        neuron_ids=["n1"],
+        reorder_indices=np.array([0], dtype=np.intp),
+        labels=np.array([2], dtype=np.int32),
+        unassigned_neuron_ids=["n2"],
+    )
+
+    widget.update_cluster_assignments(result)
+
+    assert widget._entries["n1"].cluster_id == 2
+    assert widget._entries["n2"].cluster_id is None
+    assert widget._entries["n3"].cluster_id == 7
+    assert cluster_cells == [(1, None), (0, 2)]
+    assert len(widget.state_changed.calls) == 1
 
 
 def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallback() -> None:

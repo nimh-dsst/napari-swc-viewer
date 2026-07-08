@@ -696,6 +696,12 @@ class NeuronViewerWidget(QWidget):
             self._analysis_tab.set_current_table_file_ids_provider(
                 self._current_table_file_ids
             )
+            self._analysis_tab.set_flatmap_correlation_source_provider(
+                self._flatmap_tab.latest_flatmap_correlation_source
+            )
+            self._flatmap_tab.set_flatmap_correlation_source_changed_callback(
+                self._analysis_tab.refresh_flatmap_correlation_option
+            )
             self._analysis_tab.cluster_colors_updated.connect(
                 self._on_cluster_colors_updated
             )

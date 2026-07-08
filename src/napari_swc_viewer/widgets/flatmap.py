@@ -25,6 +25,7 @@ from qtpy.QtWidgets import (
 )
 
 from ..flatmap_export import export_projected_nodes_csv
+from ..analysis.flatmap_correlation import FlatmapVoxelCorrelationSource
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_XY_BINS,
@@ -127,6 +128,15 @@ class FlatmapProjectionWidget(QWidget):
         self._last_projected_nodes: pd.DataFrame | None = None
         self._last_summary: ProjectionSummary | None = None
         self._last_render_summary: FlatmapRenderSummary | None = None
+        self._last_render_mode: str | None = None
+        self._last_flatmap_style: str | None = None
+        self._last_coordinate_mode: str | None = None
+        self._last_volume_shape: tuple[int, int, int] | None = None
+        self._last_lookup_stats: FlatmapLookupStats | None = None
+        self._last_input_file_ids: tuple[str, ...] = ()
+        self._last_flatmap_path: str | None = None
+        self._last_depth_path: str | None = None
+        self._flatmap_correlation_source_changed_callback = None
         self._lookup_stats_cache_key: tuple[object, ...] | None = None
         self._lookup_stats_cache: FlatmapLookupStats | None = None
 
@@ -315,12 +325,27 @@ class FlatmapProjectionWidget(QWidget):
         self._flatmap_path = Path(path) if path else None
         text = str(self._flatmap_path) if self._flatmap_path else "No flatmap selected"
         self._flatmap_path_label.setText(text)
+        self._notify_flatmap_correlation_source_changed()
 
     def set_depth_path(self, path: str | Path | None) -> None:
         """Set the depth path, primarily for tests and scripted use."""
         self._depth_path = Path(path) if path else None
         text = str(self._depth_path) if self._depth_path else "No depth selected"
         self._depth_path_label.setText(text)
+        self._notify_flatmap_correlation_source_changed()
+
+    def set_flatmap_correlation_source_changed_callback(self, callback) -> None:
+        """Set a callback invoked when the latest flatmap clustering source changes."""
+        self._flatmap_correlation_source_changed_callback = callback
+
+    def _notify_flatmap_correlation_source_changed(self) -> None:
+        callback = getattr(
+            self,
+            "_flatmap_correlation_source_changed_callback",
+            None,
+        )
+        if callable(callback):
+            callback()
 
     def _current_style_key(self) -> str:
         key = self._style_combo.currentData()
@@ -453,7 +478,9 @@ class FlatmapProjectionWidget(QWidget):
             file_ids = self._file_ids_for_source()
             nodes = self._query_nodes(file_ids)
             if self._lookup_files_ready():
-                result, render_result = self._project_from_lookup_files(nodes)
+                result, render_result, lookup_stats = self._project_from_lookup_files(
+                    nodes
+                )
                 flatmap_style = self._current_style_filename()
                 coordinate_mode = self._current_coordinate_mode()
                 source_note = "lookup NRRDs"
@@ -463,7 +490,9 @@ class FlatmapProjectionWidget(QWidget):
                         "Choose both flatmap and depth NRRD files, or load an "
                         "augmented Parquet with x_flat, y_flat, and depth_um columns."
                     )
-                result, render_result = self._project_from_parquet_columns(nodes)
+                result, render_result, lookup_stats = (
+                    self._project_from_parquet_columns(nodes)
+                )
                 flatmap_style = "precomputed_parquet"
                 coordinate_mode = "parquet_columns"
                 source_note = "Parquet flatmap/depth columns"
@@ -473,6 +502,8 @@ class FlatmapProjectionWidget(QWidget):
                 render_result,
                 flatmap_style=flatmap_style,
                 coordinate_mode=coordinate_mode,
+                lookup_stats=lookup_stats,
+                input_file_ids=tuple(str(file_id) for file_id in file_ids),
             )
             self._status_label.setText(
                 f"Rendered {render_result.summary.rendered_nodes:,} of "
@@ -488,8 +519,15 @@ class FlatmapProjectionWidget(QWidget):
     def _project_from_lookup_files(
         self,
         nodes: pd.DataFrame,
-    ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult]:
+    ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult, FlatmapLookupStats]:
         volume_set = load_flatmap_volume_set(self._flatmap_path, self._depth_path)
+        lookup_stats = self._lookup_stats_for_volume_set(
+            volume_set,
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=(
+                self._negative_one_sentinel_cb.isChecked()
+            ),
+        )
         result = project_and_build_segments(
             nodes,
             volume_set.flatmap,
@@ -517,20 +555,14 @@ class FlatmapProjectionWidget(QWidget):
             invalid_negative_one_sentinel=(
                 self._negative_one_sentinel_cb.isChecked()
             ),
-            lookup_stats=self._lookup_stats_for_volume_set(
-                volume_set,
-                invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-                invalid_negative_one_sentinel=(
-                    self._negative_one_sentinel_cb.isChecked()
-                ),
-            ),
+            lookup_stats=lookup_stats,
         )
-        return result, render_result
+        return result, render_result, lookup_stats
 
     def _project_from_parquet_columns(
         self,
         nodes: pd.DataFrame,
-    ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult]:
+    ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult, None]:
         result = self._projection_result_from_parquet_columns(nodes)
         render_result = build_flatmap_render_data_from_projected_nodes(
             result.projected_nodes,
@@ -540,7 +572,7 @@ class FlatmapProjectionWidget(QWidget):
                 not self._exclude_depth_minus_one_cb.isChecked()
             ),
         )
-        return result, render_result
+        return result, render_result, None
 
     def _projection_result_from_parquet_columns(
         self,
@@ -734,10 +766,20 @@ class FlatmapProjectionWidget(QWidget):
         *,
         flatmap_style: str | None = None,
         coordinate_mode: str | None = None,
+        lookup_stats: FlatmapLookupStats | None = None,
+        input_file_ids: tuple[str, ...] = (),
     ) -> None:
         self._last_projected_nodes = render_result.projected_nodes
         self._last_summary = result.summary
         self._last_render_summary = render_result.summary
+        self._last_render_mode = self._current_render_mode()
+        self._last_flatmap_style = flatmap_style or self._current_style_filename()
+        self._last_coordinate_mode = coordinate_mode or self._current_coordinate_mode()
+        self._last_volume_shape = tuple(int(size) for size in render_result.volume.shape)
+        self._last_lookup_stats = lookup_stats
+        self._last_input_file_ids = tuple(input_file_ids)
+        self._last_flatmap_path = str(self._flatmap_path) if self._flatmap_path else None
+        self._last_depth_path = str(self._depth_path) if self._depth_path else None
         self._summary_label.setText(
             self._format_render_summary(result.summary, render_result.summary)
         )
@@ -749,6 +791,63 @@ class FlatmapProjectionWidget(QWidget):
             render_mode=self._current_render_mode(),
         )
         self._export_btn.setEnabled(not render_result.projected_nodes.empty)
+        self._notify_flatmap_correlation_source_changed()
+
+    def latest_flatmap_correlation_source(
+        self,
+    ) -> FlatmapVoxelCorrelationSource | None:
+        """Return the latest heatmap render as a flatmap-clustering source."""
+        if self._last_render_mode != _RENDER_HEATMAP:
+            return None
+        if not self._latest_heatmap_layer_is_rendered():
+            return None
+        projected_nodes = getattr(self, "_last_projected_nodes", None)
+        render_summary = getattr(self, "_last_render_summary", None)
+        volume_shape = getattr(self, "_last_volume_shape", None)
+        if projected_nodes is None or render_summary is None or volume_shape is None:
+            return None
+        if projected_nodes.empty or int(render_summary.traces_represented) < 2:
+            return None
+        if (
+            getattr(self, "_last_lookup_stats", None) is None
+            or not self._last_flatmap_path
+            or not self._last_depth_path
+        ):
+            return None
+        if (
+            self._flatmap_path is None
+            or self._depth_path is None
+            or str(self._flatmap_path) != self._last_flatmap_path
+            or str(self._depth_path) != self._last_depth_path
+        ):
+            return None
+
+        input_file_ids = tuple(getattr(self, "_last_input_file_ids", ()) or ())
+        if not input_file_ids and "file_id" in projected_nodes.columns:
+            input_file_ids = tuple(
+                str(value)
+                for value in self._deduplicate_file_ids(
+                    projected_nodes["file_id"].tolist()
+                )
+            )
+
+        return FlatmapVoxelCorrelationSource(
+            projected_nodes=projected_nodes,
+            volume_shape=tuple(int(size) for size in volume_shape),
+            input_file_ids=input_file_ids,
+            xy_bins=int(render_summary.xy_bins),
+            depth_bin_um=float(render_summary.depth_bin_um),
+            include_depth_minus_one=bool(
+                render_summary.includes_depth_minus_one_plane
+            ),
+            flatmap_style=getattr(self, "_last_flatmap_style", None),
+            coordinate_mode=getattr(self, "_last_coordinate_mode", None),
+            flatmap_path=self._last_flatmap_path,
+            depth_path=self._last_depth_path,
+            invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
+            invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
+            lookup_stats=getattr(self, "_last_lookup_stats", None),
+        )
 
     def _create_region_labels(self) -> None:
         """Create or update the selected-region flatmap labels layer."""
@@ -1128,6 +1227,25 @@ class FlatmapProjectionWidget(QWidget):
         if layer is None or layers is None:
             return False
         return any(existing is layer for existing in layers)
+
+    def _latest_heatmap_layer_is_rendered(self) -> bool:
+        """Return whether the latest flatmap render still has a heatmap layer."""
+        layer = getattr(self, "_projection_layer", None)
+        if self._layer_is_in_viewer(layer):
+            metadata = getattr(layer, "metadata", {}) or {}
+            if metadata.get("flatmap_render_mode") == _RENDER_HEATMAP:
+                return True
+
+        layers = getattr(self._viewer, "layers", ())
+        for candidate in layers:
+            name = getattr(candidate, "name", None)
+            metadata = getattr(candidate, "metadata", {}) or {}
+            if (
+                self._is_flatmap_render_layer_name(name)
+                and metadata.get("flatmap_render_mode") == _RENDER_HEATMAP
+            ):
+                return True
+        return False
 
     def _cached_projection_layer_for_name(self, name: str):
         layer = getattr(self, "_projection_layer", None)

@@ -55,6 +55,17 @@ logger = logging.getLogger(__name__)
 
 _ANALYSIS_SCOPE_WHOLE = "whole"
 _ANALYSIS_SCOPE_CURRENT = "current"
+_CLUSTER_METHOD_VOXEL = "Voxel Correlation"
+_CLUSTER_METHOD_FLATMAP = "Flatmap Voxel Correlation"
+_CLUSTER_METHOD_SOMA = "Soma Location"
+_FLATMAP_CORRELATION_AVAILABLE_TEXT = (
+    "Uses the latest 3D flatmap heatmap. Region filters are projected into "
+    "flatmap space using the Flatmap tab NRRD files."
+)
+_FLATMAP_CORRELATION_UNAVAILABLE_TEXT = (
+    "Render a Flatmap tab 3D heatmap with flatmap/depth NRRDs to enable "
+    "Flatmap Voxel Correlation."
+)
 
 
 @dataclass(frozen=True)
@@ -325,6 +336,7 @@ class AnalysisTabWidget(QWidget):
         self._clustermap_rendered = False
         self._cluster_region_query_scope = _ANALYSIS_SCOPE_WHOLE
         self._current_table_file_ids_provider = None
+        self._flatmap_correlation_source_provider = None
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -382,6 +394,11 @@ class AnalysisTabWidget(QWidget):
         """Set a callback returning the current neuron-table file IDs."""
         self._current_table_file_ids_provider = provider
 
+    def set_flatmap_correlation_source_provider(self, provider) -> None:
+        """Set a callback returning the latest flatmap heatmap clustering source."""
+        self._flatmap_correlation_source_provider = provider
+        self.refresh_flatmap_correlation_option()
+
     def _raw_current_table_file_ids(self) -> list[object]:
         """Return current neuron-table file IDs from the configured provider."""
         provider = self.__dict__.get("_current_table_file_ids_provider")
@@ -425,6 +442,7 @@ class AnalysisTabWidget(QWidget):
 
     def _update_button_states(self) -> None:
         """Enable/disable buttons based on loaded data."""
+        self.refresh_flatmap_correlation_option()
         ready = self._db is not None and self._atlas is not None
         busy = (
             self._worker_thread is not None and self._worker_thread.isRunning()
@@ -485,14 +503,23 @@ class AnalysisTabWidget(QWidget):
         method_type_row = QHBoxLayout()
         method_type_row.addWidget(QLabel("Method:"))
         self._clustering_method_combo = QComboBox()
-        self._clustering_method_combo.addItems(
-            ["Voxel Correlation", "Soma Location"]
-        )
+        self._clustering_method_combo.addItems([_CLUSTER_METHOD_VOXEL, _CLUSTER_METHOD_SOMA])
         self._clustering_method_combo.currentTextChanged.connect(
             self._on_clustering_method_changed
         )
         method_type_row.addWidget(self._clustering_method_combo)
         corr_layout.addLayout(method_type_row)
+        self._flatmap_correlation_status_label = QLabel(
+            _FLATMAP_CORRELATION_UNAVAILABLE_TEXT
+        )
+        set_word_wrap = getattr(
+            self._flatmap_correlation_status_label,
+            "setWordWrap",
+            None,
+        )
+        if callable(set_word_wrap):
+            set_word_wrap(True)
+        corr_layout.addWidget(self._flatmap_correlation_status_label)
 
         # Algorithm (only for Soma Location)
         self._algorithm_row = QHBoxLayout()
@@ -508,7 +535,8 @@ class AnalysisTabWidget(QWidget):
 
         # Search scope
         scope_row = QHBoxLayout()
-        scope_row.addWidget(QLabel("Search scope:"))
+        self._cluster_region_scope_label = QLabel("Search scope:")
+        scope_row.addWidget(self._cluster_region_scope_label)
         self._cluster_region_scope_combo = QComboBox()
         self._cluster_region_scope_combo.addItem(
             "Whole Parquet",
@@ -572,7 +600,8 @@ class AnalysisTabWidget(QWidget):
 
         # Dilation fraction
         dilation_row = QHBoxLayout()
-        dilation_row.addWidget(QLabel("Dilation %:"))
+        self._dilation_label = QLabel("Dilation %:")
+        dilation_row.addWidget(self._dilation_label)
         self._dilation_spin = QSpinBox()
         self._dilation_spin.setRange(0, 100)
         self._dilation_spin.setValue(0)
@@ -1036,6 +1065,109 @@ class AnalysisTabWidget(QWidget):
         )
         return False, None, "current table", 0
 
+    def _current_flatmap_correlation_source(self):
+        """Return a usable flatmap heatmap source for voxel correlation, if any."""
+        provider = getattr(self, "_flatmap_correlation_source_provider", None)
+        if not callable(provider):
+            return None
+        try:
+            return provider()
+        except Exception:
+            logger.exception("Failed to resolve flatmap correlation source")
+            return None
+
+    @staticmethod
+    def _flatmap_correlation_source_is_complete(source) -> bool:
+        """Return whether *source* can run flatmap voxel correlation safely."""
+        if source is None:
+            return False
+        projected_nodes = getattr(source, "projected_nodes", None)
+        if projected_nodes is None or getattr(projected_nodes, "empty", True):
+            return False
+        required_columns = {
+            "file_id",
+            "render_valid",
+            "depth_bin",
+            "y_flat_bin",
+            "x_flat_bin",
+        }
+        if not required_columns.issubset(set(getattr(projected_nodes, "columns", []))):
+            return False
+        volume_shape = getattr(source, "volume_shape", None)
+        if volume_shape is None or len(tuple(volume_shape)) != 3:
+            return False
+        if not getattr(source, "flatmap_path", None) or not getattr(
+            source,
+            "depth_path",
+            None,
+        ):
+            return False
+        if getattr(source, "lookup_stats", None) is None:
+            return False
+        try:
+            input_count = len(tuple(getattr(source, "input_file_ids", ())))
+            xy_bins = int(getattr(source, "xy_bins"))
+            depth_bin_um = float(getattr(source, "depth_bin_um"))
+        except (TypeError, ValueError):
+            return False
+        return input_count >= 2 and xy_bins > 0 and depth_bin_um > 0.0
+
+    def refresh_flatmap_correlation_option(self) -> None:
+        """Refresh method dropdown availability for flatmap voxel correlation."""
+        combo = getattr(self, "_clustering_method_combo", None)
+        if combo is None:
+            return
+
+        current_text = combo.currentText()
+        source = self._current_flatmap_correlation_source()
+        flatmap_available = self._flatmap_correlation_source_is_complete(source)
+        options = [_CLUSTER_METHOD_VOXEL]
+        if flatmap_available:
+            options.append(_CLUSTER_METHOD_FLATMAP)
+        options.append(_CLUSTER_METHOD_SOMA)
+        if current_text not in options:
+            current_text = _CLUSTER_METHOD_VOXEL
+
+        blocker = getattr(combo, "blockSignals", None)
+        if callable(blocker):
+            blocker(True)
+        try:
+            combo.clear()
+            combo.addItems(options)
+            combo.setCurrentText(current_text)
+        finally:
+            if callable(blocker):
+                blocker(False)
+
+        self._on_clustering_method_changed(current_text)
+
+    @staticmethod
+    def _region_selection_is_all_flatmap_space(
+        region_selection: ClusterRegionSelection | None,
+    ) -> bool:
+        """Return whether the selected Analysis region should mean all voxels."""
+        if region_selection is None:
+            return True
+        acronyms = [
+            str(acronym).strip().lower()
+            for acronym in region_selection.selected_region_acronyms
+        ]
+        return bool(acronyms) and "root" in acronyms
+
+    def _flatmap_region_selection_for_clustering(
+        self,
+    ) -> ClusterRegionSelection | None:
+        """Return selected region filter for flatmap clustering, or None for all."""
+        region_selection = self._selected_cluster_region_selection()
+        if self._region_selection_is_all_flatmap_space(region_selection):
+            return None
+        if not region_selection.represented_region_ids:
+            self._progress_label.setText(
+                "Selected region(s) have no represented dataset regions."
+            )
+            return None
+        return region_selection
+
     def _selected_regions(
         self,
         selector: RegionSelectorWidget | None,
@@ -1173,7 +1305,37 @@ class AnalysisTabWidget(QWidget):
 
     def _on_clustering_method_changed(self, text: str) -> None:
         """Show/hide UI rows based on the selected clustering method."""
-        is_soma = text == "Soma Location"
+        is_soma = text == _CLUSTER_METHOD_SOMA
+        is_flatmap = text == _CLUSTER_METHOD_FLATMAP
+        flatmap_source = self._current_flatmap_correlation_source()
+        flatmap_available = self._flatmap_correlation_source_is_complete(
+            flatmap_source
+        )
+
+        status_label = getattr(self, "_flatmap_correlation_status_label", None)
+        if status_label is not None:
+            if is_flatmap:
+                status_label.setText(_FLATMAP_CORRELATION_AVAILABLE_TEXT)
+                status_label.setVisible(True)
+            elif not flatmap_available:
+                status_label.setText(_FLATMAP_CORRELATION_UNAVAILABLE_TEXT)
+                status_label.setVisible(True)
+            else:
+                status_label.setText("")
+                status_label.setVisible(False)
+
+        for widget in (
+            getattr(self, "_cluster_region_scope_label", None),
+            getattr(self, "_cluster_region_scope_combo", None),
+        ):
+            if widget is not None:
+                widget.setVisible(not is_flatmap)
+        for widget in (
+            getattr(self, "_dilation_label", None),
+            getattr(self, "_dilation_spin", None),
+        ):
+            if widget is not None:
+                widget.setVisible(not is_flatmap)
 
         # Algorithm row: only for soma
         self._algorithm_label.setVisible(is_soma)
@@ -1182,7 +1344,7 @@ class AnalysisTabWidget(QWidget):
         if is_soma:
             self._on_algorithm_changed(self._algorithm_combo.currentText())
         else:
-            # Voxel Correlation: show linkage + clusters, hide DBSCAN params
+            # Voxel correlation methods: show linkage + clusters, hide DBSCAN params.
             self._linkage_label.setVisible(True)
             self._method_combo.setVisible(True)
             self._clusters_label.setVisible(True)
@@ -1214,6 +1376,52 @@ class AnalysisTabWidget(QWidget):
         if self._worker_thread is not None and self._worker_thread.isRunning():
             return
 
+        clustering_method = self._clustering_method_combo.currentText()
+
+        if clustering_method == _CLUSTER_METHOD_SOMA:
+            proceed, base_file_ids, _scope_label, _input_count = (
+                self._resolve_cluster_query_file_scope()
+            )
+            if not proceed:
+                return
+            region_selection = self._selected_cluster_region_selection()
+            if region_selection is None:
+                self._progress_label.setText("Select at least one target region.")
+                return
+            if not region_selection.represented_region_ids:
+                self._progress_label.setText(
+                    "Selected region(s) have no represented dataset regions."
+                )
+                return
+            self._run_soma_clustering(
+                region_selection,
+                self._dilation_spin.value() / 100.0,
+                file_ids=base_file_ids,
+            )
+            return
+
+        if clustering_method == _CLUSTER_METHOD_FLATMAP:
+            flatmap_source = self._current_flatmap_correlation_source()
+            if not self._flatmap_correlation_source_is_complete(flatmap_source):
+                self.refresh_flatmap_correlation_option()
+                self._progress_label.setText(
+                    _FLATMAP_CORRELATION_UNAVAILABLE_TEXT
+                )
+                return
+            region_selection = self._flatmap_region_selection_for_clustering()
+            selected = self._selected_cluster_region_selection()
+            if (
+                selected is not None
+                and not self._region_selection_is_all_flatmap_space(selected)
+                and region_selection is None
+            ):
+                return
+            self._run_flatmap_correlation_clustering(
+                flatmap_source,
+                region_selection,
+            )
+            return
+
         proceed, base_file_ids, _scope_label, _input_count = (
             self._resolve_cluster_query_file_scope()
         )
@@ -1230,21 +1438,11 @@ class AnalysisTabWidget(QWidget):
             )
             return
 
-        dilation = self._dilation_spin.value() / 100.0
-        clustering_method = self._clustering_method_combo.currentText()
-
-        if clustering_method == "Soma Location":
-            self._run_soma_clustering(
-                region_selection,
-                dilation,
-                file_ids=base_file_ids,
-            )
-        else:
-            self._run_correlation_clustering(
-                region_selection,
-                dilation,
-                file_ids=base_file_ids,
-            )
+        self._run_correlation_clustering(
+            region_selection,
+            self._dilation_spin.value() / 100.0,
+            file_ids=base_file_ids,
+        )
 
     def _run_correlation_clustering(
         self,
@@ -1269,6 +1467,24 @@ class AnalysisTabWidget(QWidget):
             file_ids=file_ids,
         )
 
+        self._start_background_worker(worker, self._on_correlation_finished)
+
+    def _run_flatmap_correlation_clustering(
+        self,
+        flatmap_source,
+        region_selection: ClusterRegionSelection | None,
+    ) -> None:
+        """Start flatmap-space voxel correlation + clustering."""
+        from ..workers import FlatmapCorrelationWorker
+
+        worker = FlatmapCorrelationWorker(
+            source=flatmap_source,
+            atlas=self._atlas,
+            parquet_path=self._parquet_path,
+            region_selection=region_selection,
+            linkage_method=self._method_combo.currentText(),
+            n_clusters=self._n_clusters_spin.value(),
+        )
         self._start_background_worker(worker, self._on_correlation_finished)
 
     def _run_soma_clustering(

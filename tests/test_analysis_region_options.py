@@ -10,11 +10,33 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 
 from napari_swc_viewer.analysis.clustering import (
     ClusterRegionSelection,
     ClusterResult,
 )
+
+
+def _complete_flatmap_source():
+    return types.SimpleNamespace(
+        projected_nodes=pd.DataFrame(
+            {
+                "file_id": ["n1", "n2"],
+                "render_valid": [True, True],
+                "depth_bin": [0, 0],
+                "y_flat_bin": [0, 1],
+                "x_flat_bin": [0, 1],
+            }
+        ),
+        volume_shape=(1, 2, 2),
+        input_file_ids=("n1", "n2"),
+        xy_bins=2,
+        depth_bin_um=25.0,
+        flatmap_path="flatmap.nrrd",
+        depth_path="depth.nrrd",
+        lookup_stats=object(),
+    )
 
 
 class _BoundSignal:
@@ -1224,6 +1246,207 @@ def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -
         selection,
         0.35,
         file_ids=["n1", "n2"],
+    )
+
+
+def test_flatmap_correlation_option_requires_complete_source() -> None:
+    """Flatmap method should only appear when a complete source is available."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert "Flatmap Voxel Correlation" not in [
+        item["text"] for item in widget._clustering_method_combo._items
+    ]
+
+    widget.set_flatmap_correlation_source_provider(_complete_flatmap_source)
+
+    assert "Flatmap Voxel Correlation" in [
+        item["text"] for item in widget._clustering_method_combo._items
+    ]
+
+
+def test_flatmap_correlation_unavailable_resets_method_selection() -> None:
+    """Losing flatmap metadata should remove the method and select atlas correlation."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    source = _complete_flatmap_source()
+    widget.set_flatmap_correlation_source_provider(lambda: source)
+    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+
+    incomplete_source = _complete_flatmap_source()
+    incomplete_source.lookup_stats = None
+    widget.set_flatmap_correlation_source_provider(lambda: incomplete_source)
+
+    assert widget._clustering_method_combo.currentText() == "Voxel Correlation"
+    assert "Flatmap Voxel Correlation" not in [
+        item["text"] for item in widget._clustering_method_combo._items
+    ]
+    assert "Render a Flatmap tab 3D heatmap" in (
+        widget._flatmap_correlation_status_label.text()
+    )
+
+
+def test_flatmap_correlation_method_hides_nonapplicable_controls() -> None:
+    """Flatmap mode should hide search scope and dilation controls."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget.set_flatmap_correlation_source_provider(_complete_flatmap_source)
+
+    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+
+    assert widget._cluster_region_scope_label._visible is False
+    assert widget._cluster_region_scope_combo._visible is False
+    assert widget._dilation_label._visible is False
+    assert widget._dilation_spin._visible is False
+    assert "Region filters are projected into flatmap space" in (
+        widget._flatmap_correlation_status_label.text()
+    )
+
+
+def test_run_clustering_pipeline_uses_flatmap_only_when_explicitly_selected() -> None:
+    """Voxel Correlation should stay atlas-space even when a flatmap source exists."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    source = _complete_flatmap_source()
+    widget.set_flatmap_correlation_source_provider(lambda: source)
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._run_flatmap_correlation_clustering = MagicMock()
+    widget._run_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    widget._run_correlation_clustering.assert_called_once_with(
+        selection,
+        0.0,
+        file_ids=None,
+    )
+    widget._run_flatmap_correlation_clustering.assert_not_called()
+
+
+def test_run_clustering_pipeline_flatmap_source_without_region() -> None:
+    """Explicit flatmap clustering should use the latest flatmap heatmap."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    source = _complete_flatmap_source()
+    widget.set_flatmap_correlation_source_provider(lambda: source)
+    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._run_flatmap_correlation_clustering = MagicMock()
+    widget._run_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    widget._run_flatmap_correlation_clustering.assert_called_once_with(
+        source,
+        None,
+    )
+    widget._run_correlation_clustering.assert_not_called()
+
+
+def test_flatmap_correlation_method_constructs_flatmap_worker(monkeypatch) -> None:
+    """Flatmap method should launch the flatmap-specific worker."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    source = _complete_flatmap_source()
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    widget._method_combo.setCurrentText("complete")
+    widget._n_clusters_spin.setValue(7)
+    widget._start_background_worker = MagicMock()
+
+    created_workers = []
+
+    class _FakeFlatmapCorrelationWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapCorrelationWorker = _FakeFlatmapCorrelationWorker
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+    widget._run_flatmap_correlation_clustering(source, selection)
+
+    assert len(created_workers) == 1
+    assert created_workers[0].kwargs == {
+        "source": source,
+        "atlas": widget._atlas,
+        "parquet_path": "neurons.parquet",
+        "region_selection": selection,
+        "linkage_method": "complete",
+        "n_clusters": 7,
+    }
+    widget._start_background_worker.assert_called_once_with(
+        created_workers[0],
+        widget._on_correlation_finished,
+    )
+
+
+def test_run_clustering_pipeline_treats_root_as_all_flatmap_space() -> None:
+    """Selecting root in Analysis should not restrict flatmap voxel clustering."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    source = _complete_flatmap_source()
+    widget.set_flatmap_correlation_source_provider(lambda: source)
+    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+    selection = ClusterRegionSelection(
+        selected_region_ids=[997],
+        selected_region_acronyms=["root"],
+        represented_region_ids=[68, 500],
+        represented_region_acronyms=["FRP1", "CP"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._run_flatmap_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    widget._run_flatmap_correlation_clustering.assert_called_once_with(
+        source,
+        None,
+    )
+
+
+def test_run_clustering_pipeline_passes_nonroot_region_to_flatmap_clustering() -> None:
+    """Non-root Analysis regions should become flatmap-space filters."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    source = _complete_flatmap_source()
+    widget.set_flatmap_correlation_source_provider(lambda: source)
+    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._run_flatmap_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    widget._run_flatmap_correlation_clustering.assert_called_once_with(
+        source,
+        selection,
     )
 
 

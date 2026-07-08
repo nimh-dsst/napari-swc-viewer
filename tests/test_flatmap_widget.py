@@ -262,6 +262,9 @@ def _widget(module):
     widget._cluster_map_provider = lambda: {}
     widget._atlas_provider = lambda: None
     widget._selected_region_acronyms_provider = lambda: ["VISp"]
+    widget._zero_sentinel_cb = types.SimpleNamespace(isChecked=lambda: False)
+    widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
+    widget._flatmap_correlation_source_changed_callback = None
     return widget
 
 
@@ -697,7 +700,7 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
             projected_nodes=nodes,
             summary=types.SimpleNamespace(rendered_nodes=1, total_nodes=1),
         )
-        return result, render
+        return result, render, None
 
     def fake_parquet(self, _nodes):
         calls["parquet"] += 1
@@ -711,6 +714,80 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
 
     assert calls == {"lookup": 1, "parquet": 0}
     assert "lookup NRRDs" in widget._status_label.text
+
+
+def test_latest_flatmap_correlation_source_requires_heatmap_render(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._last_projected_nodes = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc"],
+            "render_valid": [True, True],
+            "depth_bin": [0, 1],
+            "y_flat_bin": [0, 1],
+            "x_flat_bin": [0, 1],
+        }
+    )
+    widget._last_render_summary = module.FlatmapRenderSummary(
+        total_nodes=2,
+        flatmap_valid_nodes=2,
+        depth_valid_nodes=2,
+        depth_minus_one_nodes=0,
+        rendered_nodes=2,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=2,
+        traces_represented=2,
+        xy_bins=4,
+        depth_bins=2,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+        includes_depth_minus_one_plane=False,
+    )
+    widget._last_volume_shape = (2, 4, 4)
+    widget._last_input_file_ids = ("a.swc", "b.swc")
+    widget._last_flatmap_style = "both"
+    widget._last_coordinate_mode = "microns"
+    widget._last_flatmap_path = str(widget._flatmap_path)
+    widget._last_depth_path = str(widget._depth_path)
+    widget._last_lookup_stats = module.FlatmapLookupStats(
+        x_bounds=(0.0, 1.0),
+        y_bounds=(0.0, 1.0),
+        depth_range_um=(0.0, 25.0),
+        flatmap_valid_voxels=2,
+        depth_valid_voxels=2,
+        flatmap_shape=(1, 1, 1, 2),
+        depth_shape=(1, 1, 1),
+        flatmap_dtype="float32",
+        depth_dtype="float32",
+        invalid_zero_sentinel=False,
+        invalid_negative_one_sentinel=True,
+    )
+
+    widget._last_render_mode = module._RENDER_POINTS
+    assert widget.latest_flatmap_correlation_source() is None
+
+    widget._last_render_mode = module._RENDER_HEATMAP
+    assert widget.latest_flatmap_correlation_source() is None
+
+    layer = _DummyLayer(
+        np.zeros(widget._last_volume_shape, dtype=np.float32),
+        name=module._HEATMAP_LAYER_NAME,
+        metadata={"flatmap_render_mode": module._RENDER_HEATMAP},
+    )
+    widget._projection_layer = layer
+    widget._viewer.layers.append(layer)
+    source = widget.latest_flatmap_correlation_source()
+
+    assert source is not None
+    assert source.volume_shape == (2, 4, 4)
+    assert source.input_file_ids == ("a.swc", "b.swc")
+    assert source.xy_bins == 4
+    assert source.depth_bin_um == 25.0
 
 
 def test_project_without_nrrds_requires_augmented_parquet_columns(monkeypatch) -> None:

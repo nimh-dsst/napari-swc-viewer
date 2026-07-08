@@ -259,9 +259,13 @@ def _attach_cluster_run_metadata(
     requested_cluster_count: int | None,
     dbscan_eps: float | None = None,
     dbscan_min_samples: int | None = None,
+    extra_metadata: dict[str, object] | None = None,
 ):
     """Populate the cluster result with reproducibility metadata."""
-    from .analysis.clustering import ClusterRunMetadata
+    from .analysis.clustering import ClusterRegionSelection, ClusterRunMetadata
+
+    if region_selection is None:
+        region_selection = ClusterRegionSelection()
 
     result.metadata = ClusterRunMetadata.from_region_selection(
         region_selection=region_selection,
@@ -279,6 +283,7 @@ def _attach_cluster_run_metadata(
         atlas_resolution_um=tuple(float(value) for value in getattr(atlas, "resolution", ()) or ()),
         source_parquet_path=str(Path(parquet_path)),
         dendrogram_leaf_order=[int(value) for value in result.reorder_indices.tolist()],
+        extra_metadata=extra_metadata,
     )
     return result
 
@@ -690,6 +695,147 @@ class CorrelationWorker(QObject):
 
         except Exception as e:
             logger.exception("Correlation pipeline failed")
+            self.error.emit(str(e))
+
+
+class FlatmapCorrelationWorker(QObject):
+    """Compute flatmap-space voxel correlation + clustering in background."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        source,
+        atlas: BrainGlobeAtlas,
+        parquet_path: str,
+        region_selection: ClusterRegionSelection | None = None,
+        linkage_method: str = "average",
+        n_clusters: int = 5,
+    ):
+        super().__init__()
+        self._source = source
+        self._atlas = atlas
+        self._parquet_path = parquet_path
+        self._region_selection = region_selection
+        self._linkage_method = linkage_method
+        self._n_clusters = n_clusters
+
+    def _build_region_mask(self):
+        """Return a flatmap-space boolean mask for the selected region."""
+        if self._region_selection is None:
+            return None, {}
+        represented_ids = list(self._region_selection.represented_region_ids)
+        if not represented_ids:
+            return None, {}
+
+        source = self._source
+        if not source.flatmap_path or not source.depth_path:
+            raise RuntimeError(
+                "Region-filtered flatmap clustering requires the flatmap and "
+                "depth NRRD files used to render the heatmap."
+            )
+
+        from .flatmap_labels import build_flatmap_region_label_volume
+        from .flatmap_loader import load_flatmap_volume_set
+
+        volume_set = load_flatmap_volume_set(source.flatmap_path, source.depth_path)
+        result = build_flatmap_region_label_volume(
+            np.asarray(self._atlas.annotation),
+            volume_set.flatmap,
+            volume_set.depth,
+            selected_region_ids=represented_ids,
+            xy_bins=source.xy_bins,
+            depth_bin_um=source.depth_bin_um,
+            invalid_zero_sentinel=source.invalid_zero_sentinel,
+            invalid_negative_one_sentinel=source.invalid_negative_one_sentinel,
+            lookup_stats=source.lookup_stats,
+        )
+        mask = np.asarray(result.labels > 0, dtype=bool)
+        source_shape = tuple(int(size) for size in source.volume_shape)
+        if source.include_depth_minus_one and source_shape[0] == mask.shape[0] + 1:
+            padded = np.zeros(source_shape, dtype=bool)
+            padded[1:, :, :] = mask
+            mask = padded
+        elif mask.shape != source_shape:
+            raise RuntimeError(
+                "Projected region mask shape does not match the flatmap heatmap; "
+                f"got mask {mask.shape} and heatmap {source_shape}."
+            )
+
+        return mask, {
+            "flatmap_region_labeled_voxels": int(result.summary.labeled_voxels),
+            "flatmap_region_valid_source_voxels": int(
+                result.summary.valid_source_voxels
+            ),
+            "flatmap_region_collision_voxels": int(result.summary.collision_voxels),
+            "flatmap_region_represented_region_ids": [
+                int(region_id) for region_id in result.represented_region_ids
+            ],
+        }
+
+    def run(self) -> None:
+        """Execute the flatmap correlation pipeline."""
+        try:
+            from .analysis.flatmap_correlation import (
+                compute_flatmap_voxel_correlation_result,
+            )
+
+            total = 4
+            self.progress.emit("Preparing flatmap voxel source...", 1, total)
+            region_mask, region_metadata = self._build_region_mask()
+
+            self.progress.emit("Computing flatmap voxel correlations...", 2, total)
+            result, count_data = compute_flatmap_voxel_correlation_result(
+                self._source,
+                method=self._linkage_method,
+                n_clusters=self._n_clusters,
+                region_mask=region_mask,
+            )
+
+            self.progress.emit("Recording flatmap clustering metadata...", 3, total)
+            source = self._source
+            extra_metadata = {
+                "flatmap_style": source.flatmap_style,
+                "flatmap_coordinate_mode": source.coordinate_mode,
+                "flatmap_xy_bins": int(source.xy_bins),
+                "flatmap_depth_bin_um": float(source.depth_bin_um),
+                "flatmap_include_depth_minus_one": bool(
+                    source.include_depth_minus_one
+                ),
+                "flatmap_path": source.flatmap_path,
+                "depth_path": source.depth_path,
+                "flatmap_input_neuron_count": int(len(source.input_file_ids)),
+                "flatmap_clustered_neuron_count": int(len(result.neuron_ids)),
+                "flatmap_unassigned_neuron_count": int(
+                    len(result.unassigned_neuron_ids)
+                ),
+                "flatmap_rendered_node_count": int(count_data.rendered_node_count),
+                "flatmap_occupied_voxel_count": int(len(count_data.voxel_ids)),
+            }
+            extra_metadata.update(region_metadata)
+            _attach_cluster_run_metadata(
+                result,
+                atlas=self._atlas,
+                parquet_path=self._parquet_path,
+                region_selection=self._region_selection,
+                analysis_method="flatmap_voxel_correlation",
+                clustering_algorithm="hierarchical",
+                distance_metric="one_minus_pearson_r",
+                clustering_linkage=self._linkage_method,
+                dendrogram_linkage=self._linkage_method,
+                dilation_fraction=0.0,
+                requested_cluster_count=self._n_clusters,
+                extra_metadata=extra_metadata,
+            )
+
+            self.progress.emit("Done", 4, total)
+            self.finished.emit(result)
+
+        except Exception as e:
+            logger.exception("Flatmap correlation pipeline failed")
             self.error.emit(str(e))
 
 
