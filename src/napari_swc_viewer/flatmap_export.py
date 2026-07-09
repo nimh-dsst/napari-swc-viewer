@@ -29,6 +29,7 @@ FLATMAP_EXPORT_COLUMNS = [
     "region_acronym",
     "flatmap_style",
     "coordinate_mode",
+    "flatmap_lookup_mode",
     "flatmap_valid",
     "depth_valid",
     "render_valid",

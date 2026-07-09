@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
@@ -16,13 +15,15 @@ import pyarrow.parquet as pq
 from .flatmap_loader import load_flatmap_volume_set
 from .flatmap_projection import (
     COORDINATE_MODE_MICRONS,
+    DEFAULT_CCFV3_MIRROR_MIDLINE_UM as _DEFAULT_CCFV3_MIRROR_MIDLINE_UM,
     REQUIRED_NODE_COLUMNS,
     project_neuron_nodes_to_flatmap,
+    resolve_flatmap_mirror_midline,
 )
 
 FLATMAP_PARQUET_METADATA_KEY = b"napari_swc_viewer.flatmap_projection_json"
 FLATMAP_PARQUET_FORMAT_VERSION = 1
-DEFAULT_CCFV3_MIRROR_MIDLINE_UM = 5695.0
+DEFAULT_CCFV3_MIRROR_MIDLINE_UM = _DEFAULT_CCFV3_MIRROR_MIDLINE_UM
 DEFAULT_FLATMAP_PARQUET_BATCH_SIZE = 250_000
 
 FLATMAP_AUGMENTED_COLUMNS = (
@@ -217,95 +218,7 @@ def _file_id_filter_expression(
     return ds.field("file_id").isin(values)
 
 
-def _mirror_chunk_coordinates(
-    nodes: pd.DataFrame,
-    *,
-    mirror_coord_axis: int,
-    mirror_midline: float,
-) -> pd.DataFrame:
-    mirrored = nodes.copy()
-    coord_columns = ["x", "y", "z"]
-    coord_column = coord_columns[mirror_coord_axis]
-    values = pd.to_numeric(mirrored[coord_column], errors="coerce").to_numpy(
-        dtype=float
-    )
-    mirrored.loc[:, coord_column] = (2.0 * float(mirror_midline)) - values
-    return mirrored
-
-
-def _project_chunk_with_mirror(
-    nodes: pd.DataFrame,
-    flatmap: np.ndarray,
-    depth: np.ndarray,
-    *,
-    flatmap_style: str,
-    coordinate_mode: str,
-    invalid_zero_sentinel: bool,
-    invalid_negative_one_sentinel: bool,
-    mirror_fallback: bool,
-    mirror_coord_axis: int,
-    mirror_midline: float,
-    space_directions: np.ndarray | None,
-    space_origin: np.ndarray | None,
-) -> pd.DataFrame:
-    direct = project_neuron_nodes_to_flatmap(
-        nodes,
-        flatmap,
-        depth,
-        flatmap_style=flatmap_style,
-        coordinate_mode=coordinate_mode,
-        invalid_zero_sentinel=invalid_zero_sentinel,
-        invalid_negative_one_sentinel=invalid_negative_one_sentinel,
-        space_directions=space_directions,
-        space_origin=space_origin,
-    )
-
-    selected = direct.reset_index(drop=True)
-    lookup_mode = np.full(len(selected), "unmapped", dtype=object)
-    direct_valid = selected["valid"].to_numpy(dtype=bool)
-    lookup_mode[direct_valid] = "direct"
-
-    if mirror_fallback and (~direct_valid).any():
-        retry_positions = np.flatnonzero(~direct_valid)
-        retry_nodes = nodes.iloc[retry_positions].reset_index(drop=True)
-        mirrored_nodes = _mirror_chunk_coordinates(
-            retry_nodes,
-            mirror_coord_axis=mirror_coord_axis,
-            mirror_midline=mirror_midline,
-        )
-        mirrored = project_neuron_nodes_to_flatmap(
-            mirrored_nodes,
-            flatmap,
-            depth,
-            flatmap_style=flatmap_style,
-            coordinate_mode=coordinate_mode,
-            invalid_zero_sentinel=invalid_zero_sentinel,
-            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
-            space_directions=space_directions,
-            space_origin=space_origin,
-        ).reset_index(drop=True)
-
-        projection_columns = (
-            "x_flat",
-            "y_flat",
-            "depth_um",
-            "flatmap_valid",
-            "depth_valid",
-            "valid",
-            "invalid_reason",
-        )
-        selected.loc[retry_positions, projection_columns] = mirrored.loc[
-            :,
-            projection_columns,
-        ].to_numpy()
-        mirrored_valid = mirrored["valid"].to_numpy(dtype=bool)
-        lookup_mode[retry_positions[mirrored_valid]] = "mirrored"
-
-    selected.loc[:, "flatmap_lookup_mode"] = lookup_mode
-    return selected
-
-
-def _invalid_codes(projected: pd.DataFrame) -> np.ndarray:
+def _invalid_codes(projected) -> np.ndarray:
     valid = projected["valid"].to_numpy(dtype=bool)
     reasons = projected["invalid_reason"].fillna("").astype(str).to_numpy()
     codes = np.asarray(
@@ -320,7 +233,7 @@ def _invalid_codes(projected: pd.DataFrame) -> np.ndarray:
     return codes
 
 
-def _augmentation_arrays(projected: pd.DataFrame) -> list[tuple[str, pa.Array]]:
+def _augmentation_arrays(projected) -> list[tuple[str, pa.Array]]:
     return [
         (
             "x_flat",
@@ -362,7 +275,7 @@ def _augmentation_arrays(projected: pd.DataFrame) -> list[tuple[str, pa.Array]]:
 
 def _append_augmentation_columns(
     source_table: pa.Table,
-    projected: pd.DataFrame,
+    projected,
 ) -> pa.Table:
     existing_augmented = [
         name for name in FLATMAP_AUGMENTED_COLUMNS if name in source_table.column_names
@@ -457,14 +370,15 @@ def augment_neuron_parquet_with_flatmap(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
 
-    resolved_midline = (
-        DEFAULT_CCFV3_MIRROR_MIDLINE_UM
-        if mirror_midline is None
-        else float(mirror_midline)
-    )
     style = flatmap_style or flatmap_source.name
 
     volume_set = load_flatmap_volume_set(flatmap_source, depth_source)
+    resolved_midline = resolve_flatmap_mirror_midline(
+        coordinate_mode=coordinate_mode,
+        flatmap_shape=tuple(int(size) for size in volume_set.flatmap.shape[:3]),
+        mirror_coord_axis=mirror_coord_axis,
+        mirror_midline=mirror_midline,
+    )
     source_file = pq.ParquetFile(source_path)
     _require_source_columns(source_file.schema_arrow)
     total_rows = int(source_file.metadata.num_rows)
@@ -522,7 +436,7 @@ def augment_neuron_parquet_with_flatmap(
         for batch in batches:
             source_table = pa.Table.from_batches([batch])
             nodes = source_table.to_pandas()
-            projected = _project_chunk_with_mirror(
+            projected = project_neuron_nodes_to_flatmap(
                 nodes,
                 volume_set.flatmap,
                 volume_set.depth,

@@ -69,10 +69,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mirror-midline",
         type=float,
-        default=DEFAULT_CCFV3_MIRROR_MIDLINE_UM,
+        default=None,
         help=(
-            "Midline in microns for mirrored fallback "
-            f"(default: {DEFAULT_CCFV3_MIRROR_MIDLINE_UM:g})."
+            "Override the mirror midline. Defaults to "
+            f"{DEFAULT_CCFV3_MIRROR_MIDLINE_UM:g} microns in micron mode "
+            "or the lookup-grid center in voxel mode."
         ),
     )
     parser.add_argument(

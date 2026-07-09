@@ -776,6 +776,37 @@ class FlatmapCorrelationWorker(QObject):
             ],
         }
 
+    @staticmethod
+    def _lookup_mode_counts(projected_nodes) -> dict[str, int]:
+        if projected_nodes is None:
+            return {
+                "flatmap_direct_lookup_node_count": 0,
+                "flatmap_mirrored_lookup_node_count": 0,
+                "flatmap_unmapped_lookup_node_count": 0,
+            }
+        if "flatmap_lookup_mode" in projected_nodes.columns:
+            modes = (
+                projected_nodes["flatmap_lookup_mode"]
+                .fillna("")
+                .astype(str)
+                .to_numpy()
+            )
+        else:
+            valid = projected_nodes.get("valid")
+            if valid is None:
+                valid_mask = np.zeros(len(projected_nodes), dtype=bool)
+            else:
+                valid_mask = valid.fillna(False).astype(bool).to_numpy()
+            modes = np.where(valid_mask, "direct", "unmapped")
+        direct = int(np.count_nonzero(modes == "direct"))
+        mirrored = int(np.count_nonzero(modes == "mirrored"))
+        unmapped = int(np.count_nonzero(modes == "unmapped"))
+        return {
+            "flatmap_direct_lookup_node_count": direct,
+            "flatmap_mirrored_lookup_node_count": mirrored,
+            "flatmap_unmapped_lookup_node_count": unmapped,
+        }
+
     def run(self) -> None:
         """Execute the flatmap correlation pipeline."""
         try:
@@ -815,6 +846,7 @@ class FlatmapCorrelationWorker(QObject):
                 "flatmap_rendered_node_count": int(count_data.rendered_node_count),
                 "flatmap_occupied_voxel_count": int(len(count_data.voxel_ids)),
             }
+            extra_metadata.update(self._lookup_mode_counts(source.projected_nodes))
             extra_metadata.update(region_metadata)
             _attach_cluster_run_metadata(
                 result,

@@ -7,6 +7,9 @@ import pytest
 from napari_swc_viewer.flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
+    FLATMAP_LOOKUP_DIRECT,
+    FLATMAP_LOOKUP_MIRRORED,
+    FLATMAP_LOOKUP_UNMAPPED,
     build_projected_segments,
     coordinates_to_voxel_indices,
     project_and_build_segments,
@@ -95,6 +98,7 @@ def test_project_neuron_nodes_to_flatmap_preserves_metadata_for_valid_points() -
     assert row["depth_um"] == pytest.approx(103.0)
     assert row["region_acronym"] == "VISp"
     assert row["flatmap_style"] == "flatmap_both_shaped.nrrd"
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_DIRECT
 
 
 def test_project_neuron_nodes_to_flatmap_uses_nrrd_spatial_transform() -> None:
@@ -143,6 +147,110 @@ def test_project_neuron_nodes_to_flatmap_rejects_negative_depth_sentinel() -> No
     assert row["flatmap_valid"] is np.True_
     assert row["depth_valid"] is np.False_
     assert row["invalid_reason"] == "invalid_depth"
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_UNMAPPED
+
+
+def test_project_neuron_nodes_to_flatmap_keeps_zero_zero_valid_by_default() -> None:
+    flatmap, depth = _volumes()
+    flatmap[1, 0, 0] = (0.0, 0.0)
+
+    default_projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 10.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+    )
+    explicit_projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 10.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        invalid_zero_sentinel=True,
+    )
+
+    assert default_projected.iloc[0]["valid"] is np.True_
+    assert default_projected.iloc[0]["flatmap_lookup_mode"] == FLATMAP_LOOKUP_DIRECT
+    assert explicit_projected.iloc[0]["valid"] is np.False_
+    assert explicit_projected.iloc[0]["invalid_reason"] == "invalid_flatmap"
+
+
+def test_project_neuron_nodes_to_flatmap_mirrors_invalid_direct_depth() -> None:
+    flatmap, depth = _volumes()
+    depth[1, 0, 0] = -1.0
+
+    projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 10.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        mirror_fallback=True,
+        mirror_midline=15.0,
+    )
+
+    row = projected.iloc[0]
+    assert row["valid"] is np.True_
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED
+    assert row["z_um"] == pytest.approx(0.0)
+    assert row["voxel_k"] == 3
+    assert row["depth_um"] == pytest.approx(103.0)
+    assert row["invalid_reason"] == ""
+
+
+def test_project_neuron_nodes_to_flatmap_keeps_direct_reason_when_mirror_fails() -> None:
+    flatmap, depth = _volumes()
+    depth[1, 0, 0] = -1.0
+    depth[1, 0, 3] = -1.0
+
+    projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 10.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        mirror_fallback=True,
+        mirror_midline=15.0,
+    )
+
+    row = projected.iloc[0]
+    assert row["valid"] is np.False_
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_UNMAPPED
+    assert row["voxel_k"] == 0
+    assert row["depth_um"] == pytest.approx(-1.0)
+    assert row["invalid_reason"] == "invalid_depth"
+
+
+def test_project_neuron_nodes_to_flatmap_voxel_mode_mirrors_at_grid_center() -> None:
+    flatmap, depth = _volumes()
+    depth[1, 0, 0] = -1.0
+
+    projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 1.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        coordinate_mode=COORDINATE_MODE_VOXELS,
+        mirror_fallback=True,
+    )
+
+    row = projected.iloc[0]
+    assert row["valid"] is np.True_
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED
+    assert row["voxel_k"] == 3
+    assert row["depth_um"] == pytest.approx(103.0)
 
 
 def test_projection_classifies_out_of_bounds_missing_and_invalid_values() -> None:
@@ -199,6 +307,8 @@ def test_build_projected_segments_skips_only_invalid_edges() -> None:
     assert result.segments.target_node_ids == [4]
     assert result.summary.rendered_segments == 1
     assert result.summary.traces_with_partial_projection == 1
+    assert result.summary.direct_lookup_nodes == 3
+    assert result.summary.unmapped_lookup_nodes == 1
 
 
 def test_summarize_projection_counts_multiple_invalid_reasons() -> None:

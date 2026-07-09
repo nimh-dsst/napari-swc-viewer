@@ -7,6 +7,7 @@ import types
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from napari_swc_viewer.flatmap_labels import (
     FlatmapRegionLabelsResult,
@@ -733,6 +734,55 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
 
     assert calls == {"lookup": 1, "parquet": 0}
     assert "lookup NRRDs" in widget._status_label.text
+
+
+def test_project_from_lookup_files_uses_depth_mirror_fallback(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    nodes = pd.DataFrame(
+        {
+            "file_id": ["a.swc"],
+            "neuron_id": ["a"],
+            "subject": ["s"],
+            "node_id": [1],
+            "parent_id": [-1],
+            "type": [3],
+            "x": [1.0],
+            "y": [0.0],
+            "z": [0.0],
+            "region_id": [1],
+            "region_acronym": ["R1"],
+        }
+    )
+    _configure_projection_widget(widget, module, nodes)
+    widget._coordinate_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module.COORDINATE_MODE_VOXELS
+    )
+
+    grid = np.indices((4, 4, 4), dtype=float)
+    flatmap = np.stack((grid[0] + 0.25, grid[1] + 0.5), axis=-1).astype(
+        np.float32
+    )
+    depth = (grid[2] + 100.0).astype(np.float32)
+    depth[1, 0, 0] = -1.0
+    volume_set = types.SimpleNamespace(
+        flatmap=flatmap,
+        depth=depth,
+        flatmap_path=Path("flatmap.nrrd"),
+        depth_path=Path("depth.nrrd"),
+        space_directions=None,
+        space_origin=None,
+    )
+    monkeypatch.setattr(module, "load_flatmap_volume_set", lambda *_args: volume_set)
+
+    result, render_result, _lookup_stats = widget._project_from_lookup_files(nodes)
+
+    projected = result.projected_nodes
+    assert projected["flatmap_lookup_mode"].tolist() == ["mirrored"]
+    assert projected["voxel_k"].tolist() == [3]
+    assert projected["depth_um"].tolist() == pytest.approx([103.0])
+    assert result.summary.mirrored_lookup_nodes == 1
+    assert render_result.summary.rendered_nodes == 1
 
 
 def test_project_updates_progress_bar_and_restores_button(monkeypatch) -> None:
@@ -1528,6 +1578,7 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
             "valid": [True],
             "x_flat": [0.25],
             "y_flat": [0.5],
+            "flatmap_lookup_mode": ["mirrored"],
             "flatmap_valid": [True],
             "depth_valid": [True],
             "render_valid": [True],
@@ -1545,6 +1596,7 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
     assert exported["file_id"].tolist() == ["a.swc"]
     assert "depth_um" in exported.columns
     assert "coordinate_mode" in exported.columns
+    assert exported["flatmap_lookup_mode"].tolist() == ["mirrored"]
     assert "render_valid" in exported.columns
     assert exported["x_flat_bin"].tolist() == [10]
     assert "Exported flatmap projection" in widget._status_label.text

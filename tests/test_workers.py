@@ -883,6 +883,29 @@ def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
     assert metadata["flatmap_region_labeled_voxels"] == 2
 
 
+def test_flatmap_correlation_worker_counts_lookup_modes_for_metadata() -> None:
+    workers = _import_workers_module()
+
+    counts = workers.FlatmapCorrelationWorker._lookup_mode_counts(
+        pd.DataFrame(
+            {
+                "flatmap_lookup_mode": [
+                    "direct",
+                    "mirrored",
+                    "mirrored",
+                    "unmapped",
+                ]
+            }
+        )
+    )
+
+    assert counts == {
+        "flatmap_direct_lookup_node_count": 1,
+        "flatmap_mirrored_lookup_node_count": 2,
+        "flatmap_unmapped_lookup_node_count": 1,
+    }
+
+
 def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
     """Hierarchical soma clustering should record the chosen linkage for clustering and dendrograms."""
     workers = _import_workers_module()

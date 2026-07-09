@@ -12,6 +12,10 @@ COORDINATE_MODE_MICRONS = "microns"
 COORDINATE_MODE_VOXELS = "voxels"
 VALID_COORDINATE_MODES = {COORDINATE_MODE_MICRONS, COORDINATE_MODE_VOXELS}
 DEFAULT_CCF_RESOLUTION_UM = 10.0
+DEFAULT_CCFV3_MIRROR_MIDLINE_UM = 5695.0
+FLATMAP_LOOKUP_DIRECT = "direct"
+FLATMAP_LOOKUP_MIRRORED = "mirrored"
+FLATMAP_LOOKUP_UNMAPPED = "unmapped"
 
 REQUIRED_NODE_COLUMNS = ("file_id", "node_id", "parent_id", "type", "x", "y", "z")
 
@@ -39,6 +43,9 @@ class ProjectionSummary:
     rendered_segments: int
     total_traces: int
     traces_with_partial_projection: int
+    direct_lookup_nodes: int = 0
+    mirrored_lookup_nodes: int = 0
+    unmapped_lookup_nodes: int = 0
 
     def to_dict(self) -> dict[str, int]:
         """Return a JSON-safe dictionary."""
@@ -54,6 +61,9 @@ class ProjectionSummary:
             "traces_with_partial_projection": int(
                 self.traces_with_partial_projection
             ),
+            "direct_lookup_nodes": int(self.direct_lookup_nodes),
+            "mirrored_lookup_nodes": int(self.mirrored_lookup_nodes),
+            "unmapped_lookup_nodes": int(self.unmapped_lookup_nodes),
         }
 
 
@@ -140,7 +150,48 @@ def _copy_optional_column(
     return pd.Series([default] * len(nodes), index=range(len(nodes)))
 
 
-def project_neuron_nodes_to_flatmap(
+def resolve_flatmap_mirror_midline(
+    *,
+    coordinate_mode: str,
+    flatmap_shape: tuple[int, ...],
+    mirror_coord_axis: int = 2,
+    mirror_midline: float | None = None,
+) -> float:
+    """Return the mirror midline for a flatmap/depth lookup grid."""
+    if mirror_coord_axis not in (0, 1, 2):
+        raise ValueError("mirror_coord_axis must be 0, 1, or 2.")
+    if coordinate_mode not in VALID_COORDINATE_MODES:
+        raise ValueError(
+            f"coordinate_mode must be one of {sorted(VALID_COORDINATE_MODES)}; "
+            f"got {coordinate_mode!r}."
+        )
+    if mirror_midline is not None:
+        return float(mirror_midline)
+    if coordinate_mode == COORDINATE_MODE_VOXELS:
+        if len(flatmap_shape) < 3:
+            raise ValueError(
+                f"flatmap_shape must have at least 3 axes; got {flatmap_shape}."
+            )
+        return (float(flatmap_shape[mirror_coord_axis]) - 1.0) / 2.0
+    return DEFAULT_CCFV3_MIRROR_MIDLINE_UM
+
+
+def _mirror_node_coordinates(
+    nodes: pd.DataFrame,
+    *,
+    mirror_coord_axis: int,
+    mirror_midline: float,
+) -> pd.DataFrame:
+    mirrored = nodes.copy()
+    coord_column = ("x", "y", "z")[mirror_coord_axis]
+    values = pd.to_numeric(mirrored[coord_column], errors="coerce").to_numpy(
+        dtype=float
+    )
+    mirrored.loc[:, coord_column] = (2.0 * float(mirror_midline)) - values
+    return mirrored
+
+
+def _project_neuron_nodes_to_flatmap_direct(
     nodes: pd.DataFrame,
     flatmap_volume: np.ndarray,
     depth_volume: np.ndarray,
@@ -153,12 +204,15 @@ def project_neuron_nodes_to_flatmap(
     space_directions: np.ndarray | None = None,
     space_origin: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Project neuron nodes into flatmap coordinates with validity metadata."""
+    """Project neuron nodes directly into flatmap coordinates."""
     _require_columns(nodes, REQUIRED_NODE_COLUMNS)
     flatmap = np.asarray(flatmap_volume)
     depth = np.asarray(depth_volume)
     if flatmap.ndim != 4 or flatmap.shape[-1] != 2:
-        raise ValueError(f"flatmap_volume must have shape (nx, ny, nz, 2); got {flatmap.shape}.")
+        raise ValueError(
+            "flatmap_volume must have shape (nx, ny, nz, 2); "
+            f"got {flatmap.shape}."
+        )
     if depth.shape != flatmap.shape[:3]:
         raise ValueError(
             "depth_volume shape must match the flatmap lookup grid; "
@@ -236,6 +290,96 @@ def project_neuron_nodes_to_flatmap(
     return out
 
 
+def project_neuron_nodes_to_flatmap(
+    nodes: pd.DataFrame,
+    flatmap_volume: np.ndarray,
+    depth_volume: np.ndarray,
+    *,
+    flatmap_style: str = "",
+    coordinate_mode: str = COORDINATE_MODE_MICRONS,
+    invalid_zero_sentinel: bool = False,
+    invalid_negative_one_sentinel: bool = True,
+    resolution_um: float = DEFAULT_CCF_RESOLUTION_UM,
+    space_directions: np.ndarray | None = None,
+    space_origin: np.ndarray | None = None,
+    mirror_fallback: bool = False,
+    mirror_coord_axis: int = 2,
+    mirror_midline: float | None = None,
+) -> pd.DataFrame:
+    """Project neuron nodes into flatmap coordinates with validity metadata."""
+    direct = _project_neuron_nodes_to_flatmap_direct(
+        nodes,
+        flatmap_volume,
+        depth_volume,
+        flatmap_style=flatmap_style,
+        coordinate_mode=coordinate_mode,
+        invalid_zero_sentinel=invalid_zero_sentinel,
+        invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+        resolution_um=resolution_um,
+        space_directions=space_directions,
+        space_origin=space_origin,
+    ).reset_index(drop=True)
+
+    selected = direct.copy()
+    lookup_mode = np.full(len(selected), FLATMAP_LOOKUP_UNMAPPED, dtype=object)
+    direct_valid = selected["valid"].to_numpy(dtype=bool)
+    lookup_mode[direct_valid] = FLATMAP_LOOKUP_DIRECT
+
+    if mirror_fallback and (~direct_valid).any():
+        flatmap = np.asarray(flatmap_volume)
+        resolved_midline = resolve_flatmap_mirror_midline(
+            coordinate_mode=coordinate_mode,
+            flatmap_shape=tuple(int(size) for size in flatmap.shape[:3]),
+            mirror_coord_axis=mirror_coord_axis,
+            mirror_midline=mirror_midline,
+        )
+        retry_positions = np.flatnonzero(~direct_valid)
+        retry_nodes = nodes.reset_index(drop=True).iloc[retry_positions].reset_index(
+            drop=True
+        )
+        mirrored_nodes = _mirror_node_coordinates(
+            retry_nodes,
+            mirror_coord_axis=mirror_coord_axis,
+            mirror_midline=resolved_midline,
+        )
+        mirrored = _project_neuron_nodes_to_flatmap_direct(
+            mirrored_nodes,
+            flatmap_volume,
+            depth_volume,
+            flatmap_style=flatmap_style,
+            coordinate_mode=coordinate_mode,
+            invalid_zero_sentinel=invalid_zero_sentinel,
+            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+            resolution_um=resolution_um,
+            space_directions=space_directions,
+            space_origin=space_origin,
+        ).reset_index(drop=True)
+
+        mirrored_valid = mirrored["valid"].to_numpy(dtype=bool)
+        if mirrored_valid.any():
+            mirrored_positions = retry_positions[mirrored_valid]
+            projection_columns = (
+                "voxel_i",
+                "voxel_j",
+                "voxel_k",
+                "x_flat",
+                "y_flat",
+                "depth_um",
+                "flatmap_valid",
+                "depth_valid",
+                "valid",
+                "invalid_reason",
+            )
+            selected.loc[mirrored_positions, projection_columns] = mirrored.loc[
+                mirrored_valid,
+                projection_columns,
+            ].to_numpy()
+            lookup_mode[mirrored_positions] = FLATMAP_LOOKUP_MIRRORED
+
+    selected.loc[:, "flatmap_lookup_mode"] = lookup_mode
+    return selected
+
+
 def build_projected_segments(projected_nodes: pd.DataFrame) -> ProjectedSegments:
     """Build 2D parent-child line segments where both endpoints are valid."""
     _require_columns(
@@ -304,6 +448,17 @@ def summarize_projection(
 
     valid = projected_nodes["valid"].astype(bool)
     reasons = projected_nodes["invalid_reason"].astype(str)
+    if "flatmap_lookup_mode" in projected_nodes.columns:
+        lookup_modes = projected_nodes["flatmap_lookup_mode"].fillna("").astype(str)
+    else:
+        lookup_modes = pd.Series(
+            np.where(
+                valid.to_numpy(dtype=bool),
+                FLATMAP_LOOKUP_DIRECT,
+                FLATMAP_LOOKUP_UNMAPPED,
+            ),
+            index=projected_nodes.index,
+        )
     partial_traces = 0
     total_traces = 0
     for _file_id, group in projected_nodes.groupby("file_id", sort=False):
@@ -322,6 +477,9 @@ def summarize_projection(
         rendered_segments=int(len(segments.data)),
         total_traces=int(total_traces),
         traces_with_partial_projection=int(partial_traces),
+        direct_lookup_nodes=int((lookup_modes == FLATMAP_LOOKUP_DIRECT).sum()),
+        mirrored_lookup_nodes=int((lookup_modes == FLATMAP_LOOKUP_MIRRORED).sum()),
+        unmapped_lookup_nodes=int((lookup_modes == FLATMAP_LOOKUP_UNMAPPED).sum()),
     )
 
 
@@ -337,6 +495,9 @@ def project_and_build_segments(
     resolution_um: float = DEFAULT_CCF_RESOLUTION_UM,
     space_directions: np.ndarray | None = None,
     space_origin: np.ndarray | None = None,
+    mirror_fallback: bool = False,
+    mirror_coord_axis: int = 2,
+    mirror_midline: float | None = None,
 ) -> FlatmapProjectionResult:
     """Project nodes, build valid segments, and summarize the result."""
     projected = project_neuron_nodes_to_flatmap(
@@ -350,6 +511,9 @@ def project_and_build_segments(
         resolution_um=resolution_um,
         space_directions=space_directions,
         space_origin=space_origin,
+        mirror_fallback=mirror_fallback,
+        mirror_coord_axis=mirror_coord_axis,
+        mirror_midline=mirror_midline,
     )
     segments = build_projected_segments(projected)
     summary = summarize_projection(projected, segments)
@@ -365,6 +529,10 @@ def format_projection_summary(summary: ProjectionSummary) -> str:
         f"Out of bounds: {summary.out_of_bounds_nodes:,}\n"
         f"Invalid flatmap/depth: "
         f"{summary.invalid_flatmap_nodes:,}/{summary.invalid_depth_nodes:,}\n"
+        f"Lookup direct/mirrored/unmapped: "
+        f"{summary.direct_lookup_nodes:,}/"
+        f"{summary.mirrored_lookup_nodes:,}/"
+        f"{summary.unmapped_lookup_nodes:,}\n"
         f"Missing input: {summary.missing_input_nodes:,}\n"
         f"Partial traces: {summary.traces_with_partial_projection:,} "
         f"of {summary.total_traces:,}"

@@ -623,6 +623,7 @@ class FlatmapProjectionWidget(QWidget):
             resolution_um=DEFAULT_CCF_RESOLUTION_UM,
             space_directions=volume_set.space_directions,
             space_origin=volume_set.space_origin,
+            mirror_fallback=True,
         )
         self._emit_projection_progress(
             progress_callback,
@@ -797,6 +798,19 @@ class FlatmapProjectionWidget(QWidget):
             depth_valid=depth_valid,
             valid=valid,
         )
+        if "flatmap_lookup_mode" in source.columns:
+            lookup_mode = source["flatmap_lookup_mode"].fillna("").astype(str)
+            lookup_mode = lookup_mode.reset_index(drop=True)
+            lookup_mode = lookup_mode.where(
+                lookup_mode.isin(["direct", "mirrored", "unmapped"]),
+                np.where(valid, "direct", "unmapped"),
+            )
+        else:
+            lookup_mode = pd.Series(
+                np.where(valid, "direct", "unmapped"),
+                index=range(len(source)),
+            )
+
         projected = pd.DataFrame(
             {
                 "file_id": source["file_id"].reset_index(drop=True),
@@ -826,12 +840,9 @@ class FlatmapProjectionWidget(QWidget):
                 ),
                 "flatmap_style": "precomputed_parquet",
                 "coordinate_mode": "parquet_columns",
+                "flatmap_lookup_mode": lookup_mode,
             }
         )
-        if "flatmap_lookup_mode" in source.columns:
-            projected.loc[:, "flatmap_lookup_mode"] = source[
-                "flatmap_lookup_mode"
-            ].reset_index(drop=True)
 
         segments = build_projected_segments(projected)
         summary = summarize_projection(projected, segments)
@@ -1536,7 +1547,11 @@ class FlatmapProjectionWidget(QWidget):
             f"of {projection_summary.total_traces:,}\n"
             f"Invalid flatmap/depth: "
             f"{projection_summary.invalid_flatmap_nodes:,}/"
-            f"{projection_summary.invalid_depth_nodes:,}"
+            f"{projection_summary.invalid_depth_nodes:,}\n"
+            f"Lookup direct/mirrored/unmapped: "
+            f"{projection_summary.direct_lookup_nodes:,}/"
+            f"{projection_summary.mirrored_lookup_nodes:,}/"
+            f"{projection_summary.unmapped_lookup_nodes:,}"
         )
 
     def _create_or_update_render_layer(

@@ -46,6 +46,25 @@ def test_build_flatmap_count_matrix_uses_rendered_binned_nodes() -> None:
     )
 
 
+def test_build_flatmap_count_matrix_includes_mirrored_rendered_nodes() -> None:
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc", "c.swc"],
+            "flatmap_lookup_mode": ["mirrored", "direct", "unmapped"],
+            "render_valid": [True, True, False],
+            "depth_bin": [0, 1, 1],
+            "y_flat_bin": [0, 1, 1],
+            "x_flat_bin": [0, 1, 0],
+        }
+    )
+
+    result = build_flatmap_count_matrix(_source(projected))
+
+    assert result.neuron_ids == ["a.swc", "b.swc"]
+    assert result.unassigned_neuron_ids == ["c.swc"]
+    assert result.rendered_node_count == 2
+
+
 def test_build_flatmap_count_matrix_applies_region_mask() -> None:
     projected = pd.DataFrame(
         {

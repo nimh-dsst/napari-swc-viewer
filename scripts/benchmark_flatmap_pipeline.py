@@ -50,6 +50,7 @@ from napari_swc_viewer.flatmap_loader import load_flatmap_volume_set
 from napari_swc_viewer.flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
+    DEFAULT_CCFV3_MIRROR_MIDLINE_UM,
     DEFAULT_CCF_RESOLUTION_UM,
     FlatmapProjectionResult,
     build_projected_segments,
@@ -383,6 +384,28 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="CCF voxel resolution used when coordinate mode is microns.",
     )
     parser.add_argument(
+        "--no-mirror-fallback",
+        action="store_true",
+        help="Disable opposite-hemisphere retry for invalid direct lookup rows.",
+    )
+    parser.add_argument(
+        "--mirror-axis",
+        type=int,
+        choices=(0, 1, 2),
+        default=2,
+        help="Coordinate axis mirrored across the CCFv3 midline (default: 2).",
+    )
+    parser.add_argument(
+        "--mirror-midline",
+        type=float,
+        default=None,
+        help=(
+            "Override the mirror midline. Defaults to "
+            f"{DEFAULT_CCFV3_MIRROR_MIDLINE_UM:g} microns in micron mode "
+            "or the lookup-grid center in voxel mode."
+        ),
+    )
+    parser.add_argument(
         "--treat-zero-flatmap-invalid",
         action="store_true",
         help="Treat flatmap lookup coordinates (0, 0) as invalid sentinels.",
@@ -493,6 +516,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 resolution_um=args.resolution_um,
                 space_directions=volume_set.space_directions,
                 space_origin=volume_set.space_origin,
+                mirror_fallback=not args.no_mirror_fallback,
+                mirror_coord_axis=args.mirror_axis,
+                mirror_midline=args.mirror_midline,
             ),
             details=_dataframe_details,
         )
@@ -555,6 +581,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "depth_bin_um": float(args.depth_bin_um),
                 "coordinate_mode": args.coordinate_mode,
                 "resolution_um": float(args.resolution_um),
+                "mirror_fallback": bool(not args.no_mirror_fallback),
+                "mirror_axis": int(args.mirror_axis),
+                "mirror_midline": (
+                    None if args.mirror_midline is None else float(args.mirror_midline)
+                ),
                 "use_npy_cache": bool(not args.no_npy_cache),
                 "npy_cache_dir": (
                     None if args.npy_cache_dir is None else str(args.npy_cache_dir)
