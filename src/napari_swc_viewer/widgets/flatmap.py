@@ -103,10 +103,13 @@ class FlatmapProjectionWidget(QWidget):
         atlas_provider: Callable[[], object | None] | None = None,
         selected_region_ids_provider: Callable[[], list[int]] | None = None,
         selected_region_acronyms_provider: Callable[[], list[str]] | None = None,
+        display_viewer_provider: Callable[..., object | None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._viewer = viewer
+        self._display_viewer_provider = display_viewer_provider
+        self._last_display_viewer = None
         self._database_provider = database_provider
         self._selected_file_ids_provider = selected_file_ids_provider
         self._table_file_ids_provider = table_file_ids_provider
@@ -142,6 +145,33 @@ class FlatmapProjectionWidget(QWidget):
         self._lookup_stats_cache: FlatmapLookupStats | None = None
 
         self._setup_ui()
+
+    def _resolve_display_viewer(self, *, create: bool):
+        """Return the viewer used for flatmap display layers."""
+        provider = getattr(self, "_display_viewer_provider", None)
+        if callable(provider):
+            try:
+                viewer = provider(create=create)
+            except TypeError:
+                if not create:
+                    return getattr(self, "_last_display_viewer", None)
+                viewer = provider()
+            if viewer is not None:
+                self._last_display_viewer = viewer
+            return viewer
+        return getattr(self, "_viewer", None)
+
+    def _display_viewer(self):
+        return self._resolve_display_viewer(create=True)
+
+    def _current_display_viewer(self):
+        return self._resolve_display_viewer(create=False)
+
+    def _display_layers(self, *, create: bool = True):
+        viewer = self._resolve_display_viewer(create=create)
+        if viewer is None:
+            return None
+        return getattr(viewer, "layers", None)
 
     def _setup_ui(self) -> None:
         """Build the tab UI."""
@@ -1212,8 +1242,14 @@ class FlatmapProjectionWidget(QWidget):
         *,
         atlas=None,
     ):
-        layer = self._region_labels_layer or self._find_layer_by_name(
-            _REGION_LABELS_LAYER_NAME
+        viewer = self._display_viewer()
+        layer = self._region_labels_layer
+        if not self._layer_is_in_viewer(layer, viewer=viewer):
+            self._region_labels_layer = None
+            layer = None
+        layer = layer or self._find_layer_by_name(
+            _REGION_LABELS_LAYER_NAME,
+            viewer=viewer,
         )
         colormap = self._region_label_colormap(atlas, result.represented_region_ids)
         kwargs: dict[str, object] = {
@@ -1226,7 +1262,7 @@ class FlatmapProjectionWidget(QWidget):
             kwargs["colormap"] = colormap
 
         if layer is None:
-            layer = self._viewer.add_labels(result.labels, **kwargs)
+            layer = viewer.add_labels(result.labels, **kwargs)
         else:
             blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
             if callable(blocker):
@@ -1298,10 +1334,13 @@ class FlatmapProjectionWidget(QWidget):
 
     def _clear_region_labels(self) -> None:
         """Remove the flatmap region labels layer if present."""
-        layer = self._region_labels_layer or self._find_layer_by_name(
-            _REGION_LABELS_LAYER_NAME
-        )
-        layers = getattr(self._viewer, "layers", None)
+        layers = self._display_layers(create=False)
+        layer = self._region_labels_layer
+        if not self._layer_is_in_viewer(layer):
+            layer = self._find_layer_by_name(
+                _REGION_LABELS_LAYER_NAME,
+                create=False,
+            )
         if layer is not None and layers is not None:
             try:
                 layers.remove(layer)
@@ -1359,15 +1398,24 @@ class FlatmapProjectionWidget(QWidget):
             )
         )
 
-    def _find_layer_by_name(self, name: str):
-        layers = getattr(self._viewer, "layers", ())
+    def _find_layer_by_name(self, name: str, *, viewer=None, create: bool = True):
+        if viewer is None:
+            layers = self._display_layers(create=create)
+        else:
+            layers = getattr(viewer, "layers", None)
+        if layers is None:
+            return None
         for layer in layers:
             if getattr(layer, "name", None) == name:
                 return layer
         return None
 
-    def _layer_is_in_viewer(self, layer) -> bool:
-        layers = getattr(self._viewer, "layers", None)
+    def _layer_is_in_viewer(self, layer, *, viewer=None) -> bool:
+        layers = (
+            getattr(viewer, "layers", None)
+            if viewer is not None
+            else self._display_layers(create=False)
+        )
         if layer is None or layers is None:
             return False
         return any(existing is layer for existing in layers)
@@ -1380,7 +1428,7 @@ class FlatmapProjectionWidget(QWidget):
             if metadata.get("flatmap_render_mode") == _RENDER_HEATMAP:
                 return True
 
-        layers = getattr(self._viewer, "layers", ())
+        layers = self._display_layers(create=False) or ()
         for candidate in layers:
             name = getattr(candidate, "name", None)
             metadata = getattr(candidate, "metadata", {}) or {}
@@ -1400,8 +1448,13 @@ class FlatmapProjectionWidget(QWidget):
             return None
         return layer
 
-    def _remove_projection_layer(self, *, except_name: str | None = None) -> None:
-        layers = getattr(self._viewer, "layers", None)
+    def _remove_projection_layer(
+        self,
+        *,
+        except_name: str | None = None,
+        create: bool = True,
+    ) -> None:
+        layers = self._display_layers(create=create)
         if layers is None:
             self._projection_layer = None
             return
@@ -1497,7 +1550,7 @@ class FlatmapProjectionWidget(QWidget):
     ):
         """Create or update the napari depth-aware flatmap render layer."""
         if render_result.summary.rendered_nodes == 0:
-            self._remove_projection_layer()
+            self._remove_projection_layer(create=False)
             return None
 
         heatmap_color_mode = (
@@ -1563,7 +1616,7 @@ class FlatmapProjectionWidget(QWidget):
         metadata = dict(metadata)
         metadata["flatmap_heatmap_contrast_limits"] = contrast_limits
         if layer is None:
-            layer = self._viewer.add_image(
+            layer = self._display_viewer().add_image(
                 volume,
                 name=_HEATMAP_LAYER_NAME,
                 colormap="hot",
@@ -1720,7 +1773,7 @@ class FlatmapProjectionWidget(QWidget):
             group,
             heatmap_color_mode=heatmap_color_mode,
         )
-        layer = self._viewer.add_image(
+        layer = self._display_viewer().add_image(
             volume,
             name=layer_name,
             colormap=self._solid_tint_colormap(color, layer_name),
@@ -1986,7 +2039,7 @@ class FlatmapProjectionWidget(QWidget):
         points = render_result.points
         colors = self._colors_for_file_ids(render_result.point_file_ids)
         if layer is None:
-            return self._viewer.add_points(
+            return self._display_viewer().add_points(
                 points,
                 name=_POINTS_LAYER_NAME,
                 size=2.0,
@@ -2020,7 +2073,8 @@ class FlatmapProjectionWidget(QWidget):
         except Exception:
             pass
 
-        dims = getattr(self._viewer, "dims", None)
+        viewer = self._display_viewer()
+        dims = getattr(viewer, "dims", None)
         if dims is not None and getattr(dims, "ndisplay", None) != 3:
             try:
                 dims.ndisplay = 3
@@ -2028,7 +2082,7 @@ class FlatmapProjectionWidget(QWidget):
                 logger.debug("Failed to switch viewer to 3D display.", exc_info=True)
         self._reslice_layer_for_current_dims(layer)
 
-        layers = getattr(self._viewer, "layers", None)
+        layers = getattr(viewer, "layers", None)
         selection = getattr(layers, "selection", None)
         if selection is not None:
             try:
@@ -2056,9 +2110,9 @@ class FlatmapProjectionWidget(QWidget):
         center = tuple(((lower + upper) / 2.0).tolist())
         span = float(np.max(upper - lower))
 
-        camera = getattr(self._viewer, "camera", None)
+        camera = getattr(viewer, "camera", None)
         if camera is None:
-            reset_view = getattr(self._viewer, "reset_view", None)
+            reset_view = getattr(viewer, "reset_view", None)
             if callable(reset_view):
                 reset_view()
             return
@@ -2075,7 +2129,8 @@ class FlatmapProjectionWidget(QWidget):
                 logger.debug("Failed to zoom camera to flatmap layer.", exc_info=True)
 
     def _reslice_layer_for_current_dims(self, layer) -> None:
-        dims = getattr(self._viewer, "dims", None)
+        viewer = self._current_display_viewer()
+        dims = getattr(viewer, "dims", None)
         if dims is None:
             return
         slice_dims = getattr(layer, "_slice_dims", None)

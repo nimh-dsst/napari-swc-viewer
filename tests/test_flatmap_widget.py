@@ -914,6 +914,40 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     assert widget._viewer.camera.zoom == 300.0
 
 
+def test_flatmap_render_layers_use_display_viewer_provider(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    main_viewer = widget._viewer
+    display_viewer = _DummyViewer()
+    widget._display_viewer_provider = (
+        lambda create=True: display_viewer if create else display_viewer
+    )
+    projected = pd.DataFrame({"file_id": ["a.swc"]})
+    volume = np.zeros((1, 4, 4), dtype=np.float32)
+    volume[0, 1, 2] = 1.0
+    render_result = module.FlatmapRenderResult(
+        projected_nodes=projected,
+        volume=volume,
+        points=np.asarray([[0.0, 1.0, 2.0]]),
+        point_file_ids=["a.swc"],
+        summary=_simple_render_summary(module),
+    )
+
+    layer = widget._create_or_update_render_layer(
+        render_result,
+        _simple_projection_summary(module),
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+
+    assert main_viewer.layers == []
+    assert display_viewer.layers == [layer]
+    assert display_viewer.dims.ndisplay == 3
+    assert layer.slice_dims_calls[-1] == (display_viewer.dims, True)
+    assert display_viewer.camera.center == (0.0, 1.0, 2.0)
+
+
 def _simple_projection_summary(module, total_nodes: int = 1):
     return module.ProjectionSummary(total_nodes, total_nodes, 0, 0, 0, 0, 0, 1, 0)
 
@@ -1129,6 +1163,53 @@ def test_deleted_heatmap_layer_is_recreated_from_stale_cache(monkeypatch) -> Non
     np.testing.assert_array_equal(second.data, second_render.volume)
 
 
+def test_heatmap_layer_is_recreated_when_display_viewer_changes(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    first_viewer = _DummyViewer()
+    active_viewer = first_viewer
+    widget._display_viewer_provider = lambda create=True: active_viewer
+    summary = _simple_projection_summary(module)
+    first_render = module.FlatmapRenderResult(
+        projected_nodes=pd.DataFrame({"file_id": ["a.swc"]}),
+        volume=np.ones((1, 4, 4), dtype=np.float32),
+        points=np.asarray([[0.0, 0.0, 0.0]]),
+        point_file_ids=["a.swc"],
+        summary=_simple_render_summary(module),
+    )
+    second_render = module.FlatmapRenderResult(
+        projected_nodes=pd.DataFrame({"file_id": ["a.swc"]}),
+        volume=np.full((1, 4, 4), 2.0, dtype=np.float32),
+        points=np.asarray([[0.0, 1.0, 1.0]]),
+        point_file_ids=["a.swc"],
+        summary=_simple_render_summary(module),
+    )
+
+    first = widget._create_or_update_render_layer(
+        first_render,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+    second_viewer = _DummyViewer()
+    active_viewer = second_viewer
+
+    second = widget._create_or_update_render_layer(
+        second_render,
+        summary,
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode="heatmap",
+    )
+
+    assert second is not first
+    assert widget._projection_layer is second
+    assert first_viewer.layers == [first]
+    assert second_viewer.layers == [second]
+    np.testing.assert_array_equal(second.data, second_render.volume)
+
+
 def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -1181,6 +1262,48 @@ def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None
     np.testing.assert_array_equal(layer.data, second.labels)
     assert layer._napari_swc_flatmap_region_labels_result is second
     assert layer.refresh_count == 1
+
+
+def test_region_labels_layer_uses_display_viewer_provider(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    main_viewer = widget._viewer
+    display_viewer = _DummyViewer()
+    widget._display_viewer_provider = (
+        lambda create=True: display_viewer if create else display_viewer
+    )
+    summary = FlatmapRegionLabelsSummary(
+        input_voxels=4,
+        selected_region_count=1,
+        selected_source_voxels=2,
+        valid_source_voxels=2,
+        labeled_voxels=1,
+        collision_voxels=0,
+        xy_bins=2,
+        depth_bins=1,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+    )
+    result = FlatmapRegionLabelsResult(
+        labels=np.asarray([[[0, 7], [0, 0]]], dtype=np.int32),
+        summary=summary,
+        selected_region_ids=[7],
+        represented_region_ids=[7],
+    )
+
+    layer = widget._create_or_update_region_labels_layer(
+        result,
+        {"projection_kind": "flatmap_region_labels"},
+    )
+
+    assert main_viewer.layers == []
+    assert display_viewer.layers == [layer]
+    assert layer.name == "Flatmap Region Labels"
 
 
 def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> None:

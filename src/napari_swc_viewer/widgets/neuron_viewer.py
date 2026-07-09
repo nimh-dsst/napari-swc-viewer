@@ -559,6 +559,7 @@ class NeuronViewerWidget(QWidget):
                 int,
                 tuple[object, object, object],
             ] = {}
+            self._flatmap_viewer = None
 
             with startup_timing(
                 logger,
@@ -642,6 +643,63 @@ class NeuronViewerWidget(QWidget):
             ):
                 QTimer.singleShot(0, self._start_cached_template_autoload)
 
+    def _get_or_create_flatmap_viewer(self, *, create: bool = True):
+        """Return the detached napari viewer used for flatmap display layers."""
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if self._flatmap_viewer_is_open(viewer):
+            return viewer
+
+        self._flatmap_viewer = None
+        if not create:
+            return None
+
+        import napari
+
+        viewer = napari.Viewer(title="SWC Viewer Flatmap")
+        try:
+            viewer.dims.ndisplay = 3
+        except Exception:
+            logger.debug(
+                "Failed to initialize detached flatmap viewer in 3D mode.",
+                exc_info=True,
+            )
+
+        self._flatmap_viewer = viewer
+        self._connect_flatmap_viewer_destroyed(viewer)
+        return viewer
+
+    @staticmethod
+    def _flatmap_viewer_is_open(viewer) -> bool:
+        if viewer is None:
+            return False
+
+        window = getattr(viewer, "window", None)
+        qt_window = getattr(window, "_qt_window", None)
+        if qt_window is None:
+            return window is not None
+
+        is_visible = getattr(qt_window, "isVisible", None)
+        if callable(is_visible):
+            try:
+                return bool(is_visible())
+            except RuntimeError:
+                return False
+        return True
+
+    def _connect_flatmap_viewer_destroyed(self, viewer) -> None:
+        window = getattr(viewer, "window", None)
+        qt_window = getattr(window, "_qt_window", None)
+        destroyed = getattr(qt_window, "destroyed", None)
+        connect = getattr(destroyed, "connect", None)
+        if not callable(connect):
+            return
+
+        def clear_reference(*_args) -> None:
+            if getattr(self, "_flatmap_viewer", None) is viewer:
+                self._flatmap_viewer = None
+
+        connect(clear_reference)
+
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
         layout = QVBoxLayout(self)
@@ -682,6 +740,7 @@ class NeuronViewerWidget(QWidget):
                 atlas_provider=lambda: self._atlas,
                 selected_region_ids_provider=self._active_flatmap_region_ids,
                 selected_region_acronyms_provider=self._active_flatmap_region_acronyms,
+                display_viewer_provider=self._get_or_create_flatmap_viewer,
             )
             tabs.addTab(self._flatmap_tab, "Flatmap")
 
