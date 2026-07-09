@@ -260,7 +260,7 @@ class FlatmapProjectionWidget(QWidget):
         self._zero_sentinel_cb = QCheckBox("Treat flatmap (0, 0) as invalid")
         options_layout.addWidget(self._zero_sentinel_cb)
         self._exclude_depth_minus_one_cb = QCheckBox("Exclude depth -1 nodes")
-        self._exclude_depth_minus_one_cb.setChecked(False)
+        self._exclude_depth_minus_one_cb.setChecked(True)
         options_layout.addWidget(self._exclude_depth_minus_one_cb)
         layout.addWidget(options_group)
 
