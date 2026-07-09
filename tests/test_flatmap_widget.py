@@ -49,6 +49,7 @@ def _load_flatmap_widget_module(monkeypatch):
         "QGroupBox",
         "QHBoxLayout",
         "QLabel",
+        "QProgressBar",
         "QPushButton",
         "QScrollArea",
         "QSpinBox",
@@ -112,6 +113,22 @@ class _DummyButton:
 
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
+
+
+class _DummyProgressBar:
+    def __init__(self) -> None:
+        self.visible = False
+        self.range = (0, 1)
+        self.value = 0
+
+    def setVisible(self, visible: bool) -> None:
+        self.visible = bool(visible)
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        self.range = (int(minimum), int(maximum))
+
+    def setValue(self, value: int) -> None:
+        self.value = int(value)
 
 
 class _DummyCombo:
@@ -248,6 +265,8 @@ def _widget(module):
     widget._depth_path = Path("depth.nrrd")
     widget._status_label = _DummyLabel()
     widget._region_labels_status_label = _DummyLabel()
+    widget._project_btn = _DummyButton()
+    widget._projection_progress_bar = _DummyProgressBar()
     widget._region_label_atlas_combo = _DummyCombo("allen_mouse_10um")
     widget._region_labels_btn = _DummyButton()
     widget._clear_region_labels_btn = _DummyButton()
@@ -693,7 +712,7 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
     _configure_projection_widget(widget, module, _augmented_nodes())
     calls = {"lookup": 0, "parquet": 0}
 
-    def fake_lookup(self, nodes):
+    def fake_lookup(self, nodes, **_kwargs):
         calls["lookup"] += 1
         result = types.SimpleNamespace(projected_nodes=nodes, summary=object())
         render = types.SimpleNamespace(
@@ -702,7 +721,7 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
         )
         return result, render, None
 
-    def fake_parquet(self, _nodes):
+    def fake_parquet(self, _nodes, **_kwargs):
         calls["parquet"] += 1
         raise AssertionError("Parquet branch should not run when both NRRDs are set")
 
@@ -714,6 +733,34 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
 
     assert calls == {"lookup": 1, "parquet": 0}
     assert "lookup NRRDs" in widget._status_label.text
+
+
+def test_project_updates_progress_bar_and_restores_button(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._flatmap_path = None
+    widget._depth_path = None
+    _configure_projection_widget(widget, module, _augmented_nodes())
+    progress_events = []
+    original_set_progress = widget._set_projection_progress
+
+    def record_progress(message: str, current: int, total: int) -> None:
+        progress_events.append((message, current, total))
+        original_set_progress(message, current, total)
+
+    widget._set_projection_progress = record_progress
+    widget._apply_projection_result = lambda *_args, **_kwargs: None
+
+    widget._project()
+
+    assert progress_events[0] == ("Querying neuron rows...", 0, 4)
+    assert ("Reading precomputed flatmap columns...", 1, 4) in progress_events
+    assert ("Building flatmap render data...", 2, 4) in progress_events
+    assert progress_events[-1] == ("Done", 4, 4)
+    assert widget._project_btn.enabled is True
+    assert widget._projection_progress_bar.visible is False
+    assert widget._projection_progress_bar.range == (0, 1)
+    assert widget._projection_progress_bar.value == 0
 
 
 def test_latest_flatmap_correlation_source_requires_heatmap_render(monkeypatch) -> None:

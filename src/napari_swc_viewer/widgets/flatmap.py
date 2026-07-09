@@ -17,6 +17,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -276,6 +277,12 @@ class FlatmapProjectionWidget(QWidget):
         actions_row.addWidget(self._augment_parquet_btn)
         layout.addLayout(actions_row)
 
+        self._projection_progress_bar = QProgressBar()
+        self._projection_progress_bar.setRange(0, 1)
+        self._projection_progress_bar.setValue(0)
+        self._projection_progress_bar.setVisible(False)
+        layout.addWidget(self._projection_progress_bar)
+
         labels_group = QGroupBox("Region Labels")
         labels_layout = QVBoxLayout(labels_group)
         atlas_row = QHBoxLayout()
@@ -474,12 +481,23 @@ class FlatmapProjectionWidget(QWidget):
 
     def _project(self) -> None:
         """Run projection from the current UI state and render the layer."""
+        use_lookup_files = self._lookup_files_ready()
+        total_steps = 6 if use_lookup_files else 4
+        self._set_projection_controls_enabled(False)
+        self._set_projection_progress(
+            "Querying neuron rows...",
+            0,
+            total_steps,
+        )
         try:
             file_ids = self._file_ids_for_source()
             nodes = self._query_nodes(file_ids)
-            if self._lookup_files_ready():
+
+            if use_lookup_files:
                 result, render_result, lookup_stats = self._project_from_lookup_files(
-                    nodes
+                    nodes,
+                    progress_callback=self._set_projection_progress,
+                    progress_total=total_steps,
                 )
                 flatmap_style = self._current_style_filename()
                 coordinate_mode = self._current_coordinate_mode()
@@ -491,12 +509,21 @@ class FlatmapProjectionWidget(QWidget):
                         "augmented Parquet with x_flat, y_flat, and depth_um columns."
                     )
                 result, render_result, lookup_stats = (
-                    self._project_from_parquet_columns(nodes)
+                    self._project_from_parquet_columns(
+                        nodes,
+                        progress_callback=self._set_projection_progress,
+                        progress_total=total_steps,
+                    )
                 )
                 flatmap_style = "precomputed_parquet"
                 coordinate_mode = "parquet_columns"
                 source_note = "Parquet flatmap/depth columns"
 
+            self._set_projection_progress(
+                "Updating flatmap layer...",
+                total_steps - 1,
+                total_steps,
+            )
             self._apply_projection_result(
                 result,
                 render_result,
@@ -505,6 +532,7 @@ class FlatmapProjectionWidget(QWidget):
                 lookup_stats=lookup_stats,
                 input_file_ids=tuple(str(file_id) for file_id in file_ids),
             )
+            self._set_projection_progress("Done", total_steps, total_steps)
             self._status_label.setText(
                 f"Rendered {render_result.summary.rendered_nodes:,} of "
                 f"{render_result.summary.total_nodes:,} projected node(s) using "
@@ -515,18 +543,42 @@ class FlatmapProjectionWidget(QWidget):
             logger.exception("Flatmap projection failed")
             self._status_label.setText(f"Flatmap projection failed: {exc}")
             show_warning(f"Flatmap projection failed: {exc}")
+        finally:
+            self._hide_projection_progress()
+            self._set_projection_controls_enabled(True)
 
     def _project_from_lookup_files(
         self,
         nodes: pd.DataFrame,
+        *,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+        progress_total: int = 6,
     ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult, FlatmapLookupStats]:
+        self._emit_projection_progress(
+            progress_callback,
+            "Loading flatmap lookup files...",
+            1,
+            progress_total,
+        )
         volume_set = load_flatmap_volume_set(self._flatmap_path, self._depth_path)
+        self._emit_projection_progress(
+            progress_callback,
+            "Computing flatmap lookup statistics...",
+            2,
+            progress_total,
+        )
         lookup_stats = self._lookup_stats_for_volume_set(
             volume_set,
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
             invalid_negative_one_sentinel=(
                 self._negative_one_sentinel_cb.isChecked()
             ),
+        )
+        self._emit_projection_progress(
+            progress_callback,
+            "Projecting nodes into flatmap space...",
+            3,
+            progress_total,
         )
         result = project_and_build_segments(
             nodes,
@@ -541,6 +593,12 @@ class FlatmapProjectionWidget(QWidget):
             resolution_um=DEFAULT_CCF_RESOLUTION_UM,
             space_directions=volume_set.space_directions,
             space_origin=volume_set.space_origin,
+        )
+        self._emit_projection_progress(
+            progress_callback,
+            "Building flatmap render data...",
+            4,
+            progress_total,
         )
         render_result = build_flatmap_render_data(
             result.projected_nodes,
@@ -562,8 +620,23 @@ class FlatmapProjectionWidget(QWidget):
     def _project_from_parquet_columns(
         self,
         nodes: pd.DataFrame,
+        *,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+        progress_total: int = 4,
     ) -> tuple[FlatmapProjectionResult, FlatmapRenderResult, None]:
+        self._emit_projection_progress(
+            progress_callback,
+            "Reading precomputed flatmap columns...",
+            1,
+            progress_total,
+        )
         result = self._projection_result_from_parquet_columns(nodes)
+        self._emit_projection_progress(
+            progress_callback,
+            "Building flatmap render data...",
+            2,
+            progress_total,
+        )
         render_result = build_flatmap_render_data_from_projected_nodes(
             result.projected_nodes,
             xy_bins=self._current_xy_bins(),
@@ -573,6 +646,77 @@ class FlatmapProjectionWidget(QWidget):
             ),
         )
         return result, render_result, None
+
+    @staticmethod
+    def _emit_projection_progress(
+        progress_callback: Callable[[str, int, int], None] | None,
+        message: str,
+        current: int,
+        total: int,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(message, current, total)
+
+    def _set_projection_controls_enabled(self, enabled: bool) -> None:
+        button = getattr(self, "_project_btn", None)
+        set_enabled = getattr(button, "setEnabled", None)
+        if callable(set_enabled):
+            set_enabled(bool(enabled))
+
+    def _set_projection_progress(
+        self,
+        message: str,
+        current: int,
+        total: int,
+    ) -> None:
+        status_label = getattr(self, "_status_label", None)
+        if status_label is not None:
+            status_label.setText(str(message))
+
+        progress_bar = getattr(self, "_projection_progress_bar", None)
+        if progress_bar is not None:
+            set_visible = getattr(progress_bar, "setVisible", None)
+            if callable(set_visible):
+                set_visible(True)
+            if int(total) > 0:
+                maximum = int(total)
+                value = max(0, min(int(current), maximum))
+                set_range = getattr(progress_bar, "setRange", None)
+                if callable(set_range):
+                    set_range(0, maximum)
+                set_value = getattr(progress_bar, "setValue", None)
+                if callable(set_value):
+                    set_value(value)
+            else:
+                set_range = getattr(progress_bar, "setRange", None)
+                if callable(set_range):
+                    set_range(0, 0)
+        self._flush_projection_progress_updates()
+
+    def _hide_projection_progress(self) -> None:
+        progress_bar = getattr(self, "_projection_progress_bar", None)
+        if progress_bar is None:
+            return
+        set_range = getattr(progress_bar, "setRange", None)
+        if callable(set_range):
+            set_range(0, 1)
+        set_value = getattr(progress_bar, "setValue", None)
+        if callable(set_value):
+            set_value(0)
+        set_visible = getattr(progress_bar, "setVisible", None)
+        if callable(set_visible):
+            set_visible(False)
+
+    @staticmethod
+    def _flush_projection_progress_updates() -> None:
+        try:
+            from qtpy.QtWidgets import QApplication
+        except ImportError:
+            return
+
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
 
     def _projection_result_from_parquet_columns(
         self,
