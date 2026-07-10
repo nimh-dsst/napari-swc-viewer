@@ -28,6 +28,8 @@ class FlatmapVoxelCorrelationSource:
     invalid_zero_sentinel: bool = False
     invalid_negative_one_sentinel: bool = True
     lookup_stats: FlatmapLookupStats | None = None
+    mirror_depth_fallback: bool = True
+    mirror_coord_axis: int = 2
 
 
 @dataclass(frozen=True)

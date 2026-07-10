@@ -57,7 +57,10 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-mirror-fallback",
         action="store_true",
-        help="Disable opposite-hemisphere retry for invalid direct lookup rows.",
+        help=(
+            "Disable both mirrored-depth recovery and full opposite-hemisphere "
+            "retry for invalid direct lookup rows."
+        ),
     )
     parser.add_argument(
         "--mirror-axis",
@@ -126,6 +129,7 @@ def main(args: list[str] | None = None) -> int:
 
     print(f"Rows written: {summary.rows:,}")
     print(f"Direct lookup rows: {summary.direct_rows:,}")
+    print(f"Mirrored-depth lookup rows: {summary.mirrored_depth_rows:,}")
     print(f"Mirrored lookup rows: {summary.mirrored_rows:,}")
     print(f"Unmapped rows: {summary.unmapped_rows:,}")
     print(f"Output path: {summary.output_parquet}")

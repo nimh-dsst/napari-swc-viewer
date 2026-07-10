@@ -14,6 +14,7 @@ VALID_COORDINATE_MODES = {COORDINATE_MODE_MICRONS, COORDINATE_MODE_VOXELS}
 DEFAULT_CCF_RESOLUTION_UM = 10.0
 DEFAULT_CCFV3_MIRROR_MIDLINE_UM = 5695.0
 FLATMAP_LOOKUP_DIRECT = "direct"
+FLATMAP_LOOKUP_MIRRORED_DEPTH = "mirrored_depth"
 FLATMAP_LOOKUP_MIRRORED = "mirrored"
 FLATMAP_LOOKUP_UNMAPPED = "unmapped"
 
@@ -46,6 +47,7 @@ class ProjectionSummary:
     direct_lookup_nodes: int = 0
     mirrored_lookup_nodes: int = 0
     unmapped_lookup_nodes: int = 0
+    mirrored_depth_lookup_nodes: int = 0
 
     def to_dict(self) -> dict[str, int]:
         """Return a JSON-safe dictionary."""
@@ -62,6 +64,9 @@ class ProjectionSummary:
                 self.traces_with_partial_projection
             ),
             "direct_lookup_nodes": int(self.direct_lookup_nodes),
+            "mirrored_depth_lookup_nodes": int(
+                self.mirrored_depth_lookup_nodes
+            ),
             "mirrored_lookup_nodes": int(self.mirrored_lookup_nodes),
             "unmapped_lookup_nodes": int(self.unmapped_lookup_nodes),
         }
@@ -355,9 +360,32 @@ def project_neuron_nodes_to_flatmap(
             space_origin=space_origin,
         ).reset_index(drop=True)
 
-        mirrored_valid = mirrored["valid"].to_numpy(dtype=bool)
-        if mirrored_valid.any():
-            mirrored_positions = retry_positions[mirrored_valid]
+        direct_flatmap_valid = selected["flatmap_valid"].to_numpy(dtype=bool)
+        direct_depth_valid = selected["depth_valid"].to_numpy(dtype=bool)
+        mirrored_depth_valid = mirrored["depth_valid"].to_numpy(dtype=bool)
+
+        depth_only_retry = (
+            direct_flatmap_valid[retry_positions]
+            & ~direct_depth_valid[retry_positions]
+        )
+        mirrored_depth_valid &= depth_only_retry
+        if mirrored_depth_valid.any():
+            mirrored_depth_positions = retry_positions[mirrored_depth_valid]
+            selected.loc[mirrored_depth_positions, "depth_um"] = mirrored.loc[
+                mirrored_depth_valid,
+                "depth_um",
+            ].to_numpy()
+            selected.loc[mirrored_depth_positions, "depth_valid"] = True
+            selected.loc[mirrored_depth_positions, "valid"] = True
+            selected.loc[mirrored_depth_positions, "invalid_reason"] = ""
+            lookup_mode[mirrored_depth_positions] = FLATMAP_LOOKUP_MIRRORED_DEPTH
+
+        full_mirror_valid = (
+            ~direct_flatmap_valid[retry_positions]
+            & mirrored["valid"].to_numpy(dtype=bool)
+        )
+        if full_mirror_valid.any():
+            mirrored_positions = retry_positions[full_mirror_valid]
             projection_columns = (
                 "voxel_i",
                 "voxel_j",
@@ -371,7 +399,7 @@ def project_neuron_nodes_to_flatmap(
                 "invalid_reason",
             )
             selected.loc[mirrored_positions, projection_columns] = mirrored.loc[
-                mirrored_valid,
+                full_mirror_valid,
                 projection_columns,
             ].to_numpy()
             lookup_mode[mirrored_positions] = FLATMAP_LOOKUP_MIRRORED
@@ -478,6 +506,9 @@ def summarize_projection(
         total_traces=int(total_traces),
         traces_with_partial_projection=int(partial_traces),
         direct_lookup_nodes=int((lookup_modes == FLATMAP_LOOKUP_DIRECT).sum()),
+        mirrored_depth_lookup_nodes=int(
+            (lookup_modes == FLATMAP_LOOKUP_MIRRORED_DEPTH).sum()
+        ),
         mirrored_lookup_nodes=int((lookup_modes == FLATMAP_LOOKUP_MIRRORED).sum()),
         unmapped_lookup_nodes=int((lookup_modes == FLATMAP_LOOKUP_UNMAPPED).sum()),
     )
@@ -529,8 +560,9 @@ def format_projection_summary(summary: ProjectionSummary) -> str:
         f"Out of bounds: {summary.out_of_bounds_nodes:,}\n"
         f"Invalid flatmap/depth: "
         f"{summary.invalid_flatmap_nodes:,}/{summary.invalid_depth_nodes:,}\n"
-        f"Lookup direct/mirrored/unmapped: "
+        f"Lookup direct/mirrored-depth/mirrored/unmapped: "
         f"{summary.direct_lookup_nodes:,}/"
+        f"{summary.mirrored_depth_lookup_nodes:,}/"
         f"{summary.mirrored_lookup_nodes:,}/"
         f"{summary.unmapped_lookup_nodes:,}\n"
         f"Missing input: {summary.missing_input_nodes:,}\n"

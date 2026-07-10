@@ -852,6 +852,8 @@ def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
 
     def fake_build_labels(*_args, **kwargs):
         captured["selected_region_ids"] = kwargs["selected_region_ids"]
+        captured["mirror_depth_fallback"] = kwargs["mirror_depth_fallback"]
+        captured["mirror_coord_axis"] = kwargs["mirror_coord_axis"]
         return types.SimpleNamespace(
             labels=np.array([[[1, 0], [0, 1]]], dtype=np.int32),
             summary=types.SimpleNamespace(
@@ -877,10 +879,13 @@ def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
     mask, metadata = worker._build_region_mask()
 
     assert captured["selected_region_ids"] == [68]
+    assert captured["mirror_depth_fallback"] is True
+    assert captured["mirror_coord_axis"] == 2
     assert mask.shape == (2, 2, 2)
     assert mask[0].sum() == 0
     assert bool(mask[1, 0, 0]) is True
     assert metadata["flatmap_region_labeled_voxels"] == 2
+    assert metadata["flatmap_region_mirrored_depth_source_voxels"] == 0
 
 
 def test_flatmap_correlation_worker_counts_lookup_modes_for_metadata() -> None:
@@ -891,6 +896,7 @@ def test_flatmap_correlation_worker_counts_lookup_modes_for_metadata() -> None:
             {
                 "flatmap_lookup_mode": [
                     "direct",
+                    "mirrored_depth",
                     "mirrored",
                     "mirrored",
                     "unmapped",
@@ -901,6 +907,7 @@ def test_flatmap_correlation_worker_counts_lookup_modes_for_metadata() -> None:
 
     assert counts == {
         "flatmap_direct_lookup_node_count": 1,
+        "flatmap_mirrored_depth_lookup_node_count": 1,
         "flatmap_mirrored_lookup_node_count": 2,
         "flatmap_unmapped_lookup_node_count": 1,
     }

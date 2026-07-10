@@ -112,6 +112,7 @@ def test_benchmark_flatmap_pipeline_writes_json_and_csv(tmp_path: Path) -> None:
     assert report["selected_file_id"] == "small.swc"
     assert report["selected_node_count"] == 2
     assert report["projection_summary"]["total_nodes"] == 2
+    assert report["projection_summary"]["mirrored_depth_lookup_nodes"] == 0
     assert report["render_summary"]["rendered_nodes"] == 2
     assert report["object_sizes"]["heatmap_volume_bytes"] > 0
     load_stage = next(

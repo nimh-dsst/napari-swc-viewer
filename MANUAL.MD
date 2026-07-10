@@ -105,8 +105,12 @@ Recommended Parquet schema columns:
 - The output Parquet preserves original CCFv3 `x`, `y`, and `z` columns and adds
   `x_flat`, `y_flat`, `depth_um`, validity flags, `flatmap_invalid_code`, and
   `flatmap_lookup_mode`
-- Coordinate lookup tries the direct CCFv3 coordinate first, then mirrors across
-  the CCFv3 left-right midline when direct lookup fails
+- Coordinate lookup keeps valid flatmap coordinates from the original CCFv3
+  voxel. When only depth is unavailable, it reads depth from the mirrored voxel
+  without moving the node to the opposite flatmap hemisphere. A full mirrored
+  lookup is used only when the original flatmap coordinates are invalid.
+- Both-hemisphere flatmaps preserve the hemispheres present in the source data;
+  they do not create synthetic contralateral neuron copies.
 - Command-line equivalent:
 
 ```bash
@@ -124,6 +128,9 @@ conversion to specific neurons.
   `allen_mouse_10um` for 10 µm flatmap/depth NRRDs
 - Click `Create Region Labels` to add a `Flatmap Region Labels` labels layer
   aligned to the current Flatmap tab XY/depth bin settings
+- For lookup datasets whose depth field covers one hemisphere, region labels
+  borrow only the mirrored voxel's depth while retaining each atlas voxel's
+  original bilateral flatmap coordinates
 - The layer uses the selected regions and the Regions tab `Include child
   regions` setting; the atlas annotation grid must match the flatmap/depth
   lookup grid resolution

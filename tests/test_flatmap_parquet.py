@@ -14,6 +14,7 @@ from napari_swc_viewer.flatmap_parquet import (
     FLATMAP_INVALID_CODE_OUT_OF_BOUNDS,
     FLATMAP_INVALID_CODE_VALID,
     FLATMAP_PARQUET_METADATA_KEY,
+    FLATMAP_PARQUET_FORMAT_VERSION,
     augment_neuron_parquet_with_flatmap,
     read_flatmap_parquet_transform_info,
 )
@@ -65,6 +66,7 @@ def test_read_flatmap_parquet_transform_info_detects_no_transform(tmp_path) -> N
     assert info.has_full_transform is False
     assert info.present_transform_text == ""
     assert info.metadata is None
+    assert info.uses_legacy_mirror_fallback is False
 
 
 def test_read_flatmap_parquet_transform_info_detects_partial_transforms(tmp_path) -> None:
@@ -95,6 +97,34 @@ def test_read_flatmap_parquet_transform_info_detects_partial_transforms(tmp_path
     assert depth_info.present_transform_text == "depth"
 
 
+def test_read_flatmap_parquet_transform_info_flags_version_one_mirror_fallback(
+    tmp_path,
+) -> None:
+    source = tmp_path / "legacy_flatmap.parquet"
+    _write_source_parquet(source)
+    table = pq.read_table(source)
+    table = table.append_column(
+        "x_flat",
+        pa.array([0.1, 0.2, 0.3], type=pa.float32()),
+    ).append_column(
+        "y_flat",
+        pa.array([0.4, 0.5, 0.6], type=pa.float32()),
+    ).append_column(
+        "depth_um",
+        pa.array([100.0, 200.0, 300.0], type=pa.float32()),
+    )
+    metadata = dict(table.schema.metadata or {})
+    metadata[FLATMAP_PARQUET_METADATA_KEY] = json.dumps(
+        {"version": 1, "mirror_fallback": True}
+    ).encode("utf-8")
+    pq.write_table(table.replace_schema_metadata(metadata), source)
+
+    info = read_flatmap_parquet_transform_info(source)
+
+    assert info.has_full_transform is True
+    assert info.uses_legacy_mirror_fallback is True
+
+
 def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     tmp_path,
 ) -> None:
@@ -119,7 +149,8 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
 
     assert summary.rows == 3
     assert summary.direct_rows == 1
-    assert summary.mirrored_rows == 1
+    assert summary.mirrored_depth_rows == 1
+    assert summary.mirrored_rows == 0
     assert summary.unmapped_rows == 1
 
     table = pq.read_table(output)
@@ -128,7 +159,11 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     assert table.column("custom_note").to_pylist() == ["keep-a", "keep-b", "keep-c"]
 
     out = table.to_pandas()
-    assert out["flatmap_lookup_mode"].tolist() == ["direct", "mirrored", "unmapped"]
+    assert out["flatmap_lookup_mode"].tolist() == [
+        "direct",
+        "mirrored_depth",
+        "unmapped",
+    ]
     assert out["flatmap_projection_valid"].tolist() == [True, True, False]
     assert out["flatmap_invalid_code"].tolist() == [
         FLATMAP_INVALID_CODE_VALID,
@@ -145,9 +180,19 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     metadata = table.schema.metadata or {}
     assert FLATMAP_PARQUET_METADATA_KEY in metadata
     payload = json.loads(metadata[FLATMAP_PARQUET_METADATA_KEY].decode("utf-8"))
+    assert payload["version"] == FLATMAP_PARQUET_FORMAT_VERSION == 2
     assert payload["flatmap_nrrd"]["path"] == str(flatmap_path.resolve())
     assert payload["depth_nrrd"]["path"] == str(depth_path.resolve())
     assert payload["mirror_fallback"] is True
+    assert payload["mirror_fallback_strategy"] == (
+        "preserve_original_flatmap_then_mirror_depth_then_full_lookup"
+    )
+    assert payload["lookup_modes"] == [
+        "direct",
+        "mirrored_depth",
+        "mirrored",
+        "unmapped",
+    ]
     assert payload["mirror_coord_axis"] == 2
     assert payload["mirror_midline"] == 15.0
     info = read_flatmap_parquet_transform_info(output)
@@ -156,6 +201,7 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     assert info.has_full_transform is True
     assert info.present_transform_text == "flatmap and depth"
     assert info.metadata == payload
+    assert info.uses_legacy_mirror_fallback is False
 
     db = NeuronDatabase(output)
     try:
@@ -163,6 +209,57 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     finally:
         db.close()
     assert rows["n"].tolist() == [3]
+
+
+def test_augment_neuron_parquet_preserves_bilateral_flatmap_coordinates(
+    tmp_path,
+) -> None:
+    source = tmp_path / "bilateral_neurons.parquet"
+    output = tmp_path / "bilateral_neurons_flatmap.parquet"
+    flatmap_path = tmp_path / "flatmap_both_shaped.nrrd"
+    depth_path = tmp_path / "depth.nrrd"
+    pq.write_table(
+        pa.Table.from_pydict(
+            {
+                "file_id": ["left.swc", "right.swc"],
+                "node_id": [1, 1],
+                "type": [1, 1],
+                "x": [0.0, 0.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 30.0],
+                "parent_id": [-1, -1],
+            }
+        ),
+        source,
+    )
+    flatmap = np.full((1, 1, 4, 2), -1.0, dtype=np.float32)
+    flatmap[0, 0, 0] = (0.1, 0.5)
+    flatmap[0, 0, 3] = (1.9, 0.5)
+    depth = np.full((1, 1, 4), -1.0, dtype=np.float32)
+    depth[0, 0, 3] = 100.0
+    _write_nrrd(flatmap_path, flatmap)
+    _write_nrrd(depth_path, depth)
+
+    summary = augment_neuron_parquet_with_flatmap(
+        source,
+        output,
+        flatmap_path,
+        depth_path,
+        mirror_midline=15.0,
+    )
+
+    out = pq.read_table(output).to_pandas()
+    assert out["x_flat"].tolist() == pytest.approx([0.1, 1.9])
+    assert out["depth_um"].tolist() == pytest.approx([100.0, 100.0])
+    assert out["flatmap_lookup_mode"].tolist() == [
+        "mirrored_depth",
+        "direct",
+    ]
+    assert summary.rows == 2
+    assert summary.direct_rows == 1
+    assert summary.mirrored_depth_rows == 1
+    assert summary.mirrored_rows == 0
+    assert summary.unmapped_rows == 0
 
 
 def test_augment_neuron_parquet_file_ids_none_writes_all_rows(tmp_path) -> None:
@@ -253,6 +350,7 @@ def test_augment_neuron_parquet_can_disable_mirror_fallback(tmp_path) -> None:
 
     out = pq.read_table(output).to_pandas()
     assert summary.direct_rows == 1
+    assert summary.mirrored_depth_rows == 0
     assert summary.mirrored_rows == 0
     assert summary.unmapped_rows == 2
     assert out["flatmap_lookup_mode"].tolist() == ["direct", "unmapped", "unmapped"]

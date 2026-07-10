@@ -4,11 +4,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from napari_swc_viewer.flatmap_heatmap import build_flatmap_render_data
 from napari_swc_viewer.flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
     FLATMAP_LOOKUP_DIRECT,
     FLATMAP_LOOKUP_MIRRORED,
+    FLATMAP_LOOKUP_MIRRORED_DEPTH,
     FLATMAP_LOOKUP_UNMAPPED,
     build_projected_segments,
     coordinates_to_voxel_indices,
@@ -180,7 +182,7 @@ def test_project_neuron_nodes_to_flatmap_keeps_zero_zero_valid_by_default() -> N
     assert explicit_projected.iloc[0]["invalid_reason"] == "invalid_flatmap"
 
 
-def test_project_neuron_nodes_to_flatmap_mirrors_invalid_direct_depth() -> None:
+def test_project_neuron_nodes_to_flatmap_mirrors_only_invalid_direct_depth() -> None:
     flatmap, depth = _volumes()
     depth[1, 0, 0] = -1.0
 
@@ -198,9 +200,11 @@ def test_project_neuron_nodes_to_flatmap_mirrors_invalid_direct_depth() -> None:
 
     row = projected.iloc[0]
     assert row["valid"] is np.True_
-    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED_DEPTH
     assert row["z_um"] == pytest.approx(0.0)
-    assert row["voxel_k"] == 3
+    assert row["voxel_k"] == 0
+    assert row["x_flat"] == pytest.approx(1.25)
+    assert row["y_flat"] == pytest.approx(0.5)
     assert row["depth_um"] == pytest.approx(103.0)
     assert row["invalid_reason"] == ""
 
@@ -248,9 +252,157 @@ def test_project_neuron_nodes_to_flatmap_voxel_mode_mirrors_at_grid_center() -> 
 
     row = projected.iloc[0]
     assert row["valid"] is np.True_
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED_DEPTH
+    assert row["voxel_k"] == 0
+    assert row["depth_um"] == pytest.approx(103.0)
+
+
+def test_project_mirrored_depth_honors_nrrd_spatial_transform() -> None:
+    flatmap, depth = _volumes()
+    depth[1, 0, 0] = -1.0
+
+    projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 10.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        space_directions=np.diag([10.0, 10.0, 10.0]),
+        space_origin=np.zeros(3),
+        mirror_fallback=True,
+        mirror_midline=15.0,
+    )
+
+    row = projected.iloc[0]
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED_DEPTH
+    assert row["voxel_k"] == 0
+    assert row["x_flat"] == pytest.approx(1.25)
+    assert row["depth_um"] == pytest.approx(103.0)
+
+
+def test_project_mirrored_depth_honors_custom_mirror_axis() -> None:
+    flatmap, depth = _volumes()
+    depth[0, 1, 0] = -1.0
+    depth[3, 1, 0] = 333.0
+
+    projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 0.0, "y": 10.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        mirror_fallback=True,
+        mirror_coord_axis=0,
+        mirror_midline=15.0,
+    )
+
+    row = projected.iloc[0]
+    assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED_DEPTH
+    assert (row["voxel_i"], row["voxel_j"], row["voxel_k"]) == (0, 1, 0)
+    assert row["x_flat"] == pytest.approx(0.25)
+    assert row["depth_um"] == pytest.approx(333.0)
+
+
+def test_project_neuron_nodes_to_flatmap_full_mirrors_invalid_flatmap() -> None:
+    flatmap, depth = _volumes()
+    flatmap[1, 0, 0] = (-1.0, -1.0)
+
+    projected = project_neuron_nodes_to_flatmap(
+        _nodes(
+            [
+                {"node_id": 1, "parent_id": -1, "x": 1.0, "y": 0.0, "z": 0.0},
+            ]
+        ),
+        flatmap,
+        depth,
+        coordinate_mode=COORDINATE_MODE_VOXELS,
+        mirror_fallback=True,
+    )
+
+    row = projected.iloc[0]
+    assert row["valid"] is np.True_
     assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED
     assert row["voxel_k"] == 3
     assert row["depth_um"] == pytest.approx(103.0)
+
+
+@pytest.mark.parametrize("invalid_depth", [-1.0, np.nan])
+def test_project_bilateral_nodes_preserve_distinct_flatmap_panels(
+    invalid_depth: float,
+) -> None:
+    flatmap = np.full((1, 1, 4, 2), -1.0, dtype=np.float32)
+    flatmap[0, 0, 0] = (0.1, 0.5)
+    flatmap[0, 0, 3] = (1.9, 0.5)
+    depth = np.full((1, 1, 4), invalid_depth, dtype=np.float32)
+    depth[0, 0, 3] = 100.0
+    nodes = _nodes(
+        [
+            {
+                "file_id": "left.swc",
+                "node_id": 1,
+                "parent_id": -1,
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+            },
+            {
+                "file_id": "right.swc",
+                "node_id": 1,
+                "parent_id": -1,
+                "x": 0.0,
+                "y": 0.0,
+                "z": 3.0,
+            },
+        ]
+    )
+
+    projected = project_neuron_nodes_to_flatmap(
+        nodes,
+        flatmap,
+        depth,
+        coordinate_mode=COORDINATE_MODE_VOXELS,
+        mirror_fallback=True,
+    )
+
+    assert len(projected) == 2
+    assert projected["x_flat"].tolist() == pytest.approx([0.1, 1.9])
+    assert projected["voxel_k"].tolist() == [0, 3]
+    assert projected["depth_um"].tolist() == pytest.approx([100.0, 100.0])
+    assert projected["flatmap_lookup_mode"].tolist() == [
+        FLATMAP_LOOKUP_MIRRORED_DEPTH,
+        FLATMAP_LOOKUP_DIRECT,
+    ]
+    summary = summarize_projection(projected, build_projected_segments(projected))
+    assert summary.direct_lookup_nodes == 1
+    assert summary.mirrored_depth_lookup_nodes == 1
+    assert summary.mirrored_lookup_nodes == 0
+    assert summary.unmapped_lookup_nodes == 0
+    assert summary.to_dict()["mirrored_depth_lookup_nodes"] == 1
+    render = build_flatmap_render_data(
+        projected,
+        flatmap,
+        depth,
+        xy_bins=20,
+        depth_bin_um=25.0,
+        include_depth_minus_one=False,
+    )
+    assert render.projected_nodes["x_flat_bin"].tolist() == [0, 19]
+    assert render.summary.rendered_nodes == 2
+    assert render.summary.nonzero_voxels == 2
+
+    unilateral = project_neuron_nodes_to_flatmap(
+        nodes.iloc[[0]].reset_index(drop=True),
+        flatmap,
+        depth,
+        coordinate_mode=COORDINATE_MODE_VOXELS,
+        mirror_fallback=True,
+    )
+    assert len(unilateral) == 1
+    assert unilateral["x_flat"].tolist() == pytest.approx([0.1])
 
 
 def test_projection_classifies_out_of_bounds_missing_and_invalid_values() -> None:

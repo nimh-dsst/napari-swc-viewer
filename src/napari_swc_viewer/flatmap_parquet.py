@@ -16,13 +16,17 @@ from .flatmap_loader import load_flatmap_volume_set
 from .flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     DEFAULT_CCFV3_MIRROR_MIDLINE_UM as _DEFAULT_CCFV3_MIRROR_MIDLINE_UM,
+    FLATMAP_LOOKUP_DIRECT,
+    FLATMAP_LOOKUP_MIRRORED,
+    FLATMAP_LOOKUP_MIRRORED_DEPTH,
+    FLATMAP_LOOKUP_UNMAPPED,
     REQUIRED_NODE_COLUMNS,
     project_neuron_nodes_to_flatmap,
     resolve_flatmap_mirror_midline,
 )
 
 FLATMAP_PARQUET_METADATA_KEY = b"napari_swc_viewer.flatmap_projection_json"
-FLATMAP_PARQUET_FORMAT_VERSION = 1
+FLATMAP_PARQUET_FORMAT_VERSION = 2
 DEFAULT_CCFV3_MIRROR_MIDLINE_UM = _DEFAULT_CCFV3_MIRROR_MIDLINE_UM
 DEFAULT_FLATMAP_PARQUET_BATCH_SIZE = 250_000
 
@@ -70,6 +74,7 @@ class FlatmapParquetAugmentationSummary:
     direct_rows: int
     mirrored_rows: int
     unmapped_rows: int
+    mirrored_depth_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,18 @@ class FlatmapParquetTransformInfo:
     def has_full_transform(self) -> bool:
         """Return True when the parquet can render flatmap/depth without NRRDs."""
         return bool(self.has_flatmap and self.has_depth)
+
+    @property
+    def uses_legacy_mirror_fallback(self) -> bool:
+        """Return whether stored coordinates use the version-1 mirror strategy."""
+        metadata = self.metadata
+        if not isinstance(metadata, dict):
+            return False
+        try:
+            version = int(metadata.get("version", 0))
+        except (TypeError, ValueError):
+            return False
+        return version == 1 and bool(metadata.get("mirror_fallback", False))
 
     @property
     def present_transform_text(self) -> str:
@@ -319,12 +336,21 @@ def _schema_metadata(
         "invalid_zero_sentinel": bool(invalid_zero_sentinel),
         "invalid_negative_one_sentinel": bool(invalid_negative_one_sentinel),
         "mirror_fallback": bool(mirror_fallback),
+        "mirror_fallback_strategy": (
+            "preserve_original_flatmap_then_mirror_depth_then_full_lookup"
+        ),
         "mirror_coord_axis": int(mirror_coord_axis),
         "mirror_midline": float(mirror_midline),
         "file_ids_filter_count": file_ids_filter_count,
         "space_directions": space_directions,
         "space_origin": space_origin,
         "columns": list(FLATMAP_AUGMENTED_COLUMNS),
+        "lookup_modes": [
+            FLATMAP_LOOKUP_DIRECT,
+            FLATMAP_LOOKUP_MIRRORED_DEPTH,
+            FLATMAP_LOOKUP_MIRRORED,
+            FLATMAP_LOOKUP_UNMAPPED,
+        ],
         "invalid_codes": {
             "valid": FLATMAP_INVALID_CODE_VALID,
             "missing_input": FLATMAP_INVALID_CODE_MISSING_INPUT,
@@ -428,6 +454,7 @@ def augment_neuron_parquet_with_flatmap(
 
     rows_written = 0
     direct_rows = 0
+    mirrored_depth_rows = 0
     mirrored_rows = 0
     unmapped_rows = 0
     writer: pq.ParquetWriter | None = None
@@ -462,9 +489,12 @@ def augment_neuron_parquet_with_flatmap(
             writer.write_table(augmented.cast(writer.schema))
 
             modes = projected["flatmap_lookup_mode"].astype(str)
-            direct_rows += int((modes == "direct").sum())
-            mirrored_rows += int((modes == "mirrored").sum())
-            unmapped_rows += int((modes == "unmapped").sum())
+            direct_rows += int((modes == FLATMAP_LOOKUP_DIRECT).sum())
+            mirrored_depth_rows += int(
+                (modes == FLATMAP_LOOKUP_MIRRORED_DEPTH).sum()
+            )
+            mirrored_rows += int((modes == FLATMAP_LOOKUP_MIRRORED).sum())
+            unmapped_rows += int((modes == FLATMAP_LOOKUP_UNMAPPED).sum())
             rows_written += int(source_table.num_rows)
             if progress_callback is not None:
                 progress_callback(
@@ -514,6 +544,7 @@ def augment_neuron_parquet_with_flatmap(
         depth_path=depth_source,
         rows=rows_written,
         direct_rows=direct_rows,
+        mirrored_depth_rows=mirrored_depth_rows,
         mirrored_rows=mirrored_rows,
         unmapped_rows=unmapped_rows,
     )

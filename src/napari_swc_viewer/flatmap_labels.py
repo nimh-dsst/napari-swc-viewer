@@ -43,6 +43,7 @@ class FlatmapRegionLabelsSummary:
     y_flat_max: float
     depth_min_um: float
     depth_max_um: float
+    mirrored_depth_source_voxels: int = 0
 
     def to_dict(self) -> dict[str, int | float]:
         """Return a JSON-safe dictionary."""
@@ -51,6 +52,9 @@ class FlatmapRegionLabelsSummary:
             "selected_region_count": int(self.selected_region_count),
             "selected_source_voxels": int(self.selected_source_voxels),
             "valid_source_voxels": int(self.valid_source_voxels),
+            "mirrored_depth_source_voxels": int(
+                self.mirrored_depth_source_voxels
+            ),
             "labeled_voxels": int(self.labeled_voxels),
             "collision_voxels": int(self.collision_voxels),
             "xy_bins": int(self.xy_bins),
@@ -152,6 +156,39 @@ def _validate_label_grid_size(depth_bins: int, xy_bins: int) -> None:
         )
 
 
+def _fill_missing_depth_from_mirror(
+    depth_values: np.ndarray,
+    depth_volume: np.ndarray,
+    missing_depth: np.ndarray,
+    *,
+    chunk_slice: slice,
+    mirror_coord_axis: int,
+) -> int:
+    """Fill selected invalid depths from mirrored source voxels in-place."""
+    local_coords = np.argwhere(missing_depth)
+    if local_coords.size == 0:
+        return 0
+
+    global_coords = local_coords.copy()
+    global_coords[:, 0] += int(chunk_slice.start or 0)
+    global_coords[:, mirror_coord_axis] = (
+        int(depth_volume.shape[mirror_coord_axis])
+        - 1
+        - global_coords[:, mirror_coord_axis]
+    )
+    mirrored_values = np.asarray(
+        depth_volume[tuple(global_coords.T)],
+        dtype=float,
+    )
+    mirrored_valid = np.isfinite(mirrored_values) & (mirrored_values >= 0.0)
+    if not mirrored_valid.any():
+        return 0
+
+    rescued_local = local_coords[mirrored_valid]
+    depth_values[tuple(rescued_local.T)] = mirrored_values[mirrored_valid]
+    return int(mirrored_valid.sum())
+
+
 def build_flatmap_region_label_volume(
     annotation_volume: np.ndarray,
     flatmap_volume: np.ndarray,
@@ -164,6 +201,8 @@ def build_flatmap_region_label_volume(
     invalid_negative_one_sentinel: bool = True,
     lookup_stats: FlatmapLookupStats | None = None,
     lookup_stats_chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+    mirror_depth_fallback: bool = True,
+    mirror_coord_axis: int = 2,
 ) -> FlatmapRegionLabelsResult:
     """Build a depth-aware flatmap labels volume from atlas annotations."""
     xy_bins = int(xy_bins)
@@ -172,6 +211,8 @@ def build_flatmap_region_label_volume(
         raise ValueError("xy_bins must be positive.")
     if depth_bin_um <= 0.0:
         raise ValueError("depth_bin_um must be positive.")
+    if mirror_coord_axis not in (0, 1, 2):
+        raise ValueError("mirror_coord_axis must be 0, 1, or 2.")
 
     annotation = np.asarray(annotation_volume)
     flatmap = _validate_flatmap_volume(flatmap_volume)
@@ -213,6 +254,7 @@ def build_flatmap_region_label_volume(
     count_chunks: list[np.ndarray] = []
     selected_source_voxels = 0
     valid_source_voxels = 0
+    mirrored_depth_source_voxels = 0
 
     for chunk_slice in _spatial_chunk_slices(
         annotation.shape,
@@ -232,6 +274,15 @@ def build_flatmap_region_label_volume(
             invalid_negative_one_sentinel=invalid_negative_one_sentinel,
         ).reshape(annotation_chunk.shape)
         depth_valid = np.isfinite(depth_values) & (depth_values >= 0.0)
+        if mirror_depth_fallback:
+            mirrored_depth_source_voxels += _fill_missing_depth_from_mirror(
+                depth_values,
+                depth,
+                selected & flat_valid & ~depth_valid,
+                chunk_slice=chunk_slice,
+                mirror_coord_axis=mirror_coord_axis,
+            )
+            depth_valid = np.isfinite(depth_values) & (depth_values >= 0.0)
         valid = selected & flat_valid & depth_valid
         if not valid.any():
             continue
@@ -276,6 +327,7 @@ def build_flatmap_region_label_volume(
         selected_region_count=int(len(selected_ids)),
         selected_source_voxels=int(selected_source_voxels),
         valid_source_voxels=int(valid_source_voxels),
+        mirrored_depth_source_voxels=int(mirrored_depth_source_voxels),
         labeled_voxels=int(np.count_nonzero(labels)),
         collision_voxels=int(collision_voxels),
         xy_bins=int(xy_bins),

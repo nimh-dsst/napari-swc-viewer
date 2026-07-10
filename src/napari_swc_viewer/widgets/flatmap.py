@@ -53,6 +53,10 @@ from ..flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
     DEFAULT_CCF_RESOLUTION_UM,
+    FLATMAP_LOOKUP_DIRECT,
+    FLATMAP_LOOKUP_MIRRORED,
+    FLATMAP_LOOKUP_MIRRORED_DEPTH,
+    FLATMAP_LOOKUP_UNMAPPED,
     FlatmapProjectionResult,
     ProjectionSummary,
     build_projected_segments,
@@ -802,12 +806,27 @@ class FlatmapProjectionWidget(QWidget):
             lookup_mode = source["flatmap_lookup_mode"].fillna("").astype(str)
             lookup_mode = lookup_mode.reset_index(drop=True)
             lookup_mode = lookup_mode.where(
-                lookup_mode.isin(["direct", "mirrored", "unmapped"]),
-                np.where(valid, "direct", "unmapped"),
+                lookup_mode.isin(
+                    [
+                        FLATMAP_LOOKUP_DIRECT,
+                        FLATMAP_LOOKUP_MIRRORED_DEPTH,
+                        FLATMAP_LOOKUP_MIRRORED,
+                        FLATMAP_LOOKUP_UNMAPPED,
+                    ]
+                ),
+                np.where(
+                    valid,
+                    FLATMAP_LOOKUP_DIRECT,
+                    FLATMAP_LOOKUP_UNMAPPED,
+                ),
             )
         else:
             lookup_mode = pd.Series(
-                np.where(valid, "direct", "unmapped"),
+                np.where(
+                    valid,
+                    FLATMAP_LOOKUP_DIRECT,
+                    FLATMAP_LOOKUP_UNMAPPED,
+                ),
                 index=range(len(source)),
             )
 
@@ -1031,6 +1050,8 @@ class FlatmapProjectionWidget(QWidget):
             depth_path=self._last_depth_path,
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
             invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
+            mirror_depth_fallback=True,
+            mirror_coord_axis=2,
             lookup_stats=getattr(self, "_last_lookup_stats", None),
         )
 
@@ -1093,6 +1114,8 @@ class FlatmapProjectionWidget(QWidget):
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
             invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
             lookup_stats=lookup_stats,
+            mirror_depth_fallback=True,
+            mirror_coord_axis=2,
         )
         metadata = self._region_labels_metadata(result, atlas)
         layer = self._create_or_update_region_labels_layer(
@@ -1548,8 +1571,9 @@ class FlatmapProjectionWidget(QWidget):
             f"Invalid flatmap/depth: "
             f"{projection_summary.invalid_flatmap_nodes:,}/"
             f"{projection_summary.invalid_depth_nodes:,}\n"
-            f"Lookup direct/mirrored/unmapped: "
+            f"Lookup direct/mirrored-depth/mirrored/unmapped: "
             f"{projection_summary.direct_lookup_nodes:,}/"
+            f"{projection_summary.mirrored_depth_lookup_nodes:,}/"
             f"{projection_summary.mirrored_lookup_nodes:,}/"
             f"{projection_summary.unmapped_lookup_nodes:,}"
         )
@@ -2235,6 +2259,7 @@ class FlatmapProjectionWidget(QWidget):
             f"{summary.output_parquet} "
             f"({summary.rows:,} rows from {len(file_ids):,} file ID(s); "
             f"{summary.direct_rows:,} direct, "
+            f"{getattr(summary, 'mirrored_depth_rows', 0):,} mirrored-depth, "
             f"{summary.mirrored_rows:,} mirrored, "
             f"{summary.unmapped_rows:,} unmapped)."
         )

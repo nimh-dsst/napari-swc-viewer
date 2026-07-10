@@ -752,6 +752,8 @@ class FlatmapCorrelationWorker(QObject):
             invalid_zero_sentinel=source.invalid_zero_sentinel,
             invalid_negative_one_sentinel=source.invalid_negative_one_sentinel,
             lookup_stats=source.lookup_stats,
+            mirror_depth_fallback=getattr(source, "mirror_depth_fallback", True),
+            mirror_coord_axis=getattr(source, "mirror_coord_axis", 2),
         )
         mask = np.asarray(result.labels > 0, dtype=bool)
         source_shape = tuple(int(size) for size in source.volume_shape)
@@ -770,6 +772,9 @@ class FlatmapCorrelationWorker(QObject):
             "flatmap_region_valid_source_voxels": int(
                 result.summary.valid_source_voxels
             ),
+            "flatmap_region_mirrored_depth_source_voxels": int(
+                getattr(result.summary, "mirrored_depth_source_voxels", 0)
+            ),
             "flatmap_region_collision_voxels": int(result.summary.collision_voxels),
             "flatmap_region_represented_region_ids": [
                 int(region_id) for region_id in result.represented_region_ids
@@ -781,6 +786,7 @@ class FlatmapCorrelationWorker(QObject):
         if projected_nodes is None:
             return {
                 "flatmap_direct_lookup_node_count": 0,
+                "flatmap_mirrored_depth_lookup_node_count": 0,
                 "flatmap_mirrored_lookup_node_count": 0,
                 "flatmap_unmapped_lookup_node_count": 0,
             }
@@ -799,10 +805,12 @@ class FlatmapCorrelationWorker(QObject):
                 valid_mask = valid.fillna(False).astype(bool).to_numpy()
             modes = np.where(valid_mask, "direct", "unmapped")
         direct = int(np.count_nonzero(modes == "direct"))
+        mirrored_depth = int(np.count_nonzero(modes == "mirrored_depth"))
         mirrored = int(np.count_nonzero(modes == "mirrored"))
         unmapped = int(np.count_nonzero(modes == "unmapped"))
         return {
             "flatmap_direct_lookup_node_count": direct,
+            "flatmap_mirrored_depth_lookup_node_count": mirrored_depth,
             "flatmap_mirrored_lookup_node_count": mirrored,
             "flatmap_unmapped_lookup_node_count": unmapped,
         }

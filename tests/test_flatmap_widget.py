@@ -435,6 +435,8 @@ def test_create_region_labels_uses_flatmap_selected_atlas_not_main_loaded_atlas(
 
     def fake_build(annotation, *_args, **_kwargs):
         captured["annotation"] = np.asarray(annotation).copy()
+        captured["mirror_depth_fallback"] = _kwargs["mirror_depth_fallback"]
+        captured["mirror_coord_axis"] = _kwargs["mirror_coord_axis"]
         return _label_result(7)
 
     monkeypatch.setattr(module, "build_flatmap_region_label_volume", fake_build)
@@ -442,6 +444,8 @@ def test_create_region_labels_uses_flatmap_selected_atlas_not_main_loaded_atlas(
     widget._create_region_labels_from_current_state()
 
     np.testing.assert_array_equal(captured["annotation"], atlas10.annotation)
+    assert captured["mirror_depth_fallback"] is True
+    assert captured["mirror_coord_axis"] == 2
     assert widget._viewer.layers[-1].metadata["atlas_name"] == "allen_mouse_10um"
 
 
@@ -686,7 +690,9 @@ def test_project_without_nrrds_uses_augmented_parquet_columns(monkeypatch) -> No
     widget = _widget(module)
     widget._flatmap_path = None
     widget._depth_path = None
-    _configure_projection_widget(widget, module, _augmented_nodes())
+    nodes = _augmented_nodes()
+    nodes.loc[1, "flatmap_lookup_mode"] = "mirrored_depth"
+    _configure_projection_widget(widget, module, nodes)
     captured = {}
 
     def fake_apply(result, render_result, **kwargs):
@@ -702,6 +708,11 @@ def test_project_without_nrrds_uses_augmented_parquet_columns(monkeypatch) -> No
     assert captured["kwargs"]["coordinate_mode"] == "parquet_columns"
     projected = captured["result"].projected_nodes
     assert projected["valid"].tolist() == [True, True, False]
+    assert projected["flatmap_lookup_mode"].tolist() == [
+        "direct",
+        "mirrored_depth",
+        "unmapped",
+    ]
     assert projected["invalid_reason"].tolist() == ["", "", "invalid_flatmap"]
     assert captured["render_result"].summary.rendered_nodes == 2
     assert "Parquet flatmap/depth columns" in widget._status_label.text
@@ -778,11 +789,19 @@ def test_project_from_lookup_files_uses_depth_mirror_fallback(monkeypatch) -> No
     result, render_result, _lookup_stats = widget._project_from_lookup_files(nodes)
 
     projected = result.projected_nodes
-    assert projected["flatmap_lookup_mode"].tolist() == ["mirrored"]
-    assert projected["voxel_k"].tolist() == [3]
+    assert projected["flatmap_lookup_mode"].tolist() == ["mirrored_depth"]
+    assert projected["voxel_k"].tolist() == [0]
+    assert projected["x_flat"].tolist() == pytest.approx([1.25])
     assert projected["depth_um"].tolist() == pytest.approx([103.0])
-    assert result.summary.mirrored_lookup_nodes == 1
+    assert result.summary.mirrored_depth_lookup_nodes == 1
+    assert result.summary.mirrored_lookup_nodes == 0
     assert render_result.summary.rendered_nodes == 1
+    summary_text = widget._format_render_summary(
+        result.summary,
+        render_result.summary,
+    )
+    assert "Lookup direct/mirrored-depth/mirrored/unmapped" in summary_text
+    assert summary_text.endswith("0/1/0/0")
 
 
 def test_project_updates_progress_bar_and_restores_button(monkeypatch) -> None:
@@ -885,6 +904,8 @@ def test_latest_flatmap_correlation_source_requires_heatmap_render(monkeypatch) 
     assert source.input_file_ids == ("a.swc", "b.swc")
     assert source.xy_bins == 4
     assert source.depth_bin_um == 25.0
+    assert source.mirror_depth_fallback is True
+    assert source.mirror_coord_axis == 2
 
 
 def test_project_without_nrrds_requires_augmented_parquet_columns(monkeypatch) -> None:
@@ -1578,7 +1599,7 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
             "valid": [True],
             "x_flat": [0.25],
             "y_flat": [0.5],
-            "flatmap_lookup_mode": ["mirrored"],
+            "flatmap_lookup_mode": ["mirrored_depth"],
             "flatmap_valid": [True],
             "depth_valid": [True],
             "render_valid": [True],
@@ -1596,7 +1617,7 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
     assert exported["file_id"].tolist() == ["a.swc"]
     assert "depth_um" in exported.columns
     assert "coordinate_mode" in exported.columns
-    assert exported["flatmap_lookup_mode"].tolist() == ["mirrored"]
+    assert exported["flatmap_lookup_mode"].tolist() == ["mirrored_depth"]
     assert "render_valid" in exported.columns
     assert exported["x_flat_bin"].tolist() == [10]
     assert "Exported flatmap projection" in widget._status_label.text

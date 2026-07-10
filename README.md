@@ -98,14 +98,19 @@ Use repeatable `--file-id <id>` arguments to restrict the command-line
 conversion to specific neurons.
 
 The output preserves the original CCFv3 `x`, `y`, and `z` columns and appends
-`x_flat`, `y_flat`, `depth_um`, validity flags, and a lookup mode showing
-whether the direct or mirrored coordinate was used.
+`x_flat`, `y_flat`, `depth_um`, validity flags, and a lookup mode. Valid original
+flatmap coordinates are retained when depth must be read from the mirrored
+voxel (`mirrored_depth`); full-coordinate mirroring is reserved for invalid
+original flatmap lookups. Both-hemisphere flatmaps do not duplicate unilateral
+neuron data.
 
 The Flatmap tab can also convert selected atlas regions into a
 `Flatmap Region Labels` layer. Load an atlas, select regions in the Regions tab,
 choose matching flatmap/depth NRRDs, choose the Flatmap tab atlas for label
 conversion, then click `Create Region Labels`. Use `allen_mouse_10um` for
-10 µm flatmap/depth NRRDs.
+10 µm flatmap/depth NRRDs. When the depth NRRD covers one hemisphere, the label
+conversion mirrors only depth and keeps the annotation voxel's original
+bilateral flatmap coordinates.
 
 ## Standard Point Parquet Workflow
 

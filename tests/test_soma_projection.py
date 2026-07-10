@@ -3687,3 +3687,31 @@ def test_create_region_isolated_heatmaps_merged_sums_before_masking(
     assert created.metadata["heatmap_include_child_regions"] is False
     assert created.metadata["merge_mode"] == "merged_sum"
     assert created.contrast_limits == (0.0, 10.0)
+
+
+def test_load_flatmap_transform_status_warns_for_legacy_mirror_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = types.SimpleNamespace(
+        present_transform_text="flatmap and depth",
+        has_full_transform=True,
+        uses_legacy_mirror_fallback=True,
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._load_flatmap_transform_status.__globals__,
+        "read_flatmap_parquet_transform_info",
+        lambda _path: info,
+    )
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget._flatmap_transform_status_label = _DummyLabel()
+
+    result = NeuronViewerWidget._load_flatmap_transform_status(
+        widget,
+        "legacy.parquet",
+    )
+
+    assert result == "flatmap and depth"
+    assert "version-1 transform" in widget._flatmap_transform_status_label.text
+    assert "Regenerate the augmented Parquet" in (
+        widget._flatmap_transform_status_label.text
+    )

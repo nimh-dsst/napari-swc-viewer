@@ -386,7 +386,10 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-mirror-fallback",
         action="store_true",
-        help="Disable opposite-hemisphere retry for invalid direct lookup rows.",
+        help=(
+            "Disable both mirrored-depth recovery and full opposite-hemisphere "
+            "retry for invalid direct lookup rows."
+        ),
     )
     parser.add_argument(
         "--mirror-axis",

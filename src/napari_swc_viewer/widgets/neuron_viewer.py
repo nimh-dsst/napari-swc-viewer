@@ -1801,6 +1801,15 @@ class NeuronViewerWidget(QWidget):
                 "Flatmap rendering without NRRDs requires x_flat, y_flat, and "
                 "depth_um columns."
             )
+        if info.uses_legacy_mirror_fallback:
+            warning = (
+                " Warning: this version-1 transform used the legacy full-mirror "
+                "fallback, so mirrored rows may be placed in the opposite flatmap "
+                "hemisphere. Regenerate the augmented Parquet or select the original "
+                "flatmap/depth NRRDs to recompute corrected coordinates."
+            )
+            message += warning
+            logger.warning("%s: %s", Path(filepath).name, warning.strip())
         if label is not None:
             label.setText(message)
         return transform_text

@@ -118,6 +118,112 @@ def test_build_flatmap_region_label_volume_leaves_invalid_lookup_voxels_unlabele
     assert result.represented_region_ids == [1]
 
 
+def test_build_flatmap_region_labels_uses_mirrored_depth_on_both_panels() -> None:
+    annotation = np.zeros((1, 1, 4), dtype=np.int32)
+    annotation[0, 0, [0, 3]] = 315
+    flatmap = np.full((1, 1, 4, 2), -1.0, dtype=np.float32)
+    flatmap[0, 0, 0] = (0.1, 0.5)
+    flatmap[0, 0, 3] = (1.9, 0.5)
+    depth = np.full((1, 1, 4), -1.0, dtype=np.float32)
+    depth[0, 0, 3] = 100.0
+
+    result = build_flatmap_region_label_volume(
+        annotation,
+        flatmap,
+        depth,
+        selected_region_ids=[315],
+        xy_bins=20,
+        depth_bin_um=25.0,
+    )
+
+    labeled_x_bins = sorted(np.argwhere(result.labels > 0)[:, 2].tolist())
+    assert labeled_x_bins == [0, 19]
+    assert result.summary.selected_source_voxels == 2
+    assert result.summary.valid_source_voxels == 2
+    assert result.summary.mirrored_depth_source_voxels == 1
+    assert result.summary.labeled_voxels == 2
+    assert result.summary.to_dict()["mirrored_depth_source_voxels"] == 1
+
+    without_fallback = build_flatmap_region_label_volume(
+        annotation,
+        flatmap,
+        depth,
+        selected_region_ids=[315],
+        xy_bins=20,
+        depth_bin_um=25.0,
+        mirror_depth_fallback=False,
+    )
+    assert np.argwhere(without_fallback.labels > 0)[:, 2].tolist() == [19]
+    assert without_fallback.summary.valid_source_voxels == 1
+    assert without_fallback.summary.mirrored_depth_source_voxels == 0
+
+
+def test_build_flatmap_region_labels_prefers_original_depth() -> None:
+    annotation = np.zeros((1, 1, 4), dtype=np.int32)
+    annotation[0, 0, [0, 3]] = 315
+    flatmap = np.full((1, 1, 4, 2), -1.0, dtype=np.float32)
+    flatmap[0, 0, 0] = (0.1, 0.5)
+    flatmap[0, 0, 3] = (1.9, 0.5)
+    depth = np.full((1, 1, 4), -1.0, dtype=np.float32)
+    depth[0, 0, 0] = 25.0
+    depth[0, 0, 3] = 100.0
+
+    result = build_flatmap_region_label_volume(
+        annotation,
+        flatmap,
+        depth,
+        selected_region_ids=[315],
+        xy_bins=20,
+        depth_bin_um=25.0,
+    )
+
+    labeled = np.argwhere(result.labels > 0)
+    assert sorted(labeled[:, 0].tolist()) == [0, 3]
+    assert result.summary.mirrored_depth_source_voxels == 0
+
+
+def test_build_flatmap_region_labels_excludes_depth_invalid_on_both_sides() -> None:
+    annotation = np.asarray([[[7, 0, 7]]], dtype=np.int32)
+    flatmap = np.asarray(
+        [[[[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]]]],
+        dtype=np.float32,
+    )
+    depth = np.asarray([[[-1.0, 100.0, -1.0]]], dtype=np.float32)
+
+    result = build_flatmap_region_label_volume(
+        annotation,
+        flatmap,
+        depth,
+        selected_region_ids=[7],
+        xy_bins=3,
+    )
+
+    assert result.summary.selected_source_voxels == 2
+    assert result.summary.valid_source_voxels == 0
+    assert result.summary.mirrored_depth_source_voxels == 0
+    assert result.summary.labeled_voxels == 0
+
+
+def test_build_flatmap_region_labels_mirrors_axis_zero_across_chunks() -> None:
+    annotation = np.asarray([[[7]], [[7]]], dtype=np.int32)
+    flatmap = np.asarray([[[[0.1, 0.5]]], [[[1.9, 0.5]]]], dtype=np.float32)
+    depth = np.asarray([[[-1.0]], [[100.0]]], dtype=np.float32)
+
+    result = build_flatmap_region_label_volume(
+        annotation,
+        flatmap,
+        depth,
+        selected_region_ids=[7],
+        xy_bins=2,
+        mirror_coord_axis=0,
+        lookup_stats_chunk_voxels=1,
+    )
+
+    assert result.summary.valid_source_voxels == 2
+    assert result.summary.mirrored_depth_source_voxels == 1
+    assert result.summary.labeled_voxels == 2
+
+
 def test_build_flatmap_region_label_volume_rejects_shape_mismatch() -> None:
     flatmap, depth = _grid_volumes()
 
@@ -127,4 +233,17 @@ def test_build_flatmap_region_label_volume_rejects_shape_mismatch() -> None:
             flatmap,
             depth,
             selected_region_ids=[1],
+        )
+
+
+def test_build_flatmap_region_label_volume_rejects_invalid_mirror_axis() -> None:
+    flatmap, depth = _grid_volumes()
+
+    with pytest.raises(ValueError, match="mirror_coord_axis"):
+        build_flatmap_region_label_volume(
+            np.ones(depth.shape, dtype=np.int32),
+            flatmap,
+            depth,
+            selected_region_ids=[1],
+            mirror_coord_axis=3,
         )
