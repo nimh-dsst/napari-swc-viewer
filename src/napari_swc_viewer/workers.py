@@ -49,9 +49,7 @@ def cached_brainglobe_atlas_dir(
             return None
 
     root = Path(brainglobe_dir).expanduser()
-    candidates = sorted(
-        path for path in root.glob(f"{atlas_name}_v*") if path.is_dir()
-    )
+    candidates = sorted(path for path in root.glob(f"{atlas_name}_v*") if path.is_dir())
     if len(candidates) != 1:
         return None
     return candidates[0]
@@ -72,7 +70,9 @@ def resolve_brainglobe_dirs(
         if brainglobe_dir is None:
             brainglobe_dir = default_dirs["brainglobe_dir"]
         if interm_download_dir is None:
-            interm_download_dir = default_dirs.get("interm_download_dir", brainglobe_dir)
+            interm_download_dir = default_dirs.get(
+                "interm_download_dir", brainglobe_dir
+            )
 
     return Path(brainglobe_dir).expanduser(), Path(interm_download_dir).expanduser()
 
@@ -283,7 +283,9 @@ def _attach_cluster_run_metadata(
         dbscan_eps=dbscan_eps,
         dbscan_min_samples=dbscan_min_samples,
         atlas_name=getattr(atlas, "atlas_name", None),
-        atlas_resolution_um=tuple(float(value) for value in getattr(atlas, "resolution", ()) or ()),
+        atlas_resolution_um=tuple(
+            float(value) for value in getattr(atlas, "resolution", ()) or ()
+        ),
         source_parquet_path=str(Path(parquet_path)),
         dendrogram_leaf_order=[int(value) for value in result.reorder_indices.tolist()],
         extra_metadata=extra_metadata,
@@ -519,9 +521,7 @@ class ConvertWorker(QObject):
                 from .flatmap_parquet import augment_neuron_parquet_with_flatmaps
                 from .flatmap_profiles import discover_flatmap_lookup_set
 
-                lookup_cache_dir = (
-                    self._output_path.parent / ".flatmap-lookup-arrays"
-                )
+                lookup_cache_dir = self._output_path.parent / ".flatmap-lookup-arrays"
                 self._report_progress(
                     "Adding bilateral flatmap/depth columns...",
                     total,
@@ -850,7 +850,9 @@ class CorrelationWorker(QObject):
         self._dilation_fraction = dilation_fraction
         self._linkage_method = linkage_method
         self._n_clusters = n_clusters
-        self._file_ids = None if file_ids is None else [str(file_id) for file_id in file_ids]
+        self._file_ids = (
+            None if file_ids is None else [str(file_id) for file_id in file_ids]
+        )
 
     def run(self) -> None:
         """Execute the full pipeline."""
@@ -962,44 +964,52 @@ class FlatmapCorrelationWorker(QObject):
             )
 
             cache = open_region_cache(cache_dir)
-            profile = cache.profile(cache_profile_id)
-            result = materialize_region_selection(
-                profile,
-                mask_region_ids,
-                style=(
-                    getattr(source, "cache_style", None)
-                    or source.flatmap_style
-                    or "both_shaped"
-                ),
-                include_surfaces=False,
-                include_outlines=False,
-            )
-            mask = np.asarray(result.labels > 0, dtype=bool)
-            source_shape = tuple(int(size) for size in source.volume_shape)
-            if source.include_depth_minus_one and source_shape[0] == mask.shape[0] + 1:
-                padded = np.zeros(source_shape, dtype=bool)
-                padded[1:, :, :] = mask
-                mask = padded
-            elif mask.shape != source_shape:
-                raise RuntimeError(
-                    "Cached region mask shape does not match the flatmap heatmap; "
-                    f"got mask {mask.shape} and heatmap {source_shape}."
+            try:
+                profile = cache.profile(cache_profile_id)
+                result = materialize_region_selection(
+                    profile,
+                    mask_region_ids,
+                    style=(
+                        getattr(source, "cache_style", None)
+                        or source.flatmap_style
+                        or "both_shaped"
+                    ),
+                    include_surfaces=False,
+                    include_outlines=False,
                 )
-            return mask, {
-                "flatmap_region_source": "precomputed_cache",
-                "flatmap_region_cache_path": str(cache_dir),
-                "flatmap_region_cache_profile_id": str(cache_profile_id),
-                "flatmap_region_labeled_voxels": int(result.summary.labeled_bins),
-                "flatmap_region_collision_voxels": int(
-                    result.summary.collision_bins
-                ),
-                "flatmap_region_source_voxel_count": int(
-                    result.summary.source_voxel_count
-                ),
-                "flatmap_region_represented_region_ids": [
-                    int(region_id) for region_id in result.represented_region_ids
-                ],
-            }
+                mask = np.array(result.labels > 0, dtype=bool, copy=True)
+                source_shape = tuple(int(size) for size in source.volume_shape)
+                if (
+                    source.include_depth_minus_one
+                    and source_shape[0] == mask.shape[0] + 1
+                ):
+                    padded = np.zeros(source_shape, dtype=bool)
+                    padded[1:, :, :] = mask
+                    mask = padded
+                elif mask.shape != source_shape:
+                    raise RuntimeError(
+                        "Cached region mask shape does not match the flatmap heatmap; "
+                        f"got mask {mask.shape} and heatmap {source_shape}."
+                    )
+                return mask, {
+                    "flatmap_region_source": "precomputed_cache",
+                    "flatmap_region_cache_path": str(cache_dir),
+                    "flatmap_region_cache_profile_id": str(cache_profile_id),
+                    "flatmap_region_labeled_voxels": int(result.summary.labeled_bins),
+                    "flatmap_region_collision_voxels": int(
+                        result.summary.collision_bins
+                    ),
+                    "flatmap_region_source_voxel_count": int(
+                        result.summary.source_voxel_count
+                    ),
+                    "flatmap_region_represented_region_ids": [
+                        int(region_id) for region_id in result.represented_region_ids
+                    ],
+                }
+            finally:
+                close = getattr(cache, "close", None)
+                if callable(close):
+                    close()
         if getattr(source, "coordinate_mode", None) == "parquet_columns":
             raise RuntimeError(
                 "Region-filtered precomputed flatmap clustering requires a "
@@ -1084,9 +1094,7 @@ class FlatmapCorrelationWorker(QObject):
             if isinstance(raw_path, str):
                 try:
                     path_ids = {
-                        int(part)
-                        for part in raw_path.strip("/").split("/")
-                        if part
+                        int(part) for part in raw_path.strip("/").split("/") if part
                     }
                 except ValueError:
                     continue
@@ -1110,10 +1118,7 @@ class FlatmapCorrelationWorker(QObject):
             }
         if "flatmap_lookup_mode" in projected_nodes.columns:
             modes = (
-                projected_nodes["flatmap_lookup_mode"]
-                .fillna("")
-                .astype(str)
-                .to_numpy()
+                projected_nodes["flatmap_lookup_mode"].fillna("").astype(str).to_numpy()
             )
         else:
             valid = projected_nodes.get("valid")
@@ -1159,15 +1164,11 @@ class FlatmapCorrelationWorker(QObject):
                 "flatmap_coordinate_mode": source.coordinate_mode,
                 "flatmap_xy_bins": int(source.xy_bins),
                 "flatmap_depth_bin_um": float(source.depth_bin_um),
-                "flatmap_include_depth_minus_one": bool(
-                    source.include_depth_minus_one
-                ),
+                "flatmap_include_depth_minus_one": bool(source.include_depth_minus_one),
                 "flatmap_path": source.flatmap_path,
                 "depth_path": source.depth_path,
                 "flatmap_cache_path": getattr(source, "cache_dir", None),
-                "flatmap_cache_profile_id": getattr(
-                    source, "cache_profile_id", None
-                ),
+                "flatmap_cache_profile_id": getattr(source, "cache_profile_id", None),
                 "flatmap_input_neuron_count": int(len(source.input_file_ids)),
                 "flatmap_clustered_neuron_count": int(len(result.neuron_ids)),
                 "flatmap_unassigned_neuron_count": int(
@@ -1247,7 +1248,9 @@ class SomaClusterWorker(QObject):
         self._n_clusters = n_clusters
         self._eps = eps
         self._min_samples = min_samples
-        self._file_ids = None if file_ids is None else [str(file_id) for file_id in file_ids]
+        self._file_ids = (
+            None if file_ids is None else [str(file_id) for file_id in file_ids]
+        )
 
     def run(self) -> None:
         """Execute the soma clustering pipeline."""
@@ -1339,9 +1342,7 @@ class SomaClusterWorker(QObject):
             xi = np.floor(coords[:, 2] / resolution).astype(int)
 
             in_bounds = (
-                (xi >= 0) & (xi < X)
-                & (yi >= 0) & (yi < Y)
-                & (zi >= 0) & (zi < Z)
+                (xi >= 0) & (xi < X) & (yi >= 0) & (yi < Y) & (zi >= 0) & (zi < Z)
             )
             voxel_ids = np.full(len(coords), -1, dtype=np.int32)
             voxel_ids[in_bounds] = voxel_id_map[
@@ -1375,11 +1376,14 @@ class SomaClusterWorker(QObject):
                 )
                 return
 
-            self.progress.emit(f"Clustering {len(filtered_ids)} somas ({self._algorithm})...", 3, total)
+            self.progress.emit(
+                f"Clustering {len(filtered_ids)} somas ({self._algorithm})...", 3, total
+            )
 
             if self._algorithm == "hierarchical":
                 result = cluster_somas_hierarchical(
-                    filtered_coords, filtered_ids,
+                    filtered_coords,
+                    filtered_ids,
                     method=self._linkage_method,
                     n_clusters=self._n_clusters,
                 )
@@ -1388,7 +1392,8 @@ class SomaClusterWorker(QObject):
                 requested_cluster_count = self._n_clusters
             elif self._algorithm == "kmeans":
                 result = cluster_somas_kmeans(
-                    filtered_coords, filtered_ids,
+                    filtered_coords,
+                    filtered_ids,
                     n_clusters=self._n_clusters,
                 )
                 clustering_linkage = None
@@ -1396,7 +1401,8 @@ class SomaClusterWorker(QObject):
                 requested_cluster_count = self._n_clusters
             elif self._algorithm == "dbscan":
                 result = cluster_somas_dbscan(
-                    filtered_coords, filtered_ids,
+                    filtered_coords,
+                    filtered_ids,
                     eps=self._eps,
                     min_samples=self._min_samples,
                 )
@@ -1420,7 +1426,9 @@ class SomaClusterWorker(QObject):
                 dilation_fraction=self._dilation_fraction,
                 requested_cluster_count=requested_cluster_count,
                 dbscan_eps=self._eps if self._algorithm == "dbscan" else None,
-                dbscan_min_samples=self._min_samples if self._algorithm == "dbscan" else None,
+                dbscan_min_samples=self._min_samples
+                if self._algorithm == "dbscan"
+                else None,
             )
 
             self.progress.emit("Done", 4, total)

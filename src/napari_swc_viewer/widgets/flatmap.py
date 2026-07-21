@@ -130,12 +130,14 @@ class FlatmapProjectionWidget(QWidget):
         self._color_map_provider = color_map_provider
         self._cluster_map_provider = cluster_map_provider or (lambda: {})
         self._atlas_provider = atlas_provider or (lambda: None)
-        self._selected_region_ids_provider = selected_region_ids_provider or (lambda: [])
+        self._selected_region_ids_provider = selected_region_ids_provider or (
+            lambda: []
+        )
         self._selected_parent_region_ids_provider = (
             selected_parent_region_ids_provider or self._selected_region_ids_provider
         )
-        self._selected_region_acronyms_provider = (
-            selected_region_acronyms_provider or (lambda: [])
+        self._selected_region_acronyms_provider = selected_region_acronyms_provider or (
+            lambda: []
         )
 
         self._flatmap_path: Path | None = None
@@ -241,9 +243,7 @@ class FlatmapProjectionWidget(QWidget):
         self._style_combo.addItem("Both hemispheres, square", "both_square")
         self._style_combo.addItem("Single hemisphere, shaped", "single_shaped")
         self._style_combo.addItem("Single hemisphere, square", "single_square")
-        self._style_combo.currentIndexChanged.connect(
-            self._on_flatmap_style_changed
-        )
+        self._style_combo.currentIndexChanged.connect(self._on_flatmap_style_changed)
         style_row.addWidget(self._style_combo)
         files_layout.addLayout(style_row)
 
@@ -320,9 +320,7 @@ class FlatmapProjectionWidget(QWidget):
         self._cache_build_depth_bin_spin.setDecimals(3)
         self._cache_build_depth_bin_spin.setSingleStep(5.0)
         self._cache_build_depth_bin_spin.setSuffix(" um")
-        self._cache_build_depth_bin_spin.setValue(
-            float(DEFAULT_FLATMAP_DEPTH_BIN_UM)
-        )
+        self._cache_build_depth_bin_spin.setValue(float(DEFAULT_FLATMAP_DEPTH_BIN_UM))
         cache_grid_row.addWidget(self._cache_build_depth_bin_spin)
         cache_layout.addLayout(cache_grid_row)
 
@@ -346,7 +344,9 @@ class FlatmapProjectionWidget(QWidget):
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("Input:"))
         self._source_combo = QComboBox()
-        self._source_combo.addItem("Selected table rows, otherwise all", _SOURCE_SELECTED)
+        self._source_combo.addItem(
+            "Selected table rows, otherwise all", _SOURCE_SELECTED
+        )
         self._source_combo.addItem("All table rows", _SOURCE_ALL)
         source_row.addWidget(self._source_combo)
         options_layout.addLayout(source_row)
@@ -358,7 +358,9 @@ class FlatmapProjectionWidget(QWidget):
             "CCF microns from NRRD header",
             COORDINATE_MODE_MICRONS,
         )
-        self._coordinate_mode_combo.addItem("10 um voxel indices", COORDINATE_MODE_VOXELS)
+        self._coordinate_mode_combo.addItem(
+            "10 um voxel indices", COORDINATE_MODE_VOXELS
+        )
         coordinate_row.addWidget(self._coordinate_mode_combo)
         options_layout.addLayout(coordinate_row)
 
@@ -459,9 +461,7 @@ class FlatmapProjectionWidget(QWidget):
         self._region_outlines_btn.clicked.connect(self._create_region_outlines)
         geometry_actions_row.addWidget(self._region_outlines_btn)
         self._clear_region_geometry_btn = QPushButton("Clear Geometry")
-        self._clear_region_geometry_btn.clicked.connect(
-            self._clear_region_geometry
-        )
+        self._clear_region_geometry_btn.clicked.connect(self._clear_region_geometry)
         geometry_actions_row.addWidget(self._clear_region_geometry_btn)
         labels_layout.addLayout(geometry_actions_row)
         self._region_labels_status_label = QLabel("No flatmap region labels created.")
@@ -566,7 +566,10 @@ class FlatmapProjectionWidget(QWidget):
                     source == _PROJECTION_SOURCE_RECOMPUTE
                     or str(item_data(index)) in bilateral
                 )
-        if source == _PROJECTION_SOURCE_PRECOMPUTED and self._current_style_key() not in bilateral:
+        if (
+            source == _PROJECTION_SOURCE_PRECOMPUTED
+            and self._current_style_key() not in bilateral
+        ):
             for index in range(count()):
                 if str(item_data(index)) == "both_shaped":
                     combo.setCurrentIndex(index)
@@ -621,12 +624,14 @@ class FlatmapProjectionWidget(QWidget):
     ) -> None:
         """Open a region cache directory and refresh compatible profiles."""
         previous_directory = getattr(self, "_region_cache_dir", None)
+        previous_cache = getattr(self, "_region_cache", None)
         next_directory = Path(path) if path else None
         if next_directory is None:
+            self._deactivate_cache_profile()
             self._region_cache_dir = None
             self._region_cache = None
             self._pending_cache_profile_id = None
-            self._deactivate_cache_profile()
+            self._close_region_cache(previous_cache)
             self._cache_dir_label.setText("No cache directory selected")
             self._refresh_cache_profiles()
             return
@@ -638,12 +643,22 @@ class FlatmapProjectionWidget(QWidget):
         next_cache = open_region_cache(next_directory)
         if previous_directory != next_directory:
             self._invalidate_flatmap_grid_layers()
+            self._active_cache_profile = None
         self._region_cache_dir = next_directory
         self._region_cache = next_cache
         self._pending_cache_profile_id = str(profile_id) if profile_id else None
         self._set_cache_grid_locked(False)
+        if previous_cache is not next_cache:
+            self._close_region_cache(previous_cache)
         self._cache_dir_label.setText(str(next_directory))
         self._refresh_cache_profiles()
+
+    @staticmethod
+    def _close_region_cache(cache) -> None:
+        """Release a superseded cache without assuming a concrete cache type."""
+        close = getattr(cache, "close", None)
+        if callable(close):
+            close()
 
     def active_cache_reference(self) -> dict[str, str] | None:
         """Return the external cache reference stored in project bundles."""
@@ -823,7 +838,10 @@ class FlatmapProjectionWidget(QWidget):
             )
             if pending_profile_id:
                 for index in range(combo.count()):
-                    if self._cache_profile_id(combo.itemData(index)) == pending_profile_id:
+                    if (
+                        self._cache_profile_id(combo.itemData(index))
+                        == pending_profile_id
+                    ):
                         target_index = index
                         break
             combo.setCurrentIndex(target_index)
@@ -883,14 +901,12 @@ class FlatmapProjectionWidget(QWidget):
         if labels_button is not None:
             labels_button.setEnabled(
                 cache_enabled
-                or self._current_projection_source()
-                != _PROJECTION_SOURCE_PRECOMPUTED
+                or self._current_projection_source() != _PROJECTION_SOURCE_PRECOMPUTED
             )
         atlas_combo = getattr(self, "_region_label_atlas_combo", None)
         if atlas_combo is not None:
             atlas_combo.setEnabled(
-                self._current_projection_source()
-                != _PROJECTION_SOURCE_PRECOMPUTED
+                self._current_projection_source() != _PROJECTION_SOURCE_PRECOMPUTED
             )
 
     def _set_cache_grid_locked(self, locked: bool) -> None:
@@ -1021,9 +1037,7 @@ class FlatmapProjectionWidget(QWidget):
             xy_bins=self._current_cache_build_xy_bins(),
             depth_bin_um=self._current_cache_build_depth_bin_um(),
             lookup_resolution_um=(
-                float(raw_lookup_resolution)
-                if raw_lookup_resolution > 0
-                else None
+                float(raw_lookup_resolution) if raw_lookup_resolution > 0 else None
             ),
         )
         thread = QThread()
@@ -1063,29 +1077,34 @@ class FlatmapProjectionWidget(QWidget):
 
     def _on_cache_build_finished(self, profile) -> None:
         profile_id = self._cache_profile_id(profile)
-        self.set_cache_directory(self._region_cache_dir)
-        combo = self._cache_profile_combo
-        opened = False
-        for index in range(combo.count()):
-            if self._cache_profile_id(combo.itemData(index)) == profile_id:
-                combo.setCurrentIndex(index)
-                self._on_cache_profile_changed()
-                opened = True
-                break
-        if opened:
-            self._cache_status_label.setText(
-                f"Built and opened cache profile {profile_id}."
-            )
-            show_info(f"Built flatmap region-cache profile {profile_id}")
-            return
-        current_text = getattr(self._cache_status_label, "text", None)
-        detail = current_text() if callable(current_text) else ""
-        message = (
-            f"Built cache profile {profile_id}, but it is not compatible with "
-            f"the loaded Parquet/atlas/style. {detail}"
-        ).strip()
-        self._cache_status_label.setText(message)
-        show_warning(message)
+        try:
+            self.set_cache_directory(self._region_cache_dir)
+            combo = self._cache_profile_combo
+            opened = False
+            for index in range(combo.count()):
+                if self._cache_profile_id(combo.itemData(index)) == profile_id:
+                    combo.setCurrentIndex(index)
+                    self._on_cache_profile_changed()
+                    opened = True
+                    break
+            if opened:
+                self._cache_status_label.setText(
+                    f"Built and opened cache profile {profile_id}."
+                )
+                show_info(f"Built flatmap region-cache profile {profile_id}")
+                return
+            current_text = getattr(self._cache_status_label, "text", None)
+            detail = current_text() if callable(current_text) else ""
+            message = (
+                f"Built cache profile {profile_id}, but it is not compatible with "
+                f"the loaded Parquet/atlas/style. {detail}"
+            ).strip()
+            self._cache_status_label.setText(message)
+            show_warning(message)
+        finally:
+            close = getattr(profile, "close", None)
+            if callable(close):
+                close()
 
     def _on_cache_build_error(self, message: str) -> None:
         self._cache_status_label.setText(f"Region-cache build failed: {message}")
@@ -1135,9 +1154,7 @@ class FlatmapProjectionWidget(QWidget):
             profile is not None
             and self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
         ):
-            return int(
-                profile.style(self._current_style_key()).grid_spec["xy_bins"]
-            )
+            return int(profile.style(self._current_style_key()).grid_spec["xy_bins"])
         return int(self._xy_bins_spin.value())
 
     def _current_depth_bin_um(self) -> float:
@@ -1215,7 +1232,9 @@ class FlatmapProjectionWidget(QWidget):
 
     def _file_ids_for_source(self, source_mode: str | None = None) -> list[object]:
         mode = source_mode or self._current_source_mode()
-        table_ids = self._deduplicate_file_ids(list(self._table_file_ids_provider() or []))
+        table_ids = self._deduplicate_file_ids(
+            list(self._table_file_ids_provider() or [])
+        )
         if mode == _SOURCE_ALL:
             return table_ids
 
@@ -1233,7 +1252,9 @@ class FlatmapProjectionWidget(QWidget):
 
         getter = getattr(db, "get_neurons_for_rendering", None)
         if not callable(getter):
-            raise RuntimeError("Loaded neuron database does not support rendering queries.")
+            raise RuntimeError(
+                "Loaded neuron database does not support rendering queries."
+            )
         nodes = getter(file_ids)
         if nodes is None or nodes.empty:
             raise RuntimeError("No neuron rows matched the requested file IDs.")
@@ -1375,9 +1396,7 @@ class FlatmapProjectionWidget(QWidget):
                 "and bilateral square styles. Choose Recompute from NRRDs for "
                 "a unilateral style."
             )
-        info = read_flatmap_parquet_transform_info(
-            self._current_source_parquet_path()
-        )
+        info = read_flatmap_parquet_transform_info(self._current_source_parquet_path())
         if info.format_version < 3 or not info.lookup_set_id:
             raise RuntimeError(
                 "Bilateral flatmap columns require complete version-3 metadata "
@@ -1418,9 +1437,7 @@ class FlatmapProjectionWidget(QWidget):
         lookup_stats = self._lookup_stats_for_volume_set(
             volume_set,
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-            invalid_negative_one_sentinel=(
-                self._negative_one_sentinel_cb.isChecked()
-            ),
+            invalid_negative_one_sentinel=(self._negative_one_sentinel_cb.isChecked()),
         )
         self._emit_projection_progress(
             progress_callback,
@@ -1435,9 +1452,7 @@ class FlatmapProjectionWidget(QWidget):
             flatmap_style=self._current_style_filename(),
             coordinate_mode=self._current_coordinate_mode(),
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-            invalid_negative_one_sentinel=(
-                self._negative_one_sentinel_cb.isChecked()
-            ),
+            invalid_negative_one_sentinel=(self._negative_one_sentinel_cb.isChecked()),
             resolution_um=DEFAULT_CCF_RESOLUTION_UM,
             space_directions=volume_set.space_directions,
             space_origin=volume_set.space_origin,
@@ -1455,13 +1470,9 @@ class FlatmapProjectionWidget(QWidget):
             volume_set.depth,
             xy_bins=self._current_xy_bins(),
             depth_bin_um=self._current_depth_bin_um(),
-            include_depth_minus_one=(
-                not self._exclude_depth_minus_one_cb.isChecked()
-            ),
+            include_depth_minus_one=(not self._exclude_depth_minus_one_cb.isChecked()),
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
-            invalid_negative_one_sentinel=(
-                self._negative_one_sentinel_cb.isChecked()
-            ),
+            invalid_negative_one_sentinel=(self._negative_one_sentinel_cb.isChecked()),
             lookup_stats=lookup_stats,
         )
         return result, render_result, lookup_stats
@@ -1491,9 +1502,7 @@ class FlatmapProjectionWidget(QWidget):
             result.projected_nodes,
             xy_bins=self._current_xy_bins(),
             depth_bin_um=self._current_depth_bin_um(),
-            include_depth_minus_one=(
-                not self._exclude_depth_minus_one_cb.isChecked()
-            ),
+            include_depth_minus_one=(not self._exclude_depth_minus_one_cb.isChecked()),
             **canonical_bounds,
         )
         return result, render_result, None
@@ -1516,10 +1525,13 @@ class FlatmapProjectionWidget(QWidget):
         metadata = info.metadata
         if not isinstance(metadata, dict):
             return {}
-        return self._bounds_from_projection_metadata(
-            metadata,
-            self._current_style_key(),
-        ) or {}
+        return (
+            self._bounds_from_projection_metadata(
+                metadata,
+                self._current_style_key(),
+            )
+            or {}
+        )
 
     @staticmethod
     def _bounds_from_projection_metadata(
@@ -1535,9 +1547,7 @@ class FlatmapProjectionWidget(QWidget):
         try:
             x_values = tuple(float(value) for value in style_bounds["x"])
             y_values = tuple(float(value) for value in style_bounds["y"])
-            depth_values = tuple(
-                float(value) for value in style_bounds["depth_um"]
-            )
+            depth_values = tuple(float(value) for value in style_bounds["depth_um"])
         except (KeyError, TypeError, ValueError):
             return None
         if not all(len(values) == 2 for values in (x_values, y_values, depth_values)):
@@ -1623,9 +1633,7 @@ class FlatmapProjectionWidget(QWidget):
         self,
         nodes: pd.DataFrame,
     ) -> FlatmapProjectionResult:
-        source = self._normalise_precomputed_style_columns(
-            nodes.reset_index(drop=True)
-        )
+        source = self._normalise_precomputed_style_columns(nodes.reset_index(drop=True))
         missing = [
             column
             for column in ("x_flat", "y_flat", "depth_um")
@@ -1633,8 +1641,7 @@ class FlatmapProjectionWidget(QWidget):
         ]
         if missing:
             raise RuntimeError(
-                "Loaded Parquet is missing reusable flatmap/depth column(s): "
-                f"{missing}"
+                f"Loaded Parquet is missing reusable flatmap/depth column(s): {missing}"
             )
 
         x_flat = pd.to_numeric(source["x_flat"], errors="coerce").to_numpy(dtype=float)
@@ -1654,10 +1661,7 @@ class FlatmapProjectionWidget(QWidget):
         )
         if "flatmap_projection_valid" in source.columns:
             valid = (
-                source["flatmap_projection_valid"]
-                .fillna(False)
-                .astype(bool)
-                .to_numpy()
+                source["flatmap_projection_valid"].fillna(False).astype(bool).to_numpy()
             )
         elif "valid" in source.columns:
             valid = source["valid"].fillna(False).astype(bool).to_numpy()
@@ -1763,8 +1767,7 @@ class FlatmapProjectionWidget(QWidget):
         ]
         if missing:
             raise RuntimeError(
-                "Loaded Parquet is missing version-3 precomputed column(s): "
-                f"{missing}"
+                f"Loaded Parquet is missing version-3 precomputed column(s): {missing}"
             )
 
         normalised = source.copy()
@@ -1794,9 +1797,9 @@ class FlatmapProjectionWidget(QWidget):
                 (depth_modes == FLATMAP_LOOKUP_MIRRORED_DEPTH)
                 & (combined_modes == FLATMAP_LOOKUP_DIRECT)
             ] = FLATMAP_LOOKUP_MIRRORED_DEPTH
-            combined_modes.loc[
-                depth_modes == FLATMAP_LOOKUP_UNMAPPED
-            ] = FLATMAP_LOOKUP_UNMAPPED
+            combined_modes.loc[depth_modes == FLATMAP_LOOKUP_UNMAPPED] = (
+                FLATMAP_LOOKUP_UNMAPPED
+            )
             normalised["flatmap_lookup_mode"] = combined_modes
         return normalised
 
@@ -1912,10 +1915,14 @@ class FlatmapProjectionWidget(QWidget):
         self._last_render_mode = self._current_render_mode()
         self._last_flatmap_style = flatmap_style or self._current_style_filename()
         self._last_coordinate_mode = coordinate_mode or self._current_coordinate_mode()
-        self._last_volume_shape = tuple(int(size) for size in render_result.volume.shape)
+        self._last_volume_shape = tuple(
+            int(size) for size in render_result.volume.shape
+        )
         self._last_lookup_stats = lookup_stats
         self._last_input_file_ids = tuple(input_file_ids)
-        self._last_flatmap_path = str(self._flatmap_path) if self._flatmap_path else None
+        self._last_flatmap_path = (
+            str(self._flatmap_path) if self._flatmap_path else None
+        )
         self._last_depth_path = str(self._depth_path) if self._depth_path else None
         self._last_projection_source = self._current_projection_source()
         active_profile = getattr(self, "_active_cache_profile", None)
@@ -1957,9 +1964,7 @@ class FlatmapProjectionWidget(QWidget):
             return None
         last_source = getattr(self, "_last_projection_source", None)
         if last_source == _PROJECTION_SOURCE_PRECOMPUTED:
-            if self._current_style_key() != getattr(
-                self, "_last_flatmap_style", None
-            ):
+            if self._current_style_key() != getattr(self, "_last_flatmap_style", None):
                 return None
             current_profile_id = self._cache_profile_id(
                 getattr(self, "_active_cache_profile", None)
@@ -1998,9 +2003,7 @@ class FlatmapProjectionWidget(QWidget):
             input_file_ids=input_file_ids,
             xy_bins=int(render_summary.xy_bins),
             depth_bin_um=float(render_summary.depth_bin_um),
-            include_depth_minus_one=bool(
-                render_summary.includes_depth_minus_one_plane
-            ),
+            include_depth_minus_one=bool(render_summary.includes_depth_minus_one_plane),
             flatmap_style=getattr(self, "_last_flatmap_style", None),
             coordinate_mode=getattr(self, "_last_coordinate_mode", None),
             flatmap_path=self._last_flatmap_path,
@@ -2109,7 +2112,9 @@ class FlatmapProjectionWidget(QWidget):
             }
         )
         if not selected_region_ids:
-            raise RuntimeError("Select at least one atlas region before creating labels.")
+            raise RuntimeError(
+                "Select at least one atlas region before creating labels."
+            )
         return selected_region_ids
 
     def _create_region_labels_for_atlas(
@@ -2181,9 +2186,7 @@ class FlatmapProjectionWidget(QWidget):
         from ..workers import AtlasLoadWorker
 
         self._set_region_label_controls_enabled(False)
-        self._set_region_labels_status(
-            f"Loading region-label atlas {atlas_name}..."
-        )
+        self._set_region_labels_status(f"Loading region-label atlas {atlas_name}...")
 
         thread = QThread()
         worker = AtlasLoadWorker(atlas_name)
@@ -2194,9 +2197,11 @@ class FlatmapProjectionWidget(QWidget):
         thread.started.connect(worker.run)
         worker.status.connect(self._on_region_label_atlas_load_status)
         worker.finished.connect(
-            lambda atlas, expected=atlas_name: self._on_region_label_atlas_load_finished(
-                atlas,
-                expected,
+            lambda atlas, expected=atlas_name: (
+                self._on_region_label_atlas_load_finished(
+                    atlas,
+                    expected,
+                )
             )
         )
         worker.error.connect(self._on_region_label_atlas_load_error)
@@ -2222,9 +2227,7 @@ class FlatmapProjectionWidget(QWidget):
         self._region_label_atlas_cache[atlas_name] = atlas
         self._region_label_atlas_cache[resolved_name] = atlas
         self._set_region_label_controls_enabled(True)
-        self._set_region_labels_status(
-            f"Loaded region-label atlas {resolved_name}."
-        )
+        self._set_region_labels_status(f"Loaded region-label atlas {resolved_name}.")
 
         if self._pending_region_label_request:
             self._pending_region_label_request = False
@@ -2340,7 +2343,9 @@ class FlatmapProjectionWidget(QWidget):
             blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
             if callable(blocker):
                 with blocker():
-                    self._set_region_labels_layer_data(layer, result, metadata, colormap)
+                    self._set_region_labels_layer_data(
+                        layer, result, metadata, colormap
+                    )
             else:
                 self._set_region_labels_layer_data(layer, result, metadata, colormap)
             refresh = getattr(layer, "refresh", None)
@@ -2480,8 +2485,8 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 layer = viewer.add_surface(
                     (
-                        np.asarray(surface.vertices, dtype=np.float32),
-                        np.asarray(surface.faces, dtype=np.int32),
+                        np.array(surface.vertices, dtype=np.float32, copy=True),
+                        np.array(surface.faces, dtype=np.int32, copy=True),
                         np.ones(len(surface.vertices), dtype=np.float32),
                     ),
                     name=name,
@@ -2503,7 +2508,9 @@ class FlatmapProjectionWidget(QWidget):
             message = f"Loaded {len(created)} cached region surface layer(s)."
             self._set_region_labels_status(message)
             if not created:
-                show_warning("The selected cache profile has no surface for this selection.")
+                show_warning(
+                    "The selected cache profile has no surface for this selection."
+                )
         except Exception as exc:
             logger.exception("Cached flatmap region surfaces failed")
             show_warning(f"Cached flatmap region surfaces failed: {exc}")
@@ -2532,7 +2539,7 @@ class FlatmapProjectionWidget(QWidget):
                     else f"{_REGION_OUTLINES_LAYER_NAME}: {region_id}"
                 )
                 layer = viewer.add_vectors(
-                    np.asarray(outlines.vectors, dtype=np.float32),
+                    np.array(outlines.vectors, dtype=np.float32, copy=True),
                     name=name,
                     edge_color=rgba,
                     edge_width=1.5,
@@ -2551,7 +2558,9 @@ class FlatmapProjectionWidget(QWidget):
             message = f"Loaded {len(created)} cached region outline layer(s)."
             self._set_region_labels_status(message)
             if not created:
-                show_warning("The selected cache profile has no outlines for this selection.")
+                show_warning(
+                    "The selected cache profile has no outlines for this selection."
+                )
         except Exception as exc:
             logger.exception("Cached flatmap region outlines failed")
             show_warning(f"Cached flatmap region outlines failed: {exc}")
@@ -2613,16 +2622,14 @@ class FlatmapProjectionWidget(QWidget):
 
     @staticmethod
     def _render_layer_name(render_mode: str) -> str:
-        return _POINTS_LAYER_NAME if render_mode == _RENDER_POINTS else _HEATMAP_LAYER_NAME
+        return (
+            _POINTS_LAYER_NAME if render_mode == _RENDER_POINTS else _HEATMAP_LAYER_NAME
+        )
 
     @staticmethod
     def _is_flatmap_render_layer_name(name: object) -> bool:
-        return (
-            name in _FLATMAP_RENDER_LAYER_NAMES
-            or (
-                isinstance(name, str)
-                and name.startswith(_GROUPED_HEATMAP_LAYER_PREFIX)
-            )
+        return name in _FLATMAP_RENDER_LAYER_NAMES or (
+            isinstance(name, str) and name.startswith(_GROUPED_HEATMAP_LAYER_PREFIX)
         )
 
     def _find_layer_by_name(self, name: str, *, viewer=None, create: bool = True):
@@ -2695,12 +2702,9 @@ class FlatmapProjectionWidget(QWidget):
                 pass
             if layer is self._projection_layer:
                 self._projection_layer = None
-        if (
-            self._projection_layer is not None
-            and (
-                getattr(self._projection_layer, "name", None) != except_name
-                or not self._layer_is_in_viewer(self._projection_layer)
-            )
+        if self._projection_layer is not None and (
+            getattr(self._projection_layer, "name", None) != except_name
+            or not self._layer_is_in_viewer(self._projection_layer)
         ):
             self._projection_layer = None
 
@@ -2747,9 +2751,7 @@ class FlatmapProjectionWidget(QWidget):
         render_summary: FlatmapRenderSummary,
     ) -> str:
         depth_minus_one_action = (
-            "rendered"
-            if render_summary.includes_depth_minus_one_plane
-            else "excluded"
+            "rendered" if render_summary.includes_depth_minus_one_plane else "excluded"
         )
         return (
             f"Input nodes: {projection_summary.total_nodes:,}\n"
@@ -2791,7 +2793,10 @@ class FlatmapProjectionWidget(QWidget):
             else _HEATMAP_COLOR_SINGLE
         )
         layer_name = self._render_layer_name(render_mode)
-        if render_mode == _RENDER_HEATMAP and heatmap_color_mode != _HEATMAP_COLOR_SINGLE:
+        if (
+            render_mode == _RENDER_HEATMAP
+            and heatmap_color_mode != _HEATMAP_COLOR_SINGLE
+        ):
             self._remove_projection_layer()
         else:
             self._remove_projection_layer(except_name=layer_name)
@@ -3100,7 +3105,9 @@ class FlatmapProjectionWidget(QWidget):
                     return
                 widget._apply_heatmap_contrast_limits(bound_layer, limits)
 
-            layer.reset_contrast_limits = MethodType(stable_reset_contrast_limits, layer)
+            layer.reset_contrast_limits = MethodType(
+                stable_reset_contrast_limits, layer
+            )
 
         original_reset_contrast_limits_range = getattr(
             layer,
@@ -3255,7 +3262,7 @@ class FlatmapProjectionWidget(QWidget):
             if ndim > 0:
                 coords = coords[-ndim:]
             rounded = np.round(coords).astype(int)
-            coords_str = f' [{" ".join(map(str, rounded))}]'
+            coords_str = f" [{' '.join(map(str, rounded))}]"
 
         status["coordinates"] = ": ".join((coords_str, ""))
         status["coords"] = coords_str

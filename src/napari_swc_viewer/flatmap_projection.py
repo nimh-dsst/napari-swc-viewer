@@ -60,13 +60,9 @@ class ProjectionSummary:
             "missing_input_nodes": int(self.missing_input_nodes),
             "rendered_segments": int(self.rendered_segments),
             "total_traces": int(self.total_traces),
-            "traces_with_partial_projection": int(
-                self.traces_with_partial_projection
-            ),
+            "traces_with_partial_projection": int(self.traces_with_partial_projection),
             "direct_lookup_nodes": int(self.direct_lookup_nodes),
-            "mirrored_depth_lookup_nodes": int(
-                self.mirrored_depth_lookup_nodes
-            ),
+            "mirrored_depth_lookup_nodes": int(self.mirrored_depth_lookup_nodes),
             "mirrored_lookup_nodes": int(self.mirrored_lookup_nodes),
             "unmapped_lookup_nodes": int(self.unmapped_lookup_nodes),
         }
@@ -215,8 +211,7 @@ def _project_neuron_nodes_to_flatmap_direct(
     depth = np.asarray(depth_volume)
     if flatmap.ndim != 4 or flatmap.shape[-1] != 2:
         raise ValueError(
-            "flatmap_volume must have shape (nx, ny, nz, 2); "
-            f"got {flatmap.shape}."
+            f"flatmap_volume must have shape (nx, ny, nz, 2); got {flatmap.shape}."
         )
     if depth.shape != flatmap.shape[:3]:
         raise ValueError(
@@ -339,8 +334,8 @@ def project_neuron_nodes_to_flatmap(
             mirror_midline=mirror_midline,
         )
         retry_positions = np.flatnonzero(~direct_valid)
-        retry_nodes = nodes.reset_index(drop=True).iloc[retry_positions].reset_index(
-            drop=True
+        retry_nodes = (
+            nodes.reset_index(drop=True).iloc[retry_positions].reset_index(drop=True)
         )
         mirrored_nodes = _mirror_node_coordinates(
             retry_nodes,
@@ -362,13 +357,12 @@ def project_neuron_nodes_to_flatmap(
 
         direct_flatmap_valid = selected["flatmap_valid"].to_numpy(dtype=bool)
         direct_depth_valid = selected["depth_valid"].to_numpy(dtype=bool)
-        mirrored_depth_valid = mirrored["depth_valid"].to_numpy(dtype=bool)
-
         depth_only_retry = (
-            direct_flatmap_valid[retry_positions]
-            & ~direct_depth_valid[retry_positions]
+            direct_flatmap_valid[retry_positions] & ~direct_depth_valid[retry_positions]
         )
-        mirrored_depth_valid &= depth_only_retry
+        mirrored_depth_valid = (
+            mirrored["depth_valid"].to_numpy(dtype=bool) & depth_only_retry
+        )
         if mirrored_depth_valid.any():
             mirrored_depth_positions = retry_positions[mirrored_depth_valid]
             selected.loc[mirrored_depth_positions, "depth_um"] = mirrored.loc[
@@ -380,10 +374,9 @@ def project_neuron_nodes_to_flatmap(
             selected.loc[mirrored_depth_positions, "invalid_reason"] = ""
             lookup_mode[mirrored_depth_positions] = FLATMAP_LOOKUP_MIRRORED_DEPTH
 
-        full_mirror_valid = (
-            ~direct_flatmap_valid[retry_positions]
-            & mirrored["valid"].to_numpy(dtype=bool)
-        )
+        full_mirror_valid = ~direct_flatmap_valid[retry_positions] & mirrored[
+            "valid"
+        ].to_numpy(dtype=bool)
         if full_mirror_valid.any():
             mirrored_positions = retry_positions[full_mirror_valid]
             projection_columns = (

@@ -11,6 +11,7 @@ import pytest
 import napari_swc_viewer.flatmap_region_cache as region_cache_module
 from napari_swc_viewer.flatmap_region_cache import (
     REGION_CACHE_MANIFEST_FILENAME,
+    RegionCacheError,
     RegionCacheCancelled,
     RegionCacheValidationError,
     build_region_cache_profile,
@@ -184,6 +185,30 @@ def test_region_cache_round_trip_and_parent_geometry(tmp_path):
     ] == (2, 3)
 
 
+def test_region_cache_close_releases_loaded_maps_and_is_terminal(tmp_path):
+    profile = _build(tmp_path / "cache")
+    cache = open_region_cache(tmp_path / "cache")
+    style = cache.profile(profile.profile_id).style("shaped")
+    loaded = style.array("occupancy_linear_bins")
+    assert isinstance(loaded, np.memmap)
+    assert not loaded._mmap.closed
+
+    cache.close()
+    cache.close()
+
+    assert loaded._mmap.closed
+    with pytest.raises(RegionCacheError, match="closed"):
+        style.array("occupancy_linear_bins")
+
+    profile_style = profile.style("square")
+    profile_loaded = profile_style.array("surface_faces")
+    profile.close()
+    profile.close()
+    assert profile_loaded._mmap.closed
+    with pytest.raises(RegionCacheError, match="closed"):
+        profile_style.array("surface_faces")
+
+
 def test_surface_and_outline_are_voxel_faithful_for_adjacent_bins():
     from napari_swc_viewer.flatmap_region_cache import (
         _outlines_for_bins,
@@ -340,6 +365,7 @@ def test_open_rejects_missing_corrupt_and_invalid_arrays(tmp_path):
     profile_dir = (
         root / manifest["profiles"][profile.profile_id]["directory"] / "shaped"
     )
+    profile.close()
     offsets_path = (
         profile_dir / style_data["arrays"]["occupancy_region_offsets"]["path"]
     )
@@ -372,6 +398,7 @@ def test_open_rejects_contract_dtype_even_when_file_matches_manifest(tmp_path):
     profile_dir = (
         root / manifest["profiles"][profile.profile_id]["directory"] / "shaped"
     )
+    profile.close()
     region_ids_spec = style_data["arrays"]["occupancy_region_ids"]
     region_ids_path = profile_dir / region_ids_spec["path"]
     region_ids = np.load(region_ids_path, allow_pickle=False).astype(np.int64)
@@ -384,6 +411,37 @@ def test_open_rejects_contract_dtype_even_when_file_matches_manifest(tmp_path):
         match="occupancy_region_ids.*must use int32",
     ):
         open_region_cache(root)
+
+
+@pytest.mark.parametrize("corruption", ["dtype", "shape"])
+def test_open_closes_array_rejected_before_registration(
+    tmp_path, monkeypatch, corruption
+):
+    root = tmp_path / "cache"
+    profile = _build(root)
+    manifest = json.loads((root / REGION_CACHE_MANIFEST_FILENAME).read_text())
+    style_data = manifest["profiles"][profile.profile_id]["styles"]["shaped"]
+    profile_dir = (
+        root / manifest["profiles"][profile.profile_id]["directory"] / "shaped"
+    )
+    profile.close()
+    region_ids_path = profile_dir / style_data["arrays"]["occupancy_region_ids"]["path"]
+    region_ids = np.load(region_ids_path, allow_pickle=False)
+    if corruption == "dtype":
+        region_ids = region_ids.astype(np.int64)
+    else:
+        region_ids = np.concatenate((region_ids, region_ids[:1]))
+    np.save(region_ids_path, region_ids, allow_pickle=False)
+
+    tracked, _removed_run_dirs, _published_temp_dirs = _install_windows_memmap_guard(
+        monkeypatch
+    )
+    with pytest.raises(RegionCacheValidationError, match=corruption):
+        open_region_cache(root)
+
+    rejected = [array for path, array in tracked if path == region_ids_path]
+    assert rejected
+    assert all(array._mmap.closed for array in rejected)
 
 
 def test_open_rejects_incorrect_validation_count_metadata(tmp_path):

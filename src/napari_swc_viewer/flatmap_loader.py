@@ -6,6 +6,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,48 @@ class FlatmapLookupLoadCancelledError(RuntimeError):
 def _check_load_cancelled(cancel_callback: Callable[[], bool] | None) -> None:
     if cancel_callback is not None and cancel_callback():
         raise FlatmapLookupLoadCancelledError("Flatmap lookup loading cancelled.")
+
+
+def _close_memmap(array: np.ndarray, *, flush: bool = False) -> None:
+    """Release a NumPy memory map without relying on garbage collection."""
+    if not isinstance(array, np.memmap):
+        return
+
+    mapping = getattr(array, "_mmap", None)
+    try:
+        if flush:
+            array.flush()
+    finally:
+        if mapping is not None and not mapping.closed:
+            mapping.close()
+
+
+@contextmanager
+def _create_npy_memmap(
+    path: Path,
+    *,
+    dtype: np.dtype | str,
+    shape: tuple[int, ...],
+):
+    """Create a writable NPY map and always close its Windows file handle."""
+    array = np.lib.format.open_memmap(
+        path,
+        mode="w+",
+        dtype=dtype,
+        shape=shape,
+    )
+    try:
+        yield array
+    except BaseException:
+        # The exception raised while producing the cache is the useful error.
+        # Closing is still attempted, but must not replace that primary failure.
+        try:
+            _close_memmap(array)
+        except Exception:
+            pass
+        raise
+    else:
+        _close_memmap(array, flush=True)
 
 
 @dataclass(frozen=True)
@@ -171,35 +214,71 @@ def _load_npy_cache(
     except (OSError, ValueError):
         return None
 
+    def reject_cache() -> None:
+        try:
+            _close_memmap(array)
+        except Exception:
+            # Cache loading is opportunistic. A malformed cache should fall
+            # back to its NRRD source even if releasing it also reports an
+            # error on the local filesystem.
+            pass
+
     if array.dtype != np.float32:
+        reject_cache()
         return None
 
     normalized_shape = metadata.get("normalized_shape")
     if not isinstance(normalized_shape, list) or tuple(array.shape) != tuple(
         normalized_shape
     ):
+        reject_cache()
         return None
 
     if kind == "flatmap":
         if array.ndim != 4 or array.shape[-1] != 2:
+            reject_cache()
             return None
         raw_coordinate_axis = metadata.get("coordinate_axis")
         if raw_coordinate_axis is None:
+            reject_cache()
             return None
-        coordinate_axis = int(raw_coordinate_axis)
+        try:
+            coordinate_axis = int(raw_coordinate_axis)
+        except (TypeError, ValueError, OverflowError):
+            reject_cache()
+            return None
     else:
         if array.ndim != 3:
+            reject_cache()
             return None
         coordinate_axis = None
 
     raw_source_ndim = metadata.get("source_ndim")
     if raw_source_ndim is None:
+        reject_cache()
         return None
+
+    try:
+        source_ndim = int(raw_source_ndim)
+    except (TypeError, ValueError, OverflowError):
+        reject_cache()
+        return None
+    if source_ndim <= 0 or (
+        coordinate_axis is not None and not 0 <= coordinate_axis < source_ndim
+    ):
+        reject_cache()
+        return None
+
+    try:
+        header = _read_nrrd_header(source_path)
+    except BaseException:
+        reject_cache()
+        raise
 
     return _LoadedVolume(
         data=array,
-        header=_read_nrrd_header(source_path),
-        source_ndim=int(raw_source_ndim),
+        header=header,
+        source_ndim=source_ndim,
         coordinate_axis=coordinate_axis,
         npy_path=cache_path,
         loaded_from_cache=True,
@@ -229,9 +308,7 @@ def _write_npy_cache(
         "source": _source_signature(source_path),
         "source_shape": [int(size) for size in source_shape],
         "source_ndim": int(source_ndim),
-        "coordinate_axis": (
-            None if coordinate_axis is None else int(coordinate_axis)
-        ),
+        "coordinate_axis": (None if coordinate_axis is None else int(coordinate_axis)),
         "normalized_shape": [int(size) for size in data.shape],
         "dtype": "float32",
     }
@@ -242,20 +319,17 @@ def _write_npy_cache(
     try:
         _check_load_cancelled(cancel_callback)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        output = np.lib.format.open_memmap(
+        with _create_npy_memmap(
             cache_tmp,
-            mode="w+",
             dtype=np.float32,
             shape=data.shape,
-        )
-        plane_values = max(1, int(np.prod(data.shape[1:], dtype=np.int64)))
-        chunk_size = max(1, _NPY_CACHE_WRITE_CHUNK_VALUES // plane_values)
-        for start in range(0, int(data.shape[0]), chunk_size):
-            _check_load_cancelled(cancel_callback)
-            stop = min(start + chunk_size, int(data.shape[0]))
-            output[start:stop] = data[start:stop]
-        output.flush()
-        del output
+        ) as output:
+            plane_values = max(1, int(np.prod(data.shape[1:], dtype=np.int64)))
+            chunk_size = max(1, _NPY_CACHE_WRITE_CHUNK_VALUES // plane_values)
+            for start in range(0, int(data.shape[0]), chunk_size):
+                _check_load_cancelled(cancel_callback)
+                stop = min(start + chunk_size, int(data.shape[0]))
+                output[start:stop] = data[start:stop]
         cache_tmp.replace(cache_path)
         metadata_tmp.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
         metadata_tmp.replace(metadata_path)

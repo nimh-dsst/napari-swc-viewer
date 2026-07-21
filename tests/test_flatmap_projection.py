@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -60,9 +62,7 @@ def test_coordinates_to_voxel_indices_accepts_voxel_mode() -> None:
 
 
 def test_coordinates_to_voxel_indices_uses_nrrd_spatial_transform() -> None:
-    directions = np.asarray(
-        [[0.0, 0.0, 10.0], [0.0, 10.0, 0.0], [10.0, 0.0, 0.0]]
-    )
+    directions = np.asarray([[0.0, 0.0, 10.0], [0.0, 10.0, 0.0], [10.0, 0.0, 0.0]])
     voxels, finite = coordinates_to_voxel_indices(
         np.asarray([[30.0, 20.0, 10.0], [10.0, 20.0, 30.0]]),
         coordinate_mode=COORDINATE_MODE_MICRONS,
@@ -105,9 +105,7 @@ def test_project_neuron_nodes_to_flatmap_preserves_metadata_for_valid_points() -
 
 def test_project_neuron_nodes_to_flatmap_uses_nrrd_spatial_transform() -> None:
     flatmap, depth = _volumes()
-    directions = np.asarray(
-        [[0.0, 0.0, 10.0], [0.0, 10.0, 0.0], [10.0, 0.0, 0.0]]
-    )
+    directions = np.asarray([[0.0, 0.0, 10.0], [0.0, 10.0, 0.0], [10.0, 0.0, 0.0]])
 
     projected = project_neuron_nodes_to_flatmap(
         _nodes(
@@ -209,7 +207,9 @@ def test_project_neuron_nodes_to_flatmap_mirrors_only_invalid_direct_depth() -> 
     assert row["invalid_reason"] == ""
 
 
-def test_project_neuron_nodes_to_flatmap_keeps_direct_reason_when_mirror_fails() -> None:
+def test_project_neuron_nodes_to_flatmap_keeps_direct_reason_when_mirror_fails() -> (
+    None
+):
     flatmap, depth = _volumes()
     depth[1, 0, 0] = -1.0
     depth[1, 0, 3] = -1.0
@@ -328,6 +328,62 @@ def test_project_neuron_nodes_to_flatmap_full_mirrors_invalid_flatmap() -> None:
     assert row["flatmap_lookup_mode"] == FLATMAP_LOOKUP_MIRRORED
     assert row["voxel_k"] == 3
     assert row["depth_um"] == pytest.approx(103.0)
+
+
+@pytest.mark.parametrize(
+    ("invalid_lookup", "expected_mode", "expected_voxel_k"),
+    [
+        ("depth", FLATMAP_LOOKUP_MIRRORED_DEPTH, 0),
+        ("flatmap", FLATMAP_LOOKUP_MIRRORED, 3),
+    ],
+)
+def test_mirror_fallback_supports_copy_on_write_without_mutating_inputs(
+    invalid_lookup: str,
+    expected_mode: str,
+    expected_voxel_k: int,
+) -> None:
+    flatmap, depth = _volumes()
+    if invalid_lookup == "depth":
+        depth[1, 0, 0] = -1.0
+    else:
+        flatmap[1, 0, 0] = (-1.0, -1.0)
+    nodes = _nodes(
+        [
+            {
+                "node_id": 1,
+                "parent_id": -1,
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+            },
+        ]
+    )
+    original_nodes = nodes.copy(deep=True)
+    original_flatmap = flatmap.copy()
+    original_depth = depth.copy()
+
+    copy_on_write = (
+        nullcontext()
+        if int(pd.__version__.partition(".")[0]) >= 3
+        else pd.option_context("mode.copy_on_write", True)
+    )
+    with copy_on_write:
+        projected = project_neuron_nodes_to_flatmap(
+            nodes,
+            flatmap,
+            depth,
+            coordinate_mode=COORDINATE_MODE_VOXELS,
+            mirror_fallback=True,
+        )
+
+    row = projected.iloc[0]
+    assert row["valid"] is np.True_
+    assert row["flatmap_lookup_mode"] == expected_mode
+    assert row["voxel_k"] == expected_voxel_k
+    assert row["depth_um"] == pytest.approx(103.0)
+    pd.testing.assert_frame_equal(nodes, original_nodes)
+    np.testing.assert_array_equal(flatmap, original_flatmap)
+    np.testing.assert_array_equal(depth, original_depth)
 
 
 @pytest.mark.parametrize("invalid_depth", [-1.0, np.nan])

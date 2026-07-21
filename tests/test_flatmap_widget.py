@@ -176,8 +176,7 @@ class _DummyLayer:
         self.slice_dims_calls = []
         self.raise_status_error = False
         self.status_error_message = (
-            "too many indices for array: array is 2-dimensional, "
-            "but 3 were indexed"
+            "too many indices for array: array is 2-dimensional, but 3 were indexed"
         )
 
     def refresh(self) -> None:
@@ -452,9 +451,7 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     widget._cache_dir_label = _DummyLabel()
     widget._cache_status_label = _DummyLabel()
     widget._cache_profile_combo = _ProfileCombo()
-    widget._style_combo = types.SimpleNamespace(
-        currentData=lambda: "both_shaped"
-    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
     widget._projection_source_combo = types.SimpleNamespace(
         currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
     )
@@ -500,6 +497,70 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     assert widget._xy_bins_spin.value == 256
     assert widget._depth_bin_spin.value == 25.0
     assert saved.compatibility_calls[-1]["atlas_version"] == "1.2"
+
+
+def test_set_cache_directory_closes_superseded_cache_after_invalidating_layers(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    events: list[str] = []
+
+    class _Cache:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            events.append(f"close:{self.name}")
+
+    old_cache = _Cache("old")
+    new_cache = _Cache("new")
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    monkeypatch.setattr(cache_module, "open_region_cache", lambda _path: new_cache)
+    widget._region_cache_dir = Path("old-cache")
+    widget._region_cache = old_cache
+    widget._active_cache_profile = object()
+    widget._pending_cache_profile_id = None
+    widget._cache_dir_label = _DummyLabel()
+    widget._invalidate_flatmap_grid_layers = lambda: events.append("invalidate")
+    widget._set_cache_grid_locked = lambda _locked: None
+    widget._refresh_cache_profiles = lambda: None
+
+    widget.set_cache_directory(Path("new-cache"))
+
+    assert events == ["invalidate", "close:old"]
+    assert old_cache.closed is True
+    assert widget._region_cache is new_cache
+    assert widget._active_cache_profile is None
+
+    widget._active_cache_profile = object()
+    widget._deactivate_cache_profile = lambda: events.append("deactivate")
+    widget.set_cache_directory(None)
+
+    assert events[-2:] == ["deactivate", "close:new"]
+    assert new_cache.closed is True
+    assert widget._region_cache is None
+
+
+def test_cache_build_finished_closes_worker_returned_profile(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    closed: list[bool] = []
+    profile = types.SimpleNamespace(
+        profile_id="built-profile",
+        close=lambda: closed.append(True),
+    )
+    widget._region_cache_dir = Path("cache")
+    widget.set_cache_directory = lambda _path: None
+    widget._cache_profile_combo = types.SimpleNamespace(count=lambda: 0)
+    widget._cache_status_label = _DummyLabel()
+
+    widget._on_cache_build_finished(profile)
+
+    assert closed == [True]
 
 
 def test_file_ids_for_source_uses_selected_then_all_fallback(monkeypatch) -> None:
@@ -722,9 +783,7 @@ def _configure_augmentation_widget(widget, source_mode: str, source_path: Path) 
     widget._selected_file_ids_provider = lambda: ["b.swc", "b.swc"]
     widget._source_combo = types.SimpleNamespace(currentData=lambda: source_mode)
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
-    widget._coordinate_mode_combo = types.SimpleNamespace(
-        currentData=lambda: "microns"
-    )
+    widget._coordinate_mode_combo = types.SimpleNamespace(currentData=lambda: "microns")
     widget._zero_sentinel_cb = types.SimpleNamespace(isChecked=lambda: False)
     widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
 
@@ -865,9 +924,7 @@ def _configure_projection_widget(widget, module, nodes: pd.DataFrame) -> None:
     widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
     widget._exclude_depth_minus_one_cb = types.SimpleNamespace(isChecked=lambda: False)
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
-    widget._coordinate_mode_combo = types.SimpleNamespace(
-        currentData=lambda: "microns"
-    )
+    widget._coordinate_mode_combo = types.SimpleNamespace(currentData=lambda: "microns")
 
 
 def test_project_without_nrrds_uses_augmented_parquet_columns(monkeypatch) -> None:
@@ -1102,9 +1159,7 @@ def test_project_from_lookup_files_uses_depth_mirror_fallback(monkeypatch) -> No
     )
 
     grid = np.indices((4, 4, 4), dtype=float)
-    flatmap = np.stack((grid[0] + 0.25, grid[1] + 0.5), axis=-1).astype(
-        np.float32
-    )
+    flatmap = np.stack((grid[0] + 0.25, grid[1] + 0.5), axis=-1).astype(np.float32)
     depth = (grid[2] + 100.0).astype(np.float32)
     depth[1, 0, 0] = -1.0
     volume_set = types.SimpleNamespace(
@@ -1249,7 +1304,10 @@ def test_project_without_nrrds_requires_augmented_parquet_columns(monkeypatch) -
 
     widget._project()
 
-    assert "augmented Parquet with x_flat, y_flat, and depth_um" in widget._status_label.text
+    assert (
+        "augmented Parquet with x_flat, y_flat, and depth_um"
+        in widget._status_label.text
+    )
 
 
 def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
@@ -1321,8 +1379,8 @@ def test_flatmap_render_layers_use_display_viewer_provider(monkeypatch) -> None:
     widget = _widget(module)
     main_viewer = widget._viewer
     display_viewer = _DummyViewer()
-    widget._display_viewer_provider = (
-        lambda create=True: display_viewer if create else display_viewer
+    widget._display_viewer_provider = lambda create=True: (
+        display_viewer if create else display_viewer
     )
     projected = pd.DataFrame({"file_id": ["a.swc"]})
     volume = np.zeros((1, 4, 4), dtype=np.float32)
@@ -1671,8 +1729,8 @@ def test_region_labels_layer_uses_display_viewer_provider(monkeypatch) -> None:
     widget = _widget(module)
     main_viewer = widget._viewer
     display_viewer = _DummyViewer()
-    widget._display_viewer_provider = (
-        lambda create=True: display_viewer if create else display_viewer
+    widget._display_viewer_provider = lambda create=True: (
+        display_viewer if create else display_viewer
     )
     summary = FlatmapRegionLabelsSummary(
         input_voxels=4,
@@ -1766,9 +1824,7 @@ def test_cached_region_labels_do_not_access_nrrd_or_atlas_annotation(
         )
     )
     widget._focus_projection_view = lambda *_args: None
-    widget._set_region_labels_status = lambda message: captured.update(
-        message=message
-    )
+    widget._set_region_labels_status = lambda message: captured.update(message=message)
 
     actual = widget._create_cached_region_labels()
 
@@ -1867,9 +1923,7 @@ def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> Non
 
     class _CrashLayer(_DummyLayer):
         def _update_thumbnail(self) -> None:
-            raise RuntimeError(
-                "sequence argument must have length equal to input rank"
-            )
+            raise RuntimeError("sequence argument must have length equal to input rank")
 
     layer = _CrashLayer(
         np.zeros((2, 4, 4), dtype=np.float32),

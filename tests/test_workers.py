@@ -109,20 +109,29 @@ def test_cached_brainglobe_atlas_dir_finds_single_cache(tmp_path):
     atlas_dir = tmp_path / "allen_mouse_25um_v1.2"
     atlas_dir.mkdir()
 
-    assert workers.cached_brainglobe_atlas_dir(
-        "allen_mouse_25um",
-        brainglobe_dir=tmp_path,
-    ) == atlas_dir
-    assert workers.cached_brainglobe_atlas_dir(
-        "allen_mouse_10um",
-        brainglobe_dir=tmp_path,
-    ) is None
+    assert (
+        workers.cached_brainglobe_atlas_dir(
+            "allen_mouse_25um",
+            brainglobe_dir=tmp_path,
+        )
+        == atlas_dir
+    )
+    assert (
+        workers.cached_brainglobe_atlas_dir(
+            "allen_mouse_10um",
+            brainglobe_dir=tmp_path,
+        )
+        is None
+    )
 
     (tmp_path / "allen_mouse_25um_v1.3").mkdir()
-    assert workers.cached_brainglobe_atlas_dir(
-        "allen_mouse_25um",
-        brainglobe_dir=tmp_path,
-    ) is None
+    assert (
+        workers.cached_brainglobe_atlas_dir(
+            "allen_mouse_25um",
+            brainglobe_dir=tmp_path,
+        )
+        is None
+    )
 
 
 def test_cached_atlas_load_worker_uses_local_loader(monkeypatch, tmp_path):
@@ -405,7 +414,9 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
     finished: list[tuple[str, BatchParquetConversionSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -725,7 +736,9 @@ def test_convert_worker_accepts_directory_source(monkeypatch, tmp_path):
     finished: list[tuple[str, BatchParquetConversionSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -850,7 +863,9 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
     CorrelationWorker = workers.CorrelationWorker
     calls: dict[str, object] = {}
 
-    def fake_get_expanded_region_voxel_ids_for_regions(atlas, acronyms, increase_fraction):
+    def fake_get_expanded_region_voxel_ids_for_regions(
+        atlas, acronyms, increase_fraction
+    ):
         calls["atlas"] = atlas
         calls["acronyms"] = list(acronyms)
         calls["increase_fraction"] = float(increase_fraction)
@@ -1062,16 +1077,28 @@ def test_flatmap_correlation_worker_uses_cache_without_nrrd_or_annotation(
         ),
     )
     profile = object()
+    cache_closed: list[bool] = []
+
+    cached_labels = np.array([[[68, 0], [0, 0]]], dtype=np.int32)
+
+    def close_cache():
+        cache_closed.append(True)
+        cached_labels.fill(0)
+
+    cache = types.SimpleNamespace(
+        profile=lambda _profile_id: profile,
+        close=close_cache,
+    )
     monkeypatch.setattr(
         cache_module,
         "open_region_cache",
-        lambda _path: types.SimpleNamespace(profile=lambda _profile_id: profile),
+        lambda _path: cache,
     )
     monkeypatch.setattr(
         cache_module,
         "materialize_region_selection",
         lambda *_args, **_kwargs: types.SimpleNamespace(
-            labels=np.array([[[68, 0], [0, 0]]], dtype=np.int32),
+            labels=cached_labels,
             represented_region_ids=(68,),
             summary=types.SimpleNamespace(
                 labeled_bins=1,
@@ -1092,6 +1119,7 @@ def test_flatmap_correlation_worker_uses_cache_without_nrrd_or_annotation(
     assert mask.tolist() == [[[True, False], [False, False]]]
     assert metadata["flatmap_region_source"] == "precomputed_cache"
     assert metadata["flatmap_region_cache_profile_id"] == "profile"
+    assert cache_closed == [True]
 
 
 def test_flatmap_correlation_worker_counts_lookup_modes_for_metadata() -> None:
@@ -1130,22 +1158,29 @@ def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
     )
     monkeypatch.setattr(
         "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
-        lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(neuron_ids, [1, 2]),
+        lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(
+            neuron_ids, [1, 2]
+        ),
     )
-    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
-        pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "x": [0.0, 25.0],
-                "y": [0.0, 25.0],
-                "z": [0.0, 25.0],
-            }
-        )
-    ))
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2"],
+                    "x": [0.0, 25.0],
+                    "y": [0.0, 25.0],
+                    "z": [0.0, 25.0],
+                }
+            )
+        ),
+    )
 
     worker = SomaClusterWorker(
         parquet_path="neurons.parquet",
-        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
         region_selection=ClusterRegionSelection(
             selected_region_ids=[184],
             selected_region_acronyms=["FRP"],
@@ -1246,20 +1281,25 @@ def test_soma_cluster_worker_kmeans_uses_synthesized_dendrogram_linkage(monkeypa
         "napari_swc_viewer.analysis.clustering.cluster_somas_kmeans",
         lambda coords, neuron_ids, n_clusters: _make_cluster_result(neuron_ids, [1, 1]),
     )
-    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
-        pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "x": [0.0, 25.0],
-                "y": [0.0, 25.0],
-                "z": [0.0, 25.0],
-            }
-        )
-    ))
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2"],
+                    "x": [0.0, 25.0],
+                    "y": [0.0, 25.0],
+                    "z": [0.0, 25.0],
+                }
+            )
+        ),
+    )
 
     worker = SomaClusterWorker(
         parquet_path="neurons.parquet",
-        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
         region_selection=ClusterRegionSelection(
             selected_region_ids=[184, 500],
             selected_region_acronyms=["FRP", "CP"],
@@ -1293,22 +1333,29 @@ def test_soma_cluster_worker_dbscan_records_dbscan_parameters(monkeypatch):
     )
     monkeypatch.setattr(
         "napari_swc_viewer.analysis.clustering.cluster_somas_dbscan",
-        lambda coords, neuron_ids, eps, min_samples: _make_cluster_result(neuron_ids, [1, 2]),
+        lambda coords, neuron_ids, eps, min_samples: _make_cluster_result(
+            neuron_ids, [1, 2]
+        ),
     )
-    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
-        pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "x": [0.0, 25.0],
-                "y": [0.0, 25.0],
-                "z": [0.0, 25.0],
-            }
-        )
-    ))
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2"],
+                    "x": [0.0, 25.0],
+                    "y": [0.0, 25.0],
+                    "z": [0.0, 25.0],
+                }
+            )
+        ),
+    )
 
     worker = SomaClusterWorker(
         parquet_path="neurons.parquet",
-        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
         region_selection=ClusterRegionSelection(
             selected_region_ids=[184],
             selected_region_acronyms=["FRP"],
@@ -1367,7 +1414,9 @@ def test_append_point_file_worker_routes_csv_to_append_helper(monkeypatch, tmp_p
     finished: list[tuple[str, PointParquetAppendSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -1386,7 +1435,9 @@ def test_append_point_file_worker_routes_csv_to_append_helper(monkeypatch, tmp_p
     assert finished[0][1].total_rows == 5
 
 
-def test_append_point_file_worker_routes_parquet_to_append_helper(monkeypatch, tmp_path):
+def test_append_point_file_worker_routes_parquet_to_append_helper(
+    monkeypatch, tmp_path
+):
     """AppendPointFileWorker should route Parquet input to the Parquet append helper."""
     workers = _import_workers_module()
     AppendPointFileWorker = workers.AppendPointFileWorker
@@ -1417,7 +1468,9 @@ def test_append_point_file_worker_routes_parquet_to_append_helper(monkeypatch, t
     finished: list[tuple[str, PointParquetAppendSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -1504,7 +1557,9 @@ def test_convert_point_csv_worker_delegates_to_batch_helper(monkeypatch, tmp_pat
     finished: list[tuple[str, object]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))

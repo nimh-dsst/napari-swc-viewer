@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -16,6 +19,70 @@ nrrd = pytest.importorskip("nrrd")
 
 def _write_nrrd(path, data: np.ndarray) -> None:
     nrrd.write(str(path), data)
+
+
+def _install_windows_npy_guard(monkeypatch):
+    """Simulate Windows refusing to move or delete mapped NPY files."""
+    tracked: list[tuple[Path, np.memmap]] = []
+    replaced_sources: list[Path] = []
+    unlinked_paths: list[Path] = []
+    real_load = flatmap_loader.np.load
+    real_open_memmap = flatmap_loader.np.lib.format.open_memmap
+    real_replace = Path.replace
+    real_unlink = Path.unlink
+
+    def track(path, array):
+        if isinstance(array, np.memmap) and not any(
+            existing is array for _tracked_path, existing in tracked
+        ):
+            tracked.append((Path(path), array))
+        return array
+
+    def tracked_load(path, *args, **kwargs):
+        return track(path, real_load(path, *args, **kwargs))
+
+    def tracked_open_memmap(path, *args, **kwargs):
+        return track(path, real_open_memmap(path, *args, **kwargs))
+
+    def is_open(path: Path) -> bool:
+        return any(
+            tracked_path == Path(path)
+            and getattr(array, "_mmap", None) is not None
+            and not array._mmap.closed
+            for tracked_path, array in tracked
+        )
+
+    def sharing_violation(path: Path) -> PermissionError:
+        return PermissionError(
+            32,
+            "The process cannot access the file because it is being used "
+            "by another process",
+            str(path),
+        )
+
+    def guarded_replace(path, target):
+        path = Path(path)
+        if is_open(path):
+            raise sharing_violation(path)
+        replaced_sources.append(path)
+        return real_replace(path, target)
+
+    def guarded_unlink(path, *args, **kwargs):
+        path = Path(path)
+        if is_open(path):
+            raise sharing_violation(path)
+        unlinked_paths.append(path)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(flatmap_loader.np, "load", tracked_load)
+    monkeypatch.setattr(
+        flatmap_loader.np.lib.format,
+        "open_memmap",
+        tracked_open_memmap,
+    )
+    monkeypatch.setattr(Path, "replace", guarded_replace)
+    monkeypatch.setattr(Path, "unlink", guarded_unlink)
+    return tracked, replaced_sources, unlinked_paths
 
 
 def test_load_flatmap_volume_set_normalizes_last_axis_channels(tmp_path) -> None:
@@ -135,6 +202,38 @@ def test_load_flatmap_volume_set_reuses_explicit_writable_cache_dir(
     np.testing.assert_array_equal(second.depth, depth)
 
 
+def test_normalized_cache_write_closes_mapping_before_publication(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "depth.nrrd"
+    source_path.write_bytes(b"source")
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "depth.float32.npy"
+    metadata_path = cache_dir / "depth.float32.npy.json"
+    data = np.arange(12, dtype=np.float32).reshape(3, 2, 2)
+    tracked, replaced_sources, _unlinked_paths = _install_windows_npy_guard(monkeypatch)
+
+    result = flatmap_loader._write_npy_cache(
+        data,
+        source_path=source_path,
+        kind="depth",
+        cache_path=cache_path,
+        metadata_path=metadata_path,
+        source_shape=data.shape,
+        source_ndim=data.ndim,
+        coordinate_axis=None,
+        cancel_callback=None,
+    )
+
+    assert result == cache_path
+    assert cache_path.exists()
+    assert metadata_path.exists()
+    assert len(tracked) == 1
+    assert tracked[0][1]._mmap.closed
+    assert len(replaced_sources) == 2
+
+
 def test_cancelled_normalized_cache_write_removes_temporary_files(
     tmp_path,
     monkeypatch,
@@ -152,6 +251,7 @@ def test_cancelled_normalized_cache_write_removes_temporary_files(
         callback_calls += 1
         return callback_calls >= 3
 
+    tracked, _replaced_sources, unlinked_paths = _install_windows_npy_guard(monkeypatch)
     monkeypatch.setattr(flatmap_loader, "_NPY_CACHE_WRITE_CHUNK_VALUES", 4)
 
     with pytest.raises(FlatmapLookupLoadCancelledError, match="cancelled"):
@@ -171,6 +271,133 @@ def test_cancelled_normalized_cache_write_removes_temporary_files(
     assert not cache_path.exists()
     assert not metadata_path.exists()
     assert list(cache_dir.iterdir()) == []
+    assert len(tracked) == 1
+    assert tracked[0][1]._mmap.closed
+    assert unlinked_paths
+
+
+def test_failed_normalized_cache_write_closes_mapping_and_preserves_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "depth.nrrd"
+    source_path.write_bytes(b"source")
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "depth.float32.npy"
+    metadata_path = cache_dir / "depth.float32.npy.json"
+
+    class FailingArray:
+        shape = (3, 2, 2)
+
+        def __getitem__(self, _index):
+            raise RuntimeError("injected cache conversion failure")
+
+    tracked, _replaced_sources, _unlinked_paths = _install_windows_npy_guard(
+        monkeypatch
+    )
+    real_close_memmap = flatmap_loader._close_memmap
+
+    def close_then_report_error(array, *, flush=False):
+        real_close_memmap(array, flush=flush)
+        if not flush:
+            raise PermissionError(32, "injected close failure")
+
+    monkeypatch.setattr(flatmap_loader, "_close_memmap", close_then_report_error)
+
+    with pytest.raises(RuntimeError, match="injected cache conversion failure"):
+        flatmap_loader._write_npy_cache(
+            FailingArray(),
+            source_path=source_path,
+            kind="depth",
+            cache_path=cache_path,
+            metadata_path=metadata_path,
+            source_shape=FailingArray.shape,
+            source_ndim=3,
+            coordinate_axis=None,
+            cancel_callback=None,
+        )
+
+    assert len(tracked) == 1
+    assert tracked[0][1]._mmap.closed
+    assert not cache_path.exists()
+    assert not metadata_path.exists()
+    assert list(cache_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "kind", "array", "metadata_overrides"),
+    [
+        (
+            "dtype",
+            "depth",
+            np.ones((2, 2, 2), dtype=np.float64),
+            {},
+        ),
+        (
+            "shape",
+            "depth",
+            np.ones((2, 2, 2), dtype=np.float32),
+            {"normalized_shape": [9, 9, 9]},
+        ),
+        (
+            "dimensionality",
+            "depth",
+            np.ones((2, 2), dtype=np.float32),
+            {"source_ndim": 2},
+        ),
+        (
+            "coordinate-axis",
+            "flatmap",
+            np.ones((2, 2, 2, 2), dtype=np.float32),
+            {"coordinate_axis": "invalid"},
+        ),
+    ],
+)
+def test_invalid_mapped_npy_cache_is_closed_before_fallback(
+    tmp_path,
+    monkeypatch,
+    case,
+    kind,
+    array,
+    metadata_overrides,
+) -> None:
+    source_path = tmp_path / f"{case}.nrrd"
+    source_path.write_bytes(b"source")
+    cache_path = tmp_path / f"{case}.float32.npy"
+    metadata_path = tmp_path / f"{case}.float32.npy.json"
+    np.save(cache_path, array, allow_pickle=False)
+    metadata = {
+        "cache_version": flatmap_loader._NPY_CACHE_VERSION,
+        "kind": kind,
+        "source": flatmap_loader._source_signature(source_path),
+        "source_shape": [int(size) for size in array.shape],
+        "source_ndim": int(array.ndim),
+        "coordinate_axis": 3 if kind == "flatmap" else None,
+        "normalized_shape": [int(size) for size in array.shape],
+        "dtype": "float32",
+    }
+    metadata.update(metadata_overrides)
+    metadata_path.write_text(json.dumps(metadata))
+    tracked, _replaced_sources, _unlinked_paths = _install_windows_npy_guard(
+        monkeypatch
+    )
+
+    loaded = flatmap_loader._load_npy_cache(
+        source_path,
+        kind=kind,
+        cache_path=cache_path,
+        metadata_path=metadata_path,
+        mmap_npy=True,
+    )
+
+    assert loaded is None
+    if len(tracked) != 1:
+        pytest.fail(f"expected one mapped cache array, got {len(tracked)}")
+    mapping = tracked[0][1]._mmap
+    assert mapping is not None
+    assert mapping.closed
+    cache_path.unlink()
+    assert not cache_path.exists()
 
 
 def test_spatial_transform_from_header_omits_flatmap_vector_axis() -> None:

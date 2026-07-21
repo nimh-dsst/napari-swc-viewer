@@ -469,6 +469,7 @@ class FlatmapRegionStyleCache:
             for name, spec in arrays.items()
         }
         self._arrays: dict[str, np.ndarray] = {}
+        self._closed = False
 
     @property
     def directory(self) -> Path:
@@ -503,6 +504,10 @@ class FlatmapRegionStyleCache:
             return dict(payload)
 
     def array(self, name: str) -> np.ndarray:
+        if self._closed:
+            raise RegionCacheError(
+                f"Flatmap region-cache style {self.style!r} is closed."
+            )
         if name in self._arrays:
             return self._arrays[name]
         try:
@@ -521,21 +526,39 @@ class FlatmapRegionStyleCache:
                 f"Could not open cache array {path}: {exc}"
             ) from exc
         try:
-            expected_dtype = np.dtype(spec.dtype)
-        except (TypeError, ValueError) as exc:
-            raise RegionCacheValidationError(
-                f"Cache array {name!r} declares invalid dtype {spec.dtype!r}."
-            ) from exc
-        if np.dtype(array.dtype).name != expected_dtype.name:
-            raise RegionCacheValidationError(
-                f"Cache array {name!r} has dtype {array.dtype}, expected {spec.dtype}."
-            )
-        if tuple(array.shape) != spec.shape:
-            raise RegionCacheValidationError(
-                f"Cache array {name!r} has shape {array.shape}, expected {spec.shape}."
-            )
+            try:
+                expected_dtype = np.dtype(spec.dtype)
+            except (TypeError, ValueError) as exc:
+                raise RegionCacheValidationError(
+                    f"Cache array {name!r} declares invalid dtype {spec.dtype!r}."
+                ) from exc
+            if np.dtype(array.dtype).name != expected_dtype.name:
+                raise RegionCacheValidationError(
+                    f"Cache array {name!r} has dtype {array.dtype}, "
+                    f"expected {spec.dtype}."
+                )
+            if tuple(array.shape) != spec.shape:
+                raise RegionCacheValidationError(
+                    f"Cache array {name!r} has shape {array.shape}, "
+                    f"expected {spec.shape}."
+                )
+        except BaseException:
+            try:
+                _close_memmap(array)
+            except Exception:
+                logger.warning(
+                    "Failed to close rejected cache array %s.", path, exc_info=True
+                )
+            raise
         self._arrays[name] = array
         return array
+
+    def close(self) -> None:
+        """Release all memory-mapped arrays owned by this style cache."""
+        if self._closed:
+            return
+        _close_style_mmaps(self)
+        self._closed = True
 
     def _validate(self) -> None:
         required = {
@@ -861,6 +884,7 @@ class FlatmapRegionCacheProfile:
             raise RegionCacheValidationError(
                 f"Profile {profile_id} must contain shaped and square styles."
             )
+        self._closed = False
 
     @property
     def styles(self) -> Mapping[str, FlatmapRegionStyleCache]:
@@ -868,6 +892,14 @@ class FlatmapRegionCacheProfile:
 
     def style(self, style: str) -> FlatmapRegionStyleCache:
         return self._styles[_normalise_style(style)]
+
+    def close(self) -> None:
+        """Release all memory-mapped arrays owned by this cache profile."""
+        if self._closed:
+            return
+        for style_cache in self._styles.values():
+            style_cache.close()
+        self._closed = True
 
     def compatibility_mismatches(
         self,
@@ -1014,6 +1046,7 @@ class FlatmapRegionCache:
                     "Cache profile manifest key does not match its profile ID: "
                     f"{manifest_id!r} != {profile.profile_id!r}."
                 )
+        self._closed = False
 
     @property
     def profiles(self) -> Mapping[str, FlatmapRegionCacheProfile]:
@@ -1040,6 +1073,14 @@ class FlatmapRegionCache:
             if not profile.compatibility_mismatches(**requirements)
         )
 
+    def close(self) -> None:
+        """Release all memory-mapped arrays owned by this opened cache."""
+        if self._closed:
+            return
+        for profile in self._profiles.values():
+            profile.close()
+        self._closed = True
+
 
 def _close_style_mmaps(style: FlatmapRegionStyleCache) -> None:
     """Close arrays opened only for internal validation or failed publication."""
@@ -1057,13 +1098,11 @@ def _close_style_mmaps(style: FlatmapRegionStyleCache) -> None:
 
 
 def _close_profile_mmaps(profile: FlatmapRegionCacheProfile) -> None:
-    for style in profile.styles.values():
-        _close_style_mmaps(style)
+    profile.close()
 
 
 def _close_cache_mmaps(cache: FlatmapRegionCache) -> None:
-    for profile in cache.profiles.values():
-        _close_profile_mmaps(profile)
+    cache.close()
 
 
 def open_region_cache(cache_dir: str | Path) -> FlatmapRegionCache:
