@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import napari_swc_viewer.flatmap_region_cache as region_cache_module
 from napari_swc_viewer.flatmap_region_cache import (
     REGION_CACHE_MANIFEST_FILENAME,
     RegionCacheCancelled,
@@ -72,6 +73,76 @@ def _build(cache_dir: Path, **kwargs):
         chunk_voxels=2,
         **kwargs,
     )
+
+
+def _install_windows_memmap_guard(monkeypatch):
+    """Simulate Windows refusing to remove or move mapped NPY files."""
+    tracked: list[tuple[Path, np.memmap]] = []
+    removed_run_dirs: list[Path] = []
+    published_temp_dirs: list[Path] = []
+    real_load = region_cache_module.np.load
+    real_open_memmap = region_cache_module.np.lib.format.open_memmap
+    real_rmtree = region_cache_module.shutil.rmtree
+    real_replace = region_cache_module.os.replace
+
+    def track(path, array):
+        if isinstance(array, np.memmap):
+            tracked.append((Path(path), array))
+        return array
+
+    def tracked_load(path, *args, **kwargs):
+        return track(path, real_load(path, *args, **kwargs))
+
+    def tracked_open_memmap(path, *args, **kwargs):
+        return track(path, real_open_memmap(path, *args, **kwargs))
+
+    def open_paths_below(directory: Path) -> list[Path]:
+        directory = Path(directory)
+        return [
+            path
+            for path, array in tracked
+            if path.is_relative_to(directory)
+            and getattr(array, "_mmap", None) is not None
+            and not array._mmap.closed
+        ]
+
+    def guarded_rmtree(path, *args, **kwargs):
+        path = Path(path)
+        locked = open_paths_below(path)
+        if locked:
+            raise PermissionError(
+                32,
+                "The process cannot access the file because it is being used "
+                "by another process",
+                str(locked[0]),
+            )
+        if path.name in {".occupancy-runs", ".geometry-runs"}:
+            removed_run_dirs.append(path)
+        return real_rmtree(path, *args, **kwargs)
+
+    def guarded_replace(source, destination, *args, **kwargs):
+        source_path = Path(source)
+        if source_path.is_dir() and source_path.name.endswith(".tmp"):
+            locked = open_paths_below(source_path)
+            if locked:
+                raise PermissionError(
+                    32,
+                    "The process cannot access the file because it is being used "
+                    "by another process",
+                    str(locked[0]),
+                )
+            published_temp_dirs.append(source_path)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(region_cache_module.np, "load", tracked_load)
+    monkeypatch.setattr(
+        region_cache_module.np.lib.format,
+        "open_memmap",
+        tracked_open_memmap,
+    )
+    monkeypatch.setattr(region_cache_module.shutil, "rmtree", guarded_rmtree)
+    monkeypatch.setattr(region_cache_module.os, "replace", guarded_replace)
+    return tracked, removed_run_dirs, published_temp_dirs
 
 
 def test_region_cache_round_trip_and_parent_geometry(tmp_path):
@@ -193,9 +264,10 @@ def test_depth_mirror_policy_affects_profile_identity_and_compatibility(tmp_path
     different_axis = _build(root, mirror_coord_axis=1)
     no_fallback = _build(root, mirror_depth_fallback=False)
 
-    assert len(
-        {default.profile_id, different_axis.profile_id, no_fallback.profile_id}
-    ) == 3
+    assert (
+        len({default.profile_id, different_axis.profile_id, no_fallback.profile_id})
+        == 3
+    )
     assert not default.compatibility_mismatches(
         mirror_depth_fallback=True,
         mirror_coord_axis=2,
@@ -362,6 +434,143 @@ def test_cancelled_build_keeps_existing_manifest_and_cleans_temporary_profile(tm
     assert manifest_path.read_bytes() == original
     assert not list((root / "profiles").glob("*.tmp"))
     assert len(open_region_cache(root).profiles) == 1
+
+
+def test_build_closes_all_temporary_memmaps_before_cleanup_and_publication(
+    tmp_path,
+    monkeypatch,
+):
+    tracked, removed_run_dirs, published_temp_dirs = _install_windows_memmap_guard(
+        monkeypatch
+    )
+    annotation, shaped, square, depth = _lookup_arrays()
+    profile = build_region_cache_profile(
+        tmp_path / "cache",
+        annotation=annotation,
+        shaped_flatmap=shaped,
+        square_flatmap=square,
+        depth=depth,
+        lookup_set_id="windows-handles",
+        atlas_name="test_mouse",
+        atlas_version="1.2",
+        atlas_resolution_um=10,
+        # Both directly selectable regions deliberately share one footprint,
+        # exercising the footprint comparison mapping from the reported bug.
+        region_descendants={1: {2}, 2: {2}},
+        xy_bins=2,
+        depth_bin_um=10,
+        chunk_voxels=2,
+    )
+
+    np.testing.assert_array_equal(
+        profile.style("shaped").array("geometry_region_footprint_indices"),
+        [0, 0],
+    )
+    temporary_names = {
+        path.name
+        for path, _array in tracked
+        if ".occupancy-runs" in path.parts or ".geometry-runs" in path.parts
+    }
+    assert any(name.startswith("keys-") for name in temporary_names)
+    assert any(name.startswith("counts-") for name in temporary_names)
+    assert any(name.endswith("-bins.npy") for name in temporary_names)
+    assert any(name.endswith("-vertices.npy") for name in temporary_names)
+    assert any(name.endswith("-faces.npy") for name in temporary_names)
+    assert any(name.endswith("-outlines.npy") for name in temporary_names)
+    assert sum(path.name == ".occupancy-runs" for path in removed_run_dirs) == 2
+    assert sum(path.name == ".geometry-runs" for path in removed_run_dirs) == 2
+    assert len(published_temp_dirs) == 1
+
+    # Keep strong references in ``tracked`` so this verifies explicit closure,
+    # rather than CPython reference counting incidentally releasing handles.
+    prepublication_maps = [
+        array for path, array in tracked if path.is_relative_to(published_temp_dirs[0])
+    ]
+    assert prepublication_maps
+    assert all(array._mmap.closed for array in prepublication_maps)
+
+
+def test_failed_build_preserves_original_error_when_temp_cleanup_is_locked(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    root = tmp_path / "cache"
+    _build(root)
+    manifest_path = root / REGION_CACHE_MANIFEST_FILENAME
+    original_manifest = manifest_path.read_bytes()
+    real_rmtree = region_cache_module.shutil.rmtree
+
+    def fail_build_style(**_kwargs):
+        raise RuntimeError("injected region processing failure")
+
+    def sharing_violation(path, *args, **kwargs):
+        if Path(path).name.endswith(".tmp"):
+            raise PermissionError(
+                32,
+                "The process cannot access the file because it is being used "
+                "by another process",
+                str(path),
+            )
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(region_cache_module, "_build_style", fail_build_style)
+    monkeypatch.setattr(region_cache_module.shutil, "rmtree", sharing_violation)
+    caplog.set_level("WARNING", logger=region_cache_module.__name__)
+
+    annotation, shaped, square, depth = _lookup_arrays()
+    with pytest.raises(RuntimeError, match="injected region processing failure"):
+        build_region_cache_profile(
+            root,
+            annotation=annotation,
+            shaped_flatmap=shaped,
+            square_flatmap=square,
+            depth=depth,
+            lookup_set_id="failed-windows-build",
+            atlas_name="test_mouse",
+            atlas_version="1.2",
+            atlas_resolution_um=10,
+            xy_bins=2,
+            depth_bin_um=10,
+            chunk_voxels=2,
+        )
+
+    assert manifest_path.read_bytes() == original_manifest
+    assert list((root / "profiles").glob("*.tmp"))
+    assert ".tmp" in caplog.text
+    assert len(open_region_cache(root).profiles) == 1
+
+
+def test_replace_keeps_new_profile_when_old_mapped_directory_is_locked(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    root = tmp_path / "cache"
+    old_profile = _build(root)
+    old_directory = old_profile.directory
+    real_rmtree = region_cache_module.shutil.rmtree
+
+    def sharing_violation(path, *args, **kwargs):
+        if Path(path) == old_directory:
+            raise PermissionError(
+                32,
+                "The process cannot access the file because it is being used "
+                "by another process",
+                str(path),
+            )
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(region_cache_module.shutil, "rmtree", sharing_violation)
+    caplog.set_level("WARNING", logger=region_cache_module.__name__)
+    replacement = _build(root, replace=True)
+
+    assert replacement.directory != old_directory
+    assert old_directory.is_dir()
+    reopened = open_region_cache(root).profile(old_profile.profile_id)
+    assert reopened.directory == replacement.directory
+    assert replacement.directory.is_dir()
+    assert str(old_directory) in caplog.text
 
 
 def test_build_rejects_annotation_lookup_shape_mismatch(tmp_path):

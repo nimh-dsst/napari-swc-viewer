@@ -8,9 +8,11 @@ manifest.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import heapq
 import json
+import logging
 import os
 import re
 import shutil
@@ -59,6 +61,8 @@ _STYLE_ALIASES = {
 
 _ATLAS_RESOLUTION_SUFFIX = re.compile(r"_(?:10|25|50|100)um(?=$|_)", re.IGNORECASE)
 
+logger = logging.getLogger(__name__)
+
 
 class RegionCacheError(RuntimeError):
     """Base error for flatmap region-cache operations."""
@@ -70,6 +74,56 @@ class RegionCacheValidationError(RegionCacheError):
 
 class RegionCacheCancelled(RegionCacheError):
     """Raised when cache construction is cancelled."""
+
+
+def _close_memmap(array: np.ndarray, *, flush: bool = False) -> None:
+    """Close one NumPy memmap without relying on garbage collection."""
+    if isinstance(array, np.memmap):
+        mapping = getattr(array, "_mmap", None)
+        try:
+            if flush:
+                array.flush()
+        finally:
+            if mapping is not None and not mapping.closed:
+                mapping.close()
+
+
+@contextmanager
+def _open_npy_memmap(path: Path):
+    """Open one temporary NPY mapping and always release its Windows handle."""
+    array = np.load(path, mmap_mode="r", allow_pickle=False)
+    try:
+        yield array
+    finally:
+        _close_memmap(array)
+
+
+@contextmanager
+def _create_npy_memmap(
+    path: Path,
+    *,
+    dtype: np.dtype | str,
+    shape: tuple[int, ...],
+):
+    """Create a writable NPY mapping and close it on success or failure."""
+    array = np.lib.format.open_memmap(
+        path,
+        mode="w+",
+        dtype=dtype,
+        shape=shape,
+    )
+    try:
+        yield array
+    except BaseException:
+        try:
+            _close_memmap(array)
+        except Exception:
+            logger.warning(
+                "Failed to close temporary cache array %s", path, exc_info=True
+            )
+        raise
+    else:
+        _close_memmap(array, flush=True)
 
 
 @dataclass(frozen=True)
@@ -327,18 +381,57 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
-def _array_spec(path: Path, array: np.ndarray, *, base: Path) -> dict[str, Any]:
+def _array_spec_from_shape(
+    path: Path,
+    *,
+    dtype: np.dtype | str,
+    shape: Sequence[int],
+    base: Path,
+) -> dict[str, Any]:
     return {
         "path": path.relative_to(base).as_posix(),
-        "dtype": np.dtype(array.dtype).name,
-        "shape": [int(size) for size in array.shape],
+        "dtype": np.dtype(dtype).name,
+        "shape": [int(size) for size in shape],
     }
+
+
+def _array_spec(path: Path, array: np.ndarray, *, base: Path) -> dict[str, Any]:
+    return _array_spec_from_shape(
+        path,
+        dtype=array.dtype,
+        shape=array.shape,
+        base=base,
+    )
 
 
 def _save_array(path: Path, values: np.ndarray, *, dtype: np.dtype | str) -> np.ndarray:
     array = np.asarray(values, dtype=dtype)
     np.save(path, array, allow_pickle=False)
     return array
+
+
+def _remove_tree(
+    path: Path,
+    *,
+    purpose: str,
+    suppress_errors: bool = False,
+) -> bool:
+    """Remove a cache tree without letting secondary cleanup hide a failure."""
+    if not path.is_dir():
+        return True
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        if not suppress_errors:
+            raise
+        logger.warning(
+            "Could not remove %s at %s; it may be deleted after napari closes.",
+            purpose,
+            path,
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 def _safe_array_path(base: Path, relative: str) -> Path:
@@ -948,6 +1041,31 @@ class FlatmapRegionCache:
         )
 
 
+def _close_style_mmaps(style: FlatmapRegionStyleCache) -> None:
+    """Close arrays opened only for internal validation or failed publication."""
+    for name, array in tuple(style._arrays.items()):
+        try:
+            _close_memmap(array)
+        except Exception:
+            logger.warning(
+                "Failed to close cache array %s for style %s.",
+                name,
+                style.style,
+                exc_info=True,
+            )
+    style._arrays.clear()
+
+
+def _close_profile_mmaps(profile: FlatmapRegionCacheProfile) -> None:
+    for style in profile.styles.values():
+        _close_style_mmaps(style)
+
+
+def _close_cache_mmaps(cache: FlatmapRegionCache) -> None:
+    for profile in cache.profiles.values():
+        _close_profile_mmaps(profile)
+
+
 def open_region_cache(cache_dir: str | Path) -> FlatmapRegionCache:
     """Open and fully validate a flatmap region cache using memory maps."""
     root = Path(cache_dir)
@@ -959,8 +1077,12 @@ def open_region_cache(cache_dir: str | Path) -> FlatmapRegionCache:
     manifest = _read_json(manifest_path)
     _validate_root_manifest(manifest)
     cache = FlatmapRegionCache(root, manifest)
-    for profile in cache.profiles.values():
-        profile._validate()
+    try:
+        for profile in cache.profiles.values():
+            profile._validate()
+    except BaseException:
+        _close_cache_mmaps(cache)
+        raise
     return cache
 
 
@@ -1322,28 +1444,29 @@ def _write_occupancy_runs(
 
 
 def _merged_run_records(run_paths: Sequence[tuple[Path, Path]]):
-    arrays = [
-        (
-            np.load(keys_path, mmap_mode="r", allow_pickle=False),
-            np.load(counts_path, mmap_mode="r", allow_pickle=False),
-        )
-        for keys_path, counts_path in run_paths
-    ]
-    heap: list[tuple[int, int, int]] = []
-    for run_index, (keys, _counts) in enumerate(arrays):
-        if len(keys):
-            heapq.heappush(heap, (int(keys[0]), run_index, 0))
-    while heap:
-        key = heap[0][0]
-        total = 0
-        while heap and heap[0][0] == key:
-            _same_key, run_index, position = heapq.heappop(heap)
-            keys, counts = arrays[run_index]
-            total += int(counts[position])
-            position += 1
-            if position < len(keys):
-                heapq.heappush(heap, (int(keys[position]), run_index, position))
-        yield key, total
+    with ExitStack() as stack:
+        arrays = [
+            (
+                stack.enter_context(_open_npy_memmap(keys_path)),
+                stack.enter_context(_open_npy_memmap(counts_path)),
+            )
+            for keys_path, counts_path in run_paths
+        ]
+        heap: list[tuple[int, int, int]] = []
+        for run_index, (keys, _counts) in enumerate(arrays):
+            if len(keys):
+                heapq.heappush(heap, (int(keys[0]), run_index, 0))
+        while heap:
+            key = heap[0][0]
+            total = 0
+            while heap and heap[0][0] == key:
+                _same_key, run_index, position = heapq.heappop(heap)
+                keys, counts = arrays[run_index]
+                total += int(counts[position])
+                position += 1
+                if position < len(keys):
+                    heapq.heappush(heap, (int(keys[position]), run_index, position))
+            yield key, total
 
 
 def _merge_occupancy_runs(
@@ -1351,41 +1474,49 @@ def _merge_occupancy_runs(
     *,
     output_dir: Path,
     cancel_callback: Callable[[], bool] | object | None,
-) -> tuple[dict[str, dict[str, Any]], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[dict[str, dict[str, Any]], np.ndarray, np.ndarray, Path, int]:
     record_count = 0
-    for record_count, _record in enumerate(_merged_run_records(run_paths), start=1):
-        if record_count % 100_000 == 0:
-            _check_cancel(cancel_callback)
+    with closing(_merged_run_records(run_paths)) as records:
+        for record_count, _record in enumerate(records, start=1):
+            if record_count % 100_000 == 0:
+                _check_cancel(cancel_callback)
 
     bins_path = output_dir / "occupancy-linear-bins.npy"
     counts_path = output_dir / "occupancy-source-voxel-counts.npy"
-    bins = np.lib.format.open_memmap(
-        bins_path, mode="w+", dtype=np.int64, shape=(record_count,)
-    )
-    counts = np.lib.format.open_memmap(
-        counts_path, mode="w+", dtype=np.int64, shape=(record_count,)
-    )
     region_ids_list: list[int] = []
     offsets: list[int] = [0]
     previous_region: int | None = None
-    for index, (key, count) in enumerate(_merged_run_records(run_paths)):
-        if index % 100_000 == 0:
-            _check_cancel(cancel_callback)
-        region_id = key >> 32
-        linear_bin = key & 0xFFFFFFFF
-        if previous_region is None:
-            region_ids_list.append(region_id)
-            previous_region = region_id
-        elif region_id != previous_region:
-            offsets.append(index)
-            region_ids_list.append(region_id)
-            previous_region = region_id
-        bins[index] = linear_bin
-        counts[index] = count
+    source_voxel_count = 0
+    with (
+        _create_npy_memmap(
+            bins_path,
+            dtype=np.int64,
+            shape=(record_count,),
+        ) as bins,
+        _create_npy_memmap(
+            counts_path,
+            dtype=np.int64,
+            shape=(record_count,),
+        ) as counts,
+        closing(_merged_run_records(run_paths)) as records,
+    ):
+        for index, (key, count) in enumerate(records):
+            if index % 100_000 == 0:
+                _check_cancel(cancel_callback)
+            region_id = key >> 32
+            linear_bin = key & 0xFFFFFFFF
+            if previous_region is None:
+                region_ids_list.append(region_id)
+                previous_region = region_id
+            elif region_id != previous_region:
+                offsets.append(index)
+                region_ids_list.append(region_id)
+                previous_region = region_id
+            bins[index] = linear_bin
+            counts[index] = count
+            source_voxel_count += int(count)
     if previous_region is not None:
         offsets.append(record_count)
-    bins.flush()
-    counts.flush()
     region_ids_path = output_dir / "occupancy-region-ids.npy"
     offsets_path = output_dir / "occupancy-region-offsets.npy"
     region_ids = _save_array(region_ids_path, region_ids_list, dtype=np.int32)
@@ -1397,12 +1528,20 @@ def _merge_occupancy_runs(
         "occupancy_region_offsets": _array_spec(
             offsets_path, region_offsets, base=output_dir
         ),
-        "occupancy_linear_bins": _array_spec(bins_path, bins, base=output_dir),
-        "occupancy_source_voxel_counts": _array_spec(
-            counts_path, counts, base=output_dir
+        "occupancy_linear_bins": _array_spec_from_shape(
+            bins_path,
+            dtype=np.int64,
+            shape=(record_count,),
+            base=output_dir,
+        ),
+        "occupancy_source_voxel_counts": _array_spec_from_shape(
+            counts_path,
+            dtype=np.int64,
+            shape=(record_count,),
+            base=output_dir,
         ),
     }
-    return arrays, region_ids, region_offsets, bins, counts
+    return arrays, region_ids, region_offsets, bins_path, source_voxel_count
 
 
 def _neighbour_presence(
@@ -1617,33 +1756,42 @@ def _concatenate_npy_runs(
     *,
     dtype: np.dtype | str,
     tail_shape: tuple[int, ...],
+    base: Path,
     cancel_callback: Callable[[], bool] | object | None = None,
-) -> np.ndarray:
-    lengths = [
-        int(np.load(path, mmap_mode="r", allow_pickle=False).shape[0]) for path in paths
-    ]
-    output = np.lib.format.open_memmap(
-        output_path,
-        mode="w+",
-        dtype=dtype,
-        shape=(sum(lengths), *tail_shape),
+) -> tuple[dict[str, Any], int]:
+    lengths: list[int] = []
+    for path in paths:
+        with _open_npy_memmap(path) as source:
+            lengths.append(int(source.shape[0]))
+    total = sum(lengths)
+    shape = (total, *tail_shape)
+    with _create_npy_memmap(output_path, dtype=dtype, shape=shape) as output:
+        cursor = 0
+        for path, length in zip(paths, lengths, strict=True):
+            with _open_npy_memmap(path) as source:
+                for source_start in range(0, length, 1_000_000):
+                    _check_cancel(cancel_callback)
+                    source_stop = min(source_start + 1_000_000, length)
+                    chunk_length = source_stop - source_start
+                    output[cursor : cursor + chunk_length] = source[
+                        source_start:source_stop
+                    ]
+                    cursor += chunk_length
+    return (
+        _array_spec_from_shape(
+            output_path,
+            dtype=dtype,
+            shape=shape,
+            base=base,
+        ),
+        total,
     )
-    cursor = 0
-    for path, length in zip(paths, lengths, strict=True):
-        source = np.load(path, mmap_mode="r", allow_pickle=False)
-        for source_start in range(0, length, 1_000_000):
-            _check_cancel(cancel_callback)
-            source_stop = min(source_start + 1_000_000, length)
-            chunk_length = source_stop - source_start
-            output[cursor : cursor + chunk_length] = source[source_start:source_stop]
-            cursor += chunk_length
-    output.flush()
-    return output
 
 
-def _build_geometry(
+def _build_geometry_runs(
     *,
     output_dir: Path,
+    run_dir: Path,
     region_ids: np.ndarray,
     region_offsets: np.ndarray,
     linear_bins: np.ndarray,
@@ -1653,8 +1801,6 @@ def _build_geometry(
     progress_callback: Callable[[str, int, int], None] | None,
     style: str,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
-    run_dir = output_dir / ".geometry-runs"
-    run_dir.mkdir()
     bin_slices = _region_bin_map(region_ids, region_offsets)
     geometry_region_ids = np.asarray(sorted(descendants), dtype=np.int32)
     footprint_mapping = np.empty(len(geometry_region_ids), dtype=np.int32)
@@ -1687,10 +1833,9 @@ def _build_geometry(
         ).hexdigest()
         footprint_index: int | None = None
         for candidate in hash_to_footprints.get(digest, []):
-            cached_bins = np.load(
-                footprint_bin_paths[candidate], mmap_mode="r", allow_pickle=False
-            )
-            if np.array_equal(cached_bins, footprint_bins):
+            with _open_npy_memmap(footprint_bin_paths[candidate]) as cached_bins:
+                matches = np.array_equal(cached_bins, footprint_bins)
+            if matches:
                 footprint_index = candidate
                 break
         if footprint_index is None:
@@ -1749,25 +1894,28 @@ def _build_geometry(
     saved_outline_offsets = _save_array(
         outline_offsets_path, outline_offsets, dtype=np.int64
     )
-    vertices = _concatenate_npy_runs(
+    vertices_spec, vertex_count = _concatenate_npy_runs(
         vertex_paths,
         vertices_path,
         dtype=np.float32,
         tail_shape=(3,),
+        base=output_dir,
         cancel_callback=cancel_callback,
     )
-    faces = _concatenate_npy_runs(
+    faces_spec, face_count = _concatenate_npy_runs(
         face_paths,
         faces_path,
         dtype=np.int32,
         tail_shape=(3,),
+        base=output_dir,
         cancel_callback=cancel_callback,
     )
-    outlines = _concatenate_npy_runs(
+    outlines_spec, outline_count = _concatenate_npy_runs(
         outline_paths,
         outlines_path,
         dtype=np.float32,
         tail_shape=(2, 3),
+        base=output_dir,
         cancel_callback=cancel_callback,
     )
     arrays = {
@@ -1786,24 +1934,62 @@ def _build_geometry(
         "surface_face_offsets": _array_spec(
             face_offsets_path, saved_face_offsets, base=output_dir
         ),
-        "surface_vertices": _array_spec(vertices_path, vertices, base=output_dir),
-        "surface_faces": _array_spec(faces_path, faces, base=output_dir),
+        "surface_vertices": vertices_spec,
+        "surface_faces": faces_spec,
         "outline_offsets": _array_spec(
             outline_offsets_path, saved_outline_offsets, base=output_dir
         ),
-        "outline_vectors": _array_spec(outlines_path, outlines, base=output_dir),
+        "outline_vectors": outlines_spec,
     }
     counts = {
         "direct_region_count": int(len(geometry_region_ids)),
         "empty_direct_region_count": int(empty_regions),
         "unique_footprint_count": int(len(vertex_paths)),
         "component_count": int(sum(component_counts)),
-        "surface_vertex_count": int(len(vertices)),
-        "surface_face_count": int(len(faces)),
-        "outline_segment_count": int(len(outlines)),
+        "surface_vertex_count": int(vertex_count),
+        "surface_face_count": int(face_count),
+        "outline_segment_count": int(outline_count),
     }
-    shutil.rmtree(run_dir)
     return arrays, counts
+
+
+def _build_geometry(
+    *,
+    output_dir: Path,
+    region_ids: np.ndarray,
+    region_offsets: np.ndarray,
+    linear_bins: np.ndarray,
+    descendants: Mapping[int, Sequence[int]],
+    output_shape: tuple[int, int, int],
+    cancel_callback: Callable[[], bool] | object | None,
+    progress_callback: Callable[[str, int, int], None] | None,
+    style: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Build geometry and release all temporary mappings before cleanup."""
+    run_dir = output_dir / ".geometry-runs"
+    run_dir.mkdir()
+    try:
+        result = _build_geometry_runs(
+            output_dir=output_dir,
+            run_dir=run_dir,
+            region_ids=region_ids,
+            region_offsets=region_offsets,
+            linear_bins=linear_bins,
+            descendants=descendants,
+            output_shape=output_shape,
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+            style=style,
+        )
+    except BaseException:
+        _remove_tree(
+            run_dir,
+            purpose=f"temporary {style} geometry runs",
+            suppress_errors=True,
+        )
+        raise
+    _remove_tree(run_dir, purpose=f"temporary {style} geometry runs")
+    return result
 
 
 def _style_grid(
@@ -1830,7 +2016,7 @@ def _style_grid(
             cancel_callback=(
                 None
                 if cancel_callback is None
-                else lambda: (_check_cancel(cancel_callback) or False)
+                else lambda: _check_cancel(cancel_callback) or False
             ),
         )
         default_x_bounds = stats.x_bounds
@@ -1907,45 +2093,60 @@ def _build_style(
     output_dir = profile_dir / style
     output_dir.mkdir()
     run_dir = output_dir / ".occupancy-runs"
-    run_paths, scan_counts = _write_occupancy_runs(
-        annotation=annotation,
-        flatmap=flatmap,
-        depth=depth,
-        grid=grid,
-        run_dir=run_dir,
-        chunk_voxels=chunk_voxels,
-        invalid_zero_sentinel=invalid_zero_sentinel,
-        invalid_negative_one_sentinel=invalid_negative_one_sentinel,
-        mirror_depth_fallback=mirror_depth_fallback,
-        mirror_coord_axis=mirror_coord_axis,
-        cancel_callback=cancel_callback,
-        progress_callback=progress_callback,
-        style=style,
-    )
-    occupancy_arrays, region_ids, region_offsets, linear_bins, source_counts = (
-        _merge_occupancy_runs(
-            run_paths, output_dir=output_dir, cancel_callback=cancel_callback
+    try:
+        run_paths, scan_counts = _write_occupancy_runs(
+            annotation=annotation,
+            flatmap=flatmap,
+            depth=depth,
+            grid=grid,
+            run_dir=run_dir,
+            chunk_voxels=chunk_voxels,
+            invalid_zero_sentinel=invalid_zero_sentinel,
+            invalid_negative_one_sentinel=invalid_negative_one_sentinel,
+            mirror_depth_fallback=mirror_depth_fallback,
+            mirror_coord_axis=mirror_coord_axis,
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+            style=style,
         )
-    )
-    shutil.rmtree(run_dir)
+        (
+            occupancy_arrays,
+            region_ids,
+            region_offsets,
+            bins_path,
+            source_voxel_count,
+        ) = _merge_occupancy_runs(
+            run_paths,
+            output_dir=output_dir,
+            cancel_callback=cancel_callback,
+        )
+    except BaseException:
+        _remove_tree(
+            run_dir,
+            purpose=f"temporary {style} occupancy runs",
+            suppress_errors=True,
+        )
+        raise
+    _remove_tree(run_dir, purpose=f"temporary {style} occupancy runs")
     resolved_descendants = (
         dict(descendants)
         if descendants is not None
         else _derive_region_descendants(None, atlas_structures, region_ids.tolist())
     )
-    geometry_arrays, geometry_counts = _build_geometry(
-        output_dir=output_dir,
-        region_ids=region_ids,
-        region_offsets=region_offsets,
-        linear_bins=linear_bins,
-        descendants=resolved_descendants,
-        output_shape=tuple(int(size) for size in grid["output_shape"]),
-        cancel_callback=cancel_callback,
-        progress_callback=progress_callback,
-        style=style,
-    )
+    with _open_npy_memmap(bins_path) as linear_bins:
+        geometry_arrays, geometry_counts = _build_geometry(
+            output_dir=output_dir,
+            region_ids=region_ids,
+            region_offsets=region_offsets,
+            linear_bins=linear_bins,
+            descendants=resolved_descendants,
+            output_shape=tuple(int(size) for size in grid["output_shape"]),
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+            style=style,
+        )
+        occupied_bins = int(len(linear_bins))
     arrays = {**occupancy_arrays, **geometry_arrays}
-    occupied_bins = int(len(linear_bins))
     return {
         "grid": dict(grid),
         "arrays": arrays,
@@ -1954,7 +2155,7 @@ def _build_style(
             **geometry_counts,
             "occupied_region_count": int(len(region_ids)),
             "region_bin_pair_count": occupied_bins,
-            "source_voxel_count": int(np.asarray(source_counts, dtype=np.int64).sum()),
+            "source_voxel_count": int(source_voxel_count),
         },
     }
 
@@ -2247,7 +2448,11 @@ def build_region_cache_profile(
         # Validate every published mmap before it can become reachable from the
         # root manifest. A generated/truncated array must not poison otherwise
         # usable profiles.
-        FlatmapRegionCacheProfile(root, profile_data)._validate()
+        validation_profile = FlatmapRegionCacheProfile(root, profile_data)
+        try:
+            validation_profile._validate()
+        finally:
+            _close_profile_mmaps(validation_profile)
 
         # Re-read immediately before publication so profiles added by another
         # builder during the expensive projection are retained.
@@ -2279,11 +2484,18 @@ def build_region_cache_profile(
             if isinstance(old_directory, str) and old_directory != relative_directory:
                 old_path = _safe_array_path(root, old_directory)
                 if old_path.is_dir():
-                    shutil.rmtree(old_path)
+                    _remove_tree(
+                        old_path,
+                        purpose="unreferenced replaced cache profile",
+                        suppress_errors=True,
+                    )
         return opened_profile
     except BaseException:
-        if temporary_dir.is_dir():
-            shutil.rmtree(temporary_dir)
+        _remove_tree(
+            temporary_dir,
+            purpose="failed temporary cache profile",
+            suppress_errors=True,
+        )
         if published_dir is not None and published_dir.is_dir():
             # If publication succeeded, the manifest now references this
             # directory and it must remain usable.  Otherwise it is an orphan.
@@ -2302,7 +2514,11 @@ def build_region_cache_profile(
             except RegionCacheError:
                 referenced = False
             if not referenced:
-                shutil.rmtree(published_dir)
+                _remove_tree(
+                    published_dir,
+                    purpose="unreferenced failed cache profile",
+                    suppress_errors=True,
+                )
         raise
 
 
