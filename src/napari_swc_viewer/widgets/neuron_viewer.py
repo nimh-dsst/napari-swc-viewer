@@ -739,6 +739,9 @@ class NeuronViewerWidget(QWidget):
                 cluster_map_provider=self._neuron_table.get_cluster_map,
                 atlas_provider=lambda: self._atlas,
                 selected_region_ids_provider=self._active_flatmap_region_ids,
+                selected_parent_region_ids_provider=(
+                    self._active_flatmap_parent_region_ids
+                ),
                 selected_region_acronyms_provider=self._active_flatmap_region_acronyms,
                 display_viewer_provider=self._get_or_create_flatmap_viewer,
             )
@@ -798,13 +801,13 @@ class NeuronViewerWidget(QWidget):
         convert_layout = convert_section.content_layout()
 
         convert_btn_row = QHBoxLayout()
-        convert_dir_btn = QPushButton("From Directory...")
-        convert_dir_btn.clicked.connect(self._convert_from_directory)
-        convert_btn_row.addWidget(convert_dir_btn)
+        self._convert_dir_btn = QPushButton("From Directory...")
+        self._convert_dir_btn.clicked.connect(self._convert_from_directory)
+        convert_btn_row.addWidget(self._convert_dir_btn)
 
-        convert_files_btn = QPushButton("From Files...")
-        convert_files_btn.clicked.connect(self._convert_from_files)
-        convert_btn_row.addWidget(convert_files_btn)
+        self._convert_files_btn = QPushButton("From Files...")
+        self._convert_files_btn.clicked.connect(self._convert_from_files)
+        convert_btn_row.addWidget(self._convert_files_btn)
         convert_layout.addLayout(convert_btn_row)
 
         res_row = QHBoxLayout()
@@ -823,6 +826,38 @@ class NeuronViewerWidget(QWidget):
         self._convert_hemisphere_combo.addItem("Right", "right")
         hemisphere_row.addWidget(self._convert_hemisphere_combo)
         convert_layout.addLayout(hemisphere_row)
+
+        self._convert_add_flatmap_cb = QCheckBox(
+            "Add bilateral flatmap/depth columns"
+        )
+        convert_layout.addWidget(self._convert_add_flatmap_cb)
+
+        lookup_row = QHBoxLayout()
+        self._convert_lookup_dir_label = QLabel("No lookup directory selected")
+        self._convert_lookup_dir_label.setWordWrap(True)
+        lookup_row.addWidget(self._convert_lookup_dir_label, stretch=1)
+        self._convert_lookup_dir_btn = QPushButton("Lookup directory...")
+        self._convert_lookup_dir_btn.clicked.connect(
+            self._choose_conversion_lookup_directory
+        )
+        lookup_row.addWidget(self._convert_lookup_dir_btn)
+        convert_layout.addLayout(lookup_row)
+
+        lookup_resolution_row = QHBoxLayout()
+        lookup_resolution_row.addWidget(QLabel("Lookup resolution:"))
+        self._convert_lookup_resolution_spin = QSpinBox()
+        self._convert_lookup_resolution_spin.setRange(0, 100)
+        self._convert_lookup_resolution_spin.setSpecialValueText(
+            "From NRRD header"
+        )
+        self._convert_lookup_resolution_spin.setSuffix(" μm")
+        lookup_resolution_row.addWidget(self._convert_lookup_resolution_spin)
+        convert_layout.addLayout(lookup_resolution_row)
+
+        self._convert_cancel_btn = QPushButton("Cancel conversion")
+        self._convert_cancel_btn.setEnabled(False)
+        self._convert_cancel_btn.clicked.connect(self._cancel_conversion)
+        convert_layout.addWidget(self._convert_cancel_btn)
 
         self._convert_progress = QProgressBar()
         self._convert_progress.setVisible(False)
@@ -1763,6 +1798,17 @@ class NeuronViewerWidget(QWidget):
         self._set_region_query_buttons_enabled(True)
         self._analysis_tab.set_database(self._db)
         self._regions_status_label.setText("")
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        invalidate_flatmap = getattr(
+            flatmap_tab,
+            "invalidate_loaded_parquet_projection",
+            None,
+        )
+        if callable(invalidate_flatmap):
+            invalidate_flatmap()
+        refresh_cache = getattr(flatmap_tab, "refresh_cache_profiles", None)
+        if callable(refresh_cache):
+            refresh_cache()
         saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
         if callable(saved_state_applier):
             saved_state_applier()
@@ -1789,12 +1835,19 @@ class NeuronViewerWidget(QWidget):
             return ""
 
         if info.has_full_transform:
-            message = (
-                f"Loaded Parquet contains {transform_text} transform columns. "
-                "The Flatmap tab can render it without loading NRRD files; "
-                "choosing flatmap and depth NRRDs will recompute and overwrite "
-                "those coordinates for the current projection/export."
-            )
+            if int(getattr(info, "format_version", 0) or 0) >= 3:
+                message = (
+                    "Loaded version-3 Parquet contains bilateral shaped, square, "
+                    "and depth transform columns "
+                    f"(lookup set {getattr(info, 'lookup_set_id', None)}). "
+                    "The Flatmap tab uses them by default; NRRD conversion only "
+                    "runs when Recompute from NRRDs is selected explicitly."
+                )
+            else:
+                message = (
+                    f"Loaded Parquet contains {transform_text} transform columns. "
+                    "The Flatmap tab can render it without loading NRRD files."
+                )
         else:
             message = (
                 f"Loaded Parquet contains {transform_text} transform columns. "
@@ -1912,6 +1965,9 @@ class NeuronViewerWidget(QWidget):
                 layers=self._iter_viewer_layers(),
                 atlas_name=self._current_atlas_name(),
                 analysis_metadata=self._analysis_project_metadata(),
+                flatmap_cache_reference=(
+                    self._flatmap_tab.active_cache_reference()
+                ),
                 progress_callback=_on_save_progress,
             )
         except Exception as exc:
@@ -1998,6 +2054,18 @@ class NeuronViewerWidget(QWidget):
         """Restore a loaded project bundle into the current widget/viewer."""
         self._load_parquet_path(bundle.source_parquet_path)
         self._saved_table_state = dict(bundle.table_state)
+        cache_reference = getattr(bundle, "flatmap_cache_reference", None)
+        if cache_reference:
+            try:
+                self._flatmap_tab.restore_cache_reference(cache_reference)
+            except Exception as exc:
+                logger.warning(
+                    "Could not restore external flatmap cache reference: %s",
+                    exc,
+                )
+                self._regions_status_label.setText(
+                    f"Project loaded; flatmap cache unavailable: {exc}"
+                )
 
         importer = getattr(self._neuron_table, "import_state", None)
         if callable(importer):
@@ -2404,6 +2472,20 @@ class NeuronViewerWidget(QWidget):
             atlas=atlas_name,
         ):
             self._analysis_tab.set_atlas(atlas)
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        refresh_cache_profiles = getattr(
+            flatmap_tab,
+            "refresh_cache_profiles",
+            None,
+        )
+        if callable(refresh_cache_profiles):
+            with startup_timing(
+                logger,
+                "load_atlas_phase",
+                phase="refresh_flatmap_cache_profiles",
+                atlas=atlas_name,
+            ):
+                refresh_cache_profiles()
         with startup_timing(
             logger,
             "load_atlas_phase",
@@ -5055,10 +5137,18 @@ class NeuronViewerWidget(QWidget):
             return []
         return [
             int(region_id)
-            for region_id in get_selected(
-                include_children=self._active_region_include_children()
-            )
+            for region_id in get_selected(include_children=True)
         ]
+
+    def _active_flatmap_parent_region_ids(self) -> list[int]:
+        """Return directly selected atlas IDs for cached union geometry."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+        get_selected = getattr(selector, "get_selected_ids", None)
+        if not callable(get_selected):
+            return []
+        return [int(region_id) for region_id in get_selected(include_children=False)]
 
     def _active_flatmap_region_acronyms(self) -> list[str]:
         """Return selected atlas acronyms for flatmap region-label metadata."""
@@ -5071,9 +5161,7 @@ class NeuronViewerWidget(QWidget):
             return []
         return [
             str(acronym)
-            for acronym in get_selected(
-                include_children=self._active_region_include_children()
-            )
+            for acronym in get_selected(include_children=True)
         ]
 
     def _sync_region_query_scope_selector(self) -> None:
@@ -6797,6 +6885,42 @@ class NeuronViewerWidget(QWidget):
 
     # --- SWC-to-Parquet conversion ---
 
+    def _choose_conversion_lookup_directory(self) -> None:
+        """Choose bilateral shaped/square/depth lookup files for conversion."""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Flatmap Lookup Directory",
+        )
+        if not directory:
+            return
+        self._convert_lookup_dir = Path(directory)
+        self._convert_lookup_dir_label.setText(str(self._convert_lookup_dir))
+        self._convert_add_flatmap_cb.setChecked(True)
+
+    def _cancel_conversion(self) -> None:
+        """Request cancellation of the active conversion pipeline."""
+        worker = getattr(self, "_convert_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel()
+            self._convert_status_label.setText("Cancelling conversion...")
+            self._convert_cancel_btn.setEnabled(False)
+
+    def _set_conversion_controls_enabled(self, enabled: bool) -> None:
+        """Prevent overlapping SWC conversion/augmentation pipelines."""
+        for name in (
+            "_convert_dir_btn",
+            "_convert_files_btn",
+            "_convert_resolution_spin",
+            "_convert_hemisphere_combo",
+            "_convert_add_flatmap_cb",
+            "_convert_lookup_dir_btn",
+            "_convert_lookup_resolution_spin",
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setEnabled(bool(enabled))
+
     def _convert_from_directory(self) -> None:
         """Pick a directory of SWC files and convert to Parquet."""
         dialog_start = perf_counter()
@@ -6985,9 +7109,37 @@ class NeuronViewerWidget(QWidget):
         """Launch the background conversion worker."""
         from ..workers import ConvertWorker
 
+        active_thread = getattr(self, "_convert_thread", None)
+        is_running = getattr(active_thread, "isRunning", None)
+        if active_thread is not None and (
+            not callable(is_running) or bool(is_running())
+        ):
+            show_warning("An SWC conversion is already running.")
+            return
+
         resolution = self._convert_resolution_spin.value()
         hemisphere = self._convert_hemisphere_combo.currentData()
         atlas_name = self._atlas_combo.currentText()
+        add_flatmaps_control = getattr(self, "_convert_add_flatmap_cb", None)
+        add_flatmaps = bool(
+            add_flatmaps_control is not None
+            and add_flatmaps_control.isChecked()
+        )
+        lookup_dir = getattr(self, "_convert_lookup_dir", None)
+        lookup_resolution_control = getattr(
+            self, "_convert_lookup_resolution_spin", None
+        )
+        raw_lookup_resolution = (
+            int(lookup_resolution_control.value())
+            if lookup_resolution_control is not None
+            else 0
+        )
+        if add_flatmaps and lookup_dir is None:
+            show_warning(
+                "Choose a lookup directory before enabling bilateral "
+                "flatmap/depth preprocessing."
+            )
+            return
         known_count = len(swc_paths) if isinstance(swc_paths, list) else None
         cached_atlas, use_cached_annotation = self._conversion_cached_atlas_inputs(
             atlas_name,
@@ -7037,6 +7189,10 @@ class NeuronViewerWidget(QWidget):
             self._convert_progress.setRange(0, known_count)
         self._convert_progress.setValue(0)
         self._convert_status_label.setText(status)
+        cancel_button = getattr(self, "_convert_cancel_btn", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(True)
+        self._set_conversion_controls_enabled(False)
 
         thread = QThread()
         worker = ConvertWorker(
@@ -7049,6 +7205,12 @@ class NeuronViewerWidget(QWidget):
             source_mode=source_mode,
             cached_atlas=cached_atlas,
             use_cached_annotation=use_cached_annotation,
+            flatmap_lookup_dir=lookup_dir if add_flatmaps else None,
+            flatmap_lookup_resolution_um=(
+                float(raw_lookup_resolution)
+                if add_flatmaps and raw_lookup_resolution > 0
+                else None
+            ),
         )
         self._convert_thread = thread
         self._convert_worker = worker
@@ -7121,6 +7283,9 @@ class NeuronViewerWidget(QWidget):
         self._convert_progress.setVisible(False)
         self._convert_progress.setRange(0, 1)
         self._convert_progress.setValue(0)
+        cancel_button = getattr(self, "_convert_cancel_btn", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(False)
         summary_parts = [f"Converted {summary.processed_files} file(s)"]
         if summary.failed_files:
             summary_parts.append(f"skipped {summary.failed_files}")
@@ -7150,6 +7315,9 @@ class NeuronViewerWidget(QWidget):
         self._convert_progress.setVisible(False)
         self._convert_progress.setRange(0, 1)
         self._convert_progress.setValue(0)
+        cancel_button = getattr(self, "_convert_cancel_btn", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(False)
         self._convert_status_label.setText(f"Error: {error_msg}")
         logger.error(f"SWC-to-Parquet conversion failed: {error_msg}")
 
@@ -7175,5 +7343,6 @@ class NeuronViewerWidget(QWidget):
             self._convert_thread = None
         if self._convert_worker is worker:
             self._convert_worker = None
+        self._set_conversion_controls_enabled(True)
         self._convert_source_mode = None
         self._convert_ui_start_time = None

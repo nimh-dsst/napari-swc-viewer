@@ -30,6 +30,9 @@ class FlatmapVoxelCorrelationSource:
     lookup_stats: FlatmapLookupStats | None = None
     mirror_depth_fallback: bool = True
     mirror_coord_axis: int = 2
+    cache_dir: str | None = None
+    cache_profile_id: str | None = None
+    cache_style: str | None = None
 
 
 @dataclass(frozen=True)

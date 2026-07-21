@@ -7,8 +7,11 @@ connections since DuckDB connections are not thread-safe.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
+import os
 from pathlib import Path
+import tempfile
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -318,6 +321,8 @@ class ConvertWorker(QObject):
         source_mode: str | None = None,
         cached_atlas: BrainGlobeAtlas | None = None,
         use_cached_annotation: bool = False,
+        flatmap_lookup_dir: str | Path | None = None,
+        flatmap_lookup_resolution_um: float | None = None,
     ):
         super().__init__()
         self._swc_source = (
@@ -341,6 +346,23 @@ class ConvertWorker(QObject):
         )
         self._cached_atlas = cached_atlas
         self._use_cached_annotation = use_cached_annotation
+        self._flatmap_lookup_dir = (
+            Path(flatmap_lookup_dir) if flatmap_lookup_dir is not None else None
+        )
+        self._flatmap_lookup_resolution_um = flatmap_lookup_resolution_um
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation at the next pipeline checkpoint."""
+        self._cancel_requested = True
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_requested:
+            raise RuntimeError("SWC conversion cancelled.")
+
+    def _report_progress(self, message: str, current: int, total: int) -> None:
+        self._check_cancelled()
+        self.progress.emit(str(message), int(current), int(total))
 
     def _source_log_value(self) -> str:
         """Return a compact source description for conversion timing logs."""
@@ -394,6 +416,7 @@ class ConvertWorker(QObject):
     def run(self) -> None:
         """Execute the conversion pipeline."""
         run_start = perf_counter()
+        staged_conversion_path: Path | None = None
         try:
             from .parquet import batch_convert_swc_to_parquet
 
@@ -423,18 +446,30 @@ class ConvertWorker(QObject):
                 if not isinstance(self._swc_source, list)
                 else "Preparing SWC-to-Parquet conversion..."
             )
-            self.progress.emit(
+            self._report_progress(
                 initial_message,
                 0,
                 total,
             )
+            conversion_output_path = self._output_path
+            if self._flatmap_lookup_dir is not None:
+                self._output_path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, staged_name = tempfile.mkstemp(
+                    prefix=f".{self._output_path.stem}.swc-",
+                    suffix=".parquet",
+                    dir=self._output_path.parent,
+                )
+                os.close(descriptor)
+                staged_conversion_path = Path(staged_name)
+                staged_conversion_path.unlink()
+                conversion_output_path = staged_conversion_path
             batch_start = perf_counter()
             cached_midline, cached_annotation_volume, cached_region_lookup = (
                 self._cached_atlas_conversion_inputs()
             )
             summary = batch_convert_swc_to_parquet(
                 self._swc_source,
-                self._output_path,
+                conversion_output_path,
                 recursive=self._recursive,
                 hemisphere=self._hemisphere,
                 atlas_name=self._atlas_name,
@@ -446,7 +481,7 @@ class ConvertWorker(QObject):
                 annotation_volume=cached_annotation_volume,
                 region_lookup=cached_region_lookup,
                 source_mode=self._source_mode,
-                progress_callback=self.progress.emit,
+                progress_callback=self._report_progress,
             )
             batch_elapsed_s = perf_counter() - batch_start
             logger.debug(
@@ -479,6 +514,37 @@ class ConvertWorker(QObject):
                 raise ValueError("No SWC files were successfully processed")
 
             total = summary.discovered_files
+            if self._flatmap_lookup_dir is not None:
+                self._check_cancelled()
+                from .flatmap_parquet import augment_neuron_parquet_with_flatmaps
+                from .flatmap_profiles import discover_flatmap_lookup_set
+
+                lookup_cache_dir = (
+                    self._output_path.parent / ".flatmap-lookup-arrays"
+                )
+                self._report_progress(
+                    "Adding bilateral flatmap/depth columns...",
+                    total,
+                    total,
+                )
+                lookup_set = discover_flatmap_lookup_set(
+                    self._flatmap_lookup_dir,
+                    lookup_resolution_um=self._flatmap_lookup_resolution_um,
+                    npy_cache_dir=lookup_cache_dir,
+                    progress_callback=self._report_progress,
+                    cancel_callback=lambda: self._cancel_requested,
+                )
+                augment_neuron_parquet_with_flatmaps(
+                    conversion_output_path,
+                    self._output_path,
+                    lookup_set,
+                    npy_cache_dir=lookup_cache_dir,
+                    progress_callback=self._report_progress,
+                    cancel_callback=lambda: self._cancel_requested,
+                )
+            # Returning from the final writer is the atomic publication
+            # boundary. A later cancel request must not turn success into an
+            # error after the destination already exists.
             self.progress.emit("Finalizing Parquet...", total, total)
             logger.debug(
                 "swc_conversion_worker_finished source_mode=%s elapsed_s=%.6f",
@@ -494,6 +560,160 @@ class ConvertWorker(QObject):
                 perf_counter() - run_start,
             )
             self.error.emit(str(e))
+        finally:
+            if staged_conversion_path is not None:
+                try:
+                    staged_conversion_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove staged SWC conversion %s",
+                        staged_conversion_path,
+                        exc_info=True,
+                    )
+
+
+class FlatmapParquetPreparationWorker(QObject):
+    """Prepare every row of a neuron Parquet with v3 bilateral coordinates."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        source_path: str | Path,
+        output_path: str | Path,
+        lookup_dir: str | Path,
+        *,
+        lookup_resolution_um: float | None = None,
+    ) -> None:
+        super().__init__()
+        self._source_path = Path(source_path)
+        self._output_path = Path(output_path)
+        self._lookup_dir = Path(lookup_dir)
+        self._lookup_resolution_um = lookup_resolution_um
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _progress(self, message: str, current: int, total: int) -> None:
+        if self._cancel_requested:
+            raise RuntimeError("Flatmap Parquet preparation cancelled.")
+        self.progress.emit(str(message), int(current), int(total))
+
+    def run(self) -> None:
+        try:
+            from .flatmap_parquet import augment_neuron_parquet_with_flatmaps
+            from .flatmap_profiles import discover_flatmap_lookup_set
+
+            self._progress("Validating bilateral lookup files...", 0, 0)
+            lookup_cache_dir = self._output_path.parent / ".flatmap-lookup-arrays"
+            lookup_set = discover_flatmap_lookup_set(
+                self._lookup_dir,
+                lookup_resolution_um=self._lookup_resolution_um,
+                npy_cache_dir=lookup_cache_dir,
+                progress_callback=self._progress,
+                cancel_callback=lambda: self._cancel_requested,
+            )
+            summary = augment_neuron_parquet_with_flatmaps(
+                self._source_path,
+                self._output_path,
+                lookup_set,
+                npy_cache_dir=lookup_cache_dir,
+                progress_callback=self._progress,
+                cancel_callback=lambda: self._cancel_requested,
+            )
+            self.finished.emit(summary)
+        except Exception as exc:
+            logger.exception("Flatmap Parquet preparation failed")
+            self.error.emit(str(exc))
+
+
+class RegionCacheBuildWorker(QObject):
+    """Build one shaped/square fixed-grid region-cache profile."""
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        cache_dir: str | Path,
+        lookup_dir: str | Path,
+        annotation_path: str | Path,
+        atlas_name: str,
+        atlas_version: str | None,
+        atlas_resolution_um,
+        atlas_structures,
+        xy_bins: int,
+        depth_bin_um: float,
+        lookup_resolution_um: float | None = None,
+    ) -> None:
+        super().__init__()
+        self._cache_dir = Path(cache_dir)
+        self._lookup_dir = Path(lookup_dir)
+        self._annotation_path = Path(annotation_path)
+        self._atlas_name = str(atlas_name)
+        self._atlas_version = atlas_version
+        self._atlas_resolution_um = atlas_resolution_um
+        self._atlas_structures = atlas_structures
+        self._xy_bins = int(xy_bins)
+        self._depth_bin_um = float(depth_bin_um)
+        self._lookup_resolution_um = lookup_resolution_um
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _progress(self, message: str, current: int, total: int) -> None:
+        if self._cancel_requested:
+            raise RuntimeError("Flatmap region-cache build cancelled.")
+        self.progress.emit(str(message), int(current), int(total))
+
+    def run(self) -> None:
+        try:
+            from .flatmap_profiles import discover_flatmap_lookup_set
+            from .flatmap_region_cache import build_region_cache_profile
+
+            self._progress("Validating lookup set and atlas grid...", 0, 0)
+            lookup_set = discover_flatmap_lookup_set(
+                self._lookup_dir,
+                lookup_resolution_um=self._lookup_resolution_um,
+                npy_cache_dir=self._cache_dir / "lookup-arrays",
+                progress_callback=self._progress,
+                cancel_callback=lambda: self._cancel_requested,
+            )
+            bounds_by_style = {
+                style: {
+                    "x_bounds": grid.x_bounds,
+                    "y_bounds": grid.y_bounds,
+                    "depth_bounds_um": grid.depth_bounds_um,
+                }
+                for style, grid in (
+                    ("shaped", lookup_set.shaped_grid),
+                    ("square", lookup_set.square_grid),
+                )
+            }
+            profile = build_region_cache_profile(
+                self._cache_dir,
+                lookup_set,
+                annotation_path=self._annotation_path,
+                atlas_name=self._atlas_name,
+                atlas_version=self._atlas_version,
+                atlas_resolution_um=self._atlas_resolution_um,
+                atlas_structures=self._atlas_structures,
+                xy_bins=self._xy_bins,
+                depth_bin_um=self._depth_bin_um,
+                bounds_by_style=bounds_by_style,
+                cancel_callback=lambda: self._cancel_requested,
+                progress_callback=self._progress,
+            )
+            self.finished.emit(profile)
+        except Exception as exc:
+            logger.exception("Flatmap region-cache build failed")
+            self.error.emit(str(exc))
 
 
 class AppendPointFileWorker(QObject):
@@ -730,8 +950,61 @@ class FlatmapCorrelationWorker(QObject):
         represented_ids = list(self._region_selection.represented_region_ids)
         if not represented_ids:
             return None, {}
+        mask_region_ids = self._expanded_selected_region_ids(represented_ids)
 
         source = self._source
+        cache_dir = getattr(source, "cache_dir", None)
+        cache_profile_id = getattr(source, "cache_profile_id", None)
+        if cache_dir and cache_profile_id:
+            from .flatmap_region_cache import (
+                materialize_region_selection,
+                open_region_cache,
+            )
+
+            cache = open_region_cache(cache_dir)
+            profile = cache.profile(cache_profile_id)
+            result = materialize_region_selection(
+                profile,
+                mask_region_ids,
+                style=(
+                    getattr(source, "cache_style", None)
+                    or source.flatmap_style
+                    or "both_shaped"
+                ),
+                include_surfaces=False,
+                include_outlines=False,
+            )
+            mask = np.asarray(result.labels > 0, dtype=bool)
+            source_shape = tuple(int(size) for size in source.volume_shape)
+            if source.include_depth_minus_one and source_shape[0] == mask.shape[0] + 1:
+                padded = np.zeros(source_shape, dtype=bool)
+                padded[1:, :, :] = mask
+                mask = padded
+            elif mask.shape != source_shape:
+                raise RuntimeError(
+                    "Cached region mask shape does not match the flatmap heatmap; "
+                    f"got mask {mask.shape} and heatmap {source_shape}."
+                )
+            return mask, {
+                "flatmap_region_source": "precomputed_cache",
+                "flatmap_region_cache_path": str(cache_dir),
+                "flatmap_region_cache_profile_id": str(cache_profile_id),
+                "flatmap_region_labeled_voxels": int(result.summary.labeled_bins),
+                "flatmap_region_collision_voxels": int(
+                    result.summary.collision_bins
+                ),
+                "flatmap_region_source_voxel_count": int(
+                    result.summary.source_voxel_count
+                ),
+                "flatmap_region_represented_region_ids": [
+                    int(region_id) for region_id in result.represented_region_ids
+                ],
+            }
+        if getattr(source, "coordinate_mode", None) == "parquet_columns":
+            raise RuntimeError(
+                "Region-filtered precomputed flatmap clustering requires a "
+                "compatible cache profile; NRRD recomputation is never automatic."
+            )
         if not source.flatmap_path or not source.depth_path:
             raise RuntimeError(
                 "Region-filtered flatmap clustering requires the flatmap and "
@@ -746,7 +1019,7 @@ class FlatmapCorrelationWorker(QObject):
             np.asarray(self._atlas.annotation),
             volume_set.flatmap,
             volume_set.depth,
-            selected_region_ids=represented_ids,
+            selected_region_ids=mask_region_ids,
             xy_bins=source.xy_bins,
             depth_bin_um=source.depth_bin_um,
             invalid_zero_sentinel=source.invalid_zero_sentinel,
@@ -780,6 +1053,51 @@ class FlatmapCorrelationWorker(QObject):
                 int(region_id) for region_id in result.represented_region_ids
             ],
         }
+
+    def _expanded_selected_region_ids(
+        self,
+        fallback_region_ids: list[int],
+    ) -> list[int]:
+        """Expand direct selections through the atlas structure catalog only."""
+        direct_ids = {
+            int(value)
+            for value in getattr(
+                self._region_selection,
+                "selected_region_ids",
+                (),
+            )
+            if int(value) > 0
+        }
+        structures = getattr(self._atlas, "structures", None)
+        if not direct_ids or not isinstance(structures, Mapping):
+            return sorted({int(value) for value in fallback_region_ids})
+
+        expanded = set(direct_ids)
+        for key, structure in structures.items():
+            if not isinstance(structure, Mapping):
+                continue
+            try:
+                region_id = int(structure.get("id", key))
+            except (TypeError, ValueError):
+                continue
+            raw_path = structure.get("structure_id_path", ()) or ()
+            if isinstance(raw_path, str):
+                try:
+                    path_ids = {
+                        int(part)
+                        for part in raw_path.strip("/").split("/")
+                        if part
+                    }
+                except ValueError:
+                    continue
+            else:
+                try:
+                    path_ids = {int(value) for value in raw_path}
+                except (TypeError, ValueError):
+                    continue
+            if region_id in direct_ids or direct_ids.intersection(path_ids):
+                expanded.add(region_id)
+        return sorted(expanded)
 
     @staticmethod
     def _lookup_mode_counts(projected_nodes) -> dict[str, int]:
@@ -846,6 +1164,10 @@ class FlatmapCorrelationWorker(QObject):
                 ),
                 "flatmap_path": source.flatmap_path,
                 "depth_path": source.depth_path,
+                "flatmap_cache_path": getattr(source, "cache_dir", None),
+                "flatmap_cache_profile_id": getattr(
+                    source, "cache_profile_id", None
+                ),
                 "flatmap_input_neuron_count": int(len(source.input_file_ids)),
                 "flatmap_clustered_neuron_count": int(len(result.neuron_ids)),
                 "flatmap_unassigned_neuron_count": int(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,16 @@ FLATMAP_STYLE_FILENAMES: dict[str, str] = {
 
 _NPY_CACHE_VERSION = 1
 _NPY_CACHE_SUFFIX = ".float32.npy"
+_NPY_CACHE_WRITE_CHUNK_VALUES = 16_000_000
+
+
+class FlatmapLookupLoadCancelledError(RuntimeError):
+    """Raised when normalized lookup materialization is cancelled."""
+
+
+def _check_load_cancelled(cancel_callback: Callable[[], bool] | None) -> None:
+    if cancel_callback is not None and cancel_callback():
+        raise FlatmapLookupLoadCancelledError("Flatmap lookup loading cancelled.")
 
 
 @dataclass(frozen=True)
@@ -204,6 +216,7 @@ def _write_npy_cache(
     source_shape: tuple[int, ...],
     source_ndim: int,
     coordinate_axis: int | None,
+    cancel_callback: Callable[[], bool] | None,
 ) -> Path | None:
     """Persist one normalized float32 lookup array and cache metadata.
 
@@ -220,25 +233,46 @@ def _write_npy_cache(
             None if coordinate_axis is None else int(coordinate_axis)
         ),
         "normalized_shape": [int(size) for size in data.shape],
-        "dtype": str(data.dtype),
+        "dtype": "float32",
     }
 
-    cache_tmp = cache_path.with_name(f"{cache_path.name}.tmp")
-    metadata_tmp = metadata_path.with_name(f"{metadata_path.name}.tmp")
+    token = uuid.uuid4().hex
+    cache_tmp = cache_path.with_name(f".{cache_path.name}.{token}.tmp")
+    metadata_tmp = metadata_path.with_name(f".{metadata_path.name}.{token}.tmp")
     try:
+        _check_load_cancelled(cancel_callback)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with cache_tmp.open("wb") as output_file:
-            np.save(output_file, data, allow_pickle=False)
+        output = np.lib.format.open_memmap(
+            cache_tmp,
+            mode="w+",
+            dtype=np.float32,
+            shape=data.shape,
+        )
+        plane_values = max(1, int(np.prod(data.shape[1:], dtype=np.int64)))
+        chunk_size = max(1, _NPY_CACHE_WRITE_CHUNK_VALUES // plane_values)
+        for start in range(0, int(data.shape[0]), chunk_size):
+            _check_load_cancelled(cancel_callback)
+            stop = min(start + chunk_size, int(data.shape[0]))
+            output[start:stop] = data[start:stop]
+        output.flush()
+        del output
         cache_tmp.replace(cache_path)
         metadata_tmp.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
         metadata_tmp.replace(metadata_path)
-    except OSError:
+    except (OSError, ValueError):
         for path in (cache_tmp, metadata_tmp):
             try:
                 path.unlink()
             except OSError:
                 pass
         return None
+    except BaseException:
+        for path in (cache_tmp, metadata_tmp):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
 
     return cache_path
 
@@ -250,8 +284,10 @@ def _load_flatmap_volume(
     create_npy_cache: bool,
     npy_cache_dir: str | Path | None,
     mmap_npy: bool,
+    cancel_callback: Callable[[], bool] | None,
 ) -> _LoadedVolume:
     source_path = Path(path)
+    _check_load_cancelled(cancel_callback)
     if use_npy_cache:
         cache_path, metadata_path = _npy_cache_paths(source_path, npy_cache_dir)
         cached = _load_npy_cache(
@@ -267,16 +303,16 @@ def _load_flatmap_volume(
         cache_path = metadata_path = None
 
     flatmap_data, flatmap_header = _read_nrrd(source_path)
+    _check_load_cancelled(cancel_callback)
     coordinate_axis = _flatmap_coordinate_axis(flatmap_data)
     source_shape = tuple(int(size) for size in flatmap_data.shape)
     source_ndim = int(np.asarray(flatmap_data).ndim)
-    flatmap = normalize_flatmap_volume(flatmap_data)
-    del flatmap_data
+    flatmap_view = _normalized_flatmap_view(flatmap_data)
 
     npy_path = None
     if use_npy_cache and create_npy_cache:
         npy_path = _write_npy_cache(
-            flatmap,
+            flatmap_view,
             source_path=source_path,
             kind="flatmap",
             cache_path=cache_path,
@@ -284,7 +320,33 @@ def _load_flatmap_volume(
             source_shape=source_shape,
             source_ndim=source_ndim,
             coordinate_axis=coordinate_axis,
+            cancel_callback=cancel_callback,
         )
+        if npy_path is not None:
+            del flatmap_view
+            del flatmap_data
+            cached = _load_npy_cache(
+                source_path,
+                kind="flatmap",
+                cache_path=cache_path,
+                metadata_path=metadata_path,
+                mmap_npy=mmap_npy,
+            )
+            if cached is not None:
+                return _LoadedVolume(
+                    data=cached.data,
+                    header=flatmap_header,
+                    source_ndim=source_ndim,
+                    coordinate_axis=coordinate_axis,
+                    npy_path=npy_path,
+                    loaded_from_cache=False,
+                )
+            flatmap_data, _unused_header = _read_nrrd(source_path)
+            flatmap_view = _normalized_flatmap_view(flatmap_data)
+
+    flatmap = np.asarray(flatmap_view, dtype=np.float32)
+    del flatmap_view
+    del flatmap_data
 
     return _LoadedVolume(
         data=flatmap,
@@ -303,8 +365,10 @@ def _load_depth_volume(
     create_npy_cache: bool,
     npy_cache_dir: str | Path | None,
     mmap_npy: bool,
+    cancel_callback: Callable[[], bool] | None,
 ) -> _LoadedVolume:
     source_path = Path(path)
+    _check_load_cancelled(cancel_callback)
     if use_npy_cache:
         cache_path, metadata_path = _npy_cache_paths(source_path, npy_cache_dir)
         cached = _load_npy_cache(
@@ -320,15 +384,15 @@ def _load_depth_volume(
         cache_path = metadata_path = None
 
     depth_data, depth_header = _read_nrrd(source_path)
+    _check_load_cancelled(cancel_callback)
     source_shape = tuple(int(size) for size in depth_data.shape)
     source_ndim = int(np.asarray(depth_data).ndim)
-    depth = normalize_depth_volume(depth_data)
-    del depth_data
+    depth_view = _normalized_depth_view(depth_data)
 
     npy_path = None
     if use_npy_cache and create_npy_cache:
         npy_path = _write_npy_cache(
-            depth,
+            depth_view,
             source_path=source_path,
             kind="depth",
             cache_path=cache_path,
@@ -336,7 +400,33 @@ def _load_depth_volume(
             source_shape=source_shape,
             source_ndim=source_ndim,
             coordinate_axis=None,
+            cancel_callback=cancel_callback,
         )
+        if npy_path is not None:
+            del depth_view
+            del depth_data
+            cached = _load_npy_cache(
+                source_path,
+                kind="depth",
+                cache_path=cache_path,
+                metadata_path=metadata_path,
+                mmap_npy=mmap_npy,
+            )
+            if cached is not None:
+                return _LoadedVolume(
+                    data=cached.data,
+                    header=depth_header,
+                    source_ndim=source_ndim,
+                    coordinate_axis=None,
+                    npy_path=npy_path,
+                    loaded_from_cache=False,
+                )
+            depth_data, _unused_header = _read_nrrd(source_path)
+            depth_view = _normalized_depth_view(depth_data)
+
+    depth = np.asarray(depth_view, dtype=np.float32)
+    del depth_view
+    del depth_data
 
     return _LoadedVolume(
         data=depth,
@@ -348,8 +438,8 @@ def _load_depth_volume(
     )
 
 
-def normalize_flatmap_volume(data: np.ndarray) -> np.ndarray:
-    """Return flatmap data normalized to ``(nx, ny, nz, 2)`` float32."""
+def _normalized_flatmap_view(data: np.ndarray) -> np.ndarray:
+    """Return a validated ``(nx, ny, nz, 2)`` view without dtype copying."""
     array = np.asarray(data)
     if array.ndim != 4:
         raise ValueError(
@@ -373,7 +463,12 @@ def normalize_flatmap_volume(data: np.ndarray) -> np.ndarray:
 
     if normalized.shape[-1] != 2 or any(size <= 0 for size in normalized.shape[:3]):
         raise ValueError(f"Invalid flatmap volume shape: {array.shape}.")
-    return np.asarray(normalized, dtype=np.float32)
+    return normalized
+
+
+def normalize_flatmap_volume(data: np.ndarray) -> np.ndarray:
+    """Return flatmap data normalized to ``(nx, ny, nz, 2)`` float32."""
+    return np.asarray(_normalized_flatmap_view(data), dtype=np.float32)
 
 
 def _flatmap_coordinate_axis(data: np.ndarray) -> int:
@@ -399,14 +494,19 @@ def _flatmap_coordinate_axis(data: np.ndarray) -> int:
     return coordinate_axes[0]
 
 
-def normalize_depth_volume(data: np.ndarray) -> np.ndarray:
-    """Return depth data normalized to a 3D float32 volume."""
+def _normalized_depth_view(data: np.ndarray) -> np.ndarray:
+    """Return a validated 3D depth view without dtype copying."""
     array = np.asarray(data)
     if array.ndim != 3:
         raise ValueError(f"Depth NRRD must be a 3D volume; got shape {array.shape}.")
     if any(size <= 0 for size in array.shape):
         raise ValueError(f"Invalid depth volume shape: {array.shape}.")
-    return np.asarray(array, dtype=np.float32)
+    return array
+
+
+def normalize_depth_volume(data: np.ndarray) -> np.ndarray:
+    """Return depth data normalized to a 3D float32 volume."""
+    return np.asarray(_normalized_depth_view(data), dtype=np.float32)
 
 
 def _header_vector(value: object) -> np.ndarray | None:
@@ -477,6 +577,7 @@ def load_flatmap_volume_set(
     create_npy_cache: bool = True,
     npy_cache_dir: str | Path | None = None,
     mmap_npy: bool = True,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> FlatmapVolumeSet:
     """Load and validate a flatmap lookup volume and matching depth volume.
 
@@ -490,6 +591,7 @@ def load_flatmap_volume_set(
         create_npy_cache=create_npy_cache,
         npy_cache_dir=npy_cache_dir,
         mmap_npy=mmap_npy,
+        cancel_callback=cancel_callback,
     )
     depth_volume = _load_depth_volume(
         depth_path,
@@ -497,6 +599,7 @@ def load_flatmap_volume_set(
         create_npy_cache=create_npy_cache,
         npy_cache_dir=npy_cache_dir,
         mmap_npy=mmap_npy,
+        cancel_callback=cancel_callback,
     )
 
     validate_flatmap_depth_shapes(flatmap_volume.data, depth_volume.data)

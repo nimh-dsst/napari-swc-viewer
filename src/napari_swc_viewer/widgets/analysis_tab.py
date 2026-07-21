@@ -59,12 +59,12 @@ _CLUSTER_METHOD_VOXEL = "Voxel Correlation"
 _CLUSTER_METHOD_FLATMAP = "Flatmap Voxel Correlation"
 _CLUSTER_METHOD_SOMA = "Soma Location"
 _FLATMAP_CORRELATION_AVAILABLE_TEXT = (
-    "Uses the latest 3D flatmap heatmap. Region filters are projected into "
-    "flatmap space using the Flatmap tab NRRD files."
+    "Uses the latest 3D flatmap heatmap. Precomputed views read region masks "
+    "from the active cache; explicit NRRD views project them from the lookups."
 )
 _FLATMAP_CORRELATION_UNAVAILABLE_TEXT = (
-    "Render a Flatmap tab 3D heatmap with flatmap/depth NRRDs to enable "
-    "Flatmap Voxel Correlation."
+    "Render a Flatmap tab 3D heatmap from a precomputed Parquet or explicit "
+    "flatmap/depth NRRDs to enable Flatmap Voxel Correlation."
 )
 
 
@@ -1096,14 +1096,18 @@ class AnalysisTabWidget(QWidget):
         volume_shape = getattr(source, "volume_shape", None)
         if volume_shape is None or len(tuple(volume_shape)) != 3:
             return False
-        if not getattr(source, "flatmap_path", None) or not getattr(
-            source,
-            "depth_path",
-            None,
-        ):
-            return False
-        if getattr(source, "lookup_stats", None) is None:
-            return False
+        # Binned version-3 Parquet data is already a complete correlation
+        # source. Region-filtered runs resolve masks from its active cache in
+        # FlatmapCorrelationWorker and must not require NRRDs or lookup stats.
+        if getattr(source, "coordinate_mode", None) != "parquet_columns":
+            if not getattr(source, "flatmap_path", None) or not getattr(
+                source,
+                "depth_path",
+                None,
+            ):
+                return False
+            if getattr(source, "lookup_stats", None) is None:
+                return False
         try:
             input_count = len(tuple(getattr(source, "input_file_ids", ())))
             xy_bins = int(getattr(source, "xy_bins"))

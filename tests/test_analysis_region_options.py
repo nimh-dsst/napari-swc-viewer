@@ -1265,6 +1265,23 @@ def test_flatmap_correlation_option_requires_complete_source() -> None:
     ]
 
 
+def test_flatmap_correlation_accepts_complete_precomputed_source_without_nrrds() -> None:
+    """Binned v3 Parquet data must not require lookup files or lookup stats."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    source = _complete_flatmap_source()
+    source.coordinate_mode = "parquet_columns"
+    source.flatmap_path = None
+    source.depth_path = None
+    source.lookup_stats = None
+
+    widget.set_flatmap_correlation_source_provider(lambda: source)
+
+    assert "Flatmap Voxel Correlation" in [
+        item["text"] for item in widget._clustering_method_combo._items
+    ]
+
+
 def test_flatmap_correlation_unavailable_resets_method_selection() -> None:
     """Losing flatmap metadata should remove the method and select atlas correlation."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
@@ -1298,7 +1315,7 @@ def test_flatmap_correlation_method_hides_nonapplicable_controls() -> None:
     assert widget._cluster_region_scope_combo._visible is False
     assert widget._dilation_label._visible is False
     assert widget._dilation_spin._visible is False
-    assert "Region filters are projected into flatmap space" in (
+    assert "Precomputed views read region masks from the active cache" in (
         widget._flatmap_correlation_status_label.text()
     )
 

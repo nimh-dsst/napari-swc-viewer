@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import napari_swc_viewer.flatmap_loader as flatmap_loader
 from napari_swc_viewer.flatmap_loader import (
+    FlatmapLookupLoadCancelledError,
     load_flatmap_volume_set,
     normalize_flatmap_volume,
     spatial_transform_from_header,
@@ -64,6 +66,8 @@ def test_load_flatmap_volume_set_creates_and_uses_npy_cache(
 
     assert first.flatmap_loaded_from_cache is False
     assert first.depth_loaded_from_cache is False
+    assert isinstance(first.flatmap, np.memmap)
+    assert isinstance(first.depth, np.memmap)
     assert first.flatmap_npy_path == tmp_path / "flatmap_both_shaped.float32.npy"
     assert first.depth_npy_path == tmp_path / "depth.float32.npy"
     assert first.flatmap_npy_path.exists()
@@ -87,6 +91,86 @@ def test_load_flatmap_volume_set_creates_and_uses_npy_cache(
     assert isinstance(second.depth, np.memmap)
     np.testing.assert_array_equal(second.flatmap, flatmap)
     np.testing.assert_array_equal(second.depth, depth)
+
+
+def test_load_flatmap_volume_set_reuses_explicit_writable_cache_dir(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    lookup_dir = tmp_path / "read-only-lookups"
+    lookup_dir.mkdir()
+    flatmap_path = lookup_dir / "flatmap_both_shaped.nrrd"
+    depth_path = lookup_dir / "depth.nrrd"
+    cache_dir = tmp_path / "writable-cache"
+    flatmap = np.zeros((2, 3, 4, 2), dtype=np.float32)
+    flatmap[..., 0] = 7
+    depth = np.full((2, 3, 4), 25, dtype=np.float32)
+    _write_nrrd(flatmap_path, flatmap)
+    _write_nrrd(depth_path, depth)
+
+    first = load_flatmap_volume_set(
+        flatmap_path,
+        depth_path,
+        npy_cache_dir=cache_dir,
+    )
+
+    assert first.flatmap_npy_path is not None
+    assert first.depth_npy_path is not None
+    assert first.flatmap_npy_path.parent == cache_dir
+    assert first.depth_npy_path.parent == cache_dir
+
+    def _fail_read_nrrd(path):
+        raise AssertionError(f"cache miss for {path}")
+
+    monkeypatch.setattr(flatmap_loader, "_read_nrrd", _fail_read_nrrd)
+    second = load_flatmap_volume_set(
+        flatmap_path,
+        depth_path,
+        npy_cache_dir=cache_dir,
+    )
+
+    assert second.flatmap_loaded_from_cache is True
+    assert second.depth_loaded_from_cache is True
+    np.testing.assert_array_equal(second.flatmap, flatmap)
+    np.testing.assert_array_equal(second.depth, depth)
+
+
+def test_cancelled_normalized_cache_write_removes_temporary_files(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source_path = tmp_path / "depth.nrrd"
+    source_path.write_bytes(b"source")
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "depth.float32.npy"
+    metadata_path = cache_dir / "depth.float32.npy.json"
+    data = np.arange(12, dtype=np.float32).reshape(3, 2, 2)
+    callback_calls = 0
+
+    def cancel_during_second_chunk() -> bool:
+        nonlocal callback_calls
+        callback_calls += 1
+        return callback_calls >= 3
+
+    monkeypatch.setattr(flatmap_loader, "_NPY_CACHE_WRITE_CHUNK_VALUES", 4)
+
+    with pytest.raises(FlatmapLookupLoadCancelledError, match="cancelled"):
+        flatmap_loader._write_npy_cache(
+            data,
+            source_path=source_path,
+            kind="depth",
+            cache_path=cache_path,
+            metadata_path=metadata_path,
+            source_shape=data.shape,
+            source_ndim=data.ndim,
+            coordinate_axis=None,
+            cancel_callback=cancel_during_second_chunk,
+        )
+
+    assert callback_calls == 3
+    assert not cache_path.exists()
+    assert not metadata_path.exists()
+    assert list(cache_dir.iterdir()) == []
 
 
 def test_spatial_transform_from_header_omits_flatmap_vector_axis() -> None:

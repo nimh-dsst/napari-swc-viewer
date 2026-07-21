@@ -238,3 +238,5 @@ example_data_aligned/
 
 # DS_Store
 .DS_Store
+
+*.npy

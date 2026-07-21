@@ -11,7 +11,9 @@ from napari_swc_viewer.flatmap_parquet import (
     DEFAULT_CCFV3_MIRROR_MIDLINE_UM,
     DEFAULT_FLATMAP_PARQUET_BATCH_SIZE,
     augment_neuron_parquet_with_flatmap,
+    augment_neuron_parquet_with_flatmaps,
 )
+from napari_swc_viewer.flatmap_profiles import discover_flatmap_lookup_set
 from napari_swc_viewer.flatmap_projection import COORDINATE_MODE_MICRONS
 
 
@@ -31,8 +33,34 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("source_parquet", type=Path)
     parser.add_argument("output_parquet", type=Path)
-    parser.add_argument("--flatmap", required=True, type=Path, help="Flatmap NRRD path.")
-    parser.add_argument("--depth", required=True, type=Path, help="Depth NRRD path.")
+    parser.add_argument(
+        "--lookup-dir",
+        type=Path,
+        help=(
+            "Directory containing flatmap_both_shaped.nrrd, "
+            "flatmap_both_square.nrrd, and depth.nrrd. Produces version-3 "
+            "whole-Parquet output."
+        ),
+    )
+    parser.add_argument(
+        "--flatmap",
+        type=Path,
+        help="Legacy single-style Flatmap NRRD path (requires --depth).",
+    )
+    parser.add_argument(
+        "--depth",
+        type=Path,
+        help="Legacy single-style Depth NRRD path (requires --flatmap).",
+    )
+    parser.add_argument(
+        "--lookup-resolution",
+        type=float,
+        default=None,
+        help=(
+            "Lookup voxel resolution in microns. Required for --lookup-dir "
+            "when any NRRD lacks a usable spatial transform."
+        ),
+    )
     parser.add_argument(
         "--file-id",
         action="append",
@@ -100,29 +128,68 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default="zstd",
         help="Parquet compression codec for output (default: zstd).",
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    if parsed.lookup_dir is not None:
+        if parsed.flatmap is not None or parsed.depth is not None:
+            parser.error("--lookup-dir cannot be combined with --flatmap or --depth")
+        if parsed.file_ids is not None:
+            parser.error("--lookup-dir always processes the whole Parquet; omit --file-id")
+        if parsed.no_mirror_fallback:
+            parser.error(
+                "version-3 bilateral preprocessing always uses mirrored-depth "
+                "recovery; --no-mirror-fallback is only for the legacy path"
+            )
+    elif parsed.flatmap is None or parsed.depth is None:
+        parser.error("provide --lookup-dir or both --flatmap and --depth")
+    if parsed.lookup_resolution is not None and parsed.lookup_resolution <= 0.0:
+        parser.error("--lookup-resolution must be positive")
+    return parsed
 
 
 def main(args: list[str] | None = None) -> int:
     parsed = parse_args(args)
 
     try:
-        summary = augment_neuron_parquet_with_flatmap(
-            parsed.source_parquet,
-            parsed.output_parquet,
-            parsed.flatmap,
-            parsed.depth,
-            file_ids=parsed.file_ids,
-            coordinate_mode=parsed.coordinate_mode,
-            flatmap_style=parsed.flatmap_style,
-            mirror_fallback=not parsed.no_mirror_fallback,
-            mirror_coord_axis=parsed.mirror_axis,
-            mirror_midline=parsed.mirror_midline,
-            invalid_zero_sentinel=parsed.treat_zero_flatmap_invalid,
-            invalid_negative_one_sentinel=not parsed.allow_negative_one_flatmap,
-            batch_size=parsed.batch_size,
-            compression=parsed.compression,
-        )
+        if parsed.lookup_dir is not None:
+            lookup_cache_dir = (
+                parsed.output_parquet.parent / ".flatmap-lookup-arrays"
+            )
+            lookup_set = discover_flatmap_lookup_set(
+                parsed.lookup_dir,
+                lookup_resolution_um=parsed.lookup_resolution,
+                npy_cache_dir=lookup_cache_dir,
+                invalid_zero_sentinel=parsed.treat_zero_flatmap_invalid,
+                invalid_negative_one_sentinel=(
+                    not parsed.allow_negative_one_flatmap
+                ),
+            )
+            summary = augment_neuron_parquet_with_flatmaps(
+                parsed.source_parquet,
+                parsed.output_parquet,
+                lookup_set,
+                coordinate_mode=parsed.coordinate_mode,
+                mirror_coord_axis=parsed.mirror_axis,
+                batch_size=parsed.batch_size,
+                compression=parsed.compression,
+                npy_cache_dir=lookup_cache_dir,
+            )
+        else:
+            summary = augment_neuron_parquet_with_flatmap(
+                parsed.source_parquet,
+                parsed.output_parquet,
+                parsed.flatmap,
+                parsed.depth,
+                file_ids=parsed.file_ids,
+                coordinate_mode=parsed.coordinate_mode,
+                flatmap_style=parsed.flatmap_style,
+                mirror_fallback=not parsed.no_mirror_fallback,
+                mirror_coord_axis=parsed.mirror_axis,
+                mirror_midline=parsed.mirror_midline,
+                invalid_zero_sentinel=parsed.treat_zero_flatmap_invalid,
+                invalid_negative_one_sentinel=not parsed.allow_negative_one_flatmap,
+                batch_size=parsed.batch_size,
+                compression=parsed.compression,
+            )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -133,6 +200,8 @@ def main(args: list[str] | None = None) -> int:
     print(f"Mirrored lookup rows: {summary.mirrored_rows:,}")
     print(f"Unmapped rows: {summary.unmapped_rows:,}")
     print(f"Output path: {summary.output_parquet}")
+    if summary.lookup_set_id is not None:
+        print(f"Lookup set ID: {summary.lookup_set_id}")
     return 0
 
 

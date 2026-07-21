@@ -254,6 +254,46 @@ def test_flatmap_heatmap_from_projected_nodes_infers_validity_flags() -> None:
     assert result.projected_nodes["render_valid"].tolist() == [True, False, True]
 
 
+def test_precomputed_subset_uses_canonical_bounds_for_cache_alignment() -> None:
+    full = pd.DataFrame(
+        {
+            "file_id": ["left.swc", "right.swc"],
+            "x_flat": [10.0, 90.0],
+            "y_flat": [10.0, 90.0],
+            "depth_um": [10.0, 90.0],
+            "flatmap_valid": [True, True],
+            "depth_valid": [True, True],
+        }
+    )
+    canonical = {
+        "x_bounds": (0.0, 100.0),
+        "y_bounds": (0.0, 100.0),
+        "depth_range_um": (0.0, 100.0),
+    }
+    complete = build_flatmap_render_data_from_projected_nodes(
+        full,
+        xy_bins=10,
+        depth_bin_um=10.0,
+        include_depth_minus_one=False,
+        **canonical,
+    )
+    subset = build_flatmap_render_data_from_projected_nodes(
+        full.iloc[[1]],
+        xy_bins=10,
+        depth_bin_um=10.0,
+        include_depth_minus_one=False,
+        **canonical,
+    )
+
+    assert subset.volume.shape == complete.volume.shape == (11, 10, 10)
+    row = subset.projected_nodes.iloc[0]
+    assert (int(row.depth_bin), int(row.y_flat_bin), int(row.x_flat_bin)) == (
+        9,
+        9,
+        9,
+    )
+
+
 def _binned_projected_nodes() -> pd.DataFrame:
     return pd.DataFrame(
         {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pyarrow as pa
@@ -11,12 +12,22 @@ import pytest
 from napari_swc_viewer.db import NeuronDatabase
 from napari_swc_viewer.flatmap_parquet import (
     FLATMAP_INVALID_CODE_INVALID_DEPTH,
+    FLATMAP_INVALID_CODE_INVALID_FLATMAP,
     FLATMAP_INVALID_CODE_OUT_OF_BOUNDS,
     FLATMAP_INVALID_CODE_VALID,
     FLATMAP_PARQUET_METADATA_KEY,
     FLATMAP_PARQUET_FORMAT_VERSION,
+    FLATMAP_V3_AUGMENTED_COLUMNS,
+    LEGACY_SINGLE_FLATMAP_PARQUET_FORMAT_VERSION,
+    FlatmapParquetCancelledError,
     augment_neuron_parquet_with_flatmap,
+    augment_neuron_parquet_with_flatmaps,
     read_flatmap_parquet_transform_info,
+)
+from napari_swc_viewer.flatmap_profiles import (
+    FlatmapLookupCancelledError,
+    build_flatmap_lookup_set,
+    discover_flatmap_lookup_set,
 )
 
 nrrd = pytest.importorskip("nrrd")
@@ -180,7 +191,11 @@ def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(
     metadata = table.schema.metadata or {}
     assert FLATMAP_PARQUET_METADATA_KEY in metadata
     payload = json.loads(metadata[FLATMAP_PARQUET_METADATA_KEY].decode("utf-8"))
-    assert payload["version"] == FLATMAP_PARQUET_FORMAT_VERSION == 2
+    assert (
+        payload["version"]
+        == LEGACY_SINGLE_FLATMAP_PARQUET_FORMAT_VERSION
+        == 2
+    )
     assert payload["flatmap_nrrd"]["path"] == str(flatmap_path.resolve())
     assert payload["depth_nrrd"]["path"] == str(depth_path.resolve())
     assert payload["mirror_fallback"] is True
@@ -380,3 +395,214 @@ def test_augment_neuron_parquet_replaces_existing_flatmap_columns(tmp_path) -> N
 
     out = pq.read_table(output).to_pandas()
     assert out["x_flat"].tolist()[:2] == pytest.approx([1.25, 1.25])
+
+
+def _write_bilateral_lookup_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    shaped = np.full((1, 1, 4, 2), -1.0, dtype=np.float32)
+    shaped[0, 0, 1] = (0.1, 0.5)
+    shaped[0, 0, 3] = (1.9, 0.5)
+    square = np.full((1, 1, 4, 2), -1.0, dtype=np.float32)
+    square[0, 0, 0] = (10.1, 2.5)
+    square[0, 0, 1] = (10.5, 2.5)
+    square[0, 0, 3] = (11.9, 2.5)
+    depth = np.full((1, 1, 4), -1.0, dtype=np.float32)
+    depth[0, 0, 3] = 100.0
+    _write_nrrd(path / "flatmap_both_shaped.nrrd", shaped)
+    _write_nrrd(path / "flatmap_both_square.nrrd", square)
+    _write_nrrd(path / "depth.nrrd", depth)
+
+
+def _write_bilateral_source(path: Path) -> None:
+    table = pa.Table.from_pydict(
+        {
+            "file_id": ["left.swc", "right.swc"],
+            "node_id": [1, 1],
+            "type": [1, 1],
+            "x": [0.0, 0.0],
+            "y": [0.0, 0.0],
+            "z": [0.0, 30.0],
+            "parent_id": [-1, -1],
+            "custom_note": ["preserve-left", "preserve-right"],
+        }
+    ).replace_schema_metadata({b"custom.schema.key": b"preserved"})
+    pq.write_table(table, path)
+
+
+def test_v3_whole_parquet_adds_both_styles_and_shared_mirrored_depth(
+    tmp_path,
+) -> None:
+    lookup_dir = tmp_path / "lookup"
+    _write_bilateral_lookup_dir(lookup_dir)
+    source = tmp_path / "neurons.parquet"
+    output = tmp_path / "neurons_flatmap.parquet"
+    _write_bilateral_source(source)
+    lookup_set = discover_flatmap_lookup_set(
+        lookup_dir,
+        lookup_resolution_um=10.0,
+    )
+
+    summary = augment_neuron_parquet_with_flatmaps(
+        source,
+        output,
+        lookup_set,
+        batch_size=1,
+    )
+
+    table = pq.read_table(output)
+    out = table.to_pandas()
+    assert set(FLATMAP_V3_AUGMENTED_COLUMNS).issubset(table.column_names)
+    assert out["custom_note"].tolist() == ["preserve-left", "preserve-right"]
+    assert np.isnan(out.loc[0, "x_flat_shaped"])
+    assert out.loc[1, "x_flat_shaped"] == pytest.approx(1.9)
+    assert out["x_flat_square"].tolist() == pytest.approx([10.1, 11.9])
+    assert out["depth_um"].tolist() == pytest.approx([100.0, 100.0])
+    assert out["depth_lookup_mode"].tolist() == ["mirrored_depth", "direct"]
+    assert out["flatmap_shaped_lookup_mode"].tolist() == ["unmapped", "direct"]
+    assert out["flatmap_square_lookup_mode"].tolist() == ["direct", "direct"]
+    assert out["flatmap_shaped_projection_valid"].tolist() == [False, True]
+    assert out["flatmap_square_projection_valid"].tolist() == [True, True]
+    assert out["flatmap_shaped_invalid_code"].tolist() == [
+        FLATMAP_INVALID_CODE_INVALID_FLATMAP,
+        FLATMAP_INVALID_CODE_VALID,
+    ]
+    assert summary.lookup_set_id == lookup_set.lookup_set_id
+    assert summary.rows == 2
+    assert summary.direct_rows == 1
+    assert summary.mirrored_depth_rows == 1
+    assert summary.shaped_valid_rows == 1
+    assert summary.square_valid_rows == 2
+
+    metadata = table.schema.metadata or {}
+    assert metadata[b"custom.schema.key"] == b"preserved"
+    payload = json.loads(metadata[FLATMAP_PARQUET_METADATA_KEY].decode("utf-8"))
+    assert payload["version"] == FLATMAP_PARQUET_FORMAT_VERSION == 3
+    assert payload["lookup_set_id"] == lookup_set.lookup_set_id
+    assert payload["lookup_set"]["source_sha256"] == dict(
+        lookup_set.source_sha256
+    )
+    assert payload["canonical_bounds"]["both_shaped"]["x"] == pytest.approx(
+        [0.1, 1.9]
+    )
+    assert payload["column_mapping"]["both_square"]["x"] == "x_flat_square"
+    assert payload["shared_depth_definition"]["policy"] == (
+        "original_voxel_then_mirror_depth_voxel_if_invalid"
+    )
+
+    info = read_flatmap_parquet_transform_info(output)
+    assert info.has_full_transform is True
+    assert info.available_styles == ("both_shaped", "both_square")
+    assert info.lookup_set_id == lookup_set.lookup_set_id
+    assert info.lookup_set.lookup_set_id == lookup_set.lookup_set_id
+    assert info.has_style("shaped") is True
+    assert info.column_mapping("square")["x"] == "x_flat_square"
+    assert info.grid_spec("both_shaped").x_bounds == pytest.approx((0.1, 1.9))
+
+
+def test_lookup_set_id_is_stable_after_relocation(tmp_path) -> None:
+    original = tmp_path / "original"
+    relocated = tmp_path / "relocated"
+    _write_bilateral_lookup_dir(original)
+    relocated.mkdir()
+    for source in original.glob("*.nrrd"):
+        shutil.copy2(source, relocated / source.name)
+
+    first = discover_flatmap_lookup_set(original, lookup_resolution_um=10.0)
+    second = discover_flatmap_lookup_set(relocated, lookup_resolution_um=10.0)
+
+    assert first.lookup_set_id == second.lookup_set_id
+    assert first.shaped_grid.grid_spec_id == second.shaped_grid.grid_spec_id
+    assert first.to_dict()["source_paths"] != second.to_dict()["source_paths"]
+
+
+def test_lookup_set_requires_explicit_resolution_without_transform(tmp_path) -> None:
+    lookup_dir = tmp_path / "lookup"
+    _write_bilateral_lookup_dir(lookup_dir)
+
+    with pytest.raises(ValueError, match="lookup_resolution_um"):
+        discover_flatmap_lookup_set(lookup_dir)
+
+
+def test_lookup_set_discovery_honors_cancellation(tmp_path) -> None:
+    lookup_dir = tmp_path / "lookup"
+    _write_bilateral_lookup_dir(lookup_dir)
+
+    with pytest.raises(FlatmapLookupCancelledError, match="cancelled"):
+        discover_flatmap_lookup_set(
+            lookup_dir,
+            lookup_resolution_um=10.0,
+            cancel_callback=lambda: True,
+        )
+
+
+def test_lookup_set_rejects_spatial_shape_mismatch(tmp_path) -> None:
+    lookup_dir = tmp_path / "lookup"
+    _write_bilateral_lookup_dir(lookup_dir)
+    wrong_square = np.zeros((1, 1, 5, 2), dtype=np.float32)
+    _write_nrrd(lookup_dir / "flatmap_both_square.nrrd", wrong_square)
+
+    with pytest.raises(ValueError, match="share the same 3D atlas grid"):
+        build_flatmap_lookup_set(
+            lookup_dir / "flatmap_both_shaped.nrrd",
+            lookup_dir / "flatmap_both_square.nrrd",
+            lookup_dir / "depth.nrrd",
+            lookup_resolution_um=10.0,
+        )
+
+
+def test_v3_cancellation_preserves_existing_output_atomically(tmp_path) -> None:
+    lookup_dir = tmp_path / "lookup"
+    _write_bilateral_lookup_dir(lookup_dir)
+    lookup_set = discover_flatmap_lookup_set(
+        lookup_dir,
+        lookup_resolution_um=10.0,
+    )
+    source = tmp_path / "neurons.parquet"
+    output = tmp_path / "neurons_flatmap.parquet"
+    _write_bilateral_source(source)
+    pq.write_table(pa.Table.from_pydict({"sentinel": [42]}), output)
+    callback_calls = 0
+
+    def cancel_after_first_batch() -> bool:
+        nonlocal callback_calls
+        callback_calls += 1
+        return callback_calls >= 2
+
+    with pytest.raises(FlatmapParquetCancelledError, match="cancelled"):
+        augment_neuron_parquet_with_flatmaps(
+            source,
+            output,
+            lookup_set,
+            batch_size=1,
+            cancel_callback=cancel_after_first_batch,
+        )
+
+    assert pq.read_table(output).to_pydict() == {"sentinel": [42]}
+    assert list(tmp_path.glob(f".{output.name}.*.tmp")) == []
+
+
+def test_v3_can_atomically_replace_source_parquet_in_place(tmp_path) -> None:
+    lookup_dir = tmp_path / "lookup"
+    _write_bilateral_lookup_dir(lookup_dir)
+    lookup_set = discover_flatmap_lookup_set(
+        lookup_dir,
+        lookup_resolution_um=10.0,
+    )
+    source = tmp_path / "neurons.parquet"
+    _write_bilateral_source(source)
+
+    summary = augment_neuron_parquet_with_flatmaps(
+        source,
+        source,
+        lookup_set,
+        batch_size=1,
+    )
+
+    table = pq.read_table(source)
+    assert summary.rows == table.num_rows == 2
+    assert set(FLATMAP_V3_AUGMENTED_COLUMNS).issubset(table.column_names)
+    assert table.column("custom_note").to_pylist() == [
+        "preserve-left",
+        "preserve-right",
+    ]
+    assert list(tmp_path.glob(f".{source.name}.*.tmp")) == []

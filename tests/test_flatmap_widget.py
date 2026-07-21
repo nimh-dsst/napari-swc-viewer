@@ -47,6 +47,7 @@ def _load_flatmap_widget_module(monkeypatch):
     for name in (
         "QCheckBox",
         "QComboBox",
+        "QDoubleSpinBox",
         "QGroupBox",
         "QHBoxLayout",
         "QLabel",
@@ -256,6 +257,19 @@ class _DummyViewer:
         self.layers.append(layer)
         return layer
 
+    def add_surface(self, data, **kwargs) -> _DummyLayer:
+        vertices, faces, values = data
+        layer = _DummyLayer(vertices, **kwargs)
+        layer.faces = np.asarray(faces)
+        layer.values = np.asarray(values)
+        self.layers.append(layer)
+        return layer
+
+    def add_vectors(self, data, **kwargs) -> _DummyLayer:
+        layer = _DummyLayer(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
 
 def _widget(module):
     widget = module.FlatmapProjectionWidget.__new__(module.FlatmapProjectionWidget)
@@ -343,6 +357,149 @@ def test_lookup_stats_cache_reuses_matching_file_and_sentinel_settings(
     assert first is second
     assert third is not first
     assert len(calls) == 2
+
+
+def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profile(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    class _ProfileCombo:
+        def __init__(self) -> None:
+            self.items: list[tuple[str, object]] = []
+            self.index = -1
+
+        def blockSignals(self, _blocked: bool) -> None:
+            return None
+
+        def clear(self) -> None:
+            self.items.clear()
+            self.index = -1
+
+        def addItem(self, label: str, value: object) -> None:
+            self.items.append((str(label), value))
+            if self.index < 0:
+                self.index = 0
+
+        def count(self) -> int:
+            return len(self.items)
+
+        def itemData(self, index: int):
+            return self.items[index][1]
+
+        def setCurrentIndex(self, index: int) -> None:
+            self.index = int(index)
+
+        def currentData(self):
+            return self.itemData(self.index) if self.index >= 0 else None
+
+    class _ValueControl:
+        def __init__(self) -> None:
+            self.value = None
+            self.checked = False
+            self.enabled = True
+
+        def setValue(self, value) -> None:
+            self.value = value
+
+        def setChecked(self, checked: bool) -> None:
+            self.checked = bool(checked)
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = bool(enabled)
+
+    class _Profile:
+        def __init__(self, profile_id: str, xy_bins: int) -> None:
+            self.profile_id = profile_id
+            self.atlas = {"name": "allen_mouse_25um"}
+            self._grid = {
+                "xy_bins": xy_bins,
+                "depth_bin_um": 25.0,
+            }
+            self.compatibility_calls: list[dict[str, object]] = []
+
+        def compatibility_mismatches(self, **requirements):
+            self.compatibility_calls.append(requirements)
+            return ()
+
+        def style(self, style: str):
+            assert style == "both_shaped"
+            return types.SimpleNamespace(grid_spec=self._grid)
+
+    first = _Profile("first-profile", 128)
+    saved = _Profile("saved-profile", 256)
+    cache = types.SimpleNamespace(
+        profiles={first.profile_id: first, saved.profile_id: saved}
+    )
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    monkeypatch.setattr(cache_module, "open_region_cache", lambda _path: cache)
+    monkeypatch.setattr(
+        module,
+        "read_flatmap_parquet_transform_info",
+        lambda _path: types.SimpleNamespace(
+            format_version=3,
+            lookup_set_id="lookup-set",
+            metadata={"shared_depth_definition": {"mirror_coord_axis": 2}},
+        ),
+    )
+
+    widget._region_cache_dir = None
+    widget._region_cache = None
+    widget._active_cache_profile = None
+    widget._pending_cache_profile_id = None
+    widget._cache_dir_label = _DummyLabel()
+    widget._cache_status_label = _DummyLabel()
+    widget._cache_profile_combo = _ProfileCombo()
+    widget._style_combo = types.SimpleNamespace(
+        currentData=lambda: "both_shaped"
+    )
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._current_source_parquet_path = lambda: Path("neurons.parquet")
+    widget._invalidate_flatmap_grid_layers = lambda: None
+    widget._xy_bins_spin = _ValueControl()
+    widget._depth_bin_spin = _ValueControl()
+    widget._exclude_depth_minus_one_cb = _ValueControl()
+    widget._negative_one_sentinel_cb = _ValueControl()
+    widget._zero_sentinel_cb = _ValueControl()
+    widget._region_surfaces_btn = _DummyButton()
+    widget._region_outlines_btn = _DummyButton()
+    widget._clear_region_geometry_btn = _DummyButton()
+    atlas_holder = {"atlas": None}
+    widget._atlas_provider = lambda: atlas_holder["atlas"]
+
+    widget.restore_cache_reference(
+        {"path": "/relocated/cache", "profile_id": saved.profile_id}
+    )
+
+    assert widget._pending_cache_profile_id == saved.profile_id
+    assert widget._active_cache_profile is None
+    assert widget._cache_profile_combo.count() == 0
+
+    atlas_holder["atlas"] = types.SimpleNamespace(
+        atlas_name="allen_mouse_10um",
+        local_version=(1, 2),
+        structures={
+            1: {
+                "id": 1,
+                "name": "root",
+                "acronym": "root",
+                "structure_id_path": [1],
+                "rgb_triplet": [0, 0, 0],
+            }
+        },
+    )
+    widget.refresh_cache_profiles()
+
+    assert widget._active_cache_profile is saved
+    assert widget._cache_profile_combo.currentData() is saved
+    assert widget._pending_cache_profile_id == saved.profile_id
+    assert widget._xy_bins_spin.value == 256
+    assert widget._depth_bin_spin.value == 25.0
+    assert saved.compatibility_calls[-1]["atlas_version"] == "1.2"
 
 
 def test_file_ids_for_source_uses_selected_then_all_fallback(monkeypatch) -> None:
@@ -667,6 +824,34 @@ def _augmented_nodes() -> pd.DataFrame:
     )
 
 
+def _v3_augmented_nodes() -> pd.DataFrame:
+    nodes = _augmented_nodes().drop(
+        columns=[
+            "x_flat",
+            "y_flat",
+            "flatmap_valid",
+            "flatmap_projection_valid",
+            "flatmap_invalid_code",
+            "flatmap_lookup_mode",
+        ]
+    )
+    nodes["x_flat_shaped"] = [1.0, 2.0, np.nan]
+    nodes["y_flat_shaped"] = [3.0, 4.0, np.nan]
+    nodes["flatmap_shaped_valid"] = [True, True, False]
+    nodes["flatmap_shaped_projection_valid"] = [True, True, False]
+    nodes["flatmap_shaped_invalid_code"] = [0, 0, 3]
+    nodes["flatmap_shaped_lookup_mode"] = ["direct", "direct", "unmapped"]
+    nodes["x_flat_square"] = [11.0, 12.0, np.nan]
+    nodes["y_flat_square"] = [13.0, 14.0, np.nan]
+    nodes["flatmap_square_valid"] = [True, True, False]
+    nodes["flatmap_square_projection_valid"] = [True, True, False]
+    nodes["flatmap_square_invalid_code"] = [0, 0, 3]
+    nodes["flatmap_square_lookup_mode"] = ["direct", "direct", "unmapped"]
+    nodes["depth_invalid_code"] = [0, 0, 0]
+    nodes["depth_lookup_mode"] = ["direct", "mirrored_depth", "mirrored_depth"]
+    return nodes
+
+
 def _configure_projection_widget(widget, module, nodes: pd.DataFrame) -> None:
     widget._database_provider = lambda: types.SimpleNamespace(
         get_neurons_for_rendering=lambda file_ids: nodes[
@@ -745,6 +930,152 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
 
     assert calls == {"lookup": 1, "parquet": 0}
     assert "lookup NRRDs" in widget._status_label.text
+
+
+def test_explicit_precomputed_v3_square_never_loads_selected_nrrds(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    nodes = _v3_augmented_nodes()
+    # Unrelated custom columns retained by whole-Parquet preprocessing must not
+    # override the namespaced v3 projection validity/reason columns.
+    nodes["valid"] = [False, False, True]
+    nodes["invalid_reason"] = ["out_of_bounds"] * 3
+    _configure_projection_widget(widget, module, nodes)
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_square")
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._validate_precomputed_parquet_contract = lambda _nodes: None
+    widget._flatmap_path = Path("selected-but-unused.nrrd")
+    widget._depth_path = Path("selected-but-unused-depth.nrrd")
+    widget._canonical_render_bounds = lambda: {
+        "x_bounds": (0.0, 20.0),
+        "y_bounds": (0.0, 20.0),
+        "depth_range_um": (0.0, 50.0),
+    }
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("precomputed projection must not load NRRDs")
+        ),
+    )
+    captured = {}
+    widget._apply_projection_result = lambda result, render, **kwargs: captured.update(
+        result=result,
+        render=render,
+        kwargs=kwargs,
+    )
+
+    widget._project()
+
+    projected = captured["result"].projected_nodes
+    assert projected["x_flat"].tolist()[:2] == [11.0, 12.0]
+    assert projected["y_flat"].tolist()[:2] == [13.0, 14.0]
+    assert projected["flatmap_lookup_mode"].tolist() == [
+        "direct",
+        "mirrored_depth",
+        "unmapped",
+    ]
+    assert projected["valid"].tolist() == [True, True, False]
+    assert projected["invalid_reason"].tolist() == ["", "", "invalid_flatmap"]
+    assert captured["kwargs"]["flatmap_style"] == "both_square"
+
+
+def test_explicit_precomputed_rejects_partial_v3_columns(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    nodes = _v3_augmented_nodes().drop(columns=["depth_invalid_code"])
+    _configure_projection_widget(widget, module, nodes)
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    applied: list[object] = []
+    widget._apply_projection_result = lambda *args, **kwargs: applied.append(
+        (args, kwargs)
+    )
+
+    widget._project()
+
+    assert applied == []
+    assert "missing required flatmap column(s): ['depth_invalid_code']" in (
+        widget._status_label.text
+    )
+    assert "Regenerate it with Prepare Whole Parquet" in widget._status_label.text
+
+
+@pytest.mark.parametrize(
+    ("transform_info", "expected_message"),
+    [
+        (
+            types.SimpleNamespace(
+                format_version=0,
+                lookup_set_id=None,
+                metadata=None,
+            ),
+            "complete version-3 metadata with a lookup-set ID",
+        ),
+        (
+            types.SimpleNamespace(
+                format_version=3,
+                lookup_set_id="lookup-set-id",
+                metadata={"version": 3, "canonical_bounds": {}},
+            ),
+            "no valid canonical bounds for both_shaped",
+        ),
+    ],
+)
+def test_explicit_precomputed_rejects_incomplete_canonical_metadata(
+    monkeypatch,
+    transform_info,
+    expected_message: str,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_projection_widget(widget, module, _v3_augmented_nodes())
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._current_source_parquet_path = lambda: Path("neurons.parquet")
+    monkeypatch.setattr(
+        module,
+        "read_flatmap_parquet_transform_info",
+        lambda _path: transform_info,
+    )
+    applied: list[object] = []
+    widget._apply_projection_result = lambda *args, **kwargs: applied.append(
+        (args, kwargs)
+    )
+
+    widget._project()
+
+    assert applied == []
+    assert expected_message in widget._status_label.text
+
+
+def test_precomputed_cache_grid_values_are_used_without_ui_rounding(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    style_cache = types.SimpleNamespace(
+        grid_spec={"xy_bins": 3, "depth_bin_um": 12.3456}
+    )
+    widget._active_cache_profile = types.SimpleNamespace(
+        style=lambda _style: style_cache
+    )
+    # The UI controls cannot represent this small/fractional profile exactly.
+    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 16)
+    widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 12.346)
+
+    assert widget._current_xy_bins() == 3
+    assert widget._current_depth_bin_um() == 12.3456
 
 
 def test_project_from_lookup_files_uses_depth_mirror_fallback(monkeypatch) -> None:
@@ -1375,6 +1706,159 @@ def test_region_labels_layer_uses_display_viewer_provider(monkeypatch) -> None:
     assert main_viewer.layers == []
     assert display_viewer.layers == [layer]
     assert layer.name == "Flatmap Region Labels"
+
+
+def test_cached_region_labels_do_not_access_nrrd_or_atlas_annotation(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._active_cache_profile = profile
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._selected_region_ids_provider = lambda: [10, 11]
+    widget._selected_parent_region_ids_provider = lambda: [10]
+
+    class _AtlasWithoutAnnotation:
+        structures = {}
+
+        @property
+        def annotation(self):
+            raise AssertionError("cached labels must not access atlas.annotation")
+
+    widget._atlas_provider = _AtlasWithoutAnnotation
+    result = types.SimpleNamespace(
+        labels=np.array([[[10, 0], [0, 11]]], dtype=np.int32),
+        profile_id="profile-1",
+        selected_region_ids=(10, 11),
+        represented_region_ids=(10, 11),
+        summary=types.SimpleNamespace(
+            labeled_bins=2,
+            to_dict=lambda: {"labeled_bins": 2},
+        ),
+    )
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    captured = {}
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_selection",
+        lambda received_profile, region_ids, **kwargs: (
+            captured.update(
+                profile=received_profile,
+                region_ids=region_ids,
+                kwargs=kwargs,
+            )
+            or result
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached labels must not load NRRDs")
+        ),
+    )
+    widget._create_or_update_region_labels_layer = (
+        lambda received, _metadata, **_kwargs: types.SimpleNamespace(
+            data=received.labels
+        )
+    )
+    widget._focus_projection_view = lambda *_args: None
+    widget._set_region_labels_status = lambda message: captured.update(
+        message=message
+    )
+
+    actual = widget._create_cached_region_labels()
+
+    assert actual is result
+    assert captured["profile"] is profile
+    assert captured["region_ids"] == [10, 11]
+    assert captured["kwargs"]["direct_region_ids"] == [10]
+    assert captured["kwargs"]["include_surfaces"] is False
+    assert captured["kwargs"]["include_outlines"] is False
+
+
+def test_cached_region_geometry_uses_only_materialized_cache_arrays(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._active_cache_profile = profile
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._selected_parent_region_ids_provider = lambda: [10]
+    widget._region_surfaces_layers = []
+    widget._region_outlines_layers = []
+
+    class _AtlasWithoutRuntimeGeometry:
+        structures = {
+            10: {
+                "id": 10,
+                "acronym": "VISp",
+                "rgb_triplet": [12, 34, 56],
+            }
+        }
+
+        @property
+        def annotation(self):
+            raise AssertionError("cached geometry must not access atlas.annotation")
+
+        def mesh_from_structure(self, *_args, **_kwargs):
+            raise AssertionError("cached geometry must not project atlas meshes")
+
+    widget._atlas_provider = _AtlasWithoutRuntimeGeometry
+    widget._set_region_labels_status = lambda _message: None
+
+    fake_colormaps = types.ModuleType("napari.utils.colormaps")
+    fake_colormaps.Colormap = lambda colors: np.asarray(colors)
+    monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
+
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    surface = types.SimpleNamespace(
+        vertices=np.asarray(
+            [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        ),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+        component_count=1,
+    )
+    outlines = types.SimpleNamespace(
+        vectors=np.asarray(
+            [[[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]],
+            dtype=np.float32,
+        ).reshape(1, 2, 3)
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_surface",
+        lambda received_profile, region_id, **kwargs: surface,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_outlines",
+        lambda received_profile, region_id, **kwargs: outlines,
+    )
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached geometry must not load NRRDs")
+        ),
+    )
+
+    widget._create_region_surfaces()
+    widget._create_region_outlines()
+
+    assert [layer.name for layer in widget._viewer.layers] == [
+        "Flatmap Region Surfaces",
+        "Flatmap Region Outlines",
+    ]
+    assert widget._viewer.layers[0].metadata["source"] == "precomputed_cache"
+    assert widget._viewer.layers[1].metadata["source"] == "precomputed_cache"
 
 
 def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> None:

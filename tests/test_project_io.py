@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -13,6 +14,7 @@ from napari_swc_viewer.project_io import (
     PROJECT_BUNDLE_FORMAT,
     ENHANCED_NEURON_COLUMNS,
     export_enhanced_neuron_parquet,
+    export_filtered_project_neuron_parquet,
     load_project_bundle,
     read_enhanced_parquet_metadata,
     save_project_bundle,
@@ -57,6 +59,26 @@ def _write_three_neuron_source_parquet(path: Path) -> None:
             "neuron_id": ["neuron1", "neuron1", "neuron2", "neuron3", "neuron3"],
         }
     ).to_parquet(path, index=False)
+
+
+def _add_flatmap_v3_schema_metadata(path: Path) -> dict[bytes, bytes]:
+    """Attach representative v3 and custom Arrow metadata to a fixture."""
+    table = pq.read_table(path)
+    metadata = {
+        b"napari_swc_viewer.flatmap_projection_json": (
+            b'{"version":3,"lookup_set_id":"lookup-test"}'
+        ),
+        b"custom.dataset_metadata": b"must-survive",
+    }
+    fields = [
+        field.with_metadata({b"units": b"micrometer"})
+        if field.name == "x"
+        else field
+        for field in table.schema
+    ]
+    schema = pa.schema(fields, metadata=metadata)
+    pq.write_table(pa.Table.from_arrays(table.columns, schema=schema), path)
+    return metadata
 
 
 def _table_state() -> dict[str, object]:
@@ -163,6 +185,36 @@ def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path
     assert payload["enhanced_columns"] == list(ENHANCED_NEURON_COLUMNS)
 
 
+def test_enhanced_and_filtered_exports_preserve_flatmap_v3_schema_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    enhanced = tmp_path / "enhanced.parquet"
+    filtered = tmp_path / "filtered.parquet"
+    _write_three_neuron_source_parquet(source)
+    original_metadata = _add_flatmap_v3_schema_metadata(source)
+
+    export_enhanced_neuron_parquet(
+        source,
+        enhanced,
+        table_state=_subset_table_state(),
+    )
+    export_filtered_project_neuron_parquet(
+        source,
+        filtered,
+        table_state=_subset_table_state(),
+    )
+
+    enhanced_schema = pq.read_schema(enhanced)
+    filtered_schema = pq.read_schema(filtered)
+    for key, value in original_metadata.items():
+        assert enhanced_schema.metadata[key] == value
+        assert filtered_schema.metadata[key] == value
+    assert enhanced_schema.field("x").metadata == {b"units": b"micrometer"}
+    assert filtered_schema.field("x").metadata == {b"units": b"micrometer"}
+    assert pd.read_parquet(filtered)["file_id"].tolist() == ["n3", "n3", "n1", "n1"]
+
+
 def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     _write_source_parquet(source)
@@ -254,6 +306,34 @@ def test_save_project_bundle_manifest_records_filtered_source_provenance(
     assert source_info["original_size_bytes"] == source.stat().st_size
     assert source_info["original_mtime_ns"] == source.stat().st_mtime_ns
     assert "sha256" in source_info
+
+
+def test_project_bundle_references_external_flatmap_cache_without_copying_it(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    cache_path = tmp_path / "shared-flatmap-cache"
+    cache_path.mkdir()
+    (cache_path / "flatmap-region-cache.json").write_text("{}\n")
+    _write_three_neuron_source_parquet(source)
+
+    reference = {
+        "path": str(cache_path),
+        "profile_id": "lookup-test__atlas-test__256x25",
+    }
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_subset_table_state(),
+        layers=[],
+        flatmap_cache_reference=reference,
+    )
+
+    bundle = load_project_bundle(bundle_path)
+    assert bundle.manifest["flatmap_cache"] == reference
+    assert bundle.flatmap_cache_reference == reference
+    assert not (bundle_path / "flatmap-region-cache.json").exists()
 
 
 def test_save_project_bundle_rejects_empty_table(tmp_path: Path) -> None:

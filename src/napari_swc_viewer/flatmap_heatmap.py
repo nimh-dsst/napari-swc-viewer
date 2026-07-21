@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -196,6 +197,7 @@ def _compute_flatmap_xy_bounds_and_count(
     invalid_zero_sentinel: bool = False,
     invalid_negative_one_sentinel: bool = True,
     chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float], int]:
     flatmap = _validate_flatmap_volume(flatmap_volume)
     x_min = np.inf
@@ -208,6 +210,8 @@ def _compute_flatmap_xy_bounds_and_count(
         flatmap.shape[:3],
         chunk_voxels=chunk_voxels,
     ):
+        if cancel_callback is not None and cancel_callback():
+            raise RuntimeError("Flatmap lookup statistics cancelled.")
         chunk = flatmap[chunk_slice]
         x_values = chunk[..., 0]
         y_values = chunk[..., 1]
@@ -238,6 +242,7 @@ def compute_flatmap_xy_bounds(
     invalid_zero_sentinel: bool = False,
     invalid_negative_one_sentinel: bool = True,
     chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """Return finite x/y flatmap coordinate bounds from a lookup volume."""
     x_bounds, y_bounds, _valid_count = _compute_flatmap_xy_bounds_and_count(
@@ -245,6 +250,7 @@ def compute_flatmap_xy_bounds(
         invalid_zero_sentinel=invalid_zero_sentinel,
         invalid_negative_one_sentinel=invalid_negative_one_sentinel,
         chunk_voxels=chunk_voxels,
+        cancel_callback=cancel_callback,
     )
     return x_bounds, y_bounds
 
@@ -253,6 +259,7 @@ def _compute_depth_range_and_count(
     depth_volume: np.ndarray,
     *,
     chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> tuple[tuple[float, float], int]:
     depth = _validate_depth_volume(depth_volume)
     lower = np.inf
@@ -263,6 +270,8 @@ def _compute_depth_range_and_count(
         depth.shape,
         chunk_voxels=chunk_voxels,
     ):
+        if cancel_callback is not None and cancel_callback():
+            raise RuntimeError("Flatmap lookup statistics cancelled.")
         chunk = depth[chunk_slice]
         valid = np.isfinite(chunk) & (chunk >= 0.0)
         if not valid.any():
@@ -292,6 +301,7 @@ def compute_flatmap_lookup_stats(
     invalid_zero_sentinel: bool = False,
     invalid_negative_one_sentinel: bool = True,
     chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> FlatmapLookupStats:
     """Return reusable lookup bounds and depth range using bounded chunks."""
     flatmap = _validate_flatmap_volume(flatmap_volume)
@@ -307,10 +317,12 @@ def compute_flatmap_lookup_stats(
         invalid_zero_sentinel=invalid_zero_sentinel,
         invalid_negative_one_sentinel=invalid_negative_one_sentinel,
         chunk_voxels=chunk_voxels,
+        cancel_callback=cancel_callback,
     )
     depth_range, depth_valid_voxels = _compute_depth_range_and_count(
         depth,
         chunk_voxels=chunk_voxels,
+        cancel_callback=cancel_callback,
     )
     return FlatmapLookupStats(
         x_bounds=x_bounds,
@@ -512,16 +524,44 @@ def build_flatmap_render_data_from_projected_nodes(
     xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
     depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
     include_depth_minus_one: bool = True,
+    x_bounds: tuple[float, float] | None = None,
+    y_bounds: tuple[float, float] | None = None,
+    depth_range_um: tuple[float, float] | None = None,
 ) -> FlatmapRenderResult:
-    """Build a depth-aware render using flatmap/depth columns already in a table."""
+    """Build a depth-aware render using coordinates already stored in a table.
+
+    ``x_bounds``, ``y_bounds``, and ``depth_range_um`` should be the canonical
+    bounds recorded in a version-3 Parquet or selected region-cache profile.
+    Supplying them keeps queries that contain only part of the flatmap aligned
+    to the same output grid.  The subset-derived fallback is retained only for
+    legacy version-1/2 Parquets, which did not record canonical bounds.
+    """
     xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
     projected = _projected_nodes_with_validity_flags(projected_nodes)
-    x_bounds, y_bounds, depth_range = _projected_nodes_bounds(projected)
+    supplied = (x_bounds, y_bounds, depth_range_um)
+    if any(value is not None for value in supplied) and not all(
+        value is not None for value in supplied
+    ):
+        raise ValueError(
+            "x_bounds, y_bounds, and depth_range_um must be provided together."
+        )
+    if all(value is not None for value in supplied):
+        resolved_x_bounds = _nondegenerate_bounds(*x_bounds)  # type: ignore[arg-type]
+        resolved_y_bounds = _nondegenerate_bounds(*y_bounds)  # type: ignore[arg-type]
+        resolved_depth_range = _nondegenerate_bounds(
+            *depth_range_um  # type: ignore[arg-type]
+        )
+    else:
+        (
+            resolved_x_bounds,
+            resolved_y_bounds,
+            resolved_depth_range,
+        ) = _projected_nodes_bounds(projected)
     return _build_flatmap_render_data_for_bounds(
         projected,
-        x_bounds=x_bounds,
-        y_bounds=y_bounds,
-        depth_range=depth_range,
+        x_bounds=resolved_x_bounds,
+        y_bounds=resolved_y_bounds,
+        depth_range=resolved_depth_range,
         xy_bins=xy_bins,
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include_depth_minus_one,

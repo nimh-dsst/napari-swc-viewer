@@ -83,34 +83,54 @@ Unsupported NRRD shapes are rejected with a clear error. Direct NRRD image
 layers are displayed in voxel/pixel space, matching the plugin's reference
 image layers.
 
-To write NRRD-derived flatmap/depth coordinates back into a neuron Parquet,
-use the Flatmap tab's `Save Augmented Parquet...` action after loading a source
-Parquet and choosing flatmap/depth NRRDs. The save action follows the Flatmap
-tab's `Input` dropdown: selected table rows when available, otherwise the
-current table rows, or all current table rows when that mode is selected. The
-same conversion is available from the command line:
+The primary flatmap workflow preprocesses an entire neuron Parquet once. In the
+Flatmap tab, choose the directory containing `flatmap_both_shaped.nrrd`,
+`flatmap_both_square.nrrd`, and `depth.nrrd`, then use **Prepare Whole
+Parquet...**. The suggested output is `<source>_flatmap.parquet`; replacing the
+source requires explicit confirmation. Table queries and selections do not
+limit preprocessing. The same bilateral conversion is available from the
+command line:
 
 ```bash
-pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neurons_flatmap.parquet --flatmap flatmap.nrrd --depth depth.nrrd
+pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neurons_flatmap.parquet --lookup-dir /path/to/lookups
 ```
 
-Use repeatable `--file-id <id>` arguments to restrict the command-line
-conversion to specific neurons.
+The version-3 output preserves CCFv3 coordinates, custom columns, and schema
+metadata. It appends independent `x_flat_*`, `y_flat_*`, validity, invalid-code,
+and lookup-mode columns for shaped and square bilateral maps, plus shared
+`depth_um` validity/provenance columns. XY always comes from the original voxel;
+when necessary, only depth is recovered from the mirrored voxel. Metadata
+records canonical bounds, transforms, source hashes, and a portable lookup-set
+ID. The old `--flatmap`/`--depth` single-style command remains available for
+legacy files.
 
-The output preserves the original CCFv3 `x`, `y`, and `z` columns and appends
-`x_flat`, `y_flat`, `depth_um`, validity flags, and a lookup mode. Valid original
-flatmap coordinates are retained when depth must be read from the mirrored
-voxel (`mirrored_depth`); full-coordinate mirroring is reserved for invalid
-original flatmap lookups. Both-hemisphere flatmaps do not duplicate unilateral
-neuron data.
+SWC conversion can perform both steps as one atomic background operation:
+enable **Add bilateral flatmap/depth columns** and select **Lookup directory...**
+before choosing SWC files. Cancellation or failure removes the temporary output
+and does not replace an existing Parquet.
 
-The Flatmap tab can also convert selected atlas regions into a
-`Flatmap Region Labels` layer. Load an atlas, select regions in the Regions tab,
-choose matching flatmap/depth NRRDs, choose the Flatmap tab atlas for label
-conversion, then click `Create Region Labels`. Use `allen_mouse_10um` for
-10 µm flatmap/depth NRRDs. When the depth NRRD covers one hemisphere, the label
-conversion mirrors only depth and keeps the annotation voxel's original
-bilateral flatmap coordinates.
+## Precomputed Flatmap Region Cache
+
+Use **Build Cache Profile...** to project an exactly matching BrainGlobe atlas
+annotation into fixed shaped and square render grids. A cache directory has a
+`flatmap-region-cache.json` manifest and may hold multiple atlas/lookup/grid
+profiles. Each profile stores memory-mappable sparse label occupancy, closed
+voxel-faithful surfaces, and per-depth outlines. The defaults are 256 XY bins
+and 25 µm depth bins.
+
+For viewing, select **Precomputed Parquet + Cache**, click **Choose Cache
+Directory...**, and choose a compatible profile. The selected profile fixes and
+locks the render bounds and binning, so a small neuron query still overlays the
+global region grid exactly. The plugin reads stored neuron columns and cached
+region arrays without loading NRRDs, `atlas.annotation`, or BrainGlobe meshes.
+It requires a matching atlas/version structure catalog for region selection and
+colors, but that viewing atlas may have a different voxel resolution.
+
+Missing or incompatible cache data reports the specific mismatch and never
+recomputes automatically. Select **Recompute from NRRDs** explicitly to use the
+legacy runtime conversion path. Saved project bundles retain version-3 Parquet
+metadata and reference the external cache path/profile; they do not copy the
+large cache directory.
 
 ## Standard Point Parquet Workflow
 

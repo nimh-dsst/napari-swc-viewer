@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import re
 from types import MethodType
 from typing import Callable
 
@@ -13,6 +14,7 @@ from napari.utils.notifications import show_info, show_warning
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -46,8 +48,11 @@ from ..flatmap_labels import (
 )
 from ..flatmap_loader import FLATMAP_STYLE_FILENAMES, load_flatmap_volume_set
 from ..flatmap_parquet import (
+    FLATMAP_V3_AUGMENTED_COLUMNS,
+    FLATMAP_V3_STYLE_COLUMN_MAPPING,
     augment_neuron_parquet_with_flatmap,
     flatmap_invalid_code_to_reason,
+    read_flatmap_parquet_transform_info,
 )
 from ..flatmap_projection import (
     COORDINATE_MODE_MICRONS,
@@ -73,11 +78,15 @@ _RENDER_POINTS = "points"
 _HEATMAP_COLOR_SINGLE = "single"
 _HEATMAP_COLOR_INDIVIDUAL = "individual"
 _HEATMAP_COLOR_CLUSTER = "cluster"
+_PROJECTION_SOURCE_PRECOMPUTED = "precomputed"
+_PROJECTION_SOURCE_RECOMPUTE = "recompute"
 _OLD_SHAPES_LAYER_NAME = "Isocortex Flatmap Traces"
 _HEATMAP_LAYER_NAME = "Isocortex Flatmap Heatmap"
 _GROUPED_HEATMAP_LAYER_PREFIX = f"{_HEATMAP_LAYER_NAME}: "
 _POINTS_LAYER_NAME = "Isocortex Flatmap Points"
 _REGION_LABELS_LAYER_NAME = "Flatmap Region Labels"
+_REGION_SURFACES_LAYER_NAME = "Flatmap Region Surfaces"
+_REGION_OUTLINES_LAYER_NAME = "Flatmap Region Outlines"
 _REGION_LABEL_ATLAS_DEFAULT = "allen_mouse_10um"
 _REGION_LABEL_ATLAS_OPTIONS = (
     "allen_mouse_10um",
@@ -106,6 +115,7 @@ class FlatmapProjectionWidget(QWidget):
         cluster_map_provider: Callable[[], dict[object, int | None]] | None = None,
         atlas_provider: Callable[[], object | None] | None = None,
         selected_region_ids_provider: Callable[[], list[int]] | None = None,
+        selected_parent_region_ids_provider: Callable[[], list[int]] | None = None,
         selected_region_acronyms_provider: Callable[[], list[str]] | None = None,
         display_viewer_provider: Callable[..., object | None] | None = None,
         parent: QWidget | None = None,
@@ -121,14 +131,24 @@ class FlatmapProjectionWidget(QWidget):
         self._cluster_map_provider = cluster_map_provider or (lambda: {})
         self._atlas_provider = atlas_provider or (lambda: None)
         self._selected_region_ids_provider = selected_region_ids_provider or (lambda: [])
+        self._selected_parent_region_ids_provider = (
+            selected_parent_region_ids_provider or self._selected_region_ids_provider
+        )
         self._selected_region_acronyms_provider = (
             selected_region_acronyms_provider or (lambda: [])
         )
 
         self._flatmap_path: Path | None = None
         self._depth_path: Path | None = None
+        self._preprocess_lookup_dir: Path | None = None
+        self._region_cache_dir: Path | None = None
+        self._region_cache = None
+        self._active_cache_profile = None
+        self._pending_cache_profile_id: str | None = None
         self._projection_layer = None
         self._region_labels_layer = None
+        self._region_surfaces_layers: list[object] = []
+        self._region_outlines_layers: list[object] = []
         self._region_label_atlas_cache: dict[str, object] = {}
         self._region_label_atlas_load_thread = None
         self._region_label_atlas_load_worker = None
@@ -144,6 +164,9 @@ class FlatmapProjectionWidget(QWidget):
         self._last_input_file_ids: tuple[str, ...] = ()
         self._last_flatmap_path: str | None = None
         self._last_depth_path: str | None = None
+        self._last_projection_source: str | None = None
+        self._last_cache_dir: str | None = None
+        self._last_cache_profile_id: str | None = None
         self._flatmap_correlation_source_changed_callback = None
         self._lookup_stats_cache_key: tuple[object, ...] | None = None
         self._lookup_stats_cache: FlatmapLookupStats | None = None
@@ -194,6 +217,23 @@ class FlatmapProjectionWidget(QWidget):
         files_group = QGroupBox("Flatmap Lookup Files")
         files_layout = QVBoxLayout(files_group)
 
+        projection_source_row = QHBoxLayout()
+        projection_source_row.addWidget(QLabel("Source:"))
+        self._projection_source_combo = QComboBox()
+        self._projection_source_combo.addItem(
+            "Precomputed Parquet + Cache",
+            _PROJECTION_SOURCE_PRECOMPUTED,
+        )
+        self._projection_source_combo.addItem(
+            "Recompute from NRRDs",
+            _PROJECTION_SOURCE_RECOMPUTE,
+        )
+        self._projection_source_combo.currentIndexChanged.connect(
+            self._on_projection_source_changed
+        )
+        projection_source_row.addWidget(self._projection_source_combo)
+        files_layout.addLayout(projection_source_row)
+
         style_row = QHBoxLayout()
         style_row.addWidget(QLabel("Style:"))
         self._style_combo = QComboBox()
@@ -202,7 +242,7 @@ class FlatmapProjectionWidget(QWidget):
         self._style_combo.addItem("Single hemisphere, shaped", "single_shaped")
         self._style_combo.addItem("Single hemisphere, square", "single_square")
         self._style_combo.currentIndexChanged.connect(
-            self._update_expected_filename_label
+            self._on_flatmap_style_changed
         )
         style_row.addWidget(self._style_combo)
         files_layout.addLayout(style_row)
@@ -228,7 +268,77 @@ class FlatmapProjectionWidget(QWidget):
         depth_btn.clicked.connect(self._choose_depth_path)
         depth_row.addWidget(depth_btn)
         files_layout.addLayout(depth_row)
+
+        lookup_dir_row = QHBoxLayout()
+        self._lookup_dir_label = QLabel("No preprocessing lookup directory selected")
+        self._lookup_dir_label.setWordWrap(True)
+        lookup_dir_row.addWidget(self._lookup_dir_label, stretch=1)
+        lookup_dir_btn = QPushButton("Lookup directory...")
+        lookup_dir_btn.clicked.connect(self._choose_preprocess_lookup_dir)
+        lookup_dir_row.addWidget(lookup_dir_btn)
+        files_layout.addLayout(lookup_dir_row)
+        lookup_resolution_row = QHBoxLayout()
+        lookup_resolution_row.addWidget(QLabel("Lookup resolution:"))
+        self._lookup_resolution_spin = QSpinBox()
+        self._lookup_resolution_spin.setRange(0, 100)
+        self._lookup_resolution_spin.setSpecialValueText("From NRRD header")
+        self._lookup_resolution_spin.setSuffix(" um")
+        lookup_resolution_row.addWidget(self._lookup_resolution_spin)
+        files_layout.addLayout(lookup_resolution_row)
         layout.addWidget(files_group)
+
+        cache_group = QGroupBox("Flatmap Region Cache")
+        cache_layout = QVBoxLayout(cache_group)
+        cache_dir_row = QHBoxLayout()
+        self._cache_dir_label = QLabel("No cache directory selected")
+        self._cache_dir_label.setWordWrap(True)
+        cache_dir_row.addWidget(self._cache_dir_label, stretch=1)
+        cache_dir_btn = QPushButton("Choose Cache Directory...")
+        cache_dir_btn.clicked.connect(self._choose_cache_directory)
+        cache_dir_row.addWidget(cache_dir_btn)
+        cache_layout.addLayout(cache_dir_row)
+
+        cache_profile_row = QHBoxLayout()
+        cache_profile_row.addWidget(QLabel("Profile:"))
+        self._cache_profile_combo = QComboBox()
+        self._cache_profile_combo.currentIndexChanged.connect(
+            self._on_cache_profile_changed
+        )
+        cache_profile_row.addWidget(self._cache_profile_combo, stretch=1)
+        cache_layout.addLayout(cache_profile_row)
+
+        cache_grid_row = QHBoxLayout()
+        cache_grid_row.addWidget(QLabel("New profile XY bins:"))
+        self._cache_build_xy_bins_spin = QSpinBox()
+        self._cache_build_xy_bins_spin.setRange(1, 4096)
+        self._cache_build_xy_bins_spin.setSingleStep(16)
+        self._cache_build_xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
+        cache_grid_row.addWidget(self._cache_build_xy_bins_spin)
+        cache_grid_row.addWidget(QLabel("Depth bin:"))
+        self._cache_build_depth_bin_spin = QDoubleSpinBox()
+        self._cache_build_depth_bin_spin.setRange(0.001, 1000.0)
+        self._cache_build_depth_bin_spin.setDecimals(3)
+        self._cache_build_depth_bin_spin.setSingleStep(5.0)
+        self._cache_build_depth_bin_spin.setSuffix(" um")
+        self._cache_build_depth_bin_spin.setValue(
+            float(DEFAULT_FLATMAP_DEPTH_BIN_UM)
+        )
+        cache_grid_row.addWidget(self._cache_build_depth_bin_spin)
+        cache_layout.addLayout(cache_grid_row)
+
+        cache_build_row = QHBoxLayout()
+        self._build_cache_btn = QPushButton("Build Cache Profile...")
+        self._build_cache_btn.clicked.connect(self._build_cache_profile)
+        cache_build_row.addWidget(self._build_cache_btn)
+        self._cancel_cache_btn = QPushButton("Cancel")
+        self._cancel_cache_btn.setEnabled(False)
+        self._cancel_cache_btn.clicked.connect(self._cancel_cache_build)
+        cache_build_row.addWidget(self._cancel_cache_btn)
+        self._cache_status_label = QLabel("No cache profile active.")
+        self._cache_status_label.setWordWrap(True)
+        cache_build_row.addWidget(self._cache_status_label, stretch=1)
+        cache_layout.addLayout(cache_build_row)
+        layout.addWidget(cache_group)
 
         options_group = QGroupBox("Projection Options")
         options_layout = QVBoxLayout(options_group)
@@ -272,7 +382,7 @@ class FlatmapProjectionWidget(QWidget):
         xy_bins_row = QHBoxLayout()
         xy_bins_row.addWidget(QLabel("XY bins:"))
         self._xy_bins_spin = QSpinBox()
-        self._xy_bins_spin.setRange(16, 1024)
+        self._xy_bins_spin.setRange(1, 4096)
         self._xy_bins_spin.setSingleStep(16)
         self._xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
         xy_bins_row.addWidget(self._xy_bins_spin)
@@ -280,11 +390,12 @@ class FlatmapProjectionWidget(QWidget):
 
         depth_bin_row = QHBoxLayout()
         depth_bin_row.addWidget(QLabel("Depth bin:"))
-        self._depth_bin_spin = QSpinBox()
-        self._depth_bin_spin.setRange(1, 1000)
-        self._depth_bin_spin.setSingleStep(5)
+        self._depth_bin_spin = QDoubleSpinBox()
+        self._depth_bin_spin.setRange(0.001, 1000.0)
+        self._depth_bin_spin.setDecimals(3)
+        self._depth_bin_spin.setSingleStep(5.0)
         self._depth_bin_spin.setSuffix(" um")
-        self._depth_bin_spin.setValue(int(DEFAULT_FLATMAP_DEPTH_BIN_UM))
+        self._depth_bin_spin.setValue(float(DEFAULT_FLATMAP_DEPTH_BIN_UM))
         depth_bin_row.addWidget(self._depth_bin_spin)
         options_layout.addLayout(depth_bin_row)
 
@@ -306,9 +417,13 @@ class FlatmapProjectionWidget(QWidget):
         self._export_btn.setEnabled(False)
         self._export_btn.clicked.connect(self._export_csv)
         actions_row.addWidget(self._export_btn)
-        self._augment_parquet_btn = QPushButton("Save Augmented Parquet...")
+        self._augment_parquet_btn = QPushButton("Prepare Whole Parquet...")
         self._augment_parquet_btn.clicked.connect(self._augment_parquet)
         actions_row.addWidget(self._augment_parquet_btn)
+        self._cancel_augment_btn = QPushButton("Cancel Preparation")
+        self._cancel_augment_btn.setEnabled(False)
+        self._cancel_augment_btn.clicked.connect(self._cancel_parquet_preparation)
+        actions_row.addWidget(self._cancel_augment_btn)
         layout.addLayout(actions_row)
 
         self._projection_progress_bar = QProgressBar()
@@ -317,7 +432,7 @@ class FlatmapProjectionWidget(QWidget):
         self._projection_progress_bar.setVisible(False)
         layout.addWidget(self._projection_progress_bar)
 
-        labels_group = QGroupBox("Region Labels")
+        labels_group = QGroupBox("Cached Regions")
         labels_layout = QVBoxLayout(labels_group)
         atlas_row = QHBoxLayout()
         atlas_row.addWidget(QLabel("Atlas:"))
@@ -328,13 +443,27 @@ class FlatmapProjectionWidget(QWidget):
         atlas_row.addWidget(self._region_label_atlas_combo)
         labels_layout.addLayout(atlas_row)
         labels_actions_row = QHBoxLayout()
-        self._region_labels_btn = QPushButton("Create Region Labels")
+        self._region_labels_btn = QPushButton("Show Region Labels")
         self._region_labels_btn.clicked.connect(self._create_region_labels)
         labels_actions_row.addWidget(self._region_labels_btn)
         self._clear_region_labels_btn = QPushButton("Clear Region Labels")
         self._clear_region_labels_btn.clicked.connect(self._clear_region_labels)
         labels_actions_row.addWidget(self._clear_region_labels_btn)
         labels_layout.addLayout(labels_actions_row)
+
+        geometry_actions_row = QHBoxLayout()
+        self._region_surfaces_btn = QPushButton("Show Region Surfaces")
+        self._region_surfaces_btn.clicked.connect(self._create_region_surfaces)
+        geometry_actions_row.addWidget(self._region_surfaces_btn)
+        self._region_outlines_btn = QPushButton("Show Region Outlines")
+        self._region_outlines_btn.clicked.connect(self._create_region_outlines)
+        geometry_actions_row.addWidget(self._region_outlines_btn)
+        self._clear_region_geometry_btn = QPushButton("Clear Geometry")
+        self._clear_region_geometry_btn.clicked.connect(
+            self._clear_region_geometry
+        )
+        geometry_actions_row.addWidget(self._clear_region_geometry_btn)
+        labels_layout.addLayout(geometry_actions_row)
         self._region_labels_status_label = QLabel("No flatmap region labels created.")
         self._region_labels_status_label.setWordWrap(True)
         labels_layout.addWidget(self._region_labels_status_label)
@@ -360,6 +489,7 @@ class FlatmapProjectionWidget(QWidget):
         layout.addStretch()
 
         self._update_expected_filename_label()
+        self._update_cached_region_controls()
 
     def set_flatmap_path(self, path: str | Path | None) -> None:
         """Set the flatmap path, primarily for tests and scripted use."""
@@ -387,6 +517,587 @@ class FlatmapProjectionWidget(QWidget):
         )
         if callable(callback):
             callback()
+
+    def _current_projection_source(self) -> str:
+        """Return the explicit precomputed/recompute selection.
+
+        Widgets constructed directly by legacy tests do not have the selector;
+        those retain the historical auto-detection behavior.
+        """
+        combo = getattr(self, "_projection_source_combo", None)
+        current_data = getattr(combo, "currentData", None)
+        if not callable(current_data):
+            return "legacy_auto"
+        value = current_data()
+        if value == _PROJECTION_SOURCE_RECOMPUTE:
+            return _PROJECTION_SOURCE_RECOMPUTE
+        return _PROJECTION_SOURCE_PRECOMPUTED
+
+    def _on_projection_source_changed(self) -> None:
+        source = self._current_projection_source()
+        self._invalidate_flatmap_grid_layers()
+        self._update_style_choices_for_source(source)
+        if source == _PROJECTION_SOURCE_RECOMPUTE:
+            message = "NRRD recomputation is selected explicitly."
+            self._set_cache_grid_locked(False)
+        else:
+            message = "Viewing will use precomputed Parquet/cache data only."
+            if getattr(self, "_active_cache_profile", None) is not None:
+                self._on_cache_profile_changed()
+        self._update_cached_region_controls()
+        status = getattr(self, "_status_label", None)
+        if status is not None:
+            status.setText(message)
+        self._notify_flatmap_correlation_source_changed()
+
+    def _update_style_choices_for_source(self, source: str) -> None:
+        combo = getattr(self, "_style_combo", None)
+        count = getattr(combo, "count", None)
+        item_data = getattr(combo, "itemData", None)
+        model_getter = getattr(combo, "model", None)
+        if not all(callable(value) for value in (count, item_data, model_getter)):
+            return
+        bilateral = {"both_shaped", "both_square"}
+        model = model_getter()
+        for index in range(count()):
+            item = model.item(index)
+            if item is not None:
+                item.setEnabled(
+                    source == _PROJECTION_SOURCE_RECOMPUTE
+                    or str(item_data(index)) in bilateral
+                )
+        if source == _PROJECTION_SOURCE_PRECOMPUTED and self._current_style_key() not in bilateral:
+            for index in range(count()):
+                if str(item_data(index)) == "both_shaped":
+                    combo.setCurrentIndex(index)
+                    break
+
+    def _on_flatmap_style_changed(self) -> None:
+        self._invalidate_flatmap_grid_layers()
+        self._update_expected_filename_label()
+        self._refresh_cache_profiles()
+        self._notify_flatmap_correlation_source_changed()
+
+    def _invalidate_flatmap_grid_layers(self) -> None:
+        """Remove render state that belongs to a previous style/cache grid."""
+        self._remove_projection_layer(create=False)
+        self._clear_named_region_layers(_REGION_LABELS_LAYER_NAME)
+        self._clear_region_surface_layers()
+        self._clear_region_outline_layers()
+        self._region_labels_layer = None
+        self._last_projected_nodes = None
+        self._last_summary = None
+        self._last_render_summary = None
+        self._last_render_mode = None
+        self._last_flatmap_style = None
+        self._last_coordinate_mode = None
+        self._last_volume_shape = None
+        self._last_lookup_stats = None
+        self._last_input_file_ids = ()
+        self._last_flatmap_path = None
+        self._last_depth_path = None
+        self._last_projection_source = None
+        self._last_cache_dir = None
+        self._last_cache_profile_id = None
+        export_button = getattr(self, "_export_btn", None)
+        if export_button is not None:
+            export_button.setEnabled(False)
+
+    def _choose_preprocess_lookup_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Bilateral Flatmap Lookup Directory",
+        )
+        if not path:
+            return
+        self._preprocess_lookup_dir = Path(path)
+        self._lookup_dir_label.setText(str(self._preprocess_lookup_dir))
+
+    def set_cache_directory(
+        self,
+        path: str | Path | None,
+        *,
+        profile_id: str | None = None,
+    ) -> None:
+        """Open a region cache directory and refresh compatible profiles."""
+        previous_directory = getattr(self, "_region_cache_dir", None)
+        next_directory = Path(path) if path else None
+        if next_directory is None:
+            self._region_cache_dir = None
+            self._region_cache = None
+            self._pending_cache_profile_id = None
+            self._deactivate_cache_profile()
+            self._cache_dir_label.setText("No cache directory selected")
+            self._refresh_cache_profiles()
+            return
+
+        from ..flatmap_region_cache import open_region_cache
+
+        # Open and validate first so a bad new path cannot leave an old active
+        # profile attached to the wrong directory.
+        next_cache = open_region_cache(next_directory)
+        if previous_directory != next_directory:
+            self._invalidate_flatmap_grid_layers()
+        self._region_cache_dir = next_directory
+        self._region_cache = next_cache
+        self._pending_cache_profile_id = str(profile_id) if profile_id else None
+        self._set_cache_grid_locked(False)
+        self._cache_dir_label.setText(str(next_directory))
+        self._refresh_cache_profiles()
+
+    def active_cache_reference(self) -> dict[str, str] | None:
+        """Return the external cache reference stored in project bundles."""
+        cache_dir = getattr(self, "_region_cache_dir", None)
+        profile = getattr(self, "_active_cache_profile", None)
+        profile_id = self._cache_profile_id(profile)
+        if cache_dir is None or not profile_id:
+            return None
+        return {"path": str(cache_dir), "profile_id": profile_id}
+
+    def restore_cache_reference(self, reference: object) -> None:
+        """Restore a project bundle's external cache path/profile selection."""
+        if not isinstance(reference, dict):
+            return
+        path = reference.get("path")
+        profile_id = str(reference.get("profile_id") or "")
+        if not path:
+            return
+        try:
+            self.set_cache_directory(str(path), profile_id=profile_id or None)
+        except Exception:
+            # A project reference supersedes session state: never leave an old
+            # cache active when the project's external cache is unavailable.
+            self.set_cache_directory(None)
+            raise
+
+    def refresh_cache_profiles(self) -> None:
+        """Re-evaluate cache compatibility after atlas or Parquet changes."""
+        self._refresh_cache_profiles()
+
+    def invalidate_loaded_parquet_projection(self) -> None:
+        """Clear flatmap state before associating the tab with a new Parquet."""
+        self._invalidate_flatmap_grid_layers()
+
+    def _deactivate_cache_profile(self) -> None:
+        if getattr(self, "_active_cache_profile", None) is not None:
+            self._invalidate_flatmap_grid_layers()
+        self._active_cache_profile = None
+        self._set_cache_grid_locked(False)
+        self._update_cached_region_controls()
+        self._notify_flatmap_correlation_source_changed()
+
+    def _choose_cache_directory(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Flatmap Region Cache Directory",
+        )
+        if not path:
+            return
+        try:
+            self.set_cache_directory(path, profile_id=None)
+        except Exception as exc:
+            logger.exception("Failed to open flatmap region cache")
+            message = f"Flatmap region cache is incompatible or corrupt: {exc}"
+            self._cache_status_label.setText(message)
+            show_warning(message)
+
+    @staticmethod
+    def _cache_profile_id(profile) -> str:
+        return str(getattr(profile, "profile_id", "") or "")
+
+    @staticmethod
+    def _atlas_family_name(name: object) -> str:
+        return re.sub(r"_(?:10|25|50)um$", "", str(name or ""))
+
+    def _refresh_cache_profiles(self) -> None:
+        """Show only profiles compatible with the v3 Parquet/style/catalog."""
+        combo = getattr(self, "_cache_profile_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        cache = getattr(self, "_region_cache", None)
+        if cache is None:
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            return
+
+        try:
+            info = read_flatmap_parquet_transform_info(
+                self._current_source_parquet_path()
+            )
+        except Exception as exc:
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(
+                f"Load a version-3 neuron Parquet to select a cache profile: {exc}"
+            )
+            return
+        if info.format_version < 3 or not info.lookup_set_id:
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(
+                "Legacy Parquets can render neurons, but exact cache overlays "
+                "require version-3 preprocessing."
+            )
+            return
+
+        atlas = self._atlas_provider()
+        if atlas is None:
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(
+                "Load a matching BrainGlobe atlas structure catalog to use the cache."
+            )
+            return
+
+        style = self._current_style_key()
+        current_atlas_name = str(getattr(atlas, "atlas_name", "") or "")
+        from ..flatmap_region_cache import structure_catalog_id
+
+        structures = getattr(atlas, "structures", None)
+        try:
+            current_catalog_id = structure_catalog_id(structures)
+        except (AttributeError, TypeError, ValueError):
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(
+                "The loaded atlas does not expose a usable structure catalog."
+            )
+            return
+        current_atlas_version = (
+            getattr(atlas, "local_version", None)
+            or getattr(atlas, "atlas_version", None)
+            or getattr(atlas, "version", None)
+        )
+        current_atlas_version = self._atlas_version_text(current_atlas_version)
+        shared_depth = (info.metadata or {}).get("shared_depth_definition")
+        if not isinstance(shared_depth, dict):
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(
+                "Version-3 Parquet metadata is missing its shared depth definition."
+            )
+            return
+        try:
+            parquet_mirror_axis = int(shared_depth["mirror_coord_axis"])
+        except (KeyError, TypeError, ValueError):
+            combo.blockSignals(False)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(
+                "Version-3 Parquet metadata has no valid depth mirror axis."
+            )
+            return
+        mismatch_messages: list[str] = []
+        for profile in cache.profiles.values():
+            mismatches = list(
+                profile.compatibility_mismatches(
+                    lookup_set_id=info.lookup_set_id,
+                    atlas_name=current_atlas_name,
+                    atlas_version=current_atlas_version,
+                    structure_catalog_id=current_catalog_id,
+                    style=style,
+                    mirror_depth_fallback=True,
+                    mirror_coord_axis=parquet_mirror_axis,
+                )
+            )
+            cached_atlas_name = str(profile.atlas.get("name", "") or "")
+            if mismatches:
+                mismatch_messages.append(
+                    f"{profile.profile_id[:12]}: " + "; ".join(mismatches)
+                )
+                continue
+            style_cache = profile.style(style)
+            grid = style_cache.grid_spec
+            label = (
+                f"{profile.profile_id[:12]} — {cached_atlas_name}, "
+                f"{grid.get('xy_bins')} XY / {grid.get('depth_bin_um')} um"
+            )
+            combo.addItem(label, profile)
+
+        combo.blockSignals(False)
+        if combo.count():
+            target_index = 0
+            pending_profile_id = str(
+                getattr(self, "_pending_cache_profile_id", "") or ""
+            )
+            if pending_profile_id:
+                for index in range(combo.count()):
+                    if self._cache_profile_id(combo.itemData(index)) == pending_profile_id:
+                        target_index = index
+                        break
+            combo.setCurrentIndex(target_index)
+            self._on_cache_profile_changed()
+        else:
+            self._deactivate_cache_profile()
+            detail = mismatch_messages[0] if mismatch_messages else "no profiles"
+            self._cache_status_label.setText(
+                f"No compatible cache profile: {detail}. "
+                "Recomputation will not start automatically."
+            )
+
+    def _on_cache_profile_changed(self) -> None:
+        combo = getattr(self, "_cache_profile_combo", None)
+        profile = combo.currentData() if combo is not None else None
+        previous_profile_id = self._cache_profile_id(
+            getattr(self, "_active_cache_profile", None)
+        )
+        next_profile_id = self._cache_profile_id(profile)
+        if previous_profile_id and previous_profile_id != next_profile_id:
+            self._invalidate_flatmap_grid_layers()
+        self._active_cache_profile = profile
+        if profile is None:
+            self._set_cache_grid_locked(False)
+            self._update_cached_region_controls()
+            self._notify_flatmap_correlation_source_changed()
+            return
+        self._pending_cache_profile_id = self._cache_profile_id(profile)
+        style_cache = profile.style(self._current_style_key())
+        grid = style_cache.grid_spec
+        self._xy_bins_spin.setValue(int(grid["xy_bins"]))
+        self._depth_bin_spin.setValue(float(grid["depth_bin_um"]))
+        self._exclude_depth_minus_one_cb.setChecked(True)
+        locked = self._current_projection_source() != _PROJECTION_SOURCE_RECOMPUTE
+        self._set_cache_grid_locked(locked)
+        suffix = "grid controls are locked" if locked else "NRRD fallback is active"
+        self._cache_status_label.setText(
+            f"Active cache profile {profile.profile_id}; {suffix}."
+        )
+        self._update_cached_region_controls()
+        self._notify_flatmap_correlation_source_changed()
+
+    def _update_cached_region_controls(self) -> None:
+        cache_enabled = (
+            self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
+            and getattr(self, "_active_cache_profile", None) is not None
+        )
+        for name in (
+            "_region_surfaces_btn",
+            "_region_outlines_btn",
+            "_clear_region_geometry_btn",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(cache_enabled)
+        labels_button = getattr(self, "_region_labels_btn", None)
+        if labels_button is not None:
+            labels_button.setEnabled(
+                cache_enabled
+                or self._current_projection_source()
+                != _PROJECTION_SOURCE_PRECOMPUTED
+            )
+        atlas_combo = getattr(self, "_region_label_atlas_combo", None)
+        if atlas_combo is not None:
+            atlas_combo.setEnabled(
+                self._current_projection_source()
+                != _PROJECTION_SOURCE_PRECOMPUTED
+            )
+
+    def _set_cache_grid_locked(self, locked: bool) -> None:
+        for name in (
+            "_xy_bins_spin",
+            "_depth_bin_spin",
+            "_exclude_depth_minus_one_cb",
+            "_negative_one_sentinel_cb",
+            "_zero_sentinel_cb",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not bool(locked))
+
+    @staticmethod
+    def _cache_profile_bounds(
+        profile,
+        style: str,
+    ) -> dict[str, tuple[float, float]] | None:
+        if profile is None:
+            return None
+        try:
+            grid = profile.style(style).grid_spec
+            return {
+                "x_bounds": tuple(float(value) for value in grid["x_bounds"]),
+                "y_bounds": tuple(float(value) for value in grid["y_bounds"]),
+                "depth_range_um": tuple(
+                    float(value) for value in grid["depth_bounds_um"]
+                ),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _atlas_annotation_tiff_path(atlas) -> Path:
+        """Resolve BrainGlobe's on-disk annotation without reading the volume."""
+        direct = getattr(atlas, "annotation_path", None)
+        if direct and Path(direct).is_file():
+            return Path(direct)
+        for attribute in ("root_dir", "atlas_dir", "brainglobe_dir"):
+            root = getattr(atlas, attribute, None)
+            if root:
+                candidate = Path(root) / "annotation.tiff"
+                if candidate.is_file():
+                    return candidate
+        from ..workers import cached_brainglobe_atlas_dir
+
+        atlas_name = str(getattr(atlas, "atlas_name", "") or "")
+        atlas_dir = cached_brainglobe_atlas_dir(atlas_name)
+        if atlas_dir is not None:
+            candidate = atlas_dir / "annotation.tiff"
+            if candidate.is_file():
+                return candidate
+        raise RuntimeError(
+            "The matching BrainGlobe annotation.tiff could not be located. "
+            "Cache generation requires the exact on-disk atlas grid."
+        )
+
+    @staticmethod
+    def _atlas_version_text(value: object | None) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (tuple, list)):
+            text = ".".join(str(part).strip() for part in value)
+        else:
+            text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _atlas_version(atlas, annotation_path: Path) -> str | None:
+        raw = (
+            getattr(atlas, "local_version", None)
+            or getattr(atlas, "atlas_version", None)
+            or getattr(atlas, "version", None)
+        )
+        normalized = FlatmapProjectionWidget._atlas_version_text(raw)
+        if normalized is not None:
+            return normalized
+        match = re.search(r"_v([^/]+)$", annotation_path.parent.name)
+        return match.group(1) if match else None
+
+    def _build_cache_profile(self) -> None:
+        """Validate inputs and launch one atomic cache-profile build."""
+        lookup_dir = getattr(self, "_preprocess_lookup_dir", None)
+        if lookup_dir is None:
+            show_warning("Choose the bilateral lookup directory first.")
+            return
+        atlas = self._atlas_provider()
+        if atlas is None:
+            show_warning("Load the exact BrainGlobe atlas before building a cache.")
+            return
+        cache_dir = getattr(self, "_region_cache_dir", None)
+        if cache_dir is None:
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                "Choose or Create Flatmap Region Cache Directory",
+            )
+            if not selected:
+                return
+            cache_dir = Path(selected)
+            self._region_cache_dir = cache_dir
+            self._cache_dir_label.setText(str(cache_dir))
+        try:
+            annotation_path = self._atlas_annotation_tiff_path(atlas)
+        except Exception as exc:
+            show_warning(str(exc))
+            return
+
+        from qtpy.QtCore import QThread
+
+        from ..workers import RegionCacheBuildWorker
+
+        resolution_control = getattr(self, "_lookup_resolution_spin", None)
+        raw_lookup_resolution = (
+            int(resolution_control.value()) if resolution_control is not None else 0
+        )
+        atlas_resolution = tuple(
+            float(value) for value in np.asarray(atlas.resolution).reshape(-1)
+        )
+        worker = RegionCacheBuildWorker(
+            cache_dir=cache_dir,
+            lookup_dir=lookup_dir,
+            annotation_path=annotation_path,
+            atlas_name=str(getattr(atlas, "atlas_name", "") or ""),
+            atlas_version=self._atlas_version(atlas, annotation_path),
+            atlas_resolution_um=atlas_resolution,
+            atlas_structures=getattr(atlas, "structures", None),
+            xy_bins=self._current_cache_build_xy_bins(),
+            depth_bin_um=self._current_cache_build_depth_bin_um(),
+            lookup_resolution_um=(
+                float(raw_lookup_resolution)
+                if raw_lookup_resolution > 0
+                else None
+            ),
+        )
+        thread = QThread()
+        self._cache_build_thread = thread
+        self._cache_build_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_cache_build_progress)
+        worker.finished.connect(self._on_cache_build_finished)
+        worker.error.connect(self._on_cache_build_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._cleanup_cache_build(thread, worker))
+        self._build_cache_btn.setEnabled(False)
+        self._cancel_cache_btn.setEnabled(True)
+        self._cache_status_label.setText("Starting region-cache build...")
+        thread.start()
+
+    def _on_cache_build_progress(
+        self,
+        message: str,
+        current: int,
+        total: int,
+    ) -> None:
+        suffix = f" ({current}/{total})" if total > 0 else ""
+        self._cache_status_label.setText(f"{message}{suffix}")
+
+    def _cancel_cache_build(self) -> None:
+        worker = getattr(self, "_cache_build_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel()
+            self._cache_status_label.setText("Cancelling cache build...")
+            self._cancel_cache_btn.setEnabled(False)
+
+    def _on_cache_build_finished(self, profile) -> None:
+        profile_id = self._cache_profile_id(profile)
+        self.set_cache_directory(self._region_cache_dir)
+        combo = self._cache_profile_combo
+        opened = False
+        for index in range(combo.count()):
+            if self._cache_profile_id(combo.itemData(index)) == profile_id:
+                combo.setCurrentIndex(index)
+                self._on_cache_profile_changed()
+                opened = True
+                break
+        if opened:
+            self._cache_status_label.setText(
+                f"Built and opened cache profile {profile_id}."
+            )
+            show_info(f"Built flatmap region-cache profile {profile_id}")
+            return
+        current_text = getattr(self._cache_status_label, "text", None)
+        detail = current_text() if callable(current_text) else ""
+        message = (
+            f"Built cache profile {profile_id}, but it is not compatible with "
+            f"the loaded Parquet/atlas/style. {detail}"
+        ).strip()
+        self._cache_status_label.setText(message)
+        show_warning(message)
+
+    def _on_cache_build_error(self, message: str) -> None:
+        self._cache_status_label.setText(f"Region-cache build failed: {message}")
+        show_warning(f"Region-cache build failed: {message}")
+
+    def _cleanup_cache_build(self, thread, worker) -> None:
+        if getattr(self, "_cache_build_thread", None) is thread:
+            self._cache_build_thread = None
+        if getattr(self, "_cache_build_worker", None) is worker:
+            self._cache_build_worker = None
+        self._build_cache_btn.setEnabled(True)
+        self._cancel_cache_btn.setEnabled(False)
 
     def _current_style_key(self) -> str:
         key = self._style_combo.currentData()
@@ -419,10 +1130,38 @@ class FlatmapProjectionWidget(QWidget):
         return _HEATMAP_COLOR_SINGLE
 
     def _current_xy_bins(self) -> int:
+        profile = getattr(self, "_active_cache_profile", None)
+        if (
+            profile is not None
+            and self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
+        ):
+            return int(
+                profile.style(self._current_style_key()).grid_spec["xy_bins"]
+            )
         return int(self._xy_bins_spin.value())
 
     def _current_depth_bin_um(self) -> float:
+        profile = getattr(self, "_active_cache_profile", None)
+        if (
+            profile is not None
+            and self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
+        ):
+            return float(
+                profile.style(self._current_style_key()).grid_spec["depth_bin_um"]
+            )
         return float(self._depth_bin_spin.value())
+
+    def _current_cache_build_xy_bins(self) -> int:
+        control = getattr(self, "_cache_build_xy_bins_spin", None)
+        if control is None:
+            return self._current_xy_bins()
+        return int(control.value())
+
+    def _current_cache_build_depth_bin_um(self) -> float:
+        control = getattr(self, "_cache_build_depth_bin_spin", None)
+        if control is None:
+            return self._current_depth_bin_um()
+        return float(control.value())
 
     def _current_source_mode(self) -> str:
         mode = self._source_combo.currentData()
@@ -511,11 +1250,28 @@ class FlatmapProjectionWidget(QWidget):
 
     @staticmethod
     def _has_parquet_flatmap_depth_columns(nodes: pd.DataFrame) -> bool:
-        return {"x_flat", "y_flat", "depth_um"}.issubset(nodes.columns)
+        names = set(nodes.columns)
+        return bool(
+            {"x_flat", "y_flat", "depth_um"}.issubset(names)
+            or {
+                "x_flat_shaped",
+                "y_flat_shaped",
+                "x_flat_square",
+                "y_flat_square",
+                "depth_um",
+            }.issubset(names)
+        )
 
     def _project(self) -> None:
         """Run projection from the current UI state and render the layer."""
-        use_lookup_files = self._lookup_files_ready()
+        projection_source = self._current_projection_source()
+        if projection_source == _PROJECTION_SOURCE_RECOMPUTE:
+            self._projection_request_ready()
+            use_lookup_files = True
+        elif projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
+            use_lookup_files = False
+        else:
+            use_lookup_files = self._lookup_files_ready()
         total_steps = 6 if use_lookup_files else 4
         self._set_projection_controls_enabled(False)
         self._set_projection_progress(
@@ -538,10 +1294,19 @@ class FlatmapProjectionWidget(QWidget):
                 source_note = "lookup NRRDs"
             else:
                 if not self._has_parquet_flatmap_depth_columns(nodes):
+                    if projection_source == "legacy_auto":
+                        raise RuntimeError(
+                            "Choose both flatmap and depth NRRD files, or load an "
+                            "augmented Parquet with x_flat, y_flat, and depth_um "
+                            "columns."
+                        )
                     raise RuntimeError(
-                        "Choose both flatmap and depth NRRD files, or load an "
-                        "augmented Parquet with x_flat, y_flat, and depth_um columns."
+                        "Precomputed viewing requires a version-3 Parquet with "
+                        "bilateral shaped/square flatmap and depth columns. "
+                        "Choose Recompute from NRRDs explicitly to use lookup files."
                     )
+                if projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
+                    self._validate_precomputed_parquet_contract(nodes)
                 result, render_result, lookup_stats = (
                     self._project_from_parquet_columns(
                         nodes,
@@ -549,7 +1314,11 @@ class FlatmapProjectionWidget(QWidget):
                         progress_total=total_steps,
                     )
                 )
-                flatmap_style = "precomputed_parquet"
+                flatmap_style = (
+                    "precomputed_parquet"
+                    if projection_source == "legacy_auto"
+                    else self._current_style_key()
+                )
                 coordinate_mode = "parquet_columns"
                 source_note = "Parquet flatmap/depth columns"
 
@@ -580,6 +1349,51 @@ class FlatmapProjectionWidget(QWidget):
         finally:
             self._hide_projection_progress()
             self._set_projection_controls_enabled(True)
+
+    def _validate_precomputed_parquet_contract(self, nodes: pd.DataFrame) -> None:
+        """Reject partial/corrupt v3 data before fixed-grid rendering."""
+        names = set(nodes.columns)
+        v3_markers = {
+            column
+            for mapping in FLATMAP_V3_STYLE_COLUMN_MAPPING.values()
+            for column in mapping.values()
+        }
+        if not names.intersection(v3_markers):
+            # Complete legacy x_flat/y_flat/depth_um files remain usable for
+            # neuron-only rendering with their historical subset bounds.
+            return
+        missing = sorted(set(FLATMAP_V3_AUGMENTED_COLUMNS).difference(names))
+        if missing:
+            raise RuntimeError(
+                "Version-3 Parquet is missing required flatmap column(s): "
+                f"{missing}. Regenerate it with Prepare Whole Parquet."
+            )
+        style = self._current_style_key()
+        if style not in FLATMAP_V3_STYLE_COLUMN_MAPPING:
+            raise RuntimeError(
+                "Version-3 precomputed viewing supports only bilateral shaped "
+                "and bilateral square styles. Choose Recompute from NRRDs for "
+                "a unilateral style."
+            )
+        info = read_flatmap_parquet_transform_info(
+            self._current_source_parquet_path()
+        )
+        if info.format_version < 3 or not info.lookup_set_id:
+            raise RuntimeError(
+                "Bilateral flatmap columns require complete version-3 metadata "
+                "with a lookup-set ID. Regenerate the Parquet."
+            )
+        metadata = info.metadata
+        bounds = (
+            self._bounds_from_projection_metadata(metadata, style)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if bounds is None:
+            raise RuntimeError(
+                f"Version-3 Parquet has no valid canonical bounds for {style}. "
+                "Regenerate the Parquet instead of deriving bounds from this query."
+            )
 
     def _project_from_lookup_files(
         self,
@@ -672,6 +1486,7 @@ class FlatmapProjectionWidget(QWidget):
             2,
             progress_total,
         )
+        canonical_bounds = self._canonical_render_bounds()
         render_result = build_flatmap_render_data_from_projected_nodes(
             result.projected_nodes,
             xy_bins=self._current_xy_bins(),
@@ -679,8 +1494,59 @@ class FlatmapProjectionWidget(QWidget):
             include_depth_minus_one=(
                 not self._exclude_depth_minus_one_cb.isChecked()
             ),
+            **canonical_bounds,
         )
         return result, render_result, None
+
+    def _canonical_render_bounds(self) -> dict[str, tuple[float, float]]:
+        """Return canonical style/depth bounds from the cache or v3 Parquet."""
+        profile = getattr(self, "_active_cache_profile", None)
+        if profile is not None:
+            bounds = self._cache_profile_bounds(profile, self._current_style_key())
+            if bounds is not None:
+                return bounds
+
+        try:
+            info = read_flatmap_parquet_transform_info(
+                self._current_source_parquet_path()
+            )
+        except Exception:
+            logger.debug("Could not inspect flatmap Parquet bounds", exc_info=True)
+            return {}
+        metadata = info.metadata
+        if not isinstance(metadata, dict):
+            return {}
+        return self._bounds_from_projection_metadata(
+            metadata,
+            self._current_style_key(),
+        ) or {}
+
+    @staticmethod
+    def _bounds_from_projection_metadata(
+        metadata: dict[str, object],
+        style: str,
+    ) -> dict[str, tuple[float, float]] | None:
+        canonical = metadata.get("canonical_bounds")
+        if not isinstance(canonical, dict):
+            return None
+        style_bounds = canonical.get(style)
+        if not isinstance(style_bounds, dict):
+            return None
+        try:
+            x_values = tuple(float(value) for value in style_bounds["x"])
+            y_values = tuple(float(value) for value in style_bounds["y"])
+            depth_values = tuple(
+                float(value) for value in style_bounds["depth_um"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(len(values) == 2 for values in (x_values, y_values, depth_values)):
+            return None
+        return {
+            "x_bounds": (x_values[0], x_values[1]),
+            "y_bounds": (y_values[0], y_values[1]),
+            "depth_range_um": (depth_values[0], depth_values[1]),
+        }
 
     @staticmethod
     def _emit_projection_progress(
@@ -757,7 +1623,9 @@ class FlatmapProjectionWidget(QWidget):
         self,
         nodes: pd.DataFrame,
     ) -> FlatmapProjectionResult:
-        source = nodes.reset_index(drop=True)
+        source = self._normalise_precomputed_style_columns(
+            nodes.reset_index(drop=True)
+        )
         missing = [
             column
             for column in ("x_flat", "y_flat", "depth_um")
@@ -784,15 +1652,15 @@ class FlatmapProjectionWidget(QWidget):
             "depth_valid",
             np.isfinite(depth_um) & (depth_um >= 0.0),
         )
-        if "valid" in source.columns:
-            valid = source["valid"].fillna(False).astype(bool).to_numpy()
-        elif "flatmap_projection_valid" in source.columns:
+        if "flatmap_projection_valid" in source.columns:
             valid = (
                 source["flatmap_projection_valid"]
                 .fillna(False)
                 .astype(bool)
                 .to_numpy()
             )
+        elif "valid" in source.columns:
+            valid = source["valid"].fillna(False).astype(bool).to_numpy()
         else:
             valid = flatmap_valid & depth_valid
 
@@ -867,6 +1735,71 @@ class FlatmapProjectionWidget(QWidget):
         summary = summarize_projection(projected, segments)
         return FlatmapProjectionResult(projected, segments, summary)
 
+    def _normalise_precomputed_style_columns(
+        self,
+        source: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Map the selected v3 style columns onto the renderer's generic names."""
+        style_key = self._current_style_key()
+        if style_key == "both_shaped":
+            suffix = "shaped"
+        elif style_key == "both_square":
+            suffix = "square"
+        else:
+            raise RuntimeError(
+                "Version-3 precomputed coordinates support bilateral shaped "
+                "and bilateral square styles only."
+            )
+
+        x_column = f"x_flat_{suffix}"
+        y_column = f"y_flat_{suffix}"
+        if not {x_column, y_column}.issubset(source.columns):
+            if {"x_flat", "y_flat"}.issubset(source.columns):
+                return source
+        missing = [
+            column
+            for column in (x_column, y_column, "depth_um")
+            if column not in source.columns
+        ]
+        if missing:
+            raise RuntimeError(
+                "Loaded Parquet is missing version-3 precomputed column(s): "
+                f"{missing}"
+            )
+
+        normalised = source.copy()
+        normalised["x_flat"] = normalised[x_column]
+        normalised["y_flat"] = normalised[y_column]
+        aliases = {
+            f"flatmap_{suffix}_valid": "flatmap_valid",
+            f"flatmap_{suffix}_projection_valid": "flatmap_projection_valid",
+            f"flatmap_{suffix}_invalid_code": "flatmap_invalid_code",
+            f"flatmap_{suffix}_lookup_mode": "flatmap_lookup_mode",
+        }
+        for style_column, generic_column in aliases.items():
+            if style_column in normalised.columns:
+                normalised[generic_column] = normalised[style_column]
+        if "depth_lookup_mode" in normalised.columns:
+            depth_modes = normalised["depth_lookup_mode"].fillna("").astype(str)
+            combined_modes = (
+                normalised.get("flatmap_lookup_mode", "")
+                if "flatmap_lookup_mode" in normalised.columns
+                else pd.Series([""] * len(normalised), index=normalised.index)
+            )
+            combined_modes = combined_modes.fillna("").astype(str).copy()
+            # A recovered depth only makes a valid mirrored-depth projection
+            # when the selected style's original-voxel XY lookup succeeded.
+            # Keep an independently unmapped XY lookup unmapped.
+            combined_modes.loc[
+                (depth_modes == FLATMAP_LOOKUP_MIRRORED_DEPTH)
+                & (combined_modes == FLATMAP_LOOKUP_DIRECT)
+            ] = FLATMAP_LOOKUP_MIRRORED_DEPTH
+            combined_modes.loc[
+                depth_modes == FLATMAP_LOOKUP_UNMAPPED
+            ] = FLATMAP_LOOKUP_UNMAPPED
+            normalised["flatmap_lookup_mode"] = combined_modes
+        return normalised
+
     @staticmethod
     def _column_or_default(
         table: pd.DataFrame,
@@ -895,14 +1828,14 @@ class FlatmapProjectionWidget(QWidget):
         depth_valid: np.ndarray,
         valid: np.ndarray,
     ) -> np.ndarray:
-        if "invalid_reason" in table.columns:
-            return table["invalid_reason"].fillna("").astype(str).to_numpy()
         if "flatmap_invalid_code" in table.columns:
             reasons = [
                 flatmap_invalid_code_to_reason(code)
                 for code in table["flatmap_invalid_code"].tolist()
             ]
             return np.asarray(reasons, dtype=object)
+        if "invalid_reason" in table.columns:
+            return table["invalid_reason"].fillna("").astype(str).to_numpy()
 
         reasons = np.full(len(table), "", dtype=object)
         reasons[~flatmap_valid] = "invalid_flatmap"
@@ -984,6 +1917,16 @@ class FlatmapProjectionWidget(QWidget):
         self._last_input_file_ids = tuple(input_file_ids)
         self._last_flatmap_path = str(self._flatmap_path) if self._flatmap_path else None
         self._last_depth_path = str(self._depth_path) if self._depth_path else None
+        self._last_projection_source = self._current_projection_source()
+        active_profile = getattr(self, "_active_cache_profile", None)
+        if self._last_projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
+            self._last_cache_dir = (
+                str(self._region_cache_dir) if self._region_cache_dir else None
+            )
+            self._last_cache_profile_id = self._cache_profile_id(active_profile)
+        else:
+            self._last_cache_dir = None
+            self._last_cache_profile_id = None
         self._summary_label.setText(
             self._format_render_summary(result.summary, render_result.summary)
         )
@@ -1012,19 +1955,33 @@ class FlatmapProjectionWidget(QWidget):
             return None
         if projected_nodes.empty or int(render_summary.traces_represented) < 2:
             return None
-        if (
-            getattr(self, "_last_lookup_stats", None) is None
-            or not self._last_flatmap_path
-            or not self._last_depth_path
-        ):
-            return None
-        if (
-            self._flatmap_path is None
-            or self._depth_path is None
-            or str(self._flatmap_path) != self._last_flatmap_path
-            or str(self._depth_path) != self._last_depth_path
-        ):
-            return None
+        last_source = getattr(self, "_last_projection_source", None)
+        if last_source == _PROJECTION_SOURCE_PRECOMPUTED:
+            if self._current_style_key() != getattr(
+                self, "_last_flatmap_style", None
+            ):
+                return None
+            current_profile_id = self._cache_profile_id(
+                getattr(self, "_active_cache_profile", None)
+            )
+            if current_profile_id != str(
+                getattr(self, "_last_cache_profile_id", "") or ""
+            ):
+                return None
+        else:
+            if (
+                getattr(self, "_last_lookup_stats", None) is None
+                or not self._last_flatmap_path
+                or not self._last_depth_path
+            ):
+                return None
+            if (
+                self._flatmap_path is None
+                or self._depth_path is None
+                or str(self._flatmap_path) != self._last_flatmap_path
+                or str(self._depth_path) != self._last_depth_path
+            ):
+                return None
 
         input_file_ids = tuple(getattr(self, "_last_input_file_ids", ()) or ())
         if not input_file_ids and "file_id" in projected_nodes.columns:
@@ -1053,6 +2010,13 @@ class FlatmapProjectionWidget(QWidget):
             mirror_depth_fallback=True,
             mirror_coord_axis=2,
             lookup_stats=getattr(self, "_last_lookup_stats", None),
+            cache_dir=getattr(self, "_last_cache_dir", None),
+            cache_profile_id=getattr(self, "_last_cache_profile_id", None),
+            cache_style=(
+                self._current_style_key()
+                if hasattr(self, "_style_combo")
+                else getattr(self, "_last_flatmap_style", None)
+            ),
         )
 
     def _create_region_labels(self) -> None:
@@ -1069,6 +2033,8 @@ class FlatmapProjectionWidget(QWidget):
 
     def _create_region_labels_from_current_state(self):
         """Build a flatmap region-label volume and show it as a Labels layer."""
+        if self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED:
+            return self._create_cached_region_labels()
         self._projection_request_ready()
         selected_region_ids = self._selected_region_ids_for_labels()
         atlas_name = self._current_region_label_atlas_name()
@@ -1080,6 +2046,59 @@ class FlatmapProjectionWidget(QWidget):
             atlas,
             selected_region_ids,
         )
+
+    def _require_active_cache_profile(self):
+        profile = getattr(self, "_active_cache_profile", None)
+        if profile is None:
+            raise RuntimeError(
+                "No compatible cache profile is active. Choose a cache directory "
+                "containing the loaded Parquet lookup-set ID and atlas catalog."
+            )
+        return profile
+
+    def _selected_parent_region_ids(self) -> list[int]:
+        values = self._selected_parent_region_ids_provider() or []
+        return sorted({int(value) for value in values if int(value) > 0})
+
+    def _create_cached_region_labels(self):
+        from ..flatmap_region_cache import materialize_region_selection
+
+        profile = self._require_active_cache_profile()
+        selected_region_ids = self._selected_region_ids_for_labels()
+        result = materialize_region_selection(
+            profile,
+            selected_region_ids,
+            style=self._current_style_key(),
+            direct_region_ids=self._selected_parent_region_ids(),
+            include_surfaces=False,
+            include_outlines=False,
+        )
+        atlas = self._atlas_provider()
+        metadata = {
+            "projection_kind": "flatmap_region_labels",
+            "source": "precomputed_cache",
+            "cache_path": str(self._region_cache_dir),
+            "cache_profile_id": result.profile_id,
+            "flatmap_style": self._current_style_key(),
+            "selected_region_ids": [int(value) for value in result.selected_region_ids],
+            "represented_region_ids": [
+                int(value) for value in result.represented_region_ids
+            ],
+            "summary": result.summary.to_dict(),
+        }
+        layer = self._create_or_update_region_labels_layer(
+            result,
+            metadata,
+            atlas=atlas,
+        )
+        self._region_labels_layer = layer
+        self._focus_projection_view(layer, result.labels)
+        message = (
+            f"Loaded {result.summary.labeled_bins:,} cached region bin(s) "
+            f"from profile {result.profile_id}."
+        )
+        self._set_region_labels_status(message)
+        return result
 
     def _selected_region_ids_for_labels(self) -> list[int]:
         selected_region_ids = sorted(
@@ -1230,11 +2249,31 @@ class FlatmapProjectionWidget(QWidget):
             "_region_label_atlas_combo",
             "_region_labels_btn",
             "_clear_region_labels_btn",
+            "_region_surfaces_btn",
+            "_region_outlines_btn",
+            "_clear_region_geometry_btn",
         ):
             widget = getattr(self, widget_name, None)
             set_enabled = getattr(widget, "setEnabled", None)
             if callable(set_enabled):
-                set_enabled(bool(enabled))
+                effective = bool(enabled)
+                if widget_name in {
+                    "_region_surfaces_btn",
+                    "_region_outlines_btn",
+                    "_clear_region_geometry_btn",
+                }:
+                    effective = effective and (
+                        self._current_projection_source()
+                        == _PROJECTION_SOURCE_PRECOMPUTED
+                        and getattr(self, "_active_cache_profile", None) is not None
+                    )
+                elif widget_name == "_region_labels_btn":
+                    effective = effective and (
+                        self._current_projection_source()
+                        != _PROJECTION_SOURCE_PRECOMPUTED
+                        or getattr(self, "_active_cache_profile", None) is not None
+                    )
+                set_enabled(effective)
 
     def _set_region_labels_status(self, message: str) -> None:
         status_label = getattr(self, "_status_label", None)
@@ -1386,6 +2425,160 @@ class FlatmapProjectionWidget(QWidget):
         label = getattr(self, "_region_labels_status_label", None)
         if label is not None:
             label.setText("No flatmap region labels created.")
+
+    @classmethod
+    def _atlas_region_rgba(cls, atlas, region_id: int) -> np.ndarray:
+        structure = cls._atlas_structure_for_region_id(atlas, region_id)
+        rgb = (
+            structure.get("rgb_triplet", [128, 128, 128])
+            if structure is not None
+            else [128, 128, 128]
+        )
+        return np.asarray(
+            [float(rgb[0]) / 255, float(rgb[1]) / 255, float(rgb[2]) / 255, 1],
+            dtype=np.float32,
+        )
+
+    def _cached_geometry_inputs(self):
+        profile = self._require_active_cache_profile()
+        direct_ids = self._selected_parent_region_ids()
+        if not direct_ids:
+            raise RuntimeError(
+                "Select at least one parent atlas region before showing cached geometry."
+            )
+        atlas = self._atlas_provider()
+        if atlas is None:
+            raise RuntimeError(
+                "Load a matching BrainGlobe atlas structure catalog for region colors."
+            )
+        return profile, direct_ids, atlas
+
+    def _create_region_surfaces(self) -> None:
+        """Show cached descendant-union exposed-face shells for selected parents."""
+        try:
+            from napari.utils.colormaps import Colormap
+
+            from ..flatmap_region_cache import materialize_region_surface
+
+            profile, direct_ids, atlas = self._cached_geometry_inputs()
+            self._clear_region_surface_layers()
+            viewer = self._display_viewer()
+            created = []
+            for region_id in direct_ids:
+                surface = materialize_region_surface(
+                    profile,
+                    region_id,
+                    style=self._current_style_key(),
+                )
+                if surface is None or not len(surface.faces):
+                    continue
+                rgba = self._atlas_region_rgba(atlas, region_id)
+                name = (
+                    _REGION_SURFACES_LAYER_NAME
+                    if len(direct_ids) == 1
+                    else f"{_REGION_SURFACES_LAYER_NAME}: {region_id}"
+                )
+                layer = viewer.add_surface(
+                    (
+                        np.asarray(surface.vertices, dtype=np.float32),
+                        np.asarray(surface.faces, dtype=np.int32),
+                        np.ones(len(surface.vertices), dtype=np.float32),
+                    ),
+                    name=name,
+                    colormap=Colormap(np.vstack([rgba, rgba])),
+                    contrast_limits=(0.0, 1.0),
+                    opacity=0.45,
+                    metadata={
+                        "projection_kind": "flatmap_region_surface",
+                        "source": "precomputed_cache",
+                        "cache_path": str(self._region_cache_dir),
+                        "cache_profile_id": profile.profile_id,
+                        "flatmap_style": self._current_style_key(),
+                        "region_id": int(region_id),
+                        "component_count": int(surface.component_count),
+                    },
+                )
+                created.append(layer)
+            self._region_surfaces_layers = created
+            message = f"Loaded {len(created)} cached region surface layer(s)."
+            self._set_region_labels_status(message)
+            if not created:
+                show_warning("The selected cache profile has no surface for this selection.")
+        except Exception as exc:
+            logger.exception("Cached flatmap region surfaces failed")
+            show_warning(f"Cached flatmap region surfaces failed: {exc}")
+
+    def _create_region_outlines(self) -> None:
+        """Show cached per-depth XY perimeter vectors for selected parents."""
+        try:
+            from ..flatmap_region_cache import materialize_region_outlines
+
+            profile, direct_ids, atlas = self._cached_geometry_inputs()
+            self._clear_region_outline_layers()
+            viewer = self._display_viewer()
+            created = []
+            for region_id in direct_ids:
+                outlines = materialize_region_outlines(
+                    profile,
+                    region_id,
+                    style=self._current_style_key(),
+                )
+                if outlines is None or not len(outlines.vectors):
+                    continue
+                rgba = self._atlas_region_rgba(atlas, region_id)
+                name = (
+                    _REGION_OUTLINES_LAYER_NAME
+                    if len(direct_ids) == 1
+                    else f"{_REGION_OUTLINES_LAYER_NAME}: {region_id}"
+                )
+                layer = viewer.add_vectors(
+                    np.asarray(outlines.vectors, dtype=np.float32),
+                    name=name,
+                    edge_color=rgba,
+                    edge_width=1.5,
+                    opacity=0.9,
+                    metadata={
+                        "projection_kind": "flatmap_region_outlines",
+                        "source": "precomputed_cache",
+                        "cache_path": str(self._region_cache_dir),
+                        "cache_profile_id": profile.profile_id,
+                        "flatmap_style": self._current_style_key(),
+                        "region_id": int(region_id),
+                    },
+                )
+                created.append(layer)
+            self._region_outlines_layers = created
+            message = f"Loaded {len(created)} cached region outline layer(s)."
+            self._set_region_labels_status(message)
+            if not created:
+                show_warning("The selected cache profile has no outlines for this selection.")
+        except Exception as exc:
+            logger.exception("Cached flatmap region outlines failed")
+            show_warning(f"Cached flatmap region outlines failed: {exc}")
+
+    def _clear_named_region_layers(self, prefix: str) -> None:
+        layers = self._display_layers(create=False)
+        if layers is None:
+            return
+        for layer in list(layers):
+            if str(getattr(layer, "name", "")).startswith(prefix):
+                try:
+                    layers.remove(layer)
+                except ValueError:
+                    pass
+
+    def _clear_region_surface_layers(self) -> None:
+        self._clear_named_region_layers(_REGION_SURFACES_LAYER_NAME)
+        self._region_surfaces_layers = []
+
+    def _clear_region_outline_layers(self) -> None:
+        self._clear_named_region_layers(_REGION_OUTLINES_LAYER_NAME)
+        self._region_outlines_layers = []
+
+    def _clear_region_geometry(self) -> None:
+        self._clear_region_surface_layers()
+        self._clear_region_outline_layers()
+        self._set_region_labels_status("Cleared cached flatmap region geometry.")
 
     def _color_for_file_id(
         self,
@@ -2214,27 +3407,113 @@ class FlatmapProjectionWidget(QWidget):
 
     def _augment_parquet(self) -> None:
         try:
-            self._projection_request_ready()
             source_path = self._current_source_parquet_path()
+            lookup_dir = getattr(self, "_preprocess_lookup_dir", None)
+            if lookup_dir is None:
+                raise RuntimeError(
+                    "Choose a lookup directory containing bilateral shaped, "
+                    "bilateral square, and depth NRRDs first."
+                )
         except Exception as exc:
             show_warning(str(exc))
             return
 
         output_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Augmented Flatmap Parquet",
+            "Prepare Whole Flatmap Parquet",
             str(source_path.with_name(f"{source_path.stem}_flatmap.parquet")),
             "Parquet Files (*.parquet);;All Files (*)",
         )
         if not output_path:
             return
 
-        try:
-            self._augment_current_parquet_to_path(output_path)
-        except Exception as exc:
-            logger.exception("Flatmap Parquet augmentation failed")
-            self._status_label.setText(f"Flatmap Parquet augmentation failed: {exc}")
-            show_warning(f"Flatmap Parquet augmentation failed: {exc}")
+        output = Path(output_path)
+        if output.resolve() == source_path.resolve():
+            from qtpy.QtWidgets import QMessageBox
+
+            answer = QMessageBox.question(
+                self,
+                "Replace Source Parquet?",
+                "This will atomically replace the loaded source Parquet after "
+                "all rows are prepared. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        self._start_parquet_preparation(source_path, output, lookup_dir)
+
+    def _start_parquet_preparation(
+        self,
+        source_path: Path,
+        output_path: Path,
+        lookup_dir: Path,
+    ) -> None:
+        """Run whole-file bilateral preprocessing in a cancellable QThread."""
+        from qtpy.QtCore import QThread
+
+        from ..workers import FlatmapParquetPreparationWorker
+
+        resolution_control = getattr(self, "_lookup_resolution_spin", None)
+        raw_resolution = (
+            int(resolution_control.value()) if resolution_control is not None else 0
+        )
+        lookup_resolution_um = float(raw_resolution) if raw_resolution > 0 else None
+        thread = QThread()
+        worker = FlatmapParquetPreparationWorker(
+            source_path,
+            output_path,
+            lookup_dir,
+            lookup_resolution_um=lookup_resolution_um,
+        )
+        self._augment_thread = thread
+        self._augment_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._set_projection_progress)
+        worker.finished.connect(self._on_parquet_preparation_finished)
+        worker.error.connect(self._on_parquet_preparation_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._cleanup_parquet_preparation(thread, worker)
+        )
+        self._augment_parquet_btn.setEnabled(False)
+        self._cancel_augment_btn.setEnabled(True)
+        self._set_projection_progress("Preparing whole Parquet...", 0, 0)
+        thread.start()
+
+    def _cancel_parquet_preparation(self) -> None:
+        worker = getattr(self, "_augment_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel()
+            self._status_label.setText("Cancelling Parquet preparation...")
+            self._cancel_augment_btn.setEnabled(False)
+
+    def _on_parquet_preparation_finished(self, summary) -> None:
+        self._hide_projection_progress()
+        message = (
+            f"Prepared {getattr(summary, 'rows', 0):,} row(s) in "
+            f"{getattr(summary, 'output_parquet', '')}."
+        )
+        self._status_label.setText(message)
+        show_info(message)
+
+    def _on_parquet_preparation_error(self, message: str) -> None:
+        self._hide_projection_progress()
+        self._status_label.setText(f"Flatmap Parquet preparation failed: {message}")
+        show_warning(f"Flatmap Parquet preparation failed: {message}")
+
+    def _cleanup_parquet_preparation(self, thread, worker) -> None:
+        if getattr(self, "_augment_thread", None) is thread:
+            self._augment_thread = None
+        if getattr(self, "_augment_worker", None) is worker:
+            self._augment_worker = None
+        self._augment_parquet_btn.setEnabled(True)
+        self._cancel_augment_btn.setEnabled(False)
 
     def _augment_current_parquet_to_path(self, output_path: str | Path):
         """Save a Parquet file augmented with NRRD-derived flatmap columns."""
