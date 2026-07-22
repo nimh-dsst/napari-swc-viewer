@@ -117,6 +117,25 @@ class _DummyButton:
         self.enabled = bool(enabled)
 
 
+class _DummyValueControl:
+    def __init__(self, value=0, *, checked: bool = False) -> None:
+        self.value = value
+        self.checked = bool(checked)
+        self.enabled = True
+
+    def setValue(self, value) -> None:
+        self.value = value
+
+    def setChecked(self, checked: bool) -> None:
+        self.checked = bool(checked)
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+    def isChecked(self) -> bool:
+        return self.checked
+
+
 class _DummyProgressBar:
     def __init__(self) -> None:
         self.visible = False
@@ -467,6 +486,12 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     widget._clear_region_geometry_btn = _DummyButton()
     atlas_holder = {"atlas": None}
     widget._atlas_provider = lambda: atlas_holder["atlas"]
+    widget._request_cache_directory_open = (
+        lambda path, profile_id=None: widget.set_cache_directory(
+            path,
+            profile_id=profile_id,
+        )
+    )
 
     widget.restore_cache_reference(
         {"path": "/relocated/cache", "profile_id": saved.profile_id}
@@ -499,7 +524,7 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     assert saved.compatibility_calls[-1]["atlas_version"] == "1.2"
 
 
-def test_set_cache_directory_closes_superseded_cache_after_invalidating_layers(
+def test_set_cache_directory_commits_before_closing_superseded_cache(
     monkeypatch,
 ) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
@@ -517,6 +542,7 @@ def test_set_cache_directory_closes_superseded_cache_after_invalidating_layers(
 
     old_cache = _Cache("old")
     new_cache = _Cache("new")
+    new_profile = types.SimpleNamespace(profile_id="new-profile")
     import napari_swc_viewer.flatmap_region_cache as cache_module
 
     monkeypatch.setattr(cache_module, "open_region_cache", lambda _path: new_cache)
@@ -525,16 +551,22 @@ def test_set_cache_directory_closes_superseded_cache_after_invalidating_layers(
     widget._active_cache_profile = object()
     widget._pending_cache_profile_id = None
     widget._cache_dir_label = _DummyLabel()
-    widget._invalidate_flatmap_grid_layers = lambda: events.append("invalidate")
+    widget._compatible_cache_profile_entries = lambda _cache: (
+        ("new profile", new_profile),
+    )
+    widget._populate_cache_profile_combo = lambda _entries, _profile: None
+    widget._activate_cache_profile = lambda profile, **_kwargs: (
+        events.append(f"activate:{profile.profile_id}"),
+        setattr(widget, "_active_cache_profile", profile),
+    )
     widget._set_cache_grid_locked = lambda _locked: None
-    widget._refresh_cache_profiles = lambda: None
 
     widget.set_cache_directory(Path("new-cache"))
 
-    assert events == ["invalidate", "close:old"]
+    assert events == ["activate:new-profile", "close:old"]
     assert old_cache.closed is True
     assert widget._region_cache is new_cache
-    assert widget._active_cache_profile is None
+    assert widget._active_cache_profile is new_profile
 
     widget._active_cache_profile = object()
     widget._deactivate_cache_profile = lambda: events.append("deactivate")
@@ -554,13 +586,292 @@ def test_cache_build_finished_closes_worker_returned_profile(monkeypatch) -> Non
         close=lambda: closed.append(True),
     )
     widget._region_cache_dir = Path("cache")
-    widget.set_cache_directory = lambda _path: None
-    widget._cache_profile_combo = types.SimpleNamespace(count=lambda: 0)
+    requests: list[tuple[Path, str | None]] = []
+    widget._request_cache_directory_open = (
+        lambda path, profile_id=None: requests.append((Path(path), profile_id))
+    )
     widget._cache_status_label = _DummyLabel()
 
     widget._on_cache_build_finished(profile)
 
     assert closed == [True]
+    assert requests == [(Path("cache"), "built-profile")]
+
+
+class _CacheProfile:
+    def __init__(self, profile_id: str, *, output_shape=(1, 4, 4)) -> None:
+        self.profile_id = profile_id
+        self.atlas = {"name": "allen_mouse_25um"}
+        self.grid = {
+            "output_shape": list(output_shape),
+            "xy_bins": 4,
+            "depth_bins": 1,
+            "depth_bin_um": 25.0,
+            "x_bounds": [0.0, 1.0],
+            "y_bounds": [0.0, 1.0],
+            "depth_bounds_um": [0.0, 25.0],
+            "includes_depth_minus_one_plane": False,
+        }
+
+    def style(self, style: str):
+        assert style == "both_shaped"
+        return types.SimpleNamespace(grid_spec=self.grid)
+
+
+def _configure_cache_activation_widget(widget, module) -> _DummyLayer:
+    layer = _DummyLayer(
+        np.ones((1, 4, 4), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        metadata={"flatmap_render_mode": "heatmap"},
+    )
+    widget._viewer.layers.append(layer)
+    widget._projection_layer = layer
+    widget._region_surfaces_layers = []
+    widget._region_outlines_layers = []
+    widget._active_cache_profile = None
+    widget._pending_cache_profile_id = None
+    widget._region_cache_dir = Path("cache")
+    widget._cache_status_label = _DummyLabel()
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._xy_bins_spin = _DummyValueControl(4)
+    widget._depth_bin_spin = _DummyValueControl(25.0)
+    widget._exclude_depth_minus_one_cb = _DummyValueControl(checked=False)
+    widget._negative_one_sentinel_cb = _DummyValueControl(checked=True)
+    widget._zero_sentinel_cb = _DummyValueControl(checked=False)
+    widget._region_surfaces_btn = _DummyButton()
+    widget._region_outlines_btn = _DummyButton()
+    widget._clear_region_geometry_btn = _DummyButton()
+    widget._last_projected_nodes = pd.DataFrame({"file_id": ["a.swc"]})
+    widget._last_summary = _simple_projection_summary(module)
+    widget._last_render_summary = _simple_render_summary(
+        module,
+        includes_depth_minus_one_plane=False,
+    )
+    widget._last_render_mode = module._RENDER_HEATMAP
+    widget._last_flatmap_style = "both_shaped"
+    widget._last_coordinate_mode = "parquet_columns"
+    widget._last_volume_shape = (1, 4, 4)
+    widget._last_projection_source = module._PROJECTION_SOURCE_PRECOMPUTED
+    widget._last_cache_dir = None
+    widget._last_cache_profile_id = None
+    return layer
+
+
+def test_choose_cache_directory_only_schedules_background_open(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _DummyLayer(
+        np.ones((1, 4, 4), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        metadata={"flatmap_render_mode": "heatmap"},
+    )
+    widget._viewer.layers.append(layer)
+    requests = []
+    widget._request_cache_directory_open = (
+        lambda path, profile_id=None: requests.append((path, profile_id))
+    )
+    monkeypatch.setattr(
+        module.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: "/cache/path",
+        raising=False,
+    )
+
+    widget._choose_cache_directory()
+
+    assert requests == [("/cache/path", None)]
+    assert widget._viewer.layers == [layer]
+    assert layer.visible is True
+
+
+def test_matching_cache_profile_preserves_live_heatmap(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _configure_cache_activation_widget(widget, module)
+    profile = _CacheProfile("matching-profile")
+    queued = []
+    widget._queue_gui_callback = queued.append
+
+    widget._activate_cache_profile(profile, force_transition=True)
+
+    assert widget._viewer.layers == [layer]
+    assert layer.visible is True
+    assert queued == []
+    assert widget._last_cache_dir == "cache"
+    assert widget._last_cache_profile_id == "matching-profile"
+    assert layer.metadata["cache_path"] == "cache"
+    assert layer.metadata["cache_profile_id"] == "matching-profile"
+    assert "matching heatmap kept" in widget._cache_status_label.text
+
+
+def test_matching_cache_profile_only_retires_other_profile_annotations(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    heatmap = _configure_cache_activation_widget(widget, module)
+    profile = _CacheProfile("matching-profile")
+    matching_labels = _DummyLayer(
+        np.ones((1, 4, 4), dtype=np.int32),
+        name="Flatmap Region Labels",
+        metadata={
+            "cache_path": "old-cache",
+            "cache_profile_id": "matching-profile",
+            "flatmap_style": "both_shaped",
+        },
+    )
+    stale_surface = _DummyLayer(
+        np.ones((1, 3), dtype=np.float32),
+        name="Flatmap Region Surfaces",
+        metadata={
+            "cache_path": "old-cache",
+            "cache_profile_id": "other-profile",
+            "flatmap_style": "both_shaped",
+        },
+    )
+    widget._viewer.layers.extend([matching_labels, stale_surface])
+    widget._region_labels_layer = matching_labels
+    widget._region_surfaces_layers = [stale_surface]
+    queued = []
+    widget._queue_gui_callback = queued.append
+
+    widget._activate_cache_profile(profile, force_transition=True)
+
+    assert heatmap.visible is True
+    assert matching_labels.visible is True
+    assert matching_labels.metadata["cache_path"] == "cache"
+    assert widget._region_labels_layer is matching_labels
+    assert stale_surface.visible is False
+    assert widget._region_surfaces_layers == []
+    assert len(queued) == 1
+
+    queued[0]()
+
+    assert widget._viewer.layers == [heatmap, matching_labels]
+
+
+def test_mismatched_cache_profile_hides_then_defers_heatmap_removal(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _configure_cache_activation_widget(widget, module)
+    profile = _CacheProfile("different-grid", output_shape=(2, 4, 4))
+    queued = []
+    widget._queue_gui_callback = queued.append
+
+    widget._activate_cache_profile(profile, force_transition=True)
+
+    assert widget._viewer.layers == [layer]
+    assert layer.visible is False
+    assert len(queued) == 1
+    assert widget._last_render_summary is None
+    assert "click Project to Flatmap again" in widget._cache_status_label.text
+
+    queued[0]()
+
+    assert widget._viewer.layers == []
+
+
+def test_failed_candidate_cache_preserves_active_cache_and_heatmap(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _DummyLayer(
+        np.ones((1, 4, 4), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        metadata={"flatmap_render_mode": "heatmap"},
+    )
+    widget._viewer.layers.append(layer)
+    closed = []
+    old_cache = object()
+    old_profile = types.SimpleNamespace(profile_id="old-profile")
+    candidate = types.SimpleNamespace(close=lambda: closed.append(True))
+    widget._region_cache = old_cache
+    widget._region_cache_dir = Path("old-cache")
+    widget._active_cache_profile = old_profile
+    widget._cache_status_label = _DummyLabel()
+    widget._cache_open_request_serial = 3
+    widget._cache_open_shutting_down = False
+    warnings = []
+    monkeypatch.setattr(module, "show_warning", warnings.append)
+
+    def incompatible(_cache):
+        raise RuntimeError("no compatible profile")
+
+    widget._compatible_cache_profile_entries = incompatible
+
+    widget._on_cache_open_finished(candidate, 3, Path("bad-cache"), None)
+
+    assert closed == [True]
+    assert widget._region_cache is old_cache
+    assert widget._active_cache_profile is old_profile
+    assert widget._viewer.layers == [layer]
+    assert layer.visible is True
+    assert warnings and "no compatible profile" in warnings[0]
+
+
+def test_stale_background_cache_result_is_closed(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    closed = []
+    candidate = types.SimpleNamespace(close=lambda: closed.append(True))
+    widget._cache_open_request_serial = 9
+    widget._cache_open_shutting_down = False
+
+    widget._on_cache_open_finished(candidate, 8, Path("stale-cache"), None)
+
+    assert closed == [True]
+
+
+def test_refresh_cache_profiles_activates_selected_profile_once(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    class _Combo:
+        def __init__(self) -> None:
+            self.items = []
+            self.index = -1
+
+        def blockSignals(self, _blocked) -> None:
+            return None
+
+        def clear(self) -> None:
+            self.items = []
+            self.index = -1
+
+        def addItem(self, label, value) -> None:
+            self.items.append((label, value))
+            if self.index < 0:
+                self.index = 0
+
+        def setCurrentIndex(self, index) -> None:
+            self.index = int(index)
+
+        def currentData(self):
+            return self.items[self.index][1] if self.index >= 0 else None
+
+    first = _CacheProfile("first")
+    selected = _CacheProfile("selected")
+    widget._region_cache = object()
+    widget._cache_profile_combo = _Combo()
+    widget._pending_cache_profile_id = "selected"
+    widget._active_cache_profile = None
+    widget._compatible_cache_profile_entries = lambda _cache: (
+        ("first", first),
+        ("selected", selected),
+    )
+    activated = []
+    widget._activate_cache_profile = activated.append
+
+    widget._refresh_cache_profiles()
+
+    assert activated == [selected]
+    assert widget._cache_profile_combo.currentData() is selected
 
 
 def test_file_ids_for_source_uses_selected_then_all_fallback(monkeypatch) -> None:
@@ -1412,7 +1723,12 @@ def _simple_projection_summary(module, total_nodes: int = 1):
     return module.ProjectionSummary(total_nodes, total_nodes, 0, 0, 0, 0, 0, 1, 0)
 
 
-def _simple_render_summary(module, total_nodes: int = 1):
+def _simple_render_summary(
+    module,
+    total_nodes: int = 1,
+    *,
+    includes_depth_minus_one_plane: bool = True,
+):
     return module.FlatmapRenderSummary(
         total_nodes,
         total_nodes,
@@ -1431,7 +1747,7 @@ def _simple_render_summary(module, total_nodes: int = 1):
         1.0,
         0.0,
         25.0,
-        True,
+        includes_depth_minus_one_plane,
     )
 
 

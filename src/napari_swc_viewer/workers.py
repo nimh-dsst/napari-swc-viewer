@@ -630,6 +630,36 @@ class FlatmapParquetPreparationWorker(QObject):
             self.error.emit(str(exc))
 
 
+class RegionCacheOpenWorker(QObject):
+    """Open and fully validate an existing flatmap region cache."""
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, cache_dir: str | Path) -> None:
+        super().__init__()
+        self._cache_dir = Path(cache_dir)
+
+    def run(self) -> None:
+        """Validate the cache away from the Qt/VisPy rendering thread."""
+        try:
+            from .flatmap_region_cache import open_region_cache
+
+            with startup_timing(
+                logger,
+                "flatmap_region_cache_open_worker",
+                cache_dir=self._cache_dir,
+            ):
+                cache = open_region_cache(self._cache_dir)
+            self.finished.emit(cache)
+        except Exception as exc:
+            logger.exception(
+                "Flatmap region-cache open failed: %s",
+                self._cache_dir,
+            )
+            self.error.emit(str(exc))
+
+
 class RegionCacheBuildWorker(QObject):
     """Build one shaped/square fixed-grid region-cache profile."""
 

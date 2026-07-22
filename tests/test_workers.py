@@ -134,6 +134,51 @@ def test_cached_brainglobe_atlas_dir_finds_single_cache(tmp_path):
     )
 
 
+def test_region_cache_open_worker_emits_validated_cache(monkeypatch, tmp_path):
+    workers = _import_workers_module()
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    cache = object()
+    opened = []
+
+    def fake_open(path):
+        opened.append(Path(path))
+        return cache
+
+    monkeypatch.setattr(cache_module, "open_region_cache", fake_open)
+    worker = workers.RegionCacheOpenWorker(tmp_path)
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert opened == [tmp_path]
+    assert finished == [cache]
+    assert errors == []
+
+
+def test_region_cache_open_worker_emits_validation_error(monkeypatch, tmp_path):
+    workers = _import_workers_module()
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    def fail_open(_path):
+        raise ValueError("manifest is corrupt")
+
+    monkeypatch.setattr(cache_module, "open_region_cache", fail_open)
+    worker = workers.RegionCacheOpenWorker(tmp_path)
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert finished == []
+    assert errors == ["manifest is corrupt"]
+
+
 def test_cached_atlas_load_worker_uses_local_loader(monkeypatch, tmp_path):
     """CachedAtlasLoadWorker should emit the locally loaded atlas object."""
     workers = _import_workers_module()

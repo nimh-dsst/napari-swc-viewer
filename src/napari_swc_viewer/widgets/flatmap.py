@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import re
+from time import perf_counter
 from types import MethodType
 from typing import Callable
 
@@ -101,6 +102,10 @@ _FLATMAP_RENDER_LAYER_NAMES = {
 _DEFAULT_TRACE_COLOR = np.asarray([0.5, 0.5, 0.5, 1.0], dtype=float)
 
 
+class _CacheCompatibilityUnavailable(RuntimeError):
+    """Compatibility cannot be decided until required viewer state is loaded."""
+
+
 class FlatmapProjectionWidget(QWidget):
     """Project loaded neuron rows into precomputed isocortex flatmap space."""
 
@@ -147,6 +152,14 @@ class FlatmapProjectionWidget(QWidget):
         self._region_cache = None
         self._active_cache_profile = None
         self._pending_cache_profile_id: str | None = None
+        self._cache_open_thread = None
+        self._cache_open_worker = None
+        self._cache_open_request_serial = 0
+        self._cache_open_active_request_id: int | None = None
+        self._cache_open_active_request: tuple[int, Path, str | None] | None = None
+        self._pending_cache_open_request: tuple[int, Path, str | None] | None = None
+        self._pending_validated_cache: tuple[Path, object, str | None] | None = None
+        self._cache_open_shutting_down = False
         self._projection_layer = None
         self._region_labels_layer = None
         self._region_surfaces_layers: list[object] = []
@@ -174,6 +187,7 @@ class FlatmapProjectionWidget(QWidget):
         self._lookup_stats_cache: FlatmapLookupStats | None = None
 
         self._setup_ui()
+        self.destroyed.connect(self._on_cache_widget_destroyed)
 
     def _resolve_display_viewer(self, *, create: bool):
         """Return the viewer used for flatmap display layers."""
@@ -293,9 +307,9 @@ class FlatmapProjectionWidget(QWidget):
         self._cache_dir_label = QLabel("No cache directory selected")
         self._cache_dir_label.setWordWrap(True)
         cache_dir_row.addWidget(self._cache_dir_label, stretch=1)
-        cache_dir_btn = QPushButton("Choose Cache Directory...")
-        cache_dir_btn.clicked.connect(self._choose_cache_directory)
-        cache_dir_row.addWidget(cache_dir_btn)
+        self._cache_dir_btn = QPushButton("Choose Cache Directory...")
+        self._cache_dir_btn.clicked.connect(self._choose_cache_directory)
+        cache_dir_row.addWidget(self._cache_dir_btn)
         cache_layout.addLayout(cache_dir_row)
 
         cache_profile_row = QHBoxLayout()
@@ -588,6 +602,10 @@ class FlatmapProjectionWidget(QWidget):
         self._clear_region_surface_layers()
         self._clear_region_outline_layers()
         self._region_labels_layer = None
+        self._reset_flatmap_render_state()
+
+    def _reset_flatmap_render_state(self) -> None:
+        """Forget the latest projection without performing any layer mutation."""
         self._last_projected_nodes = None
         self._last_summary = None
         self._last_render_summary = None
@@ -606,6 +624,204 @@ class FlatmapProjectionWidget(QWidget):
         if export_button is not None:
             export_button.setEnabled(False)
 
+    def _current_flatmap_render_layers(self) -> list[object]:
+        layers = self._display_layers(create=False)
+        if layers is None:
+            return []
+        return [
+            layer
+            for layer in list(layers)
+            if self._is_flatmap_render_layer_name(getattr(layer, "name", None))
+        ]
+
+    def _current_cached_region_layers(self) -> list[object]:
+        layers = self._display_layers(create=False)
+        if layers is None:
+            return []
+        prefixes = (
+            _REGION_LABELS_LAYER_NAME,
+            _REGION_SURFACES_LAYER_NAME,
+            _REGION_OUTLINES_LAYER_NAME,
+        )
+        return [
+            layer
+            for layer in list(layers)
+            if str(getattr(layer, "name", "")).startswith(prefixes)
+        ]
+
+    def _defer_cached_region_layer_removal(
+        self,
+        *,
+        keep_profile_id: str | None = None,
+        keep_style: str | None = None,
+    ) -> None:
+        """Defer removal of overlays that do not match the retained cache grid."""
+        targets = []
+        for layer in self._current_cached_region_layers():
+            metadata = getattr(layer, "metadata", None)
+            layer_profile_id = (
+                str(metadata.get("cache_profile_id", ""))
+                if isinstance(metadata, dict)
+                else ""
+            )
+            layer_style = (
+                str(metadata.get("flatmap_style", ""))
+                if isinstance(metadata, dict)
+                else ""
+            )
+            if (
+                not keep_profile_id
+                or layer_profile_id != keep_profile_id
+                or (keep_style is not None and layer_style != keep_style)
+            ):
+                targets.append(layer)
+        self._hide_and_queue_layer_removal(targets)
+        if any(layer is self._region_labels_layer for layer in targets):
+            self._region_labels_layer = None
+        self._region_surfaces_layers = [
+            layer
+            for layer in self._region_surfaces_layers
+            if not any(layer is target for target in targets)
+        ]
+        self._region_outlines_layers = [
+            layer
+            for layer in self._region_outlines_layers
+            if not any(layer is target for target in targets)
+        ]
+
+    def _defer_flatmap_grid_layer_removal(self) -> None:
+        """Retire a stale grid without deleting live GPU resources inline."""
+        targets = (
+            self._current_flatmap_render_layers()
+            + self._current_cached_region_layers()
+        )
+        self._hide_and_queue_layer_removal(targets)
+        self._projection_layer = None
+        self._region_labels_layer = None
+        self._region_surfaces_layers = []
+        self._region_outlines_layers = []
+        self._reset_flatmap_render_state()
+
+    def _hide_and_queue_layer_removal(self, targets: list[object]) -> None:
+        if not targets:
+            return
+        unique_targets: list[object] = []
+        for target in targets:
+            if not any(existing is target for existing in unique_targets):
+                unique_targets.append(target)
+        for layer in unique_targets:
+            try:
+                layer.visible = False
+            except Exception:
+                logger.debug(
+                    "Failed to hide stale flatmap layer %s.",
+                    getattr(layer, "name", "<unnamed>"),
+                    exc_info=True,
+                )
+
+        layers = self._display_layers(create=False)
+
+        def remove_hidden_layers() -> None:
+            if layers is None:
+                return
+            for layer in unique_targets:
+                try:
+                    if any(existing is layer for existing in layers):
+                        layers.remove(layer)
+                except (RuntimeError, ValueError):
+                    logger.debug(
+                        "Stale flatmap layer was already removed: %s",
+                        getattr(layer, "name", "<unnamed>"),
+                        exc_info=True,
+                    )
+
+        self._queue_gui_callback(remove_hidden_layers)
+
+    @staticmethod
+    def _queue_gui_callback(callback: Callable[[], None]) -> None:
+        try:
+            from qtpy import QtCore
+
+            timer = getattr(QtCore, "QTimer", None)
+            single_shot = getattr(timer, "singleShot", None)
+            if callable(single_shot):
+                single_shot(0, callback)
+                return
+        except ImportError:
+            pass
+        callback()
+
+    def _render_matches_cache_profile(self, profile) -> bool:
+        """Return whether the live precomputed heatmap uses the profile grid."""
+        if (
+            getattr(self, "_last_projection_source", None)
+            != _PROJECTION_SOURCE_PRECOMPUTED
+            or getattr(self, "_last_render_mode", None) != _RENDER_HEATMAP
+            or getattr(self, "_last_flatmap_style", None)
+            != self._current_style_key()
+            or not self._latest_heatmap_layer_is_rendered()
+        ):
+            return False
+
+        summary = getattr(self, "_last_render_summary", None)
+        volume_shape = getattr(self, "_last_volume_shape", None)
+        if summary is None or volume_shape is None:
+            return False
+        try:
+            grid = profile.style(self._current_style_key()).grid_spec
+            output_shape = tuple(int(value) for value in grid["output_shape"])
+            xy_bins = int(grid["xy_bins"])
+            depth_bin_um = float(grid["depth_bin_um"])
+            includes_minus_one = bool(grid["includes_depth_minus_one_plane"])
+            grid_bounds = (
+                tuple(float(value) for value in grid["x_bounds"]),
+                tuple(float(value) for value in grid["y_bounds"]),
+                tuple(float(value) for value in grid["depth_bounds_um"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        render_bounds = (
+            (float(summary.x_flat_min), float(summary.x_flat_max)),
+            (float(summary.y_flat_min), float(summary.y_flat_max)),
+            (float(summary.depth_min_um), float(summary.depth_max_um)),
+        )
+        bounds_match = all(
+            np.allclose(cached, rendered, rtol=1e-9, atol=1e-9)
+            for cached, rendered in zip(grid_bounds, render_bounds, strict=True)
+        )
+        return bool(
+            tuple(int(value) for value in volume_shape) == output_shape
+            and int(summary.xy_bins) == xy_bins
+            and np.isclose(
+                float(summary.depth_bin_um),
+                depth_bin_um,
+                rtol=1e-9,
+                atol=1e-9,
+            )
+            and bool(summary.includes_depth_minus_one_plane) == includes_minus_one
+            and bounds_match
+        )
+
+    def _adopt_render_for_cache_profile(self, profile) -> None:
+        """Attach new provenance to compatible layers without re-uploading them."""
+        cache_dir = getattr(self, "_region_cache_dir", None)
+        profile_id = self._cache_profile_id(profile)
+        self._last_cache_dir = str(cache_dir) if cache_dir is not None else None
+        self._last_cache_profile_id = profile_id
+        cached_layers = self._current_cached_region_layers()
+        for layer in self._current_flatmap_render_layers() + cached_layers:
+            metadata = getattr(layer, "metadata", None)
+            if isinstance(metadata, dict):
+                existing_profile_id = str(metadata.get("cache_profile_id", ""))
+                is_cached_layer = any(
+                    layer is cached_layer for cached_layer in cached_layers
+                )
+                if is_cached_layer and existing_profile_id != profile_id:
+                    continue
+                metadata["cache_path"] = self._last_cache_dir or ""
+                metadata["cache_profile_id"] = profile_id
+
     def _choose_preprocess_lookup_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self,
@@ -622,11 +838,17 @@ class FlatmapProjectionWidget(QWidget):
         *,
         profile_id: str | None = None,
     ) -> None:
-        """Open a region cache directory and refresh compatible profiles."""
-        previous_directory = getattr(self, "_region_cache_dir", None)
-        previous_cache = getattr(self, "_region_cache", None)
+        """Synchronously open and transactionally activate a region cache.
+
+        GUI entry points use :meth:`_request_cache_directory_open` so full
+        array validation never blocks the Qt/VisPy rendering thread.  This
+        synchronous method remains useful for tests and scripted callers.
+        """
         next_directory = Path(path) if path else None
         if next_directory is None:
+            self._invalidate_cache_open_requests()
+            self._replace_pending_validated_cache(None)
+            previous_cache = getattr(self, "_region_cache", None)
             self._deactivate_cache_profile()
             self._region_cache_dir = None
             self._region_cache = None
@@ -636,29 +858,265 @@ class FlatmapProjectionWidget(QWidget):
             self._refresh_cache_profiles()
             return
 
+        self._invalidate_cache_open_requests()
+        self._replace_pending_validated_cache(None)
         from ..flatmap_region_cache import open_region_cache
 
-        # Open and validate first so a bad new path cannot leave an old active
-        # profile attached to the wrong directory.
+        started = perf_counter()
+        logger.info("Opening flatmap region cache synchronously: %s", next_directory)
         next_cache = open_region_cache(next_directory)
-        if previous_directory != next_directory:
-            self._invalidate_flatmap_grid_layers()
-            self._active_cache_profile = None
-        self._region_cache_dir = next_directory
-        self._region_cache = next_cache
-        self._pending_cache_profile_id = str(profile_id) if profile_id else None
-        self._set_cache_grid_locked(False)
-        if previous_cache is not next_cache:
-            self._close_region_cache(previous_cache)
-        self._cache_dir_label.setText(str(next_directory))
-        self._refresh_cache_profiles()
+        try:
+            self._commit_open_region_cache(
+                next_directory,
+                next_cache,
+                profile_id=profile_id,
+            )
+        except _CacheCompatibilityUnavailable as exc:
+            self._replace_pending_validated_cache(
+                (next_directory, next_cache, profile_id)
+            )
+            self._cache_dir_label.setText(str(next_directory))
+            self._cache_status_label.setText(str(exc))
+            return
+        except Exception:
+            if next_cache is not getattr(self, "_region_cache", None):
+                self._close_region_cache(next_cache)
+            raise
+        logger.info(
+            "Activated flatmap region cache synchronously in %.3fs: %s",
+            perf_counter() - started,
+            next_directory,
+        )
+
+    def _request_cache_directory_open(
+        self,
+        path: str | Path,
+        *,
+        profile_id: str | None = None,
+    ) -> None:
+        """Queue background validation of a cache selected by the GUI."""
+        next_directory = Path(path)
+        self._replace_pending_validated_cache(None)
+        request_id = int(getattr(self, "_cache_open_request_serial", 0)) + 1
+        self._cache_open_request_serial = request_id
+        request = (
+            request_id,
+            next_directory,
+            str(profile_id) if profile_id else None,
+        )
+        if self._cache_open_is_running():
+            self._pending_cache_open_request = request
+            self._cache_status_label.setText(
+                f"Waiting to validate flatmap region cache {next_directory}..."
+            )
+            logger.info(
+                "Queued flatmap region-cache open request %d: %s",
+                request_id,
+                next_directory,
+            )
+            return
+        self._start_cache_open_request(request)
+
+    def _start_cache_open_request(
+        self,
+        request: tuple[int, Path, str | None],
+    ) -> None:
+        from qtpy.QtCore import QThread
+
+        from ..workers import RegionCacheOpenWorker
+
+        request_id, cache_dir, profile_id = request
+        worker = RegionCacheOpenWorker(cache_dir)
+        thread = QThread()
+        self._cache_open_thread = thread
+        self._cache_open_worker = worker
+        self._cache_open_active_request_id = request_id
+        self._cache_open_active_request = request
+        self._pending_cache_open_request = None
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Bound QObject methods ensure Qt queues all widget/UI work back onto
+        # the GUI thread when these signals are emitted by the worker thread.
+        worker.finished.connect(self._on_active_cache_open_finished)
+        worker.error.connect(self._on_active_cache_open_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_active_cache_open_request)
+        self._set_cache_open_controls_enabled(False)
+        self._cache_status_label.setText(
+            f"Validating flatmap region cache {cache_dir}..."
+        )
+        logger.info(
+            "Started flatmap region-cache open request %d: %s",
+            request_id,
+            cache_dir,
+        )
+        thread.start()
+
+    def _on_active_cache_open_finished(self, cache) -> None:
+        request = getattr(self, "_cache_open_active_request", None)
+        if request is None:
+            logger.info("Closing unclaimed flatmap region-cache result.")
+            self._close_region_cache(cache)
+            return
+        request_id, cache_dir, profile_id = request
+        self._on_cache_open_finished(cache, request_id, cache_dir, profile_id)
+
+    def _on_active_cache_open_error(self, message: str) -> None:
+        request = getattr(self, "_cache_open_active_request", None)
+        if request is None:
+            return
+        request_id, cache_dir, _profile_id = request
+        self._on_cache_open_error(message, request_id, cache_dir)
+
+    def _cleanup_active_cache_open_request(self) -> None:
+        request = getattr(self, "_cache_open_active_request", None)
+        thread = getattr(self, "_cache_open_thread", None)
+        worker = getattr(self, "_cache_open_worker", None)
+        if request is None or thread is None or worker is None:
+            return
+        self._cleanup_cache_open_request(request[0], thread, worker)
+
+    def _on_cache_open_finished(
+        self,
+        cache,
+        request_id: int,
+        cache_dir: Path,
+        profile_id: str | None,
+    ) -> None:
+        if not self._cache_open_request_is_current(request_id):
+            logger.info(
+                "Closing stale flatmap region-cache result %d: %s",
+                request_id,
+                cache_dir,
+            )
+            self._close_region_cache(cache)
+            return
+        try:
+            self._commit_open_region_cache(
+                cache_dir,
+                cache,
+                profile_id=profile_id,
+            )
+        except _CacheCompatibilityUnavailable as exc:
+            self._replace_pending_validated_cache((cache_dir, cache, profile_id))
+            self._cache_dir_label.setText(str(cache_dir))
+            self._cache_status_label.setText(str(exc))
+            logger.info(
+                "Holding validated flatmap region cache until compatibility "
+                "inputs are available: %s",
+                cache_dir,
+            )
+        except Exception as exc:
+            self._close_region_cache(cache)
+            self._report_cache_open_failure(cache_dir, exc)
+
+    def _on_cache_open_error(
+        self,
+        message: str,
+        request_id: int,
+        cache_dir: Path,
+    ) -> None:
+        if not self._cache_open_request_is_current(request_id):
+            return
+        self._report_cache_open_failure(cache_dir, message)
+
+    def _report_cache_open_failure(
+        self,
+        cache_dir: Path,
+        error: object,
+    ) -> None:
+        logger.error("Failed to activate flatmap region cache %s: %s", cache_dir, error)
+        message = f"Flatmap region cache is incompatible or corrupt: {error}"
+        self._cache_status_label.setText(message)
+        show_warning(message)
+
+    def _cleanup_cache_open_request(
+        self,
+        request_id: int,
+        thread,
+        worker,
+    ) -> None:
+        if getattr(self, "_cache_open_thread", None) is thread:
+            self._cache_open_thread = None
+        if getattr(self, "_cache_open_worker", None) is worker:
+            self._cache_open_worker = None
+        if getattr(self, "_cache_open_active_request_id", None) == request_id:
+            self._cache_open_active_request_id = None
+        active_request = getattr(self, "_cache_open_active_request", None)
+        if active_request is not None and active_request[0] == request_id:
+            self._cache_open_active_request = None
+
+        pending = getattr(self, "_pending_cache_open_request", None)
+        serial = int(getattr(self, "_cache_open_request_serial", 0))
+        shutting_down = bool(getattr(self, "_cache_open_shutting_down", False))
+        if pending is not None and pending[0] == serial and not shutting_down:
+            self._start_cache_open_request(pending)
+            return
+        if not shutting_down:
+            self._set_cache_open_controls_enabled(True)
+
+    def _cache_open_is_running(self) -> bool:
+        thread = getattr(self, "_cache_open_thread", None)
+        is_running = getattr(thread, "isRunning", None)
+        return bool(thread is not None and callable(is_running) and is_running())
+
+    def _cache_open_request_is_current(self, request_id: int) -> bool:
+        return bool(
+            not getattr(self, "_cache_open_shutting_down", False)
+            and int(request_id)
+            == int(getattr(self, "_cache_open_request_serial", 0))
+        )
+
+    def _invalidate_cache_open_requests(self) -> None:
+        self._cache_open_request_serial = int(
+            getattr(self, "_cache_open_request_serial", 0)
+        ) + 1
+        self._pending_cache_open_request = None
+
+    def _on_cache_widget_destroyed(self, *_args) -> None:
+        self._cache_open_shutting_down = True
+        self._invalidate_cache_open_requests()
+        self._replace_pending_validated_cache(None)
+
+    def _replace_pending_validated_cache(
+        self,
+        pending: tuple[Path, object, str | None] | None,
+    ) -> None:
+        previous = getattr(self, "_pending_validated_cache", None)
+        self._pending_validated_cache = pending
+        if previous is not None and (pending is None or previous[1] is not pending[1]):
+            self._close_region_cache(previous[1])
+
+    def _set_cache_open_controls_enabled(self, enabled: bool) -> None:
+        for name in ("_cache_dir_btn", "_cache_profile_combo", "_build_cache_btn"):
+            widget = getattr(self, name, None)
+            set_enabled = getattr(widget, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
 
     @staticmethod
     def _close_region_cache(cache) -> None:
         """Release a superseded cache without assuming a concrete cache type."""
+        if cache is None:
+            return
         close = getattr(cache, "close", None)
         if callable(close):
-            close()
+            started = perf_counter()
+            try:
+                close()
+            except Exception:
+                logger.warning(
+                    "Failed to close flatmap region-cache memory maps.",
+                    exc_info=True,
+                )
+            else:
+                logger.info(
+                    "Closed flatmap region-cache memory maps in %.3fs.",
+                    perf_counter() - started,
+                )
 
     def active_cache_reference(self) -> dict[str, str] | None:
         """Return the external cache reference stored in project bundles."""
@@ -677,16 +1135,29 @@ class FlatmapProjectionWidget(QWidget):
         profile_id = str(reference.get("profile_id") or "")
         if not path:
             return
-        try:
-            self.set_cache_directory(str(path), profile_id=profile_id or None)
-        except Exception:
-            # A project reference supersedes session state: never leave an old
-            # cache active when the project's external cache is unavailable.
-            self.set_cache_directory(None)
-            raise
+        self._pending_cache_profile_id = profile_id or None
+        self._request_cache_directory_open(
+            str(path),
+            profile_id=profile_id or None,
+        )
 
     def refresh_cache_profiles(self) -> None:
         """Re-evaluate cache compatibility after atlas or Parquet changes."""
+        pending = getattr(self, "_pending_validated_cache", None)
+        if pending is not None:
+            cache_dir, cache, profile_id = pending
+            try:
+                self._commit_open_region_cache(
+                    cache_dir,
+                    cache,
+                    profile_id=profile_id,
+                )
+            except _CacheCompatibilityUnavailable as exc:
+                self._cache_status_label.setText(str(exc))
+            except Exception as exc:
+                self._replace_pending_validated_cache(None)
+                self._report_cache_open_failure(cache_dir, exc)
+            return
         self._refresh_cache_profiles()
 
     def invalidate_loaded_parquet_projection(self) -> None:
@@ -708,13 +1179,7 @@ class FlatmapProjectionWidget(QWidget):
         )
         if not path:
             return
-        try:
-            self.set_cache_directory(path, profile_id=None)
-        except Exception as exc:
-            logger.exception("Failed to open flatmap region cache")
-            message = f"Flatmap region cache is incompatible or corrupt: {exc}"
-            self._cache_status_label.setText(message)
-            show_warning(message)
+        self._request_cache_directory_open(path, profile_id=None)
 
     @staticmethod
     def _cache_profile_id(profile) -> str:
@@ -729,80 +1194,83 @@ class FlatmapProjectionWidget(QWidget):
         combo = getattr(self, "_cache_profile_combo", None)
         if combo is None:
             return
-        combo.blockSignals(True)
-        combo.clear()
         cache = getattr(self, "_region_cache", None)
         if cache is None:
-            combo.blockSignals(False)
+            self._populate_cache_profile_combo((), None)
             self._deactivate_cache_profile()
             return
 
+        try:
+            entries = self._compatible_cache_profile_entries(cache)
+        except RuntimeError as exc:
+            self._populate_cache_profile_combo((), None)
+            self._deactivate_cache_profile()
+            self._cache_status_label.setText(str(exc))
+            return
+
+        pending_profile_id = str(
+            getattr(self, "_pending_cache_profile_id", "")
+            or self._cache_profile_id(getattr(self, "_active_cache_profile", None))
+        )
+        profile = self._select_cache_profile(entries, pending_profile_id)
+        self._populate_cache_profile_combo(entries, profile)
+        self._activate_cache_profile(profile)
+
+    def _compatible_cache_profile_entries(
+        self,
+        cache,
+    ) -> tuple[tuple[str, object], ...]:
+        """Return display labels and compatible profiles without mutating UI."""
         try:
             info = read_flatmap_parquet_transform_info(
                 self._current_source_parquet_path()
             )
         except Exception as exc:
-            combo.blockSignals(False)
-            self._deactivate_cache_profile()
-            self._cache_status_label.setText(
+            raise _CacheCompatibilityUnavailable(
                 f"Load a version-3 neuron Parquet to select a cache profile: {exc}"
-            )
-            return
+            ) from exc
         if info.format_version < 3 or not info.lookup_set_id:
-            combo.blockSignals(False)
-            self._deactivate_cache_profile()
-            self._cache_status_label.setText(
+            raise _CacheCompatibilityUnavailable(
                 "Legacy Parquets can render neurons, but exact cache overlays "
                 "require version-3 preprocessing."
             )
-            return
 
         atlas = self._atlas_provider()
         if atlas is None:
-            combo.blockSignals(False)
-            self._deactivate_cache_profile()
-            self._cache_status_label.setText(
+            raise _CacheCompatibilityUnavailable(
                 "Load a matching BrainGlobe atlas structure catalog to use the cache."
             )
-            return
 
         style = self._current_style_key()
         current_atlas_name = str(getattr(atlas, "atlas_name", "") or "")
         from ..flatmap_region_cache import structure_catalog_id
 
-        structures = getattr(atlas, "structures", None)
         try:
-            current_catalog_id = structure_catalog_id(structures)
-        except (AttributeError, TypeError, ValueError):
-            combo.blockSignals(False)
-            self._deactivate_cache_profile()
-            self._cache_status_label.setText(
-                "The loaded atlas does not expose a usable structure catalog."
+            current_catalog_id = structure_catalog_id(
+                getattr(atlas, "structures", None)
             )
-            return
-        current_atlas_version = (
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _CacheCompatibilityUnavailable(
+                "The loaded atlas does not expose a usable structure catalog."
+            ) from exc
+        current_atlas_version = self._atlas_version_text(
             getattr(atlas, "local_version", None)
             or getattr(atlas, "atlas_version", None)
             or getattr(atlas, "version", None)
         )
-        current_atlas_version = self._atlas_version_text(current_atlas_version)
         shared_depth = (info.metadata or {}).get("shared_depth_definition")
         if not isinstance(shared_depth, dict):
-            combo.blockSignals(False)
-            self._deactivate_cache_profile()
-            self._cache_status_label.setText(
+            raise RuntimeError(
                 "Version-3 Parquet metadata is missing its shared depth definition."
             )
-            return
         try:
             parquet_mirror_axis = int(shared_depth["mirror_coord_axis"])
-        except (KeyError, TypeError, ValueError):
-            combo.blockSignals(False)
-            self._deactivate_cache_profile()
-            self._cache_status_label.setText(
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
                 "Version-3 Parquet metadata has no valid depth mirror axis."
-            )
-            return
+            ) from exc
+
+        entries: list[tuple[str, object]] = []
         mismatch_messages: list[str] = []
         for profile in cache.profiles.values():
             mismatches = list(
@@ -822,47 +1290,149 @@ class FlatmapProjectionWidget(QWidget):
                     f"{profile.profile_id[:12]}: " + "; ".join(mismatches)
                 )
                 continue
-            style_cache = profile.style(style)
-            grid = style_cache.grid_spec
+            grid = profile.style(style).grid_spec
             label = (
                 f"{profile.profile_id[:12]} — {cached_atlas_name}, "
                 f"{grid.get('xy_bins')} XY / {grid.get('depth_bin_um')} um"
             )
-            combo.addItem(label, profile)
+            entries.append((label, profile))
 
-        combo.blockSignals(False)
-        if combo.count():
-            target_index = 0
-            pending_profile_id = str(
-                getattr(self, "_pending_cache_profile_id", "") or ""
-            )
-            if pending_profile_id:
-                for index in range(combo.count()):
-                    if (
-                        self._cache_profile_id(combo.itemData(index))
-                        == pending_profile_id
-                    ):
-                        target_index = index
-                        break
-            combo.setCurrentIndex(target_index)
-            self._on_cache_profile_changed()
-        else:
-            self._deactivate_cache_profile()
+        if not entries:
             detail = mismatch_messages[0] if mismatch_messages else "no profiles"
-            self._cache_status_label.setText(
+            raise RuntimeError(
                 f"No compatible cache profile: {detail}. "
                 "Recomputation will not start automatically."
             )
+        return tuple(entries)
 
-    def _on_cache_profile_changed(self) -> None:
+    @classmethod
+    def _select_cache_profile(
+        cls,
+        entries: tuple[tuple[str, object], ...],
+        profile_id: str | None,
+    ):
+        requested = str(profile_id or "")
+        if requested:
+            for _label, profile in entries:
+                if cls._cache_profile_id(profile) == requested:
+                    return profile
+        return entries[0][1] if entries else None
+
+    def _populate_cache_profile_combo(
+        self,
+        entries: tuple[tuple[str, object], ...],
+        profile,
+    ) -> None:
         combo = getattr(self, "_cache_profile_combo", None)
-        profile = combo.currentData() if combo is not None else None
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            target_index = -1
+            target_id = self._cache_profile_id(profile)
+            for index, (label, candidate) in enumerate(entries):
+                combo.addItem(label, candidate)
+                if self._cache_profile_id(candidate) == target_id:
+                    target_index = index
+            if target_index >= 0:
+                combo.setCurrentIndex(target_index)
+        finally:
+            combo.blockSignals(False)
+
+    def _commit_open_region_cache(
+        self,
+        cache_dir: Path,
+        cache,
+        *,
+        profile_id: str | None,
+    ) -> None:
+        """Commit an opened candidate only after compatibility succeeds."""
+        compatibility_started = perf_counter()
+        try:
+            entries = self._compatible_cache_profile_entries(cache)
+        except Exception:
+            logger.info(
+                "Rejected flatmap region cache after %.3fs compatibility check: %s",
+                perf_counter() - compatibility_started,
+                cache_dir,
+            )
+            raise
+        logger.info(
+            "Found %d compatible flatmap cache profile(s) in %.3fs: %s",
+            len(entries),
+            perf_counter() - compatibility_started,
+            cache_dir,
+        )
+        profile = self._select_cache_profile(entries, profile_id)
+        if profile is None:
+            raise RuntimeError("The cache contains no compatible profile.")
+
+        previous_directory = getattr(self, "_region_cache_dir", None)
+        previous_cache = getattr(self, "_region_cache", None)
         previous_profile_id = self._cache_profile_id(
             getattr(self, "_active_cache_profile", None)
         )
         next_profile_id = self._cache_profile_id(profile)
-        if previous_profile_id and previous_profile_id != next_profile_id:
-            self._invalidate_flatmap_grid_layers()
+        force_transition = bool(
+            previous_directory != cache_dir
+            or previous_profile_id != next_profile_id
+        )
+
+        self._region_cache_dir = Path(cache_dir)
+        self._region_cache = cache
+        self._pending_cache_profile_id = next_profile_id
+        self._cache_dir_label.setText(str(cache_dir))
+        self._populate_cache_profile_combo(entries, profile)
+        self._activate_cache_profile(profile, force_transition=force_transition)
+        pending = getattr(self, "_pending_validated_cache", None)
+        if pending is not None and pending[1] is cache:
+            self._pending_validated_cache = None
+
+        if previous_cache is not None and previous_cache is not cache:
+            self._close_region_cache(previous_cache)
+            logger.info("Closed superseded flatmap region cache: %s", previous_directory)
+        logger.info(
+            "Committed flatmap region cache %s with profile %s",
+            cache_dir,
+            next_profile_id,
+        )
+
+    def _on_cache_profile_changed(self) -> None:
+        combo = getattr(self, "_cache_profile_combo", None)
+        profile = combo.currentData() if combo is not None else None
+        self._activate_cache_profile(profile)
+
+    def _activate_cache_profile(
+        self,
+        profile,
+        *,
+        force_transition: bool = False,
+    ) -> None:
+        previous_profile_id = self._cache_profile_id(
+            getattr(self, "_active_cache_profile", None)
+        )
+        next_profile_id = self._cache_profile_id(profile)
+        transition = bool(
+            force_transition or previous_profile_id != next_profile_id
+        )
+        had_render = bool(self._current_flatmap_render_layers())
+        preserved_render = bool(
+            transition
+            and had_render
+            and profile is not None
+            and self._render_matches_cache_profile(profile)
+        )
+        stale_render = bool(transition and had_render and not preserved_render)
+
+        if transition:
+            if preserved_render:
+                self._defer_cached_region_layer_removal(
+                    keep_profile_id=next_profile_id,
+                    keep_style=self._current_style_key(),
+                )
+            elif stale_render:
+                self._defer_flatmap_grid_layer_removal()
         self._active_cache_profile = profile
         if profile is None:
             self._set_cache_grid_locked(False)
@@ -877,7 +1447,21 @@ class FlatmapProjectionWidget(QWidget):
         self._exclude_depth_minus_one_cb.setChecked(True)
         locked = self._current_projection_source() != _PROJECTION_SOURCE_RECOMPUTE
         self._set_cache_grid_locked(locked)
-        suffix = "grid controls are locked" if locked else "NRRD fallback is active"
+        if preserved_render:
+            self._adopt_render_for_cache_profile(profile)
+            suffix = "matching heatmap kept; grid controls are locked"
+            logger.info(
+                "Preserved rendered flatmap heatmap for cache profile %s",
+                profile.profile_id,
+            )
+        elif stale_render:
+            suffix = "heatmap grid changed; click Project to Flatmap again"
+            logger.info(
+                "Deferred stale flatmap heatmap removal for cache profile %s",
+                profile.profile_id,
+            )
+        else:
+            suffix = "grid controls are locked" if locked else "NRRD fallback is active"
         self._cache_status_label.setText(
             f"Active cache profile {profile.profile_id}; {suffix}."
         )
@@ -1078,29 +1662,14 @@ class FlatmapProjectionWidget(QWidget):
     def _on_cache_build_finished(self, profile) -> None:
         profile_id = self._cache_profile_id(profile)
         try:
-            self.set_cache_directory(self._region_cache_dir)
-            combo = self._cache_profile_combo
-            opened = False
-            for index in range(combo.count()):
-                if self._cache_profile_id(combo.itemData(index)) == profile_id:
-                    combo.setCurrentIndex(index)
-                    self._on_cache_profile_changed()
-                    opened = True
-                    break
-            if opened:
-                self._cache_status_label.setText(
-                    f"Built and opened cache profile {profile_id}."
-                )
-                show_info(f"Built flatmap region-cache profile {profile_id}")
-                return
-            current_text = getattr(self._cache_status_label, "text", None)
-            detail = current_text() if callable(current_text) else ""
-            message = (
-                f"Built cache profile {profile_id}, but it is not compatible with "
-                f"the loaded Parquet/atlas/style. {detail}"
-            ).strip()
-            self._cache_status_label.setText(message)
-            show_warning(message)
+            self._cache_status_label.setText(
+                f"Built cache profile {profile_id}; validating it for viewing..."
+            )
+            self._request_cache_directory_open(
+                self._region_cache_dir,
+                profile_id=profile_id,
+            )
+            show_info(f"Built flatmap region-cache profile {profile_id}")
         finally:
             close = getattr(profile, "close", None)
             if callable(close):
@@ -1115,7 +1684,7 @@ class FlatmapProjectionWidget(QWidget):
             self._cache_build_thread = None
         if getattr(self, "_cache_build_worker", None) is worker:
             self._cache_build_worker = None
-        self._build_cache_btn.setEnabled(True)
+        self._build_cache_btn.setEnabled(not self._cache_open_is_running())
         self._cancel_cache_btn.setEnabled(False)
 
     def _current_style_key(self) -> str:

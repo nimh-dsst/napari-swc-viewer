@@ -29,7 +29,7 @@ Unless a use case says otherwise:
 | [UC-001](#uc-001-download-an-allen-mouse-atlas) | Download and cache a supported Allen Mouse Brain Atlas | Not run |
 | [UC-002](#uc-002-convert-swc-files-to-parquet) | Convert a folder or selected SWC files into one Parquet file | Not run |
 | [UC-003](#uc-003-prepare-a-whole-neuron-parquet-for-flatmap-viewing) | Append bilateral shaped/square flatmap and depth coordinates to a whole Parquet | Not run |
-| [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Not run |
+| [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -328,14 +328,24 @@ projecting meshes, or converting region coordinates while viewing.
    **Expected:** Temporary files from that build are removed, the prior profile
    remains listed and usable, and the controls are restored.
 3. **Action:** Close and reopen napari, load the version-3 Parquet and a
-   BrainGlobe atlas with the same atlas/version structure catalog, then choose
-   **Precomputed Parquet + Cache** and click **Choose Cache Directory...**.
-   **Expected:** The plugin parses `flatmap-region-cache.json`, memory-maps its
-   arrays, and lists only profiles compatible with the Parquet lookup-set ID
-   and selected style. It does not access atlas annotation or region mesh data.
+   BrainGlobe atlas with the same atlas/version structure catalog, choose
+   **Precomputed Parquet + Cache**, set **Render** to **Heatmap** and its color
+   mode to **Single color**, then click **Project to Flatmap**. After the
+   heatmap appears in the detached flatmap window, click **Choose Cache
+   Directory...** and select the existing cache. Repeat the cache selection
+   several times on both Windows and macOS when those systems are available.
+   **Expected:** Cache validation runs without freezing either napari window.
+   The plugin parses `flatmap-region-cache.json`, memory-maps its arrays, and
+   lists only profiles compatible with the Parquet lookup-set ID and selected
+   style. A heatmap whose fixed grid matches the selected profile remains
+   visible and is not recreated. Napari does not crash or show an operating
+   system crash report, and the plugin does not access atlas annotation or
+   region mesh data.
 4. **Action:** Select the new cache profile.
    **Expected:** XY bins, depth-bin size, canonical bounds, and exclusion of the
-   depth `-1` sentinel plane are set from the profile and locked.
+   depth `-1` sentinel plane are set from the profile and locked. If the profile
+   grid differs from an existing heatmap, that heatmap is hidden before being
+   removed and the status asks the user to click **Project to Flatmap** again.
 5. **Action:** Select a parent region, enable child regions, then click **Show
    Region Labels**, **Show Region Surfaces**, and **Show Region Outlines**.
    **Expected:** Labels apply the include-child-expanded selection. The surface
@@ -350,18 +360,22 @@ projecting meshes, or converting region coordinates while viewing.
    aligned, including when the queried neurons occupy only a small part of the
    global flatmap.
 7. **Action:** Load a Parquet or atlas that is incompatible with every cached
-   profile, or remove one referenced array and then reopen the cache.
+   profile, or remove one referenced array and then reopen the cache. When
+   testing a second directory, keep a valid cache and heatmap active first.
    **Expected:** The plugin reports the exact lookup, atlas, grid, missing-file,
-   or validation mismatch. It never starts NRRD recomputation automatically.
+   or validation mismatch. A failed candidate directory does not replace the
+   active cache or clear its heatmap. It never starts NRRD recomputation
+   automatically.
 8. **Action:** Explicitly choose **Recompute from NRRDs**.
    **Expected:** The legacy runtime lookup workflow becomes available only for
    this explicit fallback choice.
 
 **Manual verification**
 
-- Status: Not run
-- Last verified: Never
-- Notes: None
+- Status: Passed
+- Last verified: 2026-07-22
+- Notes: Manual testing confirmed stable cache activation with the reported
+  version-3 single-color heatmap workflow.
 
 ## Use-Case Template
 
