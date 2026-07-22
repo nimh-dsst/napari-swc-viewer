@@ -29,7 +29,7 @@ Unless a use case says otherwise:
 | [UC-001](#uc-001-download-an-allen-mouse-atlas) | Download and cache a supported Allen Mouse Brain Atlas | Not run |
 | [UC-002](#uc-002-convert-swc-files-to-parquet) | Convert a folder or selected SWC files into one Parquet file | Not run |
 | [UC-003](#uc-003-prepare-a-whole-neuron-parquet-for-flatmap-viewing) | Append bilateral shaped/square flatmap and depth coordinates to a whole Parquet | Not run |
-| [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Failed |
+| [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -419,20 +419,23 @@ projecting meshes, or converting region coordinates while viewing.
 
 **Manual verification**
 
-- Status: Failed
+- Status: Passed
 - Last verified: 2026-07-22
-- Notes: Cache activation passed with the version-3 single-color heatmap
-  workflow, but the detached flatmap window did not fully close while the main
-  napari window remained open. Logs from the cleanup fixes show complete model,
-  QtViewer, QWidget, and native-window cleanup, but also reveal that napari
-  initially exposed an empty window before its first flatmap layer was ready.
-  A later fix creates that viewer hidden in 3D and shows it only after the first
-  configured layer. The current change additionally prevents the detached viewer
-  from inheriting napari's app-wide macOS fullscreen state on show and guards the
-  close of a manually fullscreened detached window (step 10). This is a
-  macOS-specific workaround targeting napari 0.6.6 whose Qt-dependent behavior
-  can only be validated manually; retain Failed status until both the close and
-  the new fullscreen workflow pass on macOS.
+- Notes: Verified manually on macOS (macOS 26.5.1 arm64, napari 0.6.6, PyQt6
+  6.8.1). Cache build/reopen/parse and shaped/square switching all behave as
+  expected. The detached flatmap window now closes completely while the main
+  napari window stays open, and the plugin creates the viewer hidden in 3D,
+  showing it only after its first configured layer (no blank intermediate
+  window). The macOS fullscreen workflow (step 10) also passed: the detached
+  window opens normally even when the main window is in Full Screen
+  (`show_path=normal_qt`), and closing a manually fullscreened detached window
+  safely exits fullscreen and tears down without a crash — the trace shows
+  `fullscreen_close_deferred` → `fullscreen_exit_complete` →
+  `cleanup_complete` with `cleanup_status_thread=stopped`, and no
+  `QThread: Destroyed while thread is still running` warning. Cancelling the
+  close confirmation left the viewer usable, and reopening produced exactly one
+  fresh detached window. This remains a macOS-specific workaround for
+  napari 0.6.6 whose Qt-dependent behavior can only be validated manually.
 
 ## Use-Case Template
 

@@ -2054,6 +2054,38 @@ class NeuronViewerWidget(QWidget):
 
         return owner_released, tab_released
 
+    def _stop_flatmap_status_thread(self, status_thread, *, viewer_token: str) -> str:
+        """Terminate and join napari's StatusChecker QThread, guarded."""
+        if status_thread is None:
+            return "unavailable"
+        is_running = getattr(status_thread, "isRunning", None)
+        try:
+            running = bool(is_running()) if callable(is_running) else False
+        except (RuntimeError, TypeError):
+            return "unavailable"
+        if not running:
+            return "already_stopped"
+        # ``close_terminate`` also blocks napari from restarting the thread while
+        # we tear the window down; fall back to ``terminate`` if it is absent.
+        stop = getattr(status_thread, "close_terminate", None)
+        if not callable(stop):
+            stop = getattr(status_thread, "terminate", None)
+        wait = getattr(status_thread, "wait", None)
+        if not callable(stop):
+            return "unavailable"
+        try:
+            stop()
+            if callable(wait):
+                wait()
+            return "stopped"
+        except Exception as error:
+            self._log_flatmap_cleanup_failure(
+                viewer_token,
+                "status_thread_stop",
+                error,
+            )
+            return "failed"
+
     def _finalize_flatmap_viewer_model(
         self,
         viewer,
@@ -2088,6 +2120,7 @@ class NeuronViewerWidget(QWidget):
             stages.setdefault("slicer", "already_shutdown")
             stages.setdefault("dims", "already_disconnected")
             stages.setdefault("layers", "already_empty")
+            stages.setdefault("status_thread", "already_stopped")
             stages.setdefault("window", "already_torn_down")
             stages.setdefault("qt_viewer", "already_closed")
         else:
@@ -2152,6 +2185,18 @@ class NeuronViewerWidget(QWidget):
                             "clear_layers",
                             error,
                         )
+
+            if stage_needs_run("status_thread"):
+                # napari only stops its StatusChecker QThread inside
+                # ``_QtMainWindow.closeEvent``.  On macOS a detached window that
+                # is closed while fullscreen can reach DeferredDelete without
+                # that closeEvent completing, so the thread is still running
+                # when Qt destroys the window ("QThread: Destroyed while thread
+                # is still running" → crash).  Stop it here as part of teardown.
+                stages["status_thread"] = self._stop_flatmap_status_thread(
+                    getattr(qt_window, "status_thread", None),
+                    viewer_token=viewer_token,
+                )
 
             window = getattr(viewer, "window", None)
             if stage_needs_run("window"):

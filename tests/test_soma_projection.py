@@ -702,6 +702,25 @@ class _LifecycleQtViewer:
             raise self._close_error
 
 
+class _LifecycleStatusThread:
+    """Stand-in for napari's StatusChecker QThread."""
+
+    def __init__(self, *, running: bool = True) -> None:
+        self._running = running
+        self.close_terminate_calls = 0
+        self.wait_calls = 0
+
+    def isRunning(self) -> bool:
+        return self._running
+
+    def close_terminate(self) -> None:
+        self.close_terminate_calls += 1
+        self._running = False
+
+    def wait(self) -> None:
+        self.wait_calls += 1
+
+
 class _LifecycleWindow:
     def __init__(
         self,
@@ -709,6 +728,7 @@ class _LifecycleWindow:
         visible: bool = True,
         teardown_error: Exception | None = None,
         qt_viewer_close_error: Exception | None = None,
+        status_thread_running: bool = True,
     ) -> None:
         self.destroyed = _LifecycleSignal()
         self.filters = []
@@ -718,6 +738,9 @@ class _LifecycleWindow:
         self._teardown_error = teardown_error
         self._qt_viewer = _LifecycleQtViewer(
             close_error=qt_viewer_close_error,
+        )
+        self.status_thread = _LifecycleStatusThread(
+            running=status_thread_running,
         )
 
     def installEventFilter(self, event_filter) -> None:
@@ -1072,6 +1095,52 @@ def test_flatmap_deferred_delete_closes_qt_children_before_destroyed_signal(
         for record in caplog.records
     )
     _LifecycleViewer._instances = []
+
+
+def test_flatmap_cleanup_stops_napari_status_thread(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Regression: a detached window closed while fullscreen can reach
+    # DeferredDelete without napari's closeEvent stopping its StatusChecker
+    # QThread, which crashes Qt on destruction.  Our cleanup must stop it.
+    main_viewer = _LifecycleViewer(_LifecycleWindow())
+    qt_window = _LifecycleWindow()
+    viewer = _LifecycleViewer(qt_window)
+    _LifecycleViewer._instances = [main_viewer, viewer]
+    widget = _lifecycle_widget(viewer, _LifecycleTab(viewer))
+    widget._install_flatmap_cleanup_event_filter(viewer, viewer_token="flatmap-1")
+    cleanup_filter = widget._flatmap_cleanup_filters["flatmap-1"]
+    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__["logger"]
+
+    assert qt_window.status_thread.isRunning() is True
+    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
+        cleanup_filter.eventFilter(qt_window, _LifecycleEvent(_FakeQEvent.DeferredDelete))
+
+    assert qt_window.status_thread.close_terminate_calls == 1
+    assert qt_window.status_thread.wait_calls == 1
+    assert qt_window.status_thread.isRunning() is False
+    completion = next(
+        record.getMessage()
+        for record in caplog.records
+        if "event=cleanup_complete" in record.getMessage()
+    )
+    assert "cleanup_status_thread=stopped" in completion
+    assert "cleanup_status=ok" in completion
+    _LifecycleViewer._instances = []
+
+
+def test_flatmap_cleanup_status_thread_stop_is_idempotent() -> None:
+    widget = _lifecycle_widget(_LifecycleViewer(_LifecycleWindow()))
+    thread = _LifecycleStatusThread(running=False)
+
+    # An already-stopped thread is left untouched and reported, not re-stopped.
+    result = widget._stop_flatmap_status_thread(thread, viewer_token="flatmap-1")
+
+    assert result == "already_stopped"
+    assert thread.close_terminate_calls == 0
+    assert widget._stop_flatmap_status_thread(None, viewer_token="flatmap-1") == (
+        "unavailable"
+    )
 
 
 def test_flatmap_destroyed_finalizes_model_and_releases_plugin_references(

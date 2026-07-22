@@ -80,6 +80,8 @@ capture matching QWidget and native QWindow state. Napari's
 `_LayerSlicer.shutdown` records show when full viewer cleanup actually occurs.
 A successful accepted close has `event=cleanup_complete`,
 `cleanup_trigger=deferred_delete`, `cleanup_status=ok`,
+`cleanup_status_thread=stopped` (napari's StatusChecker QThread is stopped
+during teardown so the window is never destroyed with it still running),
 `cleanup_qt_viewer=closed`, `layer_count=0`,
 `napari_viewer_registered=false`, `owner_ref_is_viewer=false`,
 `tab_ref_is_viewer=false`, and `slicer_executor_shutdown=true`. At the 2000 ms
