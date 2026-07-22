@@ -123,11 +123,17 @@ class FlatmapProjectionWidget(QWidget):
         selected_parent_region_ids_provider: Callable[[], list[int]] | None = None,
         selected_region_acronyms_provider: Callable[[], list[str]] | None = None,
         display_viewer_provider: Callable[..., object | None] | None = None,
+        display_viewer_ready_callback: Callable[[object, object], None]
+        | None = None,
+        display_viewer_failed_callback: Callable[[object, str], None]
+        | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._viewer = viewer
         self._display_viewer_provider = display_viewer_provider
+        self._display_viewer_ready_callback = display_viewer_ready_callback
+        self._display_viewer_failed_callback = display_viewer_failed_callback
         self._last_display_viewer = None
         self._database_provider = database_provider
         self._selected_file_ids_provider = selected_file_ids_provider
@@ -193,6 +199,7 @@ class FlatmapProjectionWidget(QWidget):
         """Return the viewer used for flatmap display layers."""
         provider = getattr(self, "_display_viewer_provider", None)
         if callable(provider):
+            previous_viewer = getattr(self, "_last_display_viewer", None)
             try:
                 viewer = provider(create=create)
             except TypeError:
@@ -201,6 +208,18 @@ class FlatmapProjectionWidget(QWidget):
                 viewer = provider()
             if viewer is not None:
                 self._last_display_viewer = viewer
+                if viewer is not previous_viewer:
+                    logger.debug(
+                        "flatmap_viewer_lifecycle "
+                        "event=display_target_selected "
+                        "viewer_object_id=%s previous_viewer_object_id=%s "
+                        "create=%s",
+                        hex(id(viewer)),
+                        hex(id(previous_viewer))
+                        if previous_viewer is not None
+                        else "none",
+                        str(bool(create)).lower(),
+                    )
             return viewer
         return getattr(self, "_viewer", None)
 
@@ -209,6 +228,50 @@ class FlatmapProjectionWidget(QWidget):
 
     def _current_display_viewer(self):
         return self._resolve_display_viewer(create=False)
+
+    def _release_display_viewer(self, viewer) -> bool:
+        """Forget viewer-owned layer handles after its Qt window is destroyed."""
+        if getattr(self, "_last_display_viewer", None) is not viewer:
+            return False
+
+        self._last_display_viewer = None
+        self._projection_layer = None
+        self._region_labels_layer = None
+        self._region_surfaces_layers = []
+        self._region_outlines_layers = []
+        return True
+
+    def _notify_display_viewer_ready(self, layer) -> None:
+        """Report that one display layer is configured and ready to show."""
+        viewer = self._current_display_viewer()
+        if viewer is None or not self._layer_is_in_viewer(layer, viewer=viewer):
+            return
+        callback = getattr(self, "_display_viewer_ready_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback(viewer, layer)
+        except Exception:
+            logger.debug(
+                "Failed to report that the flatmap display viewer is ready.",
+                exc_info=True,
+            )
+
+    def _notify_display_viewer_failed(self, reason: str) -> None:
+        """Report an unsuccessful first render so a hidden viewer can close."""
+        viewer = self._current_display_viewer()
+        if viewer is None:
+            return
+        callback = getattr(self, "_display_viewer_failed_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback(viewer, reason)
+        except Exception:
+            logger.debug(
+                "Failed to report an unsuccessful flatmap display render.",
+                exc_info=True,
+            )
 
     def _display_layers(self, *, create: bool = True):
         viewer = self._resolve_display_viewer(create=create)
@@ -1934,6 +1997,7 @@ class FlatmapProjectionWidget(QWidget):
             show_info("Flatmap projection complete.")
         except Exception as exc:
             logger.exception("Flatmap projection failed")
+            self._notify_display_viewer_failed("projection_failed")
             self._status_label.setText(f"Flatmap projection failed: {exc}")
             show_warning(f"Flatmap projection failed: {exc}")
         finally:
@@ -2506,13 +2570,15 @@ class FlatmapProjectionWidget(QWidget):
         self._summary_label.setText(
             self._format_render_summary(result.summary, render_result.summary)
         )
-        self._create_or_update_render_layer(
+        layer = self._create_or_update_render_layer(
             render_result,
             result.summary,
             flatmap_style=flatmap_style or self._current_style_filename(),
             coordinate_mode=coordinate_mode or self._current_coordinate_mode(),
             render_mode=self._current_render_mode(),
         )
+        if layer is None:
+            self._notify_display_viewer_failed("no_render_layer")
         self._export_btn.setEnabled(not render_result.projected_nodes.empty)
         self._notify_flatmap_correlation_source_changed()
 
@@ -2599,6 +2665,7 @@ class FlatmapProjectionWidget(QWidget):
                 show_info("Flatmap region labels complete.")
         except Exception as exc:
             logger.exception("Flatmap region label creation failed")
+            self._notify_display_viewer_failed("region_labels_failed")
             message = f"Flatmap region labels failed: {exc}"
             self._set_region_labels_status(message)
             show_warning(message)
@@ -2665,6 +2732,7 @@ class FlatmapProjectionWidget(QWidget):
         )
         self._region_labels_layer = layer
         self._focus_projection_view(layer, result.labels)
+        self._notify_display_viewer_ready(layer)
         message = (
             f"Loaded {result.summary.labeled_bins:,} cached region bin(s) "
             f"from profile {result.profile_id}."
@@ -2718,6 +2786,7 @@ class FlatmapProjectionWidget(QWidget):
         )
         self._region_labels_layer = layer
         self._focus_projection_view(layer, result.labels)
+        self._notify_display_viewer_ready(layer)
 
         message = (
             "Created flatmap region labels: "
@@ -3074,6 +3143,10 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 created.append(layer)
             self._region_surfaces_layers = created
+            if created:
+                self._notify_display_viewer_ready(created[0])
+            else:
+                self._notify_display_viewer_failed("region_surfaces_empty")
             message = f"Loaded {len(created)} cached region surface layer(s)."
             self._set_region_labels_status(message)
             if not created:
@@ -3082,6 +3155,7 @@ class FlatmapProjectionWidget(QWidget):
                 )
         except Exception as exc:
             logger.exception("Cached flatmap region surfaces failed")
+            self._notify_display_viewer_failed("region_surfaces_failed")
             show_warning(f"Cached flatmap region surfaces failed: {exc}")
 
     def _create_region_outlines(self) -> None:
@@ -3124,6 +3198,10 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 created.append(layer)
             self._region_outlines_layers = created
+            if created:
+                self._notify_display_viewer_ready(created[0])
+            else:
+                self._notify_display_viewer_failed("region_outlines_empty")
             message = f"Loaded {len(created)} cached region outline layer(s)."
             self._set_region_labels_status(message)
             if not created:
@@ -3132,6 +3210,7 @@ class FlatmapProjectionWidget(QWidget):
                 )
         except Exception as exc:
             logger.exception("Cached flatmap region outlines failed")
+            self._notify_display_viewer_failed("region_outlines_failed")
             show_warning(f"Cached flatmap region outlines failed: {exc}")
 
     def _clear_named_region_layers(self, prefix: str) -> None:
@@ -3409,6 +3488,7 @@ class FlatmapProjectionWidget(QWidget):
             else render_result.volume
         )
         self._focus_projection_view(layer, data)
+        self._notify_display_viewer_ready(layer)
         return layer
 
     def _create_or_update_heatmap_layer(

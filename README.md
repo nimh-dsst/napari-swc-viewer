@@ -31,7 +31,8 @@ pixi run napari
 
 This command will automatically build the package (if needed) before launching napari.
 
-To enable plugin debug logging for clustering diagnostics:
+To enable plugin debug logging for runtime diagnostics, including detached
+flatmap viewer lifecycle events:
 
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
@@ -42,6 +43,42 @@ To write the debug trace to a custom file:
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
 ```
+
+The default file is `~/.napari-swc-viewer/debug.log`. It rotates at 10 MB and
+keeps three backups. Plugin DEBUG records are written to the file and console;
+focused napari layer-slicer DEBUG records are added to the file only.
+
+Detached viewers are created hidden in 3D and shown only after their first
+flatmap layer is configured. A normal first render records
+`event=created_hidden`, `event=first_layer_ready`, `event=show_scheduled`, and
+`event=shown` in that order. `pending_first_show=false` on the final record
+confirms that the viewer left its hidden setup state.
+
+On macOS the detached window is shown through a guarded normal-window path so
+it never inherits napari's app-wide saved fullscreen state. A normal render
+there reports `event=normal_show_requested`, `event=fullscreen_restore_suppressed`,
+and `show_path=normal_qt` on `event=shown` (other platforms report
+`show_path=napari`). If a user manually places the detached window in fullscreen
+and closes it, the close is briefly deferred so the native surface can return to
+normal before teardown: search for `event=fullscreen_close_deferred`,
+`event=fullscreen_exit_requested`, `event=fullscreen_exit_complete`, and
+`event=fullscreen_close_retried`. An `event=fullscreen_guard_failure` record
+marks any guarded fallback (missing Qt/napari private interface or a
+fullscreen-exit timeout). Each snapshot also reports `qt_fullscreen`,
+`qt_window_state`, `napari_saved_fullscreen`, and `fullscreen_close_state`.
+
+To diagnose a detached flatmap window that does not close, launch with a custom
+log path, create a projection, close **SWC Viewer Flatmap**, wait at least two
+seconds, and then close the main napari window. Search the retained trace for
+`flatmap_viewer_lifecycle event=qt_close`, the subsequent
+`event=close_checkpoint` records, `event=qt_deferreddelete`,
+`_LayerSlicer.shutdown`, `event=cleanup_complete`, and the three
+`event=post_destroy_checkpoint` records. A successful accepted close reports
+`cleanup_trigger=deferred_delete`, `cleanup_qt_viewer=closed`, zero retained
+layers, `napari_viewer_registered=false`, both plugin viewer-reference fields
+as `false`, and `slicer_executor_shutdown=true`. At the 2000 ms post-destroy
+checkpoint, both `qt_matching_top_level_widgets` and
+`qt_matching_native_windows` should be `empty`.
 
 For a complete CPD2 walkthrough covering clone/install, `pixi run napari`,
 left-hemisphere SWC-to-Parquet conversion, atlas loading, region queries, soma

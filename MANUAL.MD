@@ -38,7 +38,7 @@ pixi run napari
 
 When napari is open, launch the widget from the Plugins menu and choose **Neuron Viewer**.
 
-To enable debug-level plugin logging for large clustering runs:
+To enable debug-level plugin logging for runtime diagnostics:
 
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
@@ -49,6 +49,67 @@ Optional custom log file:
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
 ```
+
+Without an override, logs are written to
+`~/.napari-swc-viewer/debug.log`. The file rotates at 10 MB and retains three
+backups. Plugin DEBUG output is written to both the file and console. Focused
+napari layer-slicer DEBUG output is captured in the file only.
+
+### Detached flatmap window diagnostics
+
+1. Launch napari with `NAPARI_SWC_VIEWER_DEBUG=1` and a dedicated
+   `NAPARI_SWC_VIEWER_LOG_FILE`.
+2. Open the plugin, project data into the detached **SWC Viewer Flatmap**
+   window, use the operating-system control to close that window, and accept
+   napari's close confirmation. Cancelling the confirmation must leave the
+   existing viewer and layers usable.
+3. Wait at least two seconds so the bounded post-close checkpoints run, then
+   project again and confirm that exactly one fresh detached window opens.
+   Close it again, then close the main napari window and retain the complete
+   log.
+
+The trace records `flatmap_viewer_lifecycle event=qt_close`, close checkpoints
+at 0, 250, and 2000 ms, `event=qt_deferreddelete`, registered napari viewers,
+retained plugin references, flatmap worker states, and Python thread names.
+Before these close records, a successful first display records
+`event=created_hidden`, `event=first_layer_ready`, `event=show_scheduled`, and
+`event=shown`. The window should not become visible before `event=shown`, and
+that record should report `pending_first_show=false`.
+After destruction, three additional `event=post_destroy_checkpoint` records
+capture matching QWidget and native QWindow state. Napari's
+`_LayerSlicer.shutdown` records show when full viewer cleanup actually occurs.
+A successful accepted close has `event=cleanup_complete`,
+`cleanup_trigger=deferred_delete`, `cleanup_status=ok`,
+`cleanup_qt_viewer=closed`, `layer_count=0`,
+`napari_viewer_registered=false`, `owner_ref_is_viewer=false`,
+`tab_ref_is_viewer=false`, and `slicer_executor_shutdown=true`. At the 2000 ms
+post-destroy checkpoint, `qt_matching_top_level_widgets=empty` and
+`qt_matching_native_windows=empty`. Any `event=cleanup_failure` record
+identifies the teardown stage that could not be completed.
+
+### macOS fullscreen diagnostics
+
+On macOS napari reapplies its app-wide saved geometry — including fullscreen —
+to every viewer shown through `Window.show()`, and, on close, runs a blocking
+`showNormal`/`processEvents` cycle while the window is fullscreen. The plugin
+works around both for the detached viewer. Each lifecycle snapshot reports
+`qt_fullscreen`, `qt_window_state`, `napari_saved_fullscreen`, and
+`fullscreen_close_state`.
+
+- On show, the guarded normal-window path records `event=normal_show_requested`
+  and `event=fullscreen_restore_suppressed`, and `event=shown` reports
+  `show_path=normal_qt`. On other platforms `event=shown` reports
+  `show_path=napari`. The detached window must open normally even when the main
+  napari window is in macOS Full Screen.
+- When a manually fullscreened detached window is closed, the close is deferred
+  and retried after the window returns to normal: `event=fullscreen_close_deferred`
+  → `event=fullscreen_exit_requested` → `event=fullscreen_exit_complete` →
+  `event=fullscreen_close_retried`. The retry still presents napari's
+  confirmation; cancelling leaves the viewer usable in normal window mode.
+- `event=fullscreen_guard_failure` marks any guarded fallback — a missing
+  Qt/napari private interface (`reason=confirm_need_unavailable`) or a
+  fullscreen-exit timeout (`reason=exit_timed_out`); in the former case the
+  window is left open in normal mode and must be closed again.
 
 ## Quick validation commands
 

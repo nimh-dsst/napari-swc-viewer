@@ -29,7 +29,7 @@ Unless a use case says otherwise:
 | [UC-001](#uc-001-download-an-allen-mouse-atlas) | Download and cache a supported Allen Mouse Brain Atlas | Not run |
 | [UC-002](#uc-002-convert-swc-files-to-parquet) | Convert a folder or selected SWC files into one Parquet file | Not run |
 | [UC-003](#uc-003-prepare-a-whole-neuron-parquet-for-flatmap-viewing) | Append bilateral shaped/square flatmap and depth coordinates to a whole Parquet | Not run |
-| [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
+| [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Failed |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -313,6 +313,8 @@ projecting meshes, or converting region coordinates while viewing.
 - Ensure there is enough writable disk space for both shaped and square cache
   profiles. Use the default 256 XY bins and 25 μm depth bins for this test.
 - Select at least one parent region with descendants in the **Regions** tab.
+- For the detached-window close check, launch with a dedicated trace:
+  `NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari`.
 
 **Steps and expected results**
 
@@ -335,6 +337,8 @@ projecting meshes, or converting region coordinates while viewing.
    Directory...** and select the existing cache. Repeat the cache selection
    several times on both Windows and macOS when those systems are available.
    **Expected:** Cache validation runs without freezing either napari window.
+   The detached window first becomes visible with its populated 3D heatmap;
+   there is no visible blank intermediate flatmap window.
    The plugin parses `flatmap-region-cache.json`, memory-maps its arrays, and
    lists only profiles compatible with the Parquet lookup-set ID and selected
    style. A heatmap whose fixed grid matches the selected profile remains
@@ -369,13 +373,66 @@ projecting meshes, or converting region coordinates while viewing.
 8. **Action:** Explicitly choose **Recompute from NRRDs**.
    **Expected:** The legacy runtime lookup workflow becomes available only for
    this explicit fallback choice.
+9. **Action:** After a projection appears, use the operating-system close
+   control on the detached **SWC Viewer Flatmap** window while leaving the main
+   napari window open, and accept napari's close confirmation. Wait at least
+   two seconds, then click **Project to Flatmap** again. Repeat the accepted
+   close and reopen cycle three times, then close the main napari window and
+   retain the debug log. Repeat once while cancelling napari's confirmation.
+   **Expected:** The detached window closes completely, the main napari window
+   remains responsive, and the detached viewer releases its resources. The
+   next projection opens exactly one fresh detached flatmap window with the
+   expected layers and never exposes a blank setup window. Cancelling the
+   confirmation keeps the original detached viewer and its layers usable. Each
+   fresh viewer records `event=created_hidden`, `event=first_layer_ready`,
+   `event=show_scheduled`, and `event=shown` before the close records, with
+   `pending_first_show=false` after it is shown. For each accepted close, the
+   log contains
+   `event=qt_close`, three `event=close_checkpoint` records,
+   `event=qt_deferreddelete`, `_LayerSlicer.shutdown`, and
+   `event=cleanup_complete` with `cleanup_trigger=deferred_delete`,
+   `cleanup_qt_viewer=closed`, zero layers, `napari_viewer_registered=false`,
+   both plugin viewer references false, and `slicer_executor_shutdown=true`.
+   Three `event=post_destroy_checkpoint` records follow; the 2000 ms record has
+   no matching flat-map QWidget or native QWindow. The trace contains no
+   `event=cleanup_failure`.
+10. **Action (macOS only):** Put the main napari window in macOS Full Screen,
+    then create a flat-map projection. Close and reopen the detached window three
+    times while the main viewer stays fullscreen. Then manually place the
+    detached **SWC Viewer Flatmap** window in fullscreen and close it; cancel the
+    confirmation once and confirm the viewer is still usable, then close it again
+    and accept.
+    **Expected:** The detached window opens normally with populated content while
+    the main window remains fullscreen — the trace shows `show_path=normal_qt`,
+    `event=normal_show_requested`, and `event=fullscreen_restore_suppressed`, and
+    the main window stays fullscreen and registered. Closing the manually
+    fullscreened detached window safely exits fullscreen, presents confirmation,
+    and closes completely, recording `event=fullscreen_close_deferred`,
+    `event=fullscreen_exit_requested`, `event=fullscreen_exit_complete`, and
+    `event=fullscreen_close_retried`, then the normal
+    `event=qt_deferreddelete`/`event=cleanup_complete` cleanup. Cancelling leaves
+    the viewer usable in normal window mode. There is no ghost window, no crash
+    or OS crash report, no `event=fullscreen_guard_failure`, and no change to the
+    main viewer's fullscreen state. napari itself writes `window_fullscreen` to
+    its global settings on close; the detached viewer must still open normally on
+    the next projection regardless of that saved value.
 
 **Manual verification**
 
-- Status: Passed
+- Status: Failed
 - Last verified: 2026-07-22
-- Notes: Manual testing confirmed stable cache activation with the reported
-  version-3 single-color heatmap workflow.
+- Notes: Cache activation passed with the version-3 single-color heatmap
+  workflow, but the detached flatmap window did not fully close while the main
+  napari window remained open. Logs from the cleanup fixes show complete model,
+  QtViewer, QWidget, and native-window cleanup, but also reveal that napari
+  initially exposed an empty window before its first flatmap layer was ready.
+  A later fix creates that viewer hidden in 3D and shows it only after the first
+  configured layer. The current change additionally prevents the detached viewer
+  from inheriting napari's app-wide macOS fullscreen state on show and guards the
+  close of a manually fullscreened detached window (step 10). This is a
+  macOS-specific workaround targeting napari 0.6.6 whose Qt-dependent behavior
+  can only be validated manually; retain Failed status until both the close and
+  the new fullscreen workflow pass on macOS.
 
 ## Use-Case Template
 

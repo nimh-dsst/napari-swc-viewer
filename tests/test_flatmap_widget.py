@@ -1719,6 +1719,107 @@ def test_flatmap_render_layers_use_display_viewer_provider(monkeypatch) -> None:
     assert display_viewer.camera.center == (0.0, 1.0, 2.0)
 
 
+@pytest.mark.parametrize(
+    ("render_mode", "heatmap_color_mode"),
+    [
+        ("heatmap", "single"),
+        ("heatmap", "individual"),
+        ("points", "single"),
+    ],
+)
+def test_first_render_reports_ready_after_layer_focus(
+    monkeypatch,
+    render_mode: str,
+    heatmap_color_mode: str,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    display_viewer = _DummyViewer()
+    widget._display_viewer_provider = lambda create=True: display_viewer
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: heatmap_color_mode
+    )
+    events = []
+    original_focus = widget._focus_projection_view
+
+    def record_focus(layer, data) -> None:
+        original_focus(layer, data)
+        events.append(("focused", layer))
+
+    def record_ready(viewer, layer) -> None:
+        assert viewer is display_viewer
+        assert layer in display_viewer.layers
+        assert events[-1] == ("focused", layer)
+        events.append(("ready", layer))
+
+    widget._focus_projection_view = record_focus
+    widget._display_viewer_ready_callback = record_ready
+
+    layer = widget._create_or_update_render_layer(
+        _binned_render_result(module),
+        _simple_projection_summary(module, total_nodes=4),
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode=render_mode,
+    )
+
+    assert layer is not None
+    assert events == [("focused", layer), ("ready", layer)]
+
+
+def test_display_failure_callback_receives_current_viewer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    display_viewer = _DummyViewer()
+    widget._display_viewer_provider = lambda create=True: display_viewer
+    calls = []
+    widget._display_viewer_failed_callback = (
+        lambda viewer, reason: calls.append((viewer, reason))
+    )
+
+    widget._notify_display_viewer_failed("projection_failed")
+
+    assert calls == [(display_viewer, "projection_failed")]
+
+
+def test_release_display_viewer_clears_only_matching_viewer_layer_handles(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    viewer = _DummyViewer()
+    other_viewer = _DummyViewer()
+    projection_layer = object()
+    labels_layer = object()
+    surfaces = [object()]
+    outlines = [object()]
+    projected_nodes = pd.DataFrame({"file_id": ["a.swc"]})
+    cache_profile = object()
+    widget._last_display_viewer = viewer
+    widget._projection_layer = projection_layer
+    widget._region_labels_layer = labels_layer
+    widget._region_surfaces_layers = surfaces
+    widget._region_outlines_layers = outlines
+    widget._last_projected_nodes = projected_nodes
+    widget._active_cache_profile = cache_profile
+
+    assert widget._release_display_viewer(other_viewer) is False
+    assert widget._last_display_viewer is viewer
+    assert widget._projection_layer is projection_layer
+    assert widget._region_labels_layer is labels_layer
+    assert widget._region_surfaces_layers is surfaces
+    assert widget._region_outlines_layers is outlines
+
+    assert widget._release_display_viewer(viewer) is True
+    assert widget._last_display_viewer is None
+    assert widget._projection_layer is None
+    assert widget._region_labels_layer is None
+    assert widget._region_surfaces_layers == []
+    assert widget._region_outlines_layers == []
+    assert widget._last_projected_nodes is projected_nodes
+    assert widget._active_cache_profile is cache_profile
+
+
 def _simple_projection_summary(module, total_nodes: int = 1):
     return module.ProjectionSummary(total_nodes, total_nodes, 0, 0, 0, 0, 0, 1, 0)
 
