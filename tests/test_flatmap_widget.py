@@ -1300,6 +1300,173 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
     assert "lookup NRRDs" in widget._status_label.text
 
 
+def test_add_soma_projects_only_soma_nodes_to_dedicated_layer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_projection_widget(widget, module, _augmented_nodes())
+    captured = {}
+
+    def fake_lookup(self, nodes, **_kwargs):
+        captured["nodes"] = nodes
+        render = types.SimpleNamespace(
+            points=np.asarray([[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]]),
+            point_file_ids=["a.swc", "b.swc"],
+            summary=types.SimpleNamespace(
+                rendered_nodes=2,
+                total_nodes=2,
+                to_dict=lambda: {"rendered_nodes": 2},
+            ),
+        )
+        result = types.SimpleNamespace(
+            projected_nodes=nodes,
+            summary=types.SimpleNamespace(to_dict=lambda: {"total_nodes": 2}),
+        )
+        return result, render, None
+
+    widget._project_from_lookup_files = types.MethodType(fake_lookup, widget)
+
+    widget._add_soma()
+
+    # Only soma nodes (type == 1) are handed to the projector.
+    assert captured["nodes"]["type"].tolist() == [1, 1]
+    assert captured["nodes"]["node_id"].tolist() == [1, 1]
+
+    # A dedicated soma layer is added and tracked, separate from the main
+    # projection layer.
+    soma_layers = [
+        layer
+        for layer in widget._viewer.layers
+        if layer.name == module._SOMA_POINTS_LAYER_NAME
+    ]
+    assert len(soma_layers) == 1
+    assert widget._soma_layer is soma_layers[0]
+    assert soma_layers[0].metadata["flatmap_soma_only"] is True
+    np.testing.assert_allclose(
+        soma_layers[0].face_color,
+        [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]],
+    )
+    assert "soma node" in widget._status_label.text
+
+
+def test_add_soma_uses_duckdb_soma_query_not_full_node_scan(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    all_nodes = _augmented_nodes()
+    soma_nodes = all_nodes[all_nodes["type"] == 1].reset_index(drop=True)
+    calls = {"soma": 0, "full": 0}
+
+    def _get_soma(file_ids):
+        calls["soma"] += 1
+        return soma_nodes[soma_nodes["file_id"].isin(file_ids)].reset_index(
+            drop=True
+        )
+
+    def _get_full(_file_ids):
+        calls["full"] += 1
+        raise AssertionError(
+            "Full node scan must not run when a soma query is available"
+        )
+
+    widget._database_provider = lambda: types.SimpleNamespace(
+        get_soma_nodes_for_rendering=_get_soma,
+        get_neurons_for_rendering=_get_full,
+    )
+    widget._table_file_ids_provider = lambda: ["a.swc", "b.swc"]
+    widget._selected_file_ids_provider = lambda: []
+    widget._source_combo = types.SimpleNamespace(
+        currentData=lambda: module._SOURCE_ALL
+    )
+    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 4)
+    widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
+    widget._exclude_depth_minus_one_cb = types.SimpleNamespace(
+        isChecked=lambda: False
+    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._coordinate_mode_combo = types.SimpleNamespace(
+        currentData=lambda: "microns"
+    )
+    captured = {}
+
+    def fake_lookup(self, nodes, **_kwargs):
+        captured["nodes"] = nodes
+        render = types.SimpleNamespace(
+            points=np.asarray([[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]]),
+            point_file_ids=["a.swc", "b.swc"],
+            summary=types.SimpleNamespace(
+                rendered_nodes=2, total_nodes=2, to_dict=lambda: {}
+            ),
+        )
+        result = types.SimpleNamespace(
+            projected_nodes=nodes,
+            summary=types.SimpleNamespace(to_dict=lambda: {}),
+        )
+        return result, render, None
+
+    widget._project_from_lookup_files = types.MethodType(fake_lookup, widget)
+
+    widget._add_soma()
+
+    assert calls == {"soma": 1, "full": 0}
+    assert captured["nodes"]["type"].tolist() == [1, 1]
+
+
+def test_add_soma_reuses_existing_layer_on_reprojection(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_projection_widget(widget, module, _augmented_nodes())
+
+    def fake_lookup(self, nodes, **_kwargs):
+        render = types.SimpleNamespace(
+            points=np.asarray([[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]]),
+            point_file_ids=["a.swc", "b.swc"],
+            summary=types.SimpleNamespace(
+                rendered_nodes=2,
+                total_nodes=2,
+                to_dict=lambda: {},
+            ),
+        )
+        result = types.SimpleNamespace(
+            projected_nodes=nodes,
+            summary=types.SimpleNamespace(to_dict=lambda: {}),
+        )
+        return result, render, None
+
+    widget._project_from_lookup_files = types.MethodType(fake_lookup, widget)
+
+    widget._add_soma()
+    first = widget._soma_layer
+    widget._add_soma()
+
+    assert widget._soma_layer is first
+    soma_layers = [
+        layer
+        for layer in widget._viewer.layers
+        if layer.name == module._SOMA_POINTS_LAYER_NAME
+    ]
+    assert len(soma_layers) == 1
+
+
+def test_add_soma_without_soma_nodes_reports_and_adds_no_layer(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    nodes = _augmented_nodes()
+    nodes["type"] = [3, 3, 3]
+    _configure_projection_widget(widget, module, nodes)
+
+    def fail_lookup(self, _nodes, **_kwargs):
+        raise AssertionError("Projection should not run without soma nodes")
+
+    widget._project_from_lookup_files = types.MethodType(fail_lookup, widget)
+
+    widget._add_soma()
+
+    assert "No soma nodes" in widget._status_label.text
+    assert widget._viewer.layers == []
+    assert getattr(widget, "_soma_layer", None) is None
+
+
 def test_explicit_precomputed_v3_square_never_loads_selected_nrrds(
     monkeypatch,
 ) -> None:

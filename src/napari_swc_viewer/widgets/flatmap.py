@@ -69,6 +69,7 @@ from ..flatmap_projection import (
     project_and_build_segments,
     summarize_projection,
 )
+from ..swc import NodeType
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ _OLD_SHAPES_LAYER_NAME = "Isocortex Flatmap Traces"
 _HEATMAP_LAYER_NAME = "Isocortex Flatmap Heatmap"
 _GROUPED_HEATMAP_LAYER_PREFIX = f"{_HEATMAP_LAYER_NAME}: "
 _POINTS_LAYER_NAME = "Isocortex Flatmap Points"
+_SOMA_POINTS_LAYER_NAME = "Isocortex Flatmap Somas"
 _REGION_LABELS_LAYER_NAME = "Flatmap Region Labels"
 _REGION_SURFACES_LAYER_NAME = "Flatmap Region Surfaces"
 _REGION_OUTLINES_LAYER_NAME = "Flatmap Region Outlines"
@@ -167,6 +169,7 @@ class FlatmapProjectionWidget(QWidget):
         self._pending_validated_cache: tuple[Path, object, str | None] | None = None
         self._cache_open_shutting_down = False
         self._projection_layer = None
+        self._soma_layer = None
         self._region_labels_layer = None
         self._region_surfaces_layers: list[object] = []
         self._region_outlines_layers: list[object] = []
@@ -494,6 +497,13 @@ class FlatmapProjectionWidget(QWidget):
         self._project_btn = QPushButton("Project to Flatmap")
         self._project_btn.clicked.connect(self._project)
         actions_row.addWidget(self._project_btn)
+        self._add_soma_btn = QPushButton("Add Soma")
+        self._add_soma_btn.setToolTip(
+            "Project only soma nodes into flatmap + depth space as a "
+            "separate point layer."
+        )
+        self._add_soma_btn.clicked.connect(self._add_soma)
+        actions_row.addWidget(self._add_soma_btn)
         self._export_btn = QPushButton("Export CSV...")
         self._export_btn.setEnabled(False)
         self._export_btn.clicked.connect(self._export_csv)
@@ -1894,6 +1904,31 @@ class FlatmapProjectionWidget(QWidget):
             raise RuntimeError("No neuron rows matched the requested file IDs.")
         return nodes
 
+    def _query_soma_nodes(self, file_ids: list[object]) -> pd.DataFrame:
+        """Query only soma node rows (type == 1) for the given files.
+
+        Prefers a DuckDB-side ``type = 1`` filter so only soma rows are
+        materialized. Falls back to loading every node and filtering in
+        pandas when the database lacks the soma-scoped query.
+        """
+        db = self._database_provider()
+        if db is None:
+            raise RuntimeError("Load a neuron Parquet before projecting to flatmap.")
+        if not file_ids:
+            raise RuntimeError("No neurons are available to project.")
+
+        getter = getattr(db, "get_soma_nodes_for_rendering", None)
+        if callable(getter):
+            nodes = getter(file_ids)
+        else:
+            nodes = self._query_nodes(file_ids)
+            nodes = nodes[nodes["type"] == NodeType.SOMA]
+        if nodes is None or nodes.empty:
+            raise RuntimeError(
+                "No soma nodes (type == 1) were found for the selected neurons."
+            )
+        return nodes
+
     def _lookup_files_ready(self) -> bool:
         return self._flatmap_path is not None and self._depth_path is not None
 
@@ -1917,6 +1952,147 @@ class FlatmapProjectionWidget(QWidget):
             }.issubset(names)
         )
 
+    def _resolve_projection_plan(
+        self, projection_source: str
+    ) -> tuple[bool, int]:
+        """Decide whether to use lookup NRRDs and how many progress steps."""
+        if projection_source == _PROJECTION_SOURCE_RECOMPUTE:
+            self._projection_request_ready()
+            use_lookup_files = True
+        elif projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
+            use_lookup_files = False
+        else:
+            use_lookup_files = self._lookup_files_ready()
+        total_steps = 6 if use_lookup_files else 4
+        return use_lookup_files, total_steps
+
+    def _build_projection_artifacts(
+        self,
+        nodes: pd.DataFrame,
+        use_lookup_files: bool,
+        *,
+        projection_source: str,
+        total_steps: int,
+    ) -> tuple[
+        FlatmapProjectionResult,
+        FlatmapRenderResult,
+        FlatmapLookupStats | None,
+        str,
+        str,
+        str,
+    ]:
+        """Project queried nodes and build render data for the current mode."""
+        if use_lookup_files:
+            result, render_result, lookup_stats = self._project_from_lookup_files(
+                nodes,
+                progress_callback=self._set_projection_progress,
+                progress_total=total_steps,
+            )
+            flatmap_style = self._current_style_filename()
+            coordinate_mode = self._current_coordinate_mode()
+            source_note = "lookup NRRDs"
+        else:
+            if not self._has_parquet_flatmap_depth_columns(nodes):
+                if projection_source == "legacy_auto":
+                    raise RuntimeError(
+                        "Choose both flatmap and depth NRRD files, or load an "
+                        "augmented Parquet with x_flat, y_flat, and depth_um "
+                        "columns."
+                    )
+                raise RuntimeError(
+                    "Precomputed viewing requires a version-3 Parquet with "
+                    "bilateral shaped/square flatmap and depth columns. "
+                    "Choose Recompute from NRRDs explicitly to use lookup files."
+                )
+            if projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
+                self._validate_precomputed_parquet_contract(nodes)
+            result, render_result, lookup_stats = (
+                self._project_from_parquet_columns(
+                    nodes,
+                    progress_callback=self._set_projection_progress,
+                    progress_total=total_steps,
+                )
+            )
+            flatmap_style = (
+                "precomputed_parquet"
+                if projection_source == "legacy_auto"
+                else self._current_style_key()
+            )
+            coordinate_mode = "parquet_columns"
+            source_note = "Parquet flatmap/depth columns"
+        return (
+            result,
+            render_result,
+            lookup_stats,
+            flatmap_style,
+            coordinate_mode,
+            source_note,
+        )
+
+    def _add_soma(self) -> None:
+        """Project only soma nodes into a dedicated flatmap point layer.
+
+        Mirrors the Data tab's "Add Soma Only" action but renders into the
+        separate flatmap + depth viewer as an independent point layer that
+        does not replace the main projection layer.
+        """
+        projection_source = self._current_projection_source()
+        # Soma projection always renders per-node points, so the DuckDB
+        # heatmap fast path (which cannot filter by node type) is skipped.
+        use_lookup_files, total_steps = self._resolve_projection_plan(
+            projection_source
+        )
+        self._set_projection_controls_enabled(False)
+        self._set_projection_progress(
+            "Querying soma rows...",
+            0,
+            total_steps,
+        )
+        try:
+            file_ids = self._file_ids_for_source()
+            soma_nodes = self._query_soma_nodes(file_ids)
+
+            (
+                result,
+                render_result,
+                _lookup_stats,
+                _flatmap_style,
+                _coordinate_mode,
+                source_note,
+            ) = self._build_projection_artifacts(
+                soma_nodes,
+                use_lookup_files,
+                projection_source=projection_source,
+                total_steps=total_steps,
+            )
+
+            self._set_projection_progress(
+                "Updating soma layer...",
+                total_steps - 1,
+                total_steps,
+            )
+            layer = self._create_or_update_soma_layer(
+                render_result, result.summary
+            )
+            if layer is None:
+                raise RuntimeError(
+                    "No soma nodes mapped into flatmap + depth space."
+                )
+            self._set_projection_progress("Done", total_steps, total_steps)
+            self._status_label.setText(
+                f"Rendered {render_result.summary.rendered_nodes:,} of "
+                f"{render_result.summary.total_nodes:,} soma node(s) using "
+                f"{source_note}."
+            )
+            show_info("Flatmap soma projection complete.")
+        except Exception as exc:
+            logger.exception("Flatmap soma projection failed")
+            self._status_label.setText(f"Flatmap soma projection failed: {exc}")
+            show_warning(f"Flatmap soma projection failed: {exc}")
+        finally:
+            self._hide_projection_progress()
+            self._set_projection_controls_enabled(True)
+
     def _project(self) -> None:
         """Run projection from the current UI state and render the layer."""
         projection_source = self._current_projection_source()
@@ -1928,14 +2104,9 @@ class FlatmapProjectionWidget(QWidget):
             # worker thread instead of loading every node into pandas.
             self._start_precomputed_heatmap_worker()
             return
-        if projection_source == _PROJECTION_SOURCE_RECOMPUTE:
-            self._projection_request_ready()
-            use_lookup_files = True
-        elif projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
-            use_lookup_files = False
-        else:
-            use_lookup_files = self._lookup_files_ready()
-        total_steps = 6 if use_lookup_files else 4
+        use_lookup_files, total_steps = self._resolve_projection_plan(
+            projection_source
+        )
         self._set_projection_controls_enabled(False)
         self._set_projection_progress(
             "Querying neuron rows...",
@@ -1946,44 +2117,19 @@ class FlatmapProjectionWidget(QWidget):
             file_ids = self._file_ids_for_source()
             nodes = self._query_nodes(file_ids)
 
-            if use_lookup_files:
-                result, render_result, lookup_stats = self._project_from_lookup_files(
-                    nodes,
-                    progress_callback=self._set_projection_progress,
-                    progress_total=total_steps,
-                )
-                flatmap_style = self._current_style_filename()
-                coordinate_mode = self._current_coordinate_mode()
-                source_note = "lookup NRRDs"
-            else:
-                if not self._has_parquet_flatmap_depth_columns(nodes):
-                    if projection_source == "legacy_auto":
-                        raise RuntimeError(
-                            "Choose both flatmap and depth NRRD files, or load an "
-                            "augmented Parquet with x_flat, y_flat, and depth_um "
-                            "columns."
-                        )
-                    raise RuntimeError(
-                        "Precomputed viewing requires a version-3 Parquet with "
-                        "bilateral shaped/square flatmap and depth columns. "
-                        "Choose Recompute from NRRDs explicitly to use lookup files."
-                    )
-                if projection_source == _PROJECTION_SOURCE_PRECOMPUTED:
-                    self._validate_precomputed_parquet_contract(nodes)
-                result, render_result, lookup_stats = (
-                    self._project_from_parquet_columns(
-                        nodes,
-                        progress_callback=self._set_projection_progress,
-                        progress_total=total_steps,
-                    )
-                )
-                flatmap_style = (
-                    "precomputed_parquet"
-                    if projection_source == "legacy_auto"
-                    else self._current_style_key()
-                )
-                coordinate_mode = "parquet_columns"
-                source_note = "Parquet flatmap/depth columns"
+            (
+                result,
+                render_result,
+                lookup_stats,
+                flatmap_style,
+                coordinate_mode,
+                source_note,
+            ) = self._build_projection_artifacts(
+                nodes,
+                use_lookup_files,
+                projection_source=projection_source,
+                total_steps=total_steps,
+            )
 
             self._set_projection_progress(
                 "Updating flatmap layer...",
@@ -2464,10 +2610,11 @@ class FlatmapProjectionWidget(QWidget):
             progress_callback(message, current, total)
 
     def _set_projection_controls_enabled(self, enabled: bool) -> None:
-        button = getattr(self, "_project_btn", None)
-        set_enabled = getattr(button, "setEnabled", None)
-        if callable(set_enabled):
-            set_enabled(bool(enabled))
+        for name in ("_project_btn", "_add_soma_btn"):
+            button = getattr(self, name, None)
+            set_enabled = getattr(button, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
 
     def _set_projection_progress(
         self,
@@ -4225,6 +4372,72 @@ class FlatmapProjectionWidget(QWidget):
         refresh = getattr(layer, "refresh", None)
         if callable(refresh):
             refresh()
+        return layer
+
+    def _cached_soma_layer(self):
+        """Return the tracked soma layer if it still lives in the viewer."""
+        layer = getattr(self, "_soma_layer", None)
+        if layer is None:
+            return None
+        if not self._layer_is_in_viewer(layer):
+            self._soma_layer = None
+            return None
+        return layer
+
+    def _create_or_update_soma_layer(
+        self,
+        render_result: FlatmapRenderResult,
+        projection_summary: ProjectionSummary,
+    ):
+        """Create or update the dedicated flatmap soma point layer."""
+        points = render_result.points
+        if points is None or len(points) == 0:
+            return None
+
+        colors = self._colors_for_file_ids(render_result.point_file_ids)
+        metadata = {
+            "projection_kind": "isocortex_flatmap",
+            "flatmap_render_mode": _RENDER_POINTS,
+            "flatmap_soma_only": True,
+            "projection_summary": projection_summary.to_dict(),
+            "render_summary": render_result.summary.to_dict(),
+            "flatmap_path": str(self._flatmap_path) if self._flatmap_path else "",
+            "depth_path": str(self._depth_path) if self._depth_path else "",
+        }
+
+        layer = self._cached_soma_layer() or self._find_layer_by_name(
+            _SOMA_POINTS_LAYER_NAME
+        )
+        if layer is None:
+            layer = self._display_viewer().add_points(
+                points,
+                name=_SOMA_POINTS_LAYER_NAME,
+                size=1.0,
+                face_color=colors,
+                border_width=0.0,
+                blending="translucent",
+                metadata=metadata,
+            )
+        else:
+            blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
+            if callable(blocker):
+                with blocker():
+                    layer.data = points
+                    layer.face_color = colors
+                    layer.metadata = metadata
+                    layer.visible = True
+            else:
+                layer.data = points
+                layer.face_color = colors
+                layer.metadata = metadata
+                layer.visible = True
+            refresh = getattr(layer, "refresh", None)
+            if callable(refresh):
+                refresh()
+
+        self._soma_layer = layer
+        self._focus_projection_view(layer, points)
+        self._notify_display_viewer_ready(layer)
         return layer
 
     def _focus_projection_view(self, layer, data: np.ndarray) -> None:

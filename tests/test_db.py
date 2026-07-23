@@ -1,0 +1,52 @@
+"""Tests for NeuronDatabase query helpers."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+
+from napari_swc_viewer.db import NeuronDatabase
+
+
+def _write_source_parquet(path: Path) -> None:
+    pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "a.swc", "b.swc"],
+            "node_id": [1, 2, 3, 1],
+            "type": [1, 3, 2, 1],
+            "x": [10.0, 20.0, 30.0, 40.0],
+            "y": [10.0, 20.0, 30.0, 40.0],
+            "z": [10.0, 20.0, 30.0, 40.0],
+            "parent_id": [-1, 1, 2, -1],
+            "region_acronym": ["REG", "REG", "REG", "R2"],
+            "neuron_id": ["a", "a", "a", "b"],
+        }
+    ).to_parquet(path, index=False)
+
+
+def test_get_soma_nodes_for_rendering_returns_only_soma_rows(tmp_path) -> None:
+    path = tmp_path / "neurons.parquet"
+    _write_source_parquet(path)
+    db = NeuronDatabase(path)
+    try:
+        rows = db.get_soma_nodes_for_rendering(["a.swc", "b.swc"])
+    finally:
+        db.close()
+
+    # Only type == 1 rows survive, and every column is preserved.
+    assert rows["type"].tolist() == [1, 1]
+    assert rows["file_id"].tolist() == ["a.swc", "b.swc"]
+    assert rows["node_id"].tolist() == [1, 1]
+    assert {"parent_id", "x", "y", "z"}.issubset(rows.columns)
+
+
+def test_get_soma_nodes_for_rendering_empty_file_ids(tmp_path) -> None:
+    path = tmp_path / "neurons.parquet"
+    _write_source_parquet(path)
+    db = NeuronDatabase(path)
+    try:
+        rows = db.get_soma_nodes_for_rendering([])
+    finally:
+        db.close()
+    assert rows.empty
