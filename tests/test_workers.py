@@ -1653,3 +1653,111 @@ def test_convert_point_csv_worker_emits_error(monkeypatch, tmp_path):
 
     assert not finished
     assert errors == ["bad headers"]
+
+
+def _write_flatmap_v3_parquet(path: Path) -> None:
+    rng = np.random.default_rng(3)
+    n = 1500
+    x = rng.uniform(0.0, 100.0, n).astype(np.float32)
+    y = rng.uniform(0.0, 80.0, n).astype(np.float32)
+    depth = rng.uniform(0.0, 700.0, n).astype(np.float32)
+    frame = pd.DataFrame(
+        {
+            "file_id": [f"neuron_{i % 4}" for i in range(n)],
+            "node_id": np.arange(n, dtype=np.int32),
+            "parent_id": np.full(n, -1, dtype=np.int32),
+            "type": np.full(n, 3, dtype=np.int32),
+            "x_flat_shaped": x,
+            "y_flat_shaped": y,
+            "x_flat_square": x,
+            "y_flat_square": y,
+            "depth_um": depth,
+            "flatmap_shaped_valid": np.ones(n, dtype=bool),
+            "flatmap_square_valid": np.ones(n, dtype=bool),
+            "depth_valid": np.ones(n, dtype=bool),
+        }
+    )
+    frame.to_parquet(path, index=False)
+
+
+def test_flatmap_heatmap_worker_emits_single_volume(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "flatmap_v3.parquet"
+    _write_flatmap_v3_parquet(path)
+
+    worker = workers.FlatmapHeatmapWorker(
+        str(path),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=(0.0, 100.0),
+        y_bounds=(0.0, 80.0),
+        depth_range_um=(0.0, 700.0),
+        xy_bins=16,
+        depth_bin_um=50.0,
+        include_depth_minus_one=False,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert errors == []
+    assert len(finished) == 1
+    result = finished[0]
+    assert result.volume is not None
+    assert result.render_summary.rendered_nodes == 1500
+    assert float(result.volume.sum()) == 1500.0
+
+
+def test_flatmap_heatmap_worker_derives_bounds_when_missing(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "flatmap_v3.parquet"
+    _write_flatmap_v3_parquet(path)
+
+    worker = workers.FlatmapHeatmapWorker(
+        str(path),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=None,
+        y_bounds=None,
+        depth_range_um=None,
+        xy_bins=16,
+        depth_bin_um=50.0,
+        include_depth_minus_one=False,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert errors == []
+    assert len(finished) == 1
+    assert float(finished[0].volume.sum()) == 1500.0
+
+
+def test_flatmap_heatmap_worker_reports_error(tmp_path):
+    workers = _import_workers_module()
+    worker = workers.FlatmapHeatmapWorker(
+        str(tmp_path / "does_not_exist.parquet"),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=(0.0, 1.0),
+        y_bounds=(0.0, 1.0),
+        depth_range_um=(0.0, 1.0),
+        xy_bins=8,
+        depth_bin_um=10.0,
+        include_depth_minus_one=False,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert finished == []
+    assert len(errors) == 1

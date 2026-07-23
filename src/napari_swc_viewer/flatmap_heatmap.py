@@ -2,16 +2,36 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    import duckdb
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_FLATMAP_XY_BINS = 256
 DEFAULT_FLATMAP_DEPTH_BIN_UM = 25.0
 MAX_FLATMAP_HEATMAP_VOXELS = 100_000_000
 DEFAULT_LOOKUP_STATS_CHUNK_VOXELS = 10_000_000
+
+# Heatmap color modes. These values match the widget-side ``_HEATMAP_COLOR_*``
+# constants so a mode selected in the UI can be passed straight through.
+FLATMAP_HEATMAP_COLOR_SINGLE = "single"
+FLATMAP_HEATMAP_COLOR_INDIVIDUAL = "individual"
+FLATMAP_HEATMAP_COLOR_CLUSTER = "cluster"
+
+# Bilateral precomputed styles map onto the ``*_shaped``/``*_square`` column
+# families that carry ready-to-render flatmap coordinates.
+_FLATMAP_STYLE_SUFFIX = {
+    "both_shaped": "shaped",
+    "both_square": "square",
+}
 
 
 @dataclass(frozen=True)
@@ -868,3 +888,666 @@ def _build_flatmap_render_data_for_bounds(
         point_file_ids=point_file_ids,
         summary=summary,
     )
+
+
+# ---------------------------------------------------------------------------
+# DuckDB-backed precomputed heatmap rendering.
+#
+# The pandas render path above materializes every queried node in memory before
+# binning it with ``np.add.at``.  For whole-brain Parquets (hundreds of millions
+# of rows) that is prohibitively slow.  The functions below mirror the CCFv3
+# ``build_node_counts_volume`` approach instead: read only the handful of
+# precomputed flatmap columns via projection pushdown and let DuckDB bin the
+# nodes with a ``GROUP BY``, returning just the sparse non-zero voxel counts.
+# The bin math is kept identical to ``_build_flatmap_render_data_for_bounds`` so
+# the fast path produces the same volume as the pandas path.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FlatmapAggregateStats:
+    """Node/trace tallies gathered in a single streaming DuckDB pass."""
+
+    total_nodes: int
+    total_traces: int
+    flatmap_valid_nodes: int
+    depth_valid_nodes: int
+    depth_minus_one_nodes: int
+    rendered_nodes: int
+    traces_represented: int
+
+
+@dataclass(frozen=True)
+class FlatmapHeatmapVolumeResult:
+    """Binned flatmap heatmap volume(s) built directly from Parquet columns."""
+
+    color_mode: str
+    volume: np.ndarray | None
+    grouped_volumes: tuple[FlatmapGroupedVolume, ...]
+    render_summary: FlatmapRenderSummary
+    stats: FlatmapAggregateStats
+    volume_shape: tuple[int, int, int]
+
+
+def _sql_number(value: float) -> str:
+    """Render a Python float as a lossless SQL numeric literal."""
+    return repr(float(value))
+
+
+def _sql_identifier(name: str) -> str:
+    """Quote a column name for safe inline use in SQL."""
+    escaped = str(name).replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _duckdb_source_path(parquet_path: str) -> str:
+    return str(parquet_path).replace("\\", "/")
+
+
+def _duckdb_column_names(conn: duckdb.DuckDBPyConnection, source_sql: str) -> set[str]:
+    relation = conn.execute(f"SELECT * FROM {source_sql} LIMIT 0")
+    return {str(description[0]) for description in relation.description}
+
+
+def _style_suffix(style_key: str) -> str:
+    suffix = _FLATMAP_STYLE_SUFFIX.get(str(style_key))
+    if suffix is None:
+        raise ValueError(
+            "DuckDB flatmap heatmap rendering supports the bilateral shaped and "
+            f"bilateral square styles only; got {style_key!r}."
+        )
+    return suffix
+
+
+def _flatmap_sql_expressions(
+    column_names: set[str],
+    *,
+    suffix: str,
+    x_lower: float,
+    x_upper: float,
+    y_lower: float,
+    y_upper: float,
+    depth_lower: float,
+    depth_bin_um: float,
+    xy_bins: int,
+    valid_depth_bins: int,
+    sentinel_offset: int,
+    include_depth_minus_one: bool,
+) -> dict[str, str]:
+    """Build the SQL boolean/bin expressions matching the pandas render path."""
+    x_column = f"x_flat_{suffix}"
+    y_column = f"y_flat_{suffix}"
+    for required in (x_column, y_column, "depth_um", "file_id"):
+        if required not in column_names:
+            raise ValueError(
+                f"Parquet is missing required column {required!r} for flatmap "
+                "heatmap rendering."
+            )
+
+    x_ref = _sql_identifier(x_column)
+    y_ref = _sql_identifier(y_column)
+    depth_ref = _sql_identifier("depth_um")
+
+    flatmap_valid_column = f"flatmap_{suffix}_valid"
+    if flatmap_valid_column in column_names:
+        flatmap_valid = f"COALESCE({_sql_identifier(flatmap_valid_column)}, FALSE)"
+    else:
+        flatmap_valid = (
+            f"({x_ref} IS NOT NULL AND isfinite({x_ref}) "
+            f"AND {y_ref} IS NOT NULL AND isfinite({y_ref}))"
+        )
+
+    if "depth_valid" in column_names:
+        depth_valid = f"COALESCE({_sql_identifier('depth_valid')}, FALSE)"
+    else:
+        depth_valid = (
+            f"({depth_ref} IS NOT NULL AND isfinite({depth_ref}) "
+            f"AND {depth_ref} >= 0.0)"
+        )
+
+    depth_minus_one = (
+        f"({depth_ref} IS NOT NULL AND isfinite({depth_ref}) "
+        f"AND {depth_ref} = -1.0)"
+    )
+
+    if include_depth_minus_one:
+        render_where = (
+            f"({flatmap_valid}) AND (({depth_valid}) OR ({depth_minus_one}))"
+        )
+    else:
+        render_where = f"({flatmap_valid}) AND ({depth_valid})"
+
+    # Non-finite coordinates never survive ``render_where`` for a correctly built
+    # Parquet, but guard the CAST anyway: DuckDB raises on CAST(FLOOR(inf)) while
+    # numpy silently clamps.  Falling back to bin 0 keeps corrupt rows from
+    # aborting the whole render.
+    x_span = x_upper - x_lower
+    y_span = y_upper - y_lower
+    x_bin = (
+        f"CASE WHEN isfinite({x_ref}) THEN "
+        f"LEAST(GREATEST(CAST(FLOOR(({x_ref} - {_sql_number(x_lower)}) "
+        f"/ {_sql_number(x_span)} * {int(xy_bins)}) AS BIGINT), 0), {int(xy_bins) - 1}) "
+        f"ELSE 0 END"
+    )
+    y_bin = (
+        f"CASE WHEN isfinite({y_ref}) THEN "
+        f"LEAST(GREATEST(CAST(FLOOR(({y_ref} - {_sql_number(y_lower)}) "
+        f"/ {_sql_number(y_span)} * {int(xy_bins)}) AS BIGINT), 0), {int(xy_bins) - 1}) "
+        f"ELSE 0 END"
+    )
+    depth_bin = (
+        f"CASE WHEN ({depth_valid}) THEN "
+        f"(CASE WHEN isfinite({depth_ref}) THEN "
+        f"LEAST(GREATEST(CAST(FLOOR(({depth_ref} - {_sql_number(depth_lower)}) "
+        f"/ {_sql_number(depth_bin_um)}) AS BIGINT), 0), {int(valid_depth_bins) - 1}) "
+        f"ELSE 0 END) + {int(sentinel_offset)} "
+        f"ELSE 0 END"
+    )
+
+    return {
+        "flatmap_valid": flatmap_valid,
+        "depth_valid": depth_valid,
+        "depth_minus_one": depth_minus_one,
+        "render_where": render_where,
+        "x_bin": x_bin,
+        "y_bin": y_bin,
+        "depth_bin": depth_bin,
+    }
+
+
+def _file_id_filter(
+    file_ids: list[object] | None,
+) -> tuple[str, list[object]] | None:
+    """Return ``(sql, params)`` for a ``file_id IN (...)`` clause.
+
+    Returns ``("", [])`` when no filter is requested (``file_ids is None``) and
+    ``None`` when the caller passed an explicit empty selection (render nothing).
+    """
+    if file_ids is None:
+        return "", []
+    if len(file_ids) == 0:
+        return None
+    placeholders = ", ".join(["?"] * len(file_ids))
+    return f"file_id IN ({placeholders})", [str(file_id) for file_id in file_ids]
+
+
+def _combine_where(render_where: str, file_filter_sql: str) -> str:
+    if file_filter_sql:
+        return f"({render_where}) AND {file_filter_sql}"
+    return render_where
+
+
+def _query_flatmap_stats(
+    conn: duckdb.DuckDBPyConnection,
+    source_sql: str,
+    expressions: dict[str, str],
+    file_filter_sql: str,
+    params: list[object],
+) -> FlatmapAggregateStats:
+    flatmap_valid = expressions["flatmap_valid"]
+    depth_valid = expressions["depth_valid"]
+    depth_minus_one = expressions["depth_minus_one"]
+    render_where = expressions["render_where"]
+    where_sql = f"WHERE {file_filter_sql}" if file_filter_sql else ""
+    query = f"""
+        SELECT
+            COUNT(*) AS total_nodes,
+            COUNT(DISTINCT file_id) AS total_traces,
+            COUNT(*) FILTER (WHERE {flatmap_valid}) AS flatmap_valid_nodes,
+            COUNT(*) FILTER (WHERE ({flatmap_valid}) AND ({depth_valid}))
+                AS depth_valid_nodes,
+            COUNT(*) FILTER (WHERE ({flatmap_valid}) AND ({depth_minus_one}))
+                AS depth_minus_one_nodes,
+            COUNT(*) FILTER (WHERE {render_where}) AS rendered_nodes,
+            COUNT(DISTINCT file_id) FILTER (WHERE {render_where})
+                AS traces_represented
+        FROM {source_sql}
+        {where_sql}
+    """
+    row = (
+        conn.execute(query, params).fetchone()
+        if params
+        else conn.execute(query).fetchone()
+    )
+    if row is None:
+        row = (0, 0, 0, 0, 0, 0, 0)
+    return FlatmapAggregateStats(
+        total_nodes=int(row[0] or 0),
+        total_traces=int(row[1] or 0),
+        flatmap_valid_nodes=int(row[2] or 0),
+        depth_valid_nodes=int(row[3] or 0),
+        depth_minus_one_nodes=int(row[4] or 0),
+        rendered_nodes=int(row[5] or 0),
+        traces_represented=int(row[6] or 0),
+    )
+
+
+def _scatter_bin_counts(
+    volume: np.ndarray,
+    frame: pd.DataFrame,
+) -> None:
+    """Accumulate ``node_count`` into ``volume`` at (depth_bin, y_bin, x_bin)."""
+    if frame.empty:
+        return
+    np.add.at(
+        volume,
+        (
+            frame["depth_bin"].to_numpy(dtype=np.intp),
+            frame["y_bin"].to_numpy(dtype=np.intp),
+            frame["x_bin"].to_numpy(dtype=np.intp),
+        ),
+        frame["node_count"].to_numpy(dtype=np.float32),
+    )
+
+
+def _query_flatmap_bin_counts(
+    conn: duckdb.DuckDBPyConnection,
+    source_sql: str,
+    expressions: dict[str, str],
+    where_sql: str,
+    params: list[object],
+    *,
+    include_file_id: bool,
+) -> pd.DataFrame:
+    file_select = "file_id, " if include_file_id else ""
+    file_group = ", file_id" if include_file_id else ""
+    query = f"""
+        SELECT
+            {file_select}{expressions['depth_bin']} AS depth_bin,
+            {expressions['y_bin']} AS y_bin,
+            {expressions['x_bin']} AS x_bin,
+            COUNT(*) AS node_count
+        FROM {source_sql}
+        WHERE {where_sql}
+        GROUP BY depth_bin, y_bin, x_bin{file_group}
+    """
+    return (
+        conn.execute(query, params).fetchdf()
+        if params
+        else conn.execute(query).fetchdf()
+    )
+
+
+def _build_grouped_flatmap_volumes(
+    counts: pd.DataFrame,
+    volume_shape: tuple[int, int, int],
+    *,
+    color_mode: str,
+    cluster_map: dict[object, int | None] | None,
+) -> tuple[list[FlatmapGroupedVolume], np.ndarray]:
+    """Scatter per-file bin counts into one volume per group + a combined volume."""
+    combined = np.zeros(volume_shape, dtype=np.float32)
+    if counts.empty:
+        return [], combined
+    _scatter_bin_counts(combined, counts)
+
+    file_ids_in_order = _unique_in_order(counts["file_id"].tolist())
+
+    if color_mode == FLATMAP_HEATMAP_COLOR_CLUSTER:
+        resolved_map = cluster_map or {}
+        cluster_for_file = {
+            file_id: _cluster_for_file_id(file_id, resolved_map)
+            for file_id in file_ids_in_order
+        }
+        cluster_ids = sorted(
+            {
+                cluster_id
+                for cluster_id in cluster_for_file.values()
+                if cluster_id is not None
+            }
+        )
+        group_keys: list[int | None] = list(cluster_ids)
+        if any(cluster_id is None for cluster_id in cluster_for_file.values()):
+            group_keys.append(None)
+
+        groups: list[FlatmapGroupedVolume] = []
+        for group_key in group_keys:
+            source_file_ids = tuple(
+                file_id
+                for file_id in file_ids_in_order
+                if cluster_for_file[file_id] == group_key
+            )
+            label = "Unclustered" if group_key is None else f"Cluster {group_key}"
+            group_counts = counts[counts["file_id"].isin(source_file_ids)]
+            volume = np.zeros(volume_shape, dtype=np.float32)
+            _scatter_bin_counts(volume, group_counts)
+            groups.append(
+                FlatmapGroupedVolume(
+                    group_key=group_key,
+                    label=label,
+                    source_file_ids=source_file_ids,
+                    volume=volume,
+                    rendered_nodes=int(group_counts["node_count"].sum()),
+                    nonzero_voxels=int(np.count_nonzero(volume)),
+                )
+            )
+        return groups, combined
+
+    # Individual (per-file) coloring.
+    groups = []
+    for file_id in file_ids_in_order:
+        group_counts = counts[counts["file_id"] == file_id]
+        volume = np.zeros(volume_shape, dtype=np.float32)
+        _scatter_bin_counts(volume, group_counts)
+        groups.append(
+            FlatmapGroupedVolume(
+                group_key=file_id,
+                label=str(file_id),
+                source_file_ids=(file_id,),
+                volume=volume,
+                rendered_nodes=int(group_counts["node_count"].sum()),
+                nonzero_voxels=int(np.count_nonzero(volume)),
+            )
+        )
+    return groups, combined
+
+
+def _empty_flatmap_volume_result(
+    color_mode: str,
+    volume_shape: tuple[int, int, int],
+    render_summary: FlatmapRenderSummary,
+    stats: FlatmapAggregateStats,
+) -> FlatmapHeatmapVolumeResult:
+    volume = (
+        np.zeros(volume_shape, dtype=np.float32)
+        if color_mode == FLATMAP_HEATMAP_COLOR_SINGLE
+        else None
+    )
+    return FlatmapHeatmapVolumeResult(
+        color_mode=color_mode,
+        volume=volume,
+        grouped_volumes=(),
+        render_summary=render_summary,
+        stats=stats,
+        volume_shape=volume_shape,
+    )
+
+
+def build_flatmap_heatmap_volume_result(
+    conn: duckdb.DuckDBPyConnection,
+    parquet_path: str,
+    *,
+    style_key: str,
+    color_mode: str,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    depth_range_um: tuple[float, float],
+    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
+    include_depth_minus_one: bool = True,
+    file_ids: list[object] | None = None,
+    cluster_map: dict[object, int | None] | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_total: int = 3,
+) -> FlatmapHeatmapVolumeResult:
+    """Build a flatmap heatmap volume from precomputed Parquet columns via DuckDB.
+
+    The bin math mirrors :func:`_build_flatmap_render_data_for_bounds` so this
+    fast path yields the same volume the pandas path would, but only the needed
+    coordinate/validity columns are read and the binning happens inside DuckDB.
+
+    Parameters
+    ----------
+    conn
+        Open DuckDB connection.
+    parquet_path
+        Path to a version-3 augmented Parquet with ``*_shaped``/``*_square``
+        flatmap coordinate columns and ``depth_um``.
+    style_key
+        ``"both_shaped"`` or ``"both_square"`` (selects the column family).
+    color_mode
+        One of :data:`FLATMAP_HEATMAP_COLOR_SINGLE`,
+        :data:`FLATMAP_HEATMAP_COLOR_INDIVIDUAL`, or
+        :data:`FLATMAP_HEATMAP_COLOR_CLUSTER`.
+    x_bounds, y_bounds, depth_range_um
+        Canonical render bounds (typically from the region cache profile or the
+        v3 Parquet metadata).  They are made non-degenerate exactly as the
+        pandas path does.
+    file_ids
+        Restrict rendering to these ``file_id`` values.  ``None`` renders every
+        row; an empty list renders nothing.
+    cluster_map
+        ``file_id -> cluster id`` mapping used only when ``color_mode`` is
+        ``cluster``.
+    """
+    suffix = _style_suffix(style_key)
+    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
+
+    x_lower, x_upper = _nondegenerate_bounds(x_bounds[0], x_bounds[1])
+    y_lower, y_upper = _nondegenerate_bounds(y_bounds[0], y_bounds[1])
+    depth_lower, depth_upper = _nondegenerate_bounds(
+        depth_range_um[0], depth_range_um[1]
+    )
+
+    valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
+    sentinel_offset = 1 if include_depth_minus_one else 0
+    total_depth_bins = valid_depth_bins + sentinel_offset
+    volume_shape = (total_depth_bins, xy_bins, xy_bins)
+
+    voxel_count = int(total_depth_bins * xy_bins * xy_bins)
+    if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
+        raise ValueError(
+            "Flatmap heatmap is too large: "
+            f"{total_depth_bins}x{xy_bins}x{xy_bins} voxels. "
+            "Use fewer XY bins or a larger depth bin."
+        )
+
+    source_sql = f"read_parquet('{_duckdb_source_path(parquet_path)}')"
+    column_names = _duckdb_column_names(conn, source_sql)
+    expressions = _flatmap_sql_expressions(
+        column_names,
+        suffix=suffix,
+        x_lower=x_lower,
+        x_upper=x_upper,
+        y_lower=y_lower,
+        y_upper=y_upper,
+        depth_lower=depth_lower,
+        depth_bin_um=depth_bin_um,
+        xy_bins=xy_bins,
+        valid_depth_bins=valid_depth_bins,
+        sentinel_offset=sentinel_offset,
+        include_depth_minus_one=include_depth_minus_one,
+    )
+
+    file_filter = _file_id_filter(file_ids)
+
+    def _summary(stats: FlatmapAggregateStats, nonzero_voxels: int) -> FlatmapRenderSummary:
+        excluded_depth_minus_one = (
+            0 if include_depth_minus_one else stats.depth_minus_one_nodes
+        )
+        return FlatmapRenderSummary(
+            total_nodes=stats.total_nodes,
+            flatmap_valid_nodes=stats.flatmap_valid_nodes,
+            depth_valid_nodes=stats.depth_valid_nodes,
+            depth_minus_one_nodes=stats.depth_minus_one_nodes,
+            rendered_nodes=stats.rendered_nodes,
+            excluded_depth_minus_one_nodes=excluded_depth_minus_one,
+            nonzero_voxels=int(nonzero_voxels),
+            traces_represented=stats.traces_represented,
+            xy_bins=xy_bins,
+            depth_bins=total_depth_bins,
+            depth_bin_um=depth_bin_um,
+            x_flat_min=x_lower,
+            x_flat_max=x_upper,
+            y_flat_min=y_lower,
+            y_flat_max=y_upper,
+            depth_min_um=depth_lower,
+            depth_max_um=depth_upper,
+            includes_depth_minus_one_plane=bool(include_depth_minus_one),
+        )
+
+    empty_stats = FlatmapAggregateStats(0, 0, 0, 0, 0, 0, 0)
+    if file_filter is None:
+        # Explicit empty selection: render nothing without touching the Parquet.
+        return _empty_flatmap_volume_result(
+            color_mode, volume_shape, _summary(empty_stats, 0), empty_stats
+        )
+
+    file_filter_sql, file_params = file_filter
+
+    _emit_flatmap_progress(
+        progress_callback, "Counting flatmap nodes...", 1, progress_total
+    )
+    stats = _query_flatmap_stats(
+        conn, source_sql, expressions, file_filter_sql, file_params
+    )
+
+    _emit_flatmap_progress(
+        progress_callback, "Binning flatmap heatmap in DuckDB...", 2, progress_total
+    )
+    where_sql = _combine_where(expressions["render_where"], file_filter_sql)
+
+    if color_mode == FLATMAP_HEATMAP_COLOR_SINGLE:
+        counts = _query_flatmap_bin_counts(
+            conn,
+            source_sql,
+            expressions,
+            where_sql,
+            file_params,
+            include_file_id=False,
+        )
+        volume = np.zeros(volume_shape, dtype=np.float32)
+        _scatter_bin_counts(volume, counts)
+        render_summary = _summary(stats, int(np.count_nonzero(volume)))
+        logger.info(
+            "Flatmap heatmap volume: shape %s, rendered nodes %d, non-zero voxels %d",
+            volume.shape,
+            render_summary.rendered_nodes,
+            render_summary.nonzero_voxels,
+        )
+        return FlatmapHeatmapVolumeResult(
+            color_mode=color_mode,
+            volume=volume,
+            grouped_volumes=(),
+            render_summary=render_summary,
+            stats=stats,
+            volume_shape=volume_shape,
+        )
+
+    counts = _query_flatmap_bin_counts(
+        conn,
+        source_sql,
+        expressions,
+        where_sql,
+        file_params,
+        include_file_id=True,
+    )
+    groups, combined = _build_grouped_flatmap_volumes(
+        counts,
+        volume_shape,
+        color_mode=color_mode,
+        cluster_map=cluster_map,
+    )
+    render_summary = _summary(stats, int(np.count_nonzero(combined)))
+    logger.info(
+        "Flatmap heatmap groups: %d group(s), rendered nodes %d, non-zero voxels %d",
+        len(groups),
+        render_summary.rendered_nodes,
+        render_summary.nonzero_voxels,
+    )
+    return FlatmapHeatmapVolumeResult(
+        color_mode=color_mode,
+        volume=None,
+        grouped_volumes=tuple(groups),
+        render_summary=render_summary,
+        stats=stats,
+        volume_shape=volume_shape,
+    )
+
+
+def compute_flatmap_bounds_from_parquet(
+    conn: duckdb.DuckDBPyConnection,
+    parquet_path: str,
+    *,
+    style_key: str,
+    file_ids: list[object] | None = None,
+) -> dict[str, tuple[float, float]]:
+    """Derive fallback flatmap/depth bounds directly from Parquet columns.
+
+    Mirrors :func:`_projected_nodes_bounds`: x/y bounds span flatmap-valid nodes
+    and the depth range spans flatmap-and-depth-valid, non-negative depths.  Used
+    only when a v3 Parquet does not carry canonical bounds metadata.
+    """
+    suffix = _style_suffix(style_key)
+    source_sql = f"read_parquet('{_duckdb_source_path(parquet_path)}')"
+    column_names = _duckdb_column_names(conn, source_sql)
+    x_column = f"x_flat_{suffix}"
+    y_column = f"y_flat_{suffix}"
+    for required in (x_column, y_column, "depth_um", "file_id"):
+        if required not in column_names:
+            raise ValueError(
+                f"Parquet is missing required column {required!r} for flatmap "
+                "bounds computation."
+            )
+    x_ref = _sql_identifier(x_column)
+    y_ref = _sql_identifier(y_column)
+    depth_ref = _sql_identifier("depth_um")
+
+    if f"flatmap_{suffix}_valid" in column_names:
+        flatmap_valid = f"COALESCE({_sql_identifier(f'flatmap_{suffix}_valid')}, FALSE)"
+    else:
+        flatmap_valid = (
+            f"({x_ref} IS NOT NULL AND isfinite({x_ref}) "
+            f"AND {y_ref} IS NOT NULL AND isfinite({y_ref}))"
+        )
+    if "depth_valid" in column_names:
+        depth_valid = f"COALESCE({_sql_identifier('depth_valid')}, FALSE)"
+    else:
+        depth_valid = (
+            f"({depth_ref} IS NOT NULL AND isfinite({depth_ref}) "
+            f"AND {depth_ref} >= 0.0)"
+        )
+
+    flatmap_mask = f"({flatmap_valid}) AND isfinite({x_ref}) AND isfinite({y_ref})"
+    depth_mask = (
+        f"({flatmap_valid}) AND ({depth_valid}) AND isfinite({depth_ref}) "
+        f"AND {depth_ref} >= 0.0"
+    )
+
+    file_filter = _file_id_filter(file_ids)
+    if file_filter is None:
+        raise ValueError("No file IDs selected for flatmap bounds computation.")
+    file_filter_sql, params = file_filter
+    where_sql = f"WHERE {file_filter_sql}" if file_filter_sql else ""
+
+    query = f"""
+        SELECT
+            MIN({x_ref}) FILTER (WHERE {flatmap_mask}) AS x_min,
+            MAX({x_ref}) FILTER (WHERE {flatmap_mask}) AS x_max,
+            MIN({y_ref}) FILTER (WHERE {flatmap_mask}) AS y_min,
+            MAX({y_ref}) FILTER (WHERE {flatmap_mask}) AS y_max,
+            MIN({depth_ref}) FILTER (WHERE {depth_mask}) AS depth_min,
+            MAX({depth_ref}) FILTER (WHERE {depth_mask}) AS depth_max
+        FROM {source_sql}
+        {where_sql}
+    """
+    row = (
+        conn.execute(query, params).fetchone()
+        if params
+        else conn.execute(query).fetchone()
+    )
+    if row is None or row[0] is None or row[2] is None:
+        raise ValueError(
+            "Parquet does not contain valid flatmap coordinates for the "
+            f"{style_key} style."
+        )
+    if row[4] is None or row[5] is None:
+        raise ValueError(
+            "Parquet does not contain valid non-negative depths for the "
+            f"{style_key} style."
+        )
+    return {
+        "x_bounds": _nondegenerate_bounds(float(row[0]), float(row[1])),
+        "y_bounds": _nondegenerate_bounds(float(row[2]), float(row[3])),
+        "depth_range_um": _nondegenerate_bounds(float(row[4]), float(row[5])),
+    }
+
+
+def _emit_flatmap_progress(
+    progress_callback: Callable[[str, int, int], None] | None,
+    message: str,
+    current: int,
+    total: int,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(message, current, total)

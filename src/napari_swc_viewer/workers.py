@@ -1544,6 +1544,113 @@ class HeatmapWorker(QObject):
             self.error.emit(str(e))
 
 
+class FlatmapHeatmapWorker(QObject):
+    """Build a precomputed flatmap heatmap volume in the background.
+
+    Mirrors :class:`HeatmapWorker`: it opens its own DuckDB connection and lets
+    DuckDB bin the precomputed flatmap columns with a ``GROUP BY``, reading only
+    the coordinate/validity columns rather than materializing every node in
+    pandas.
+
+    Signals
+    -------
+    progress(str, int, int)
+        (step_name, current_step, total_steps)
+    finished(object)
+        Emitted with a ``FlatmapHeatmapVolumeResult`` on success.
+    error(str)
+        Emitted with an error message on failure.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        parquet_path: str,
+        *,
+        style_key: str,
+        color_mode: str,
+        x_bounds: tuple[float, float] | None,
+        y_bounds: tuple[float, float] | None,
+        depth_range_um: tuple[float, float] | None,
+        xy_bins: int,
+        depth_bin_um: float,
+        include_depth_minus_one: bool,
+        file_ids: list[object] | None = None,
+        cluster_map: dict[object, int | None] | None = None,
+    ):
+        super().__init__()
+        self._parquet_path = str(parquet_path)
+        self._style_key = str(style_key)
+        self._color_mode = str(color_mode)
+        self._x_bounds = x_bounds
+        self._y_bounds = y_bounds
+        self._depth_range_um = depth_range_um
+        self._xy_bins = int(xy_bins)
+        self._depth_bin_um = float(depth_bin_um)
+        self._include_depth_minus_one = bool(include_depth_minus_one)
+        self._file_ids = file_ids
+        self._cluster_map = cluster_map
+
+    def run(self) -> None:
+        """Execute the DuckDB flatmap heatmap pipeline."""
+        try:
+            import duckdb
+
+            from .flatmap_heatmap import (
+                build_flatmap_heatmap_volume_result,
+                compute_flatmap_bounds_from_parquet,
+            )
+
+            total_steps = 3
+            conn = duckdb.connect()
+            try:
+                x_bounds = self._x_bounds
+                y_bounds = self._y_bounds
+                depth_range_um = self._depth_range_um
+                if x_bounds is None or y_bounds is None or depth_range_um is None:
+                    self.progress.emit(
+                        "Deriving flatmap bounds...", 1, total_steps
+                    )
+                    bounds = compute_flatmap_bounds_from_parquet(
+                        conn,
+                        self._parquet_path,
+                        style_key=self._style_key,
+                        file_ids=self._file_ids,
+                    )
+                    x_bounds = bounds["x_bounds"]
+                    y_bounds = bounds["y_bounds"]
+                    depth_range_um = bounds["depth_range_um"]
+
+                result = build_flatmap_heatmap_volume_result(
+                    conn,
+                    self._parquet_path,
+                    style_key=self._style_key,
+                    color_mode=self._color_mode,
+                    x_bounds=x_bounds,
+                    y_bounds=y_bounds,
+                    depth_range_um=depth_range_um,
+                    xy_bins=self._xy_bins,
+                    depth_bin_um=self._depth_bin_um,
+                    include_depth_minus_one=self._include_depth_minus_one,
+                    file_ids=self._file_ids,
+                    cluster_map=self._cluster_map,
+                    progress_callback=self.progress.emit,
+                    progress_total=total_steps,
+                )
+            finally:
+                conn.close()
+
+            self.progress.emit("Done", total_steps, total_steps)
+            self.finished.emit(result)
+
+        except Exception as e:
+            logger.exception("Flatmap heatmap pipeline failed")
+            self.error.emit(str(e))
+
+
 class AnalysisExportWorker(QObject):
     """Export analysis outputs that benefit from background execution."""
 

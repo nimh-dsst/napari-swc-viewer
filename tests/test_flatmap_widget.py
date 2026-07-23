@@ -1315,6 +1315,11 @@ def test_explicit_precomputed_v3_square_never_loads_selected_nrrds(
     widget._projection_source_combo = types.SimpleNamespace(
         currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
     )
+    # Points render mode drives the per-node precomputed pipeline this test
+    # exercises; heatmap mode now uses the DuckDB volume fast path instead.
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_POINTS
+    )
     widget._validate_precomputed_parquet_contract = lambda _nodes: None
     widget._flatmap_path = Path("selected-but-unused.nrrd")
     widget._depth_path = Path("selected-but-unused-depth.nrrd")
@@ -1359,6 +1364,10 @@ def test_explicit_precomputed_rejects_partial_v3_columns(monkeypatch) -> None:
     _configure_projection_widget(widget, module, nodes)
     widget._projection_source_combo = types.SimpleNamespace(
         currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    # Points render mode keeps the per-node validation path under test.
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_POINTS
     )
     applied: list[object] = []
     widget._apply_projection_result = lambda *args, **kwargs: applied.append(
@@ -1407,6 +1416,10 @@ def test_explicit_precomputed_rejects_incomplete_canonical_metadata(
         currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
     )
     widget._current_source_parquet_path = lambda: Path("neurons.parquet")
+    # Points render mode keeps the per-node validation path under test.
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_POINTS
+    )
     monkeypatch.setattr(
         module,
         "read_flatmap_parquet_transform_info",
@@ -2576,3 +2589,145 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
     assert "render_valid" in exported.columns
     assert exported["x_flat_bin"].tolist() == [10]
     assert "Exported flatmap projection" in widget._status_label.text
+
+
+def test_precomputed_heatmap_uses_duckdb_fast_path(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_HEATMAP
+    )
+    called: list[bool] = []
+    widget._start_precomputed_heatmap_worker = lambda: called.append(True)
+
+    def _fail_query(_file_ids):
+        raise AssertionError("fast path must not load nodes into pandas")
+
+    widget._query_nodes = _fail_query
+    widget._apply_projection_result = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("fast path must not use the synchronous apply")
+    )
+
+    widget._project()
+
+    assert called == [True]
+
+
+def test_apply_precomputed_heatmap_result_single_disables_per_node(monkeypatch) -> None:
+    from napari_swc_viewer import flatmap_heatmap as fh
+
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._summary_label = _DummyLabel()
+    widget._export_btn = _DummyButton()
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_HEATMAP
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._active_cache_profile = None
+    widget._region_cache_dir = None
+    widget._cache_profile_id = lambda _profile: None
+    widget._precomputed_heatmap_file_ids = ["a.swc", "b.swc"]
+    notified: list[bool] = []
+    widget._notify_flatmap_correlation_source_changed = lambda: notified.append(True)
+
+    volume = np.zeros((2, 4, 4), dtype=np.float32)
+    volume[0, 1, 2] = 3.0
+    stats = fh.FlatmapAggregateStats(
+        total_nodes=10,
+        total_traces=2,
+        flatmap_valid_nodes=8,
+        depth_valid_nodes=6,
+        depth_minus_one_nodes=0,
+        rendered_nodes=6,
+        traces_represented=2,
+    )
+    result = fh.FlatmapHeatmapVolumeResult(
+        color_mode=module._HEATMAP_COLOR_SINGLE,
+        volume=volume,
+        grouped_volumes=(),
+        render_summary=_simple_render_summary(module),
+        stats=stats,
+        volume_shape=(2, 4, 4),
+    )
+
+    widget._apply_precomputed_heatmap_result(result)
+
+    assert widget._last_render_mode == module._RENDER_HEATMAP
+    assert widget._last_projected_nodes is None
+    assert widget._last_projection_source == module._PROJECTION_SOURCE_PRECOMPUTED
+    assert widget._last_coordinate_mode == "parquet_columns"
+    assert widget._export_btn.enabled is False
+    assert notified == [True]
+    layer = widget._projection_layer
+    assert layer is not None
+    assert layer.name == module._HEATMAP_LAYER_NAME
+    assert layer.metadata["flatmap_render_mode"] == "heatmap"
+    # Per-node correlation source is unavailable for a volume-only fast render.
+    assert widget.latest_flatmap_correlation_source() is None
+
+
+def test_apply_precomputed_heatmap_result_grouped_creates_layer_per_group(
+    monkeypatch,
+) -> None:
+    from napari_swc_viewer import flatmap_heatmap as fh
+
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._summary_label = _DummyLabel()
+    widget._export_btn = _DummyButton()
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_HEATMAP
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_INDIVIDUAL
+    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._active_cache_profile = None
+    widget._region_cache_dir = None
+    widget._cache_profile_id = lambda _profile: None
+    widget._precomputed_heatmap_file_ids = ["a.swc", "b.swc"]
+    widget._notify_flatmap_correlation_source_changed = lambda: None
+
+    groups = []
+    for name in ("a.swc", "b.swc"):
+        volume = np.zeros((2, 4, 4), dtype=np.float32)
+        volume[0, 1, 2] = 1.0
+        groups.append(
+            fh.FlatmapGroupedVolume(
+                group_key=name,
+                label=name,
+                source_file_ids=(name,),
+                volume=volume,
+                rendered_nodes=1,
+                nonzero_voxels=1,
+            )
+        )
+    stats = fh.FlatmapAggregateStats(4, 2, 4, 4, 0, 2, 2)
+    result = fh.FlatmapHeatmapVolumeResult(
+        color_mode=module._HEATMAP_COLOR_INDIVIDUAL,
+        volume=None,
+        grouped_volumes=tuple(groups),
+        render_summary=_simple_render_summary(module, total_nodes=2),
+        stats=stats,
+        volume_shape=(2, 4, 4),
+    )
+
+    widget._apply_precomputed_heatmap_result(result)
+
+    grouped_layers = [
+        layer
+        for layer in widget._viewer.layers
+        if str(getattr(layer, "name", "")).startswith(
+            module._GROUPED_HEATMAP_LAYER_PREFIX
+        )
+    ]
+    assert len(grouped_layers) == 2
+    assert widget._export_btn.enabled is False
+    assert widget._last_projected_nodes is None

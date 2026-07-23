@@ -174,6 +174,8 @@ class FlatmapProjectionWidget(QWidget):
         self._region_label_atlas_load_thread = None
         self._region_label_atlas_load_worker = None
         self._pending_region_label_request = False
+        self._precomputed_heatmap_thread = None
+        self._precomputed_heatmap_worker = None
         self._last_projected_nodes: pd.DataFrame | None = None
         self._last_summary: ProjectionSummary | None = None
         self._last_render_summary: FlatmapRenderSummary | None = None
@@ -1918,6 +1920,14 @@ class FlatmapProjectionWidget(QWidget):
     def _project(self) -> None:
         """Run projection from the current UI state and render the layer."""
         projection_source = self._current_projection_source()
+        if (
+            projection_source == _PROJECTION_SOURCE_PRECOMPUTED
+            and self._current_render_mode() == _RENDER_HEATMAP
+        ):
+            # Fast path: bin the precomputed flatmap columns inside DuckDB on a
+            # worker thread instead of loading every node into pandas.
+            self._start_precomputed_heatmap_worker()
+            return
         if projection_source == _PROJECTION_SOURCE_RECOMPUTE:
             self._projection_request_ready()
             use_lookup_files = True
@@ -2003,6 +2013,258 @@ class FlatmapProjectionWidget(QWidget):
         finally:
             self._hide_projection_progress()
             self._set_projection_controls_enabled(True)
+
+    def _precomputed_heatmap_is_running(self) -> bool:
+        thread = getattr(self, "_precomputed_heatmap_thread", None)
+        is_running = getattr(thread, "isRunning", None)
+        return bool(callable(is_running) and is_running())
+
+    @staticmethod
+    def _precomputed_parquet_schema_frame(source_path: Path) -> pd.DataFrame:
+        """Return an empty frame whose columns mirror the Parquet schema.
+
+        The v3 contract validator only inspects column names, so reading the
+        Parquet footer (instant, metadata-only) avoids loading any rows.
+        """
+        import pyarrow.parquet as pq
+
+        schema = pq.read_schema(source_path)
+        return pd.DataFrame(columns=list(schema.names))
+
+    def _start_precomputed_heatmap_worker(self) -> None:
+        """Bin the precomputed flatmap heatmap in DuckDB on a worker thread."""
+        if self._precomputed_heatmap_is_running():
+            return
+        try:
+            source_path = self._current_source_parquet_path()
+            self._validate_precomputed_parquet_contract(
+                self._precomputed_parquet_schema_frame(source_path)
+            )
+            file_ids = self._file_ids_for_source()
+            if not file_ids:
+                raise RuntimeError("No neurons are available to project.")
+            bounds = self._canonical_render_bounds()
+        except Exception as exc:
+            logger.exception("Flatmap heatmap projection failed to start")
+            self._notify_display_viewer_failed("projection_failed")
+            self._status_label.setText(f"Flatmap projection failed: {exc}")
+            show_warning(f"Flatmap projection failed: {exc}")
+            return
+
+        from qtpy.QtCore import QThread
+
+        from ..workers import FlatmapHeatmapWorker
+
+        color_mode = self._current_heatmap_color_mode()
+        cluster_map = (
+            dict(self._cluster_map_provider() or {})
+            if color_mode == _HEATMAP_COLOR_CLUSTER
+            else None
+        )
+        self._precomputed_heatmap_file_ids = [str(file_id) for file_id in file_ids]
+        worker = FlatmapHeatmapWorker(
+            str(source_path),
+            style_key=self._current_style_key(),
+            color_mode=color_mode,
+            x_bounds=bounds.get("x_bounds"),
+            y_bounds=bounds.get("y_bounds"),
+            depth_range_um=bounds.get("depth_range_um"),
+            xy_bins=self._current_xy_bins(),
+            depth_bin_um=self._current_depth_bin_um(),
+            include_depth_minus_one=(
+                not self._exclude_depth_minus_one_cb.isChecked()
+            ),
+            file_ids=list(file_ids),
+            cluster_map=cluster_map,
+        )
+        thread = QThread()
+        self._precomputed_heatmap_thread = thread
+        self._precomputed_heatmap_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._set_projection_progress)
+        worker.finished.connect(self._on_precomputed_heatmap_finished)
+        worker.error.connect(self._on_precomputed_heatmap_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: self._cleanup_precomputed_heatmap(thread, worker)
+        )
+        self._set_projection_controls_enabled(False)
+        self._set_projection_progress("Querying flatmap heatmap...", 0, 3)
+        thread.start()
+
+    def _on_precomputed_heatmap_finished(self, result) -> None:
+        try:
+            self._apply_precomputed_heatmap_result(result)
+            self._set_projection_progress("Done", 3, 3)
+            self._status_label.setText(
+                f"Rendered {result.render_summary.rendered_nodes:,} of "
+                f"{result.stats.total_nodes:,} projected node(s) using "
+                "precomputed Parquet columns (DuckDB)."
+            )
+            show_info("Flatmap projection complete.")
+        except Exception as exc:
+            logger.exception("Flatmap heatmap render failed")
+            self._notify_display_viewer_failed("projection_failed")
+            self._status_label.setText(f"Flatmap projection failed: {exc}")
+            show_warning(f"Flatmap projection failed: {exc}")
+
+    def _on_precomputed_heatmap_error(self, message: str) -> None:
+        logger.error("Flatmap heatmap pipeline error: %s", message)
+        self._notify_display_viewer_failed("projection_failed")
+        self._status_label.setText(f"Flatmap projection failed: {message}")
+        show_warning(f"Flatmap projection failed: {message}")
+
+    def _cleanup_precomputed_heatmap(self, thread, worker) -> None:
+        if getattr(self, "_precomputed_heatmap_thread", None) is thread:
+            self._precomputed_heatmap_thread = None
+        if getattr(self, "_precomputed_heatmap_worker", None) is worker:
+            self._precomputed_heatmap_worker = None
+        self._hide_projection_progress()
+        self._set_projection_controls_enabled(True)
+
+    @staticmethod
+    def _projection_summary_from_stats(stats) -> ProjectionSummary:
+        """Build a display-only ProjectionSummary from DuckDB aggregate counts."""
+        total_nodes = int(stats.total_nodes)
+        rendered = int(stats.rendered_nodes)
+        return ProjectionSummary(
+            total_nodes=total_nodes,
+            valid_nodes=rendered,
+            out_of_bounds_nodes=0,
+            invalid_flatmap_nodes=int(total_nodes - stats.flatmap_valid_nodes),
+            invalid_depth_nodes=int(
+                stats.flatmap_valid_nodes - stats.depth_valid_nodes
+            ),
+            missing_input_nodes=0,
+            rendered_segments=0,
+            total_traces=int(stats.total_traces),
+            traces_with_partial_projection=0,
+            direct_lookup_nodes=rendered,
+            mirrored_lookup_nodes=0,
+            unmapped_lookup_nodes=int(total_nodes - rendered),
+            mirrored_depth_lookup_nodes=0,
+        )
+
+    def _apply_precomputed_heatmap_result(self, result) -> None:
+        """Render a DuckDB-built flatmap heatmap and record volume-only state."""
+        render_summary = result.render_summary
+        projection_summary = self._projection_summary_from_stats(result.stats)
+        color_mode = result.color_mode
+        style_key = self._current_style_key()
+
+        # The fast path never materializes a per-node table.  Clearing it keeps
+        # the per-node features (Export CSV, flatmap correlation, region-mask
+        # projection) disabled until a per-node projection is run instead.
+        self._last_projected_nodes = None
+        self._last_summary = projection_summary
+        self._last_render_summary = render_summary
+        self._last_render_mode = _RENDER_HEATMAP
+        self._last_flatmap_style = style_key
+        self._last_coordinate_mode = "parquet_columns"
+        self._last_volume_shape = tuple(int(size) for size in result.volume_shape)
+        self._last_lookup_stats = None
+        self._last_input_file_ids = tuple(
+            getattr(self, "_precomputed_heatmap_file_ids", ()) or ()
+        )
+        self._last_flatmap_path = (
+            str(self._flatmap_path) if self._flatmap_path else None
+        )
+        self._last_depth_path = str(self._depth_path) if self._depth_path else None
+        self._last_projection_source = _PROJECTION_SOURCE_PRECOMPUTED
+        active_profile = getattr(self, "_active_cache_profile", None)
+        self._last_cache_dir = (
+            str(self._region_cache_dir) if self._region_cache_dir else None
+        )
+        self._last_cache_profile_id = self._cache_profile_id(active_profile)
+
+        self._summary_label.setText(
+            self._format_render_summary(projection_summary, render_summary)
+        )
+
+        if render_summary.rendered_nodes == 0:
+            self._remove_projection_layer(create=False)
+            self._notify_display_viewer_failed("no_render_layer")
+        else:
+            metadata = self._render_metadata(
+                projection_summary,
+                render_summary,
+                flatmap_style=self._current_style_filename(),
+                coordinate_mode="parquet_columns",
+                render_mode=_RENDER_HEATMAP,
+                heatmap_color_mode=color_mode,
+            )
+            layer = self._render_precomputed_heatmap_layers(result, metadata)
+            if layer is None:
+                self._notify_display_viewer_failed("no_render_layer")
+
+        # Per-node features are unavailable for a volume-only fast render.
+        self._export_btn.setEnabled(False)
+        self._notify_flatmap_correlation_source_changed()
+
+    def _render_precomputed_heatmap_layers(
+        self,
+        result,
+        metadata: dict[str, object],
+    ):
+        """Create/update napari image layers from DuckDB-built volume(s)."""
+        color_mode = result.color_mode
+        if color_mode == _HEATMAP_COLOR_SINGLE:
+            self._remove_projection_layer(except_name=_HEATMAP_LAYER_NAME)
+            layer = self._cached_projection_layer_for_name(
+                _HEATMAP_LAYER_NAME
+            ) or self._find_layer_by_name(_HEATMAP_LAYER_NAME)
+            layer = self._create_or_update_heatmap_layer_from_volume(
+                layer,
+                result.volume,
+                metadata,
+            )
+            self._projection_layer = layer
+            if layer is None:
+                return None
+            self._set_layer_state(
+                layer,
+                None,
+                self._last_summary,
+                result.render_summary,
+            )
+            self._focus_projection_view(layer, result.volume)
+            self._notify_display_viewer_ready(layer)
+            return layer
+
+        # Grouped (individual / cluster) coloring: one image layer per group.
+        self._remove_projection_layer()
+        first_layer = None
+        focus_volume = None
+        for group in result.grouped_volumes:
+            color = self._color_for_heatmap_group(
+                group,
+                heatmap_color_mode=color_mode,
+            )
+            layer = self._add_grouped_heatmap_layer(
+                group,
+                metadata,
+                color,
+                heatmap_color_mode=color_mode,
+            )
+            self._set_layer_state(
+                layer,
+                None,
+                self._last_summary,
+                result.render_summary,
+            )
+            if first_layer is None:
+                first_layer = layer
+                focus_volume = group.volume
+        self._projection_layer = first_layer
+        if first_layer is None:
+            return None
+        self._focus_projection_view(first_layer, focus_volume)
+        self._notify_display_viewer_ready(first_layer)
+        return first_layer
 
     def _validate_precomputed_parquet_contract(self, nodes: pd.DataFrame) -> None:
         """Reject partial/corrupt v3 data before fixed-grid rendering."""
@@ -3497,7 +3759,18 @@ class FlatmapProjectionWidget(QWidget):
         render_result: FlatmapRenderResult,
         metadata: dict[str, object],
     ):
-        volume = render_result.volume
+        return self._create_or_update_heatmap_layer_from_volume(
+            layer,
+            render_result.volume,
+            metadata,
+        )
+
+    def _create_or_update_heatmap_layer_from_volume(
+        self,
+        layer,
+        volume: np.ndarray,
+        metadata: dict[str, object],
+    ):
         contrast_limits = self._heatmap_contrast_limits(volume)
         metadata = dict(metadata)
         metadata["flatmap_heatmap_contrast_limits"] = contrast_limits

@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import duckdb
 import numpy as np
 import pandas as pd
 import pytest
 
 from napari_swc_viewer.flatmap_heatmap import (
+    FLATMAP_HEATMAP_COLOR_CLUSTER,
+    FLATMAP_HEATMAP_COLOR_INDIVIDUAL,
+    FLATMAP_HEATMAP_COLOR_SINGLE,
+    MAX_FLATMAP_HEATMAP_VOXELS,
     build_flatmap_cluster_volumes,
     build_flatmap_file_id_volumes,
+    build_flatmap_heatmap_volume_result,
     build_flatmap_render_data,
     build_flatmap_render_data_from_projected_nodes,
-    compute_flatmap_lookup_stats,
     compute_depth_range,
+    compute_flatmap_bounds_from_parquet,
+    compute_flatmap_lookup_stats,
     compute_flatmap_xy_bounds,
 )
 
@@ -346,3 +353,248 @@ def test_build_flatmap_cluster_volumes_groups_by_cluster_with_unclustered_last()
     assert groups[0].volume[1, 2, 0] == 1.0
     assert groups[1].volume[0, 1, 2] == 2.0
     assert groups[2].volume[1, 0, 1] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# DuckDB-backed precomputed heatmap rendering.
+# ---------------------------------------------------------------------------
+
+
+def _v3_flatmap_frame(seed: int = 0, n: int = 4000) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-5.0, 120.0, n).astype(np.float32)
+    y = rng.uniform(-5.0, 90.0, n).astype(np.float32)
+    depth = rng.uniform(-30.0, 900.0, n).astype(np.float32)
+    depth[rng.integers(0, n, 150)] = -1.0
+    flatmap_valid = rng.random(n) > 0.1
+    depth_valid = (depth >= 0.0) & (rng.random(n) > 0.05)
+    file_index = rng.integers(0, 6, n)
+    return pd.DataFrame(
+        {
+            "file_id": [f"neuron_{i}" for i in file_index],
+            "node_id": np.arange(n, dtype=np.int32),
+            "parent_id": np.full(n, -1, dtype=np.int32),
+            "type": np.full(n, 3, dtype=np.int32),
+            "x_flat_shaped": x,
+            "y_flat_shaped": y,
+            "x_flat_square": x + 1.0,
+            "y_flat_square": y + 1.0,
+            "depth_um": depth,
+            "flatmap_shaped_valid": flatmap_valid,
+            "flatmap_square_valid": flatmap_valid,
+            "depth_valid": depth_valid,
+        }
+    )
+
+
+def _pandas_reference_volume(
+    frame: pd.DataFrame,
+    *,
+    suffix: str,
+    xy_bins: int,
+    depth_bin_um: float,
+    include: bool,
+    x_bounds,
+    y_bounds,
+    depth_range_um,
+):
+    projected = pd.DataFrame(
+        {
+            "file_id": frame["file_id"].to_numpy(),
+            "x_flat": pd.to_numeric(frame[f"x_flat_{suffix}"]),
+            "y_flat": pd.to_numeric(frame[f"y_flat_{suffix}"]),
+            "depth_um": pd.to_numeric(frame["depth_um"]),
+            "flatmap_valid": frame[f"flatmap_{suffix}_valid"].astype(bool),
+            "depth_valid": frame["depth_valid"].astype(bool),
+        }
+    )
+    return build_flatmap_render_data_from_projected_nodes(
+        projected,
+        xy_bins=xy_bins,
+        depth_bin_um=depth_bin_um,
+        include_depth_minus_one=include,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range_um,
+    )
+
+
+@pytest.fixture()
+def _flatmap_parquet(tmp_path):
+    frame = _v3_flatmap_frame()
+    path = tmp_path / "flatmap_v3.parquet"
+    frame.to_parquet(path, index=False)
+    return frame, str(path)
+
+
+@pytest.mark.parametrize("include", [False, True])
+@pytest.mark.parametrize("style_key,suffix", [("both_shaped", "shaped"), ("both_square", "square")])
+def test_duckdb_single_volume_matches_pandas(_flatmap_parquet, include, style_key, suffix):
+    _frame, path = _flatmap_parquet
+    x_bounds, y_bounds, depth_range = (0.0, 118.0), (0.0, 88.0), (0.0, 890.0)
+    reference = _pandas_reference_volume(
+        _frame,
+        suffix=suffix,
+        xy_bins=32,
+        depth_bin_um=50.0,
+        include=include,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range,
+    )
+    conn = duckdb.connect()
+    try:
+        result = build_flatmap_heatmap_volume_result(
+            conn,
+            path,
+            style_key=style_key,
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            depth_range_um=depth_range,
+            xy_bins=32,
+            depth_bin_um=50.0,
+            include_depth_minus_one=include,
+        )
+    finally:
+        conn.close()
+
+    assert result.volume.shape == reference.volume.shape
+    np.testing.assert_array_equal(result.volume, reference.volume)
+    assert result.render_summary.rendered_nodes == reference.summary.rendered_nodes
+    assert result.render_summary.nonzero_voxels == reference.summary.nonzero_voxels
+    assert result.render_summary.flatmap_valid_nodes == reference.summary.flatmap_valid_nodes
+    assert result.render_summary.depth_valid_nodes == reference.summary.depth_valid_nodes
+
+
+@pytest.mark.parametrize("include", [False, True])
+def test_duckdb_grouped_volumes_sum_to_single(_flatmap_parquet, include):
+    _frame, path = _flatmap_parquet
+    x_bounds, y_bounds, depth_range = (0.0, 118.0), (0.0, 88.0), (0.0, 890.0)
+    reference = _pandas_reference_volume(
+        _frame,
+        suffix="shaped",
+        xy_bins=24,
+        depth_bin_um=75.0,
+        include=include,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range,
+    )
+    conn = duckdb.connect()
+    try:
+        individual = build_flatmap_heatmap_volume_result(
+            conn,
+            path,
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_INDIVIDUAL,
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            depth_range_um=depth_range,
+            xy_bins=24,
+            depth_bin_um=75.0,
+            include_depth_minus_one=include,
+        )
+        cluster_map = {f"neuron_{i}": i % 3 for i in range(6)}
+        cluster = build_flatmap_heatmap_volume_result(
+            conn,
+            path,
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_CLUSTER,
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            depth_range_um=depth_range,
+            xy_bins=24,
+            depth_bin_um=75.0,
+            include_depth_minus_one=include,
+            cluster_map=cluster_map,
+        )
+    finally:
+        conn.close()
+
+    assert individual.volume is None
+    combined_individual = np.zeros(individual.volume_shape, dtype=np.float32)
+    for group in individual.grouped_volumes:
+        combined_individual += group.volume
+    np.testing.assert_array_equal(combined_individual, reference.volume)
+
+    combined_cluster = np.zeros(cluster.volume_shape, dtype=np.float32)
+    for group in cluster.grouped_volumes:
+        combined_cluster += group.volume
+    np.testing.assert_array_equal(combined_cluster, reference.volume)
+    assert [group.label for group in cluster.grouped_volumes][:3] == [
+        "Cluster 0",
+        "Cluster 1",
+        "Cluster 2",
+    ]
+
+
+def test_duckdb_file_id_subset_and_empty_selection(_flatmap_parquet):
+    _frame, path = _flatmap_parquet
+    bounds = dict(x_bounds=(0.0, 118.0), y_bounds=(0.0, 88.0), depth_range_um=(0.0, 890.0))
+    conn = duckdb.connect()
+    try:
+        subset = build_flatmap_heatmap_volume_result(
+            conn,
+            path,
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            xy_bins=16,
+            depth_bin_um=100.0,
+            include_depth_minus_one=False,
+            file_ids=["neuron_0", "neuron_1"],
+            **bounds,
+        )
+        empty = build_flatmap_heatmap_volume_result(
+            conn,
+            path,
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            xy_bins=16,
+            depth_bin_um=100.0,
+            include_depth_minus_one=False,
+            file_ids=[],
+            **bounds,
+        )
+    finally:
+        conn.close()
+
+    assert subset.render_summary.traces_represented <= 2
+    assert subset.render_summary.rendered_nodes > 0
+    assert empty.render_summary.rendered_nodes == 0
+    assert float(empty.volume.sum()) == 0.0
+
+
+def test_duckdb_bounds_fallback_matches_projected_nodes_bounds(_flatmap_parquet):
+    _frame, path = _flatmap_parquet
+    conn = duckdb.connect()
+    try:
+        bounds = compute_flatmap_bounds_from_parquet(
+            conn, path, style_key="both_shaped", file_ids=None
+        )
+    finally:
+        conn.close()
+    assert set(bounds) == {"x_bounds", "y_bounds", "depth_range_um"}
+    assert bounds["x_bounds"][0] < bounds["x_bounds"][1]
+    assert bounds["depth_range_um"][0] >= 0.0
+
+
+def test_duckdb_voxel_guard_rejects_oversized_grid(_flatmap_parquet):
+    _frame, path = _flatmap_parquet
+    conn = duckdb.connect()
+    try:
+        with pytest.raises(ValueError, match="too large"):
+            build_flatmap_heatmap_volume_result(
+                conn,
+                path,
+                style_key="both_shaped",
+                color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+                x_bounds=(0.0, 118.0),
+                y_bounds=(0.0, 88.0),
+                depth_range_um=(0.0, 890.0),
+                xy_bins=int(MAX_FLATMAP_HEATMAP_VOXELS ** 0.5) + 1000,
+                depth_bin_um=1.0,
+                include_depth_minus_one=False,
+            )
+    finally:
+        conn.close()
