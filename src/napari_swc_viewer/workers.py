@@ -1232,6 +1232,248 @@ class FlatmapCorrelationWorker(QObject):
             self.error.emit(str(e))
 
 
+class FlatmapParquetCorrelationWorker(QObject):
+    """Flatmap-space voxel correlation clustering straight from Parquet.
+
+    Unlike :class:`FlatmapCorrelationWorker`, this worker does not require a
+    rendered heatmap source.  It bins the precomputed flatmap/depth Parquet
+    columns via DuckDB, so it is available whenever the coordinates exist in
+    the loaded Parquet.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        parquet_path: str,
+        atlas: BrainGlobeAtlas,
+        style: str,
+        xy_bins: int,
+        depth_bin_um: float,
+        include_depth_minus_one: bool = True,
+        linkage_method: str = "average",
+        n_clusters: int = 5,
+        file_ids: list[str] | None = None,
+    ):
+        super().__init__()
+        self._parquet_path = parquet_path
+        self._atlas = atlas
+        self._style = style
+        self._xy_bins = int(xy_bins)
+        self._depth_bin_um = float(depth_bin_um)
+        self._include_depth_minus_one = bool(include_depth_minus_one)
+        self._linkage_method = linkage_method
+        self._n_clusters = int(n_clusters)
+        self._file_ids = (
+            None if file_ids is None else [str(file_id) for file_id in file_ids]
+        )
+
+    def run(self) -> None:
+        """Execute the parquet-driven flatmap correlation pipeline."""
+        try:
+            from .analysis.flatmap_correlation import (
+                compute_flatmap_voxel_correlation_from_parquet,
+            )
+
+            total = 3
+            self.progress.emit(
+                "Binning flatmap coordinates in DuckDB...", 1, total
+            )
+            result, count_data, provenance = (
+                compute_flatmap_voxel_correlation_from_parquet(
+                    self._parquet_path,
+                    style=self._style,
+                    xy_bins=self._xy_bins,
+                    depth_bin_um=self._depth_bin_um,
+                    include_depth_minus_one=self._include_depth_minus_one,
+                    method=self._linkage_method,
+                    n_clusters=self._n_clusters,
+                    file_ids=self._file_ids,
+                )
+            )
+
+            self.progress.emit("Recording flatmap clustering metadata...", 2, total)
+            extra_metadata = {
+                "flatmap_style": provenance.style,
+                "flatmap_coordinate_mode": "parquet_columns",
+                "flatmap_xy_bins": int(provenance.xy_bins),
+                "flatmap_depth_bin_um": float(provenance.depth_bin_um),
+                "flatmap_include_depth_minus_one": bool(
+                    provenance.include_depth_minus_one
+                ),
+                "flatmap_volume_shape": [
+                    int(size) for size in provenance.volume_shape
+                ],
+                "flatmap_input_neuron_count": int(
+                    len(result.neuron_ids) + len(result.unassigned_neuron_ids)
+                ),
+                "flatmap_clustered_neuron_count": int(len(result.neuron_ids)),
+                "flatmap_unassigned_neuron_count": int(
+                    len(result.unassigned_neuron_ids)
+                ),
+                "flatmap_rendered_node_count": int(count_data.rendered_node_count),
+                "flatmap_occupied_voxel_count": int(len(count_data.voxel_ids)),
+            }
+            _attach_cluster_run_metadata(
+                result,
+                atlas=self._atlas,
+                parquet_path=self._parquet_path,
+                region_selection=None,
+                analysis_method="flatmap_voxel_correlation",
+                clustering_algorithm="hierarchical",
+                distance_metric="one_minus_pearson_r",
+                clustering_linkage=self._linkage_method,
+                dendrogram_linkage=self._linkage_method,
+                dilation_fraction=0.0,
+                requested_cluster_count=self._n_clusters,
+                extra_metadata=extra_metadata,
+            )
+
+            self.progress.emit("Done", 3, total)
+            self.finished.emit(result)
+
+        except Exception as e:
+            logger.exception("Flatmap parquet correlation pipeline failed")
+            self.error.emit(str(e))
+
+
+class FlatmapSomaClusterWorker(QObject):
+    """Cluster neurons by soma location in flatmap + depth space.
+
+    Mirrors :class:`SomaClusterWorker` but computes Euclidean distances in
+    flatmap ``(x_flat, y_flat, depth_um)`` space using the precomputed
+    Parquet columns.  Region filtering is intentionally not applied here; it
+    is handled separately for flatmap space.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        parquet_path: str,
+        atlas: BrainGlobeAtlas,
+        style: str,
+        algorithm: str = "hierarchical",
+        linkage_method: str = "ward",
+        n_clusters: int = 5,
+        eps: float = 100.0,
+        min_samples: int = 5,
+        file_ids: list[str] | None = None,
+    ):
+        super().__init__()
+        self._parquet_path = parquet_path
+        self._atlas = atlas
+        self._style = style
+        self._algorithm = algorithm
+        self._linkage_method = linkage_method
+        self._n_clusters = int(n_clusters)
+        self._eps = float(eps)
+        self._min_samples = int(min_samples)
+        self._file_ids = (
+            None if file_ids is None else [str(file_id) for file_id in file_ids]
+        )
+
+    def run(self) -> None:
+        """Execute the flatmap-space soma clustering pipeline."""
+        try:
+            from .analysis.clustering import (
+                cluster_somas_dbscan,
+                cluster_somas_hierarchical,
+                cluster_somas_kmeans,
+            )
+            from .analysis.flatmap_correlation import (
+                query_flatmap_soma_coordinates,
+            )
+
+            total = 3
+            self.progress.emit(
+                "Querying soma flatmap coordinates...", 1, total
+            )
+            filtered_ids, filtered_coords = query_flatmap_soma_coordinates(
+                self._parquet_path,
+                style=self._style,
+                file_ids=self._file_ids,
+            )
+
+            if len(filtered_ids) < 2:
+                self.error.emit(
+                    f"Only {len(filtered_ids)} soma(s) have valid flatmap/depth "
+                    "coordinates — need at least 2 for clustering."
+                )
+                return
+
+            self.progress.emit(
+                f"Clustering {len(filtered_ids)} somas ({self._algorithm})...",
+                2,
+                total,
+            )
+
+            if self._algorithm == "hierarchical":
+                result = cluster_somas_hierarchical(
+                    filtered_coords,
+                    filtered_ids,
+                    method=self._linkage_method,
+                    n_clusters=self._n_clusters,
+                )
+                clustering_linkage = self._linkage_method
+                dendrogram_linkage = self._linkage_method
+                requested_cluster_count = self._n_clusters
+            elif self._algorithm == "kmeans":
+                result = cluster_somas_kmeans(
+                    filtered_coords,
+                    filtered_ids,
+                    n_clusters=self._n_clusters,
+                )
+                clustering_linkage = None
+                dendrogram_linkage = "average"
+                requested_cluster_count = self._n_clusters
+            elif self._algorithm == "dbscan":
+                result = cluster_somas_dbscan(
+                    filtered_coords,
+                    filtered_ids,
+                    eps=self._eps,
+                    min_samples=self._min_samples,
+                )
+                clustering_linkage = None
+                dendrogram_linkage = "average"
+                requested_cluster_count = None
+            else:
+                self.error.emit(f"Unknown algorithm: {self._algorithm}")
+                return
+
+            _attach_cluster_run_metadata(
+                result,
+                atlas=self._atlas,
+                parquet_path=self._parquet_path,
+                region_selection=None,
+                analysis_method="flatmap_soma_location",
+                clustering_algorithm=self._algorithm,
+                distance_metric="euclidean_flatmap_depth",
+                clustering_linkage=clustering_linkage,
+                dendrogram_linkage=dendrogram_linkage,
+                dilation_fraction=0.0,
+                requested_cluster_count=requested_cluster_count,
+                dbscan_eps=self._eps if self._algorithm == "dbscan" else None,
+                dbscan_min_samples=self._min_samples
+                if self._algorithm == "dbscan"
+                else None,
+                extra_metadata={"flatmap_style": self._style},
+            )
+
+            self.progress.emit("Done", 3, total)
+            self.finished.emit(result)
+
+        except Exception as e:
+            logger.exception("Flatmap soma clustering pipeline failed")
+            self.error.emit(str(e))
+
+
 class SomaClusterWorker(QObject):
     """Cluster neurons by soma location in a background thread.
 

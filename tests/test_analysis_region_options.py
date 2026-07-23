@@ -18,27 +18,6 @@ from napari_swc_viewer.analysis.clustering import (
 )
 
 
-def _complete_flatmap_source():
-    return types.SimpleNamespace(
-        projected_nodes=pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "render_valid": [True, True],
-                "depth_bin": [0, 0],
-                "y_flat_bin": [0, 1],
-                "x_flat_bin": [0, 1],
-            }
-        ),
-        volume_shape=(1, 2, 2),
-        input_file_ids=("n1", "n2"),
-        xy_bins=2,
-        depth_bin_um=25.0,
-        flatmap_path="flatmap.nrrd",
-        depth_path="depth.nrrd",
-        lookup_stats=object(),
-    )
-
-
 class _BoundSignal:
     """Minimal signal object used by widget stubs."""
 
@@ -1249,85 +1228,92 @@ def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -
     )
 
 
-def test_flatmap_correlation_option_requires_complete_source() -> None:
-    """Flatmap method should only appear when a complete source is available."""
+def _enable_flatmap_coords(widget, styles=("both_shaped", "both_square")):
+    """Force the widget to treat the loaded Parquet as flatmap-capable."""
+    widget._detect_flatmap_coordinates = lambda: (True, styles)
+    widget.refresh_flatmap_coordinate_availability()
+
+
+def _coord_space_items(widget):
+    return [item["text"] for item in widget._coordinate_space_combo._items]
+
+
+def test_flatmap_space_hidden_without_coordinates() -> None:
+    """Flat map + Depth must not appear when the Parquet lacks coordinates."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
 
-    assert "Flatmap Voxel Correlation" not in [
-        item["text"] for item in widget._clustering_method_combo._items
-    ]
-
-    widget.set_flatmap_correlation_source_provider(_complete_flatmap_source)
-
-    assert "Flatmap Voxel Correlation" in [
-        item["text"] for item in widget._clustering_method_combo._items
-    ]
+    assert _coord_space_items(widget) == ["CCFv3 Coordinates"]
 
 
-def test_flatmap_correlation_accepts_complete_precomputed_source_without_nrrds() -> None:
-    """Binned v3 Parquet data must not require lookup files or lookup stats."""
+def test_flatmap_space_appears_when_coordinates_present() -> None:
+    """Flat map + Depth appears and styles populate when coords are present."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
-    source = _complete_flatmap_source()
-    source.coordinate_mode = "parquet_columns"
-    source.flatmap_path = None
-    source.depth_path = None
-    source.lookup_stats = None
 
-    widget.set_flatmap_correlation_source_provider(lambda: source)
+    _enable_flatmap_coords(widget)
 
-    assert "Flatmap Voxel Correlation" in [
-        item["text"] for item in widget._clustering_method_combo._items
-    ]
+    assert "Flat map + Depth" in _coord_space_items(widget)
+    style_keys = [item["data"] for item in widget._flatmap_style_combo._items]
+    assert style_keys == ["both_shaped", "both_square"]
 
 
-def test_flatmap_correlation_unavailable_resets_method_selection() -> None:
-    """Losing flatmap metadata should remove the method and select atlas correlation."""
+def test_flatmap_space_removed_when_coordinates_absent() -> None:
+    """Losing flatmap coords removes the option and resets to CCFv3 space."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
-    source = _complete_flatmap_source()
-    widget.set_flatmap_correlation_source_provider(lambda: source)
-    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    assert widget._current_coordinate_space() == "Flat map + Depth"
 
-    incomplete_source = _complete_flatmap_source()
-    incomplete_source.lookup_stats = None
-    widget.set_flatmap_correlation_source_provider(lambda: incomplete_source)
+    widget._detect_flatmap_coordinates = lambda: (False, ())
+    widget.refresh_flatmap_coordinate_availability()
 
-    assert widget._clustering_method_combo.currentText() == "Voxel Correlation"
-    assert "Flatmap Voxel Correlation" not in [
-        item["text"] for item in widget._clustering_method_combo._items
-    ]
-    assert "Render a Flatmap tab 3D heatmap" in (
-        widget._flatmap_correlation_status_label.text()
-    )
+    assert "Flat map + Depth" not in _coord_space_items(widget)
+    assert widget._current_coordinate_space() == "CCFv3 Coordinates"
 
 
-def test_flatmap_correlation_method_hides_nonapplicable_controls() -> None:
-    """Flatmap mode should hide search scope and dilation controls."""
+def test_flatmap_voxel_hides_region_controls_and_shows_binning() -> None:
+    """Flat map + Depth voxel mode hides CCFv3 controls and shows binning."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
-    widget.set_flatmap_correlation_source_provider(_complete_flatmap_source)
-
-    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
 
     assert widget._cluster_region_scope_label._visible is False
     assert widget._cluster_region_scope_combo._visible is False
     assert widget._dilation_label._visible is False
     assert widget._dilation_spin._visible is False
-    assert "Precomputed views read region masks from the active cache" in (
-        widget._flatmap_correlation_status_label.text()
-    )
+    assert widget._flatmap_style_combo._visible is True
+    assert widget._flatmap_xy_bins_spin._visible is True
+    assert widget._flatmap_depth_bin_spin._visible is True
+    assert widget._flatmap_include_depth_minus_one_cb._visible is True
+    assert widget._flatmap_coords_status_label._visible is True
 
 
-def test_run_clustering_pipeline_uses_flatmap_only_when_explicitly_selected() -> None:
-    """Voxel Correlation should stay atlas-space even when a flatmap source exists."""
+def test_flatmap_soma_hides_binning_and_shows_algorithm() -> None:
+    """Flat map + Depth soma mode hides binning and shows the algorithm row."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+
+    assert widget._algorithm_combo._visible is True
+    assert widget._flatmap_style_combo._visible is True
+    assert widget._flatmap_xy_bins_spin._visible is False
+    assert widget._flatmap_depth_bin_spin._visible is False
+    assert widget._flatmap_include_depth_minus_one_cb._visible is False
+
+
+def test_ccf_voxel_correlation_unaffected_by_flatmap_availability() -> None:
+    """CCFv3 space still runs atlas voxel correlation even when coords exist."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
     widget._db = object()
     widget._atlas = object()
-    source = _complete_flatmap_source()
-    widget.set_flatmap_correlation_source_provider(lambda: source)
+    _enable_flatmap_coords(widget)
     selection = ClusterRegionSelection(
         selected_region_ids=[184],
         selected_region_acronyms=["FRP"],
@@ -1335,8 +1321,8 @@ def test_run_clustering_pipeline_uses_flatmap_only_when_explicitly_selected() ->
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_flatmap_correlation_clustering = MagicMock()
     widget._run_correlation_clustering = MagicMock()
+    widget._run_flatmap_correlation_clustering = MagicMock()
 
     widget._run_clustering_pipeline()
 
@@ -1348,64 +1334,46 @@ def test_run_clustering_pipeline_uses_flatmap_only_when_explicitly_selected() ->
     widget._run_flatmap_correlation_clustering.assert_not_called()
 
 
-def test_run_clustering_pipeline_flatmap_source_without_region() -> None:
-    """Explicit flatmap clustering should use the latest flatmap heatmap."""
+def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
+    """Flat map voxel correlation launches FlatmapParquetCorrelationWorker."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
     widget._db = object()
     widget._atlas = object()
-    source = _complete_flatmap_source()
-    widget.set_flatmap_correlation_source_provider(lambda: source)
-    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
-    widget._selected_cluster_region_selection = lambda: None
-    widget._run_flatmap_correlation_clustering = MagicMock()
-    widget._run_correlation_clustering = MagicMock()
-
-    widget._run_clustering_pipeline()
-
-    widget._run_flatmap_correlation_clustering.assert_called_once_with(
-        source,
-        None,
-    )
-    widget._run_correlation_clustering.assert_not_called()
-
-
-def test_flatmap_correlation_method_constructs_flatmap_worker(monkeypatch) -> None:
-    """Flatmap method should launch the flatmap-specific worker."""
-    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
-    widget = AnalysisTabWidget(_DummyViewer())
-    source = _complete_flatmap_source()
-    selection = ClusterRegionSelection(
-        selected_region_ids=[184],
-        selected_region_acronyms=["FRP"],
-        represented_region_ids=[68],
-        represented_region_acronyms=["FRP1"],
-    )
-    widget._atlas = object()
     widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
     widget._method_combo.setCurrentText("complete")
     widget._n_clusters_spin.setValue(7)
+    widget._flatmap_xy_bins_spin.setValue(128)
+    widget._flatmap_depth_bin_spin.setValue(50.0)
+    widget._flatmap_include_depth_minus_one_cb.setChecked(False)
     widget._start_background_worker = MagicMock()
 
     created_workers = []
 
-    class _FakeFlatmapCorrelationWorker:
+    class _FakeFlatmapParquetCorrelationWorker:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
             created_workers.append(self)
 
     workers_module = types.ModuleType("napari_swc_viewer.workers")
-    workers_module.FlatmapCorrelationWorker = _FakeFlatmapCorrelationWorker
+    workers_module.FlatmapParquetCorrelationWorker = (
+        _FakeFlatmapParquetCorrelationWorker
+    )
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
-    widget._run_flatmap_correlation_clustering(source, selection)
+    widget._run_clustering_pipeline()
 
     assert len(created_workers) == 1
     assert created_workers[0].kwargs == {
-        "source": source,
-        "atlas": widget._atlas,
         "parquet_path": "neurons.parquet",
-        "region_selection": selection,
+        "atlas": widget._atlas,
+        "style": "both_shaped",
+        "xy_bins": 128,
+        "depth_bin_um": 50.0,
+        "include_depth_minus_one": False,
         "linkage_method": "complete",
         "n_clusters": 7,
     }
@@ -1415,55 +1383,50 @@ def test_flatmap_correlation_method_constructs_flatmap_worker(monkeypatch) -> No
     )
 
 
-def test_run_clustering_pipeline_treats_root_as_all_flatmap_space() -> None:
-    """Selecting root in Analysis should not restrict flatmap voxel clustering."""
+def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
+    """Flat map soma clustering launches FlatmapSomaClusterWorker."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
     widget._db = object()
     widget._atlas = object()
-    source = _complete_flatmap_source()
-    widget.set_flatmap_correlation_source_provider(lambda: source)
-    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
-    selection = ClusterRegionSelection(
-        selected_region_ids=[997],
-        selected_region_acronyms=["root"],
-        represented_region_ids=[68, 500],
-        represented_region_acronyms=["FRP1", "CP"],
-    )
-    widget._selected_cluster_region_selection = lambda: selection
-    widget._run_flatmap_correlation_clustering = MagicMock()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    widget._algorithm_combo.setCurrentText("K-Means")
+    widget._method_combo.setCurrentText("ward")
+    widget._n_clusters_spin.setValue(4)
+    widget._eps_spin.setValue(120.0)
+    widget._min_samples_spin.setValue(6)
+    widget._start_background_worker = MagicMock()
+
+    created_workers = []
+
+    class _FakeFlatmapSomaClusterWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
 
-    widget._run_flatmap_correlation_clustering.assert_called_once_with(
-        source,
-        None,
-    )
-
-
-def test_run_clustering_pipeline_passes_nonroot_region_to_flatmap_clustering() -> None:
-    """Non-root Analysis regions should become flatmap-space filters."""
-    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
-    widget = AnalysisTabWidget(_DummyViewer())
-    widget._db = object()
-    widget._atlas = object()
-    source = _complete_flatmap_source()
-    widget.set_flatmap_correlation_source_provider(lambda: source)
-    widget._clustering_method_combo.setCurrentText("Flatmap Voxel Correlation")
-    selection = ClusterRegionSelection(
-        selected_region_ids=[184],
-        selected_region_acronyms=["FRP"],
-        represented_region_ids=[68],
-        represented_region_acronyms=["FRP1"],
-    )
-    widget._selected_cluster_region_selection = lambda: selection
-    widget._run_flatmap_correlation_clustering = MagicMock()
-
-    widget._run_clustering_pipeline()
-
-    widget._run_flatmap_correlation_clustering.assert_called_once_with(
-        source,
-        selection,
+    assert len(created_workers) == 1
+    assert created_workers[0].kwargs == {
+        "parquet_path": "neurons.parquet",
+        "atlas": widget._atlas,
+        "style": "both_shaped",
+        "algorithm": "kmeans",
+        "linkage_method": "ward",
+        "n_clusters": 4,
+        "eps": 120.0,
+        "min_samples": 6,
+    }
+    widget._start_background_worker.assert_called_once_with(
+        created_workers[0],
+        widget._on_correlation_finished,
     )
 
 

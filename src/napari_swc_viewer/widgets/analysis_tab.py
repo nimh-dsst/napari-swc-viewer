@@ -40,6 +40,10 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ..flatmap_heatmap import (
+    DEFAULT_FLATMAP_DEPTH_BIN_UM,
+    DEFAULT_FLATMAP_XY_BINS,
+)
 from .collapsible_section import CollapsibleSection
 from .node_type_selector import NodeTypeSelectorComboBox
 from .region_selector import RegionSelectorWidget
@@ -55,16 +59,17 @@ logger = logging.getLogger(__name__)
 
 _ANALYSIS_SCOPE_WHOLE = "whole"
 _ANALYSIS_SCOPE_CURRENT = "current"
+_COORD_SPACE_CCF = "CCFv3 Coordinates"
+_COORD_SPACE_FLATMAP = "Flat map + Depth"
 _CLUSTER_METHOD_VOXEL = "Voxel Correlation"
-_CLUSTER_METHOD_FLATMAP = "Flatmap Voxel Correlation"
 _CLUSTER_METHOD_SOMA = "Soma Location"
-_FLATMAP_CORRELATION_AVAILABLE_TEXT = (
-    "Uses the latest 3D flatmap heatmap. Precomputed views read region masks "
-    "from the active cache; explicit NRRD views project them from the lookups."
-)
-_FLATMAP_CORRELATION_UNAVAILABLE_TEXT = (
-    "Render a Flatmap tab 3D heatmap from a precomputed Parquet or explicit "
-    "flatmap/depth NRRDs to enable Flatmap Voxel Correlation."
+_FLATMAP_STYLE_LABELS = {
+    "both_shaped": "Bilateral shaped",
+    "both_square": "Bilateral square",
+}
+_FLATMAP_COORDS_INFO_TEXT = (
+    "Clustering runs over all neurons with flatmap/depth coordinates in the "
+    "loaded Parquet. Region filtering in flat map space is not yet available."
 )
 
 
@@ -337,6 +342,9 @@ class AnalysisTabWidget(QWidget):
         self._cluster_region_query_scope = _ANALYSIS_SCOPE_WHOLE
         self._current_table_file_ids_provider = None
         self._flatmap_correlation_source_provider = None
+        self._flatmap_coords_available = False
+        self._flatmap_available_styles: tuple[str, ...] = ()
+        self._flatmap_coords_cache_path: str | None = None
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -395,9 +403,13 @@ class AnalysisTabWidget(QWidget):
         self._current_table_file_ids_provider = provider
 
     def set_flatmap_correlation_source_provider(self, provider) -> None:
-        """Set a callback returning the latest flatmap heatmap clustering source."""
+        """Retained for backward compatibility (no longer gates availability).
+
+        Flat map + Depth clustering availability is now derived from the
+        loaded Parquet's precomputed coordinate columns rather than a rendered
+        heatmap source.
+        """
         self._flatmap_correlation_source_provider = provider
-        self.refresh_flatmap_correlation_option()
 
     def _raw_current_table_file_ids(self) -> list[object]:
         """Return current neuron-table file IDs from the configured provider."""
@@ -442,7 +454,7 @@ class AnalysisTabWidget(QWidget):
 
     def _update_button_states(self) -> None:
         """Enable/disable buttons based on loaded data."""
-        self.refresh_flatmap_correlation_option()
+        self.refresh_flatmap_coordinate_availability()
         ready = self._db is not None and self._atlas is not None
         busy = (
             self._worker_thread is not None and self._worker_thread.isRunning()
@@ -499,27 +511,40 @@ class AnalysisTabWidget(QWidget):
         )
         corr_layout = self._clustering_section.content_layout()
 
-        # Clustering method
-        method_type_row = QHBoxLayout()
-        method_type_row.addWidget(QLabel("Method:"))
-        self._clustering_method_combo = QComboBox()
-        self._clustering_method_combo.addItems([_CLUSTER_METHOD_VOXEL, _CLUSTER_METHOD_SOMA])
-        self._clustering_method_combo.currentTextChanged.connect(
-            self._on_clustering_method_changed
+        # Coordinate space
+        coord_space_row = QHBoxLayout()
+        coord_space_row.addWidget(QLabel("Coordinate space:"))
+        self._coordinate_space_combo = QComboBox()
+        self._coordinate_space_combo.addItem(_COORD_SPACE_CCF)
+        self._coordinate_space_combo.currentTextChanged.connect(
+            self._on_coordinate_space_changed
         )
-        method_type_row.addWidget(self._clustering_method_combo)
-        corr_layout.addLayout(method_type_row)
-        self._flatmap_correlation_status_label = QLabel(
-            _FLATMAP_CORRELATION_UNAVAILABLE_TEXT
-        )
+        coord_space_row.addWidget(self._coordinate_space_combo)
+        corr_layout.addLayout(coord_space_row)
+
+        self._flatmap_coords_status_label = QLabel(_FLATMAP_COORDS_INFO_TEXT)
         set_word_wrap = getattr(
-            self._flatmap_correlation_status_label,
+            self._flatmap_coords_status_label,
             "setWordWrap",
             None,
         )
         if callable(set_word_wrap):
             set_word_wrap(True)
-        corr_layout.addWidget(self._flatmap_correlation_status_label)
+        self._flatmap_coords_status_label.setVisible(False)
+        corr_layout.addWidget(self._flatmap_coords_status_label)
+
+        # Clustering method
+        method_type_row = QHBoxLayout()
+        method_type_row.addWidget(QLabel("Method:"))
+        self._clustering_method_combo = QComboBox()
+        self._clustering_method_combo.addItems(
+            [_CLUSTER_METHOD_VOXEL, _CLUSTER_METHOD_SOMA]
+        )
+        self._clustering_method_combo.currentTextChanged.connect(
+            self._on_clustering_method_changed
+        )
+        method_type_row.addWidget(self._clustering_method_combo)
+        corr_layout.addLayout(method_type_row)
 
         # Algorithm (only for Soma Location)
         self._algorithm_row = QHBoxLayout()
@@ -554,7 +579,8 @@ class AnalysisTabWidget(QWidget):
 
         # Target region
         region_row = QHBoxLayout()
-        region_row.addWidget(QLabel("Target region:"))
+        self._cluster_region_target_label = QLabel("Target region:")
+        region_row.addWidget(self._cluster_region_target_label)
         self._cluster_region_summary_label = QLabel("None selected")
         region_row.addWidget(self._cluster_region_summary_label)
         corr_layout.addLayout(region_row)
@@ -650,6 +676,40 @@ class AnalysisTabWidget(QWidget):
         self._min_samples_spin.setValue(5)
         self._min_samples_row.addWidget(self._min_samples_spin)
         corr_layout.addLayout(self._min_samples_row)
+
+        # Flatmap binning controls (Flat map + Depth voxel correlation only)
+        self._flatmap_style_row = QHBoxLayout()
+        self._flatmap_style_label = QLabel("Flatmap style:")
+        self._flatmap_style_row.addWidget(self._flatmap_style_label)
+        self._flatmap_style_combo = QComboBox()
+        self._flatmap_style_row.addWidget(self._flatmap_style_combo)
+        corr_layout.addLayout(self._flatmap_style_row)
+
+        self._flatmap_xy_bins_row = QHBoxLayout()
+        self._flatmap_xy_bins_label = QLabel("XY bins:")
+        self._flatmap_xy_bins_row.addWidget(self._flatmap_xy_bins_label)
+        self._flatmap_xy_bins_spin = QSpinBox()
+        self._flatmap_xy_bins_spin.setRange(2, 4096)
+        self._flatmap_xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
+        self._flatmap_xy_bins_row.addWidget(self._flatmap_xy_bins_spin)
+        corr_layout.addLayout(self._flatmap_xy_bins_row)
+
+        self._flatmap_depth_bin_row = QHBoxLayout()
+        self._flatmap_depth_bin_label = QLabel("Depth bin (μm):")
+        self._flatmap_depth_bin_row.addWidget(self._flatmap_depth_bin_label)
+        self._flatmap_depth_bin_spin = QDoubleSpinBox()
+        self._flatmap_depth_bin_spin.setRange(1.0, 10000.0)
+        self._flatmap_depth_bin_spin.setDecimals(1)
+        self._flatmap_depth_bin_spin.setValue(float(DEFAULT_FLATMAP_DEPTH_BIN_UM))
+        self._flatmap_depth_bin_spin.setSuffix(" μm")
+        self._flatmap_depth_bin_row.addWidget(self._flatmap_depth_bin_spin)
+        corr_layout.addLayout(self._flatmap_depth_bin_row)
+
+        self._flatmap_include_depth_minus_one_cb = QCheckBox(
+            "Include depth -1 plane"
+        )
+        self._flatmap_include_depth_minus_one_cb.setChecked(True)
+        corr_layout.addWidget(self._flatmap_include_depth_minus_one_cb)
 
         # Run button
         self._run_corr_btn = QPushButton("Run Clustering")
@@ -1065,72 +1125,97 @@ class AnalysisTabWidget(QWidget):
         )
         return False, None, "current table", 0
 
-    def _current_flatmap_correlation_source(self):
-        """Return a usable flatmap heatmap source for voxel correlation, if any."""
-        provider = getattr(self, "_flatmap_correlation_source_provider", None)
-        if not callable(provider):
-            return None
+    def _detect_flatmap_coordinates(self) -> tuple[bool, tuple[str, ...]]:
+        """Return (available, styles) for flatmap coords in the loaded Parquet.
+
+        Availability requires version-3 bilateral flatmap columns plus depth;
+        legacy single-column Parquets are not supported by the DuckDB-based
+        flatmap clustering path. Results are cached per Parquet path.
+        """
+        parquet_path = self._parquet_path
+        if not parquet_path:
+            self._flatmap_coords_cache_path = None
+            self._flatmap_coords_available = False
+            self._flatmap_available_styles = ()
+            return False, ()
+
+        if parquet_path == self._flatmap_coords_cache_path:
+            return self._flatmap_coords_available, self._flatmap_available_styles
+
+        available = False
+        styles: tuple[str, ...] = ()
         try:
-            return provider()
+            from ..flatmap_parquet import read_flatmap_parquet_transform_info
+
+            info = read_flatmap_parquet_transform_info(parquet_path)
+            styles = tuple(info.available_styles)
+            available = bool(styles) and bool(info.has_v3_depth)
         except Exception:
-            logger.exception("Failed to resolve flatmap correlation source")
-            return None
+            logger.debug(
+                "Could not inspect flatmap coordinates in %s",
+                parquet_path,
+                exc_info=True,
+            )
+            available = False
+            styles = ()
 
-    @staticmethod
-    def _flatmap_correlation_source_is_complete(source) -> bool:
-        """Return whether *source* can run flatmap voxel correlation safely."""
-        if source is None:
-            return False
-        projected_nodes = getattr(source, "projected_nodes", None)
-        if projected_nodes is None or getattr(projected_nodes, "empty", True):
-            return False
-        required_columns = {
-            "file_id",
-            "render_valid",
-            "depth_bin",
-            "y_flat_bin",
-            "x_flat_bin",
-        }
-        if not required_columns.issubset(set(getattr(projected_nodes, "columns", []))):
-            return False
-        volume_shape = getattr(source, "volume_shape", None)
-        if volume_shape is None or len(tuple(volume_shape)) != 3:
-            return False
-        # Binned version-3 Parquet data is already a complete correlation
-        # source. Region-filtered runs resolve masks from its active cache in
-        # FlatmapCorrelationWorker and must not require NRRDs or lookup stats.
-        if getattr(source, "coordinate_mode", None) != "parquet_columns":
-            if not getattr(source, "flatmap_path", None) or not getattr(
-                source,
-                "depth_path",
-                None,
-            ):
-                return False
-            if getattr(source, "lookup_stats", None) is None:
-                return False
+        self._flatmap_coords_cache_path = parquet_path
+        self._flatmap_coords_available = available
+        self._flatmap_available_styles = styles
+        return available, styles
+
+    def _current_coordinate_space(self) -> str:
+        """Return the selected clustering coordinate space."""
+        combo = getattr(self, "_coordinate_space_combo", None)
+        if combo is None:
+            return _COORD_SPACE_CCF
+        return combo.currentText() or _COORD_SPACE_CCF
+
+    def _selected_flatmap_style(self) -> str | None:
+        """Return the selected flatmap style key, or the first available."""
+        combo = getattr(self, "_flatmap_style_combo", None)
+        if combo is not None:
+            style = combo.currentData()
+            if style:
+                return str(style)
+        styles = getattr(self, "_flatmap_available_styles", ())
+        return styles[0] if styles else None
+
+    def _populate_flatmap_style_combo(self, styles: tuple[str, ...]) -> None:
+        """Fill the flatmap style combo with the available bilateral styles."""
+        combo = getattr(self, "_flatmap_style_combo", None)
+        if combo is None:
+            return
+        previous = combo.currentData()
+        blocker = getattr(combo, "blockSignals", None)
+        if callable(blocker):
+            blocker(True)
         try:
-            input_count = len(tuple(getattr(source, "input_file_ids", ())))
-            xy_bins = int(getattr(source, "xy_bins"))
-            depth_bin_um = float(getattr(source, "depth_bin_um"))
-        except (TypeError, ValueError):
-            return False
-        return input_count >= 2 and xy_bins > 0 and depth_bin_um > 0.0
+            combo.clear()
+            for style in styles:
+                combo.addItem(_FLATMAP_STYLE_LABELS.get(style, style), style)
+            if previous in styles:
+                combo.setCurrentText(
+                    _FLATMAP_STYLE_LABELS.get(previous, str(previous))
+                )
+        finally:
+            if callable(blocker):
+                blocker(False)
 
-    def refresh_flatmap_correlation_option(self) -> None:
-        """Refresh method dropdown availability for flatmap voxel correlation."""
-        combo = getattr(self, "_clustering_method_combo", None)
+    def refresh_flatmap_coordinate_availability(self) -> None:
+        """Show the Flat map + Depth space only when the Parquet has coords."""
+        combo = getattr(self, "_coordinate_space_combo", None)
         if combo is None:
             return
 
+        available, styles = self._detect_flatmap_coordinates()
+        options = [_COORD_SPACE_CCF]
+        if available:
+            options.append(_COORD_SPACE_FLATMAP)
+
         current_text = combo.currentText()
-        source = self._current_flatmap_correlation_source()
-        flatmap_available = self._flatmap_correlation_source_is_complete(source)
-        options = [_CLUSTER_METHOD_VOXEL]
-        if flatmap_available:
-            options.append(_CLUSTER_METHOD_FLATMAP)
-        options.append(_CLUSTER_METHOD_SOMA)
         if current_text not in options:
-            current_text = _CLUSTER_METHOD_VOXEL
+            current_text = _COORD_SPACE_CCF
 
         blocker = getattr(combo, "blockSignals", None)
         if callable(blocker):
@@ -1143,34 +1228,8 @@ class AnalysisTabWidget(QWidget):
             if callable(blocker):
                 blocker(False)
 
-        self._on_clustering_method_changed(current_text)
-
-    @staticmethod
-    def _region_selection_is_all_flatmap_space(
-        region_selection: ClusterRegionSelection | None,
-    ) -> bool:
-        """Return whether the selected Analysis region should mean all voxels."""
-        if region_selection is None:
-            return True
-        acronyms = [
-            str(acronym).strip().lower()
-            for acronym in region_selection.selected_region_acronyms
-        ]
-        return bool(acronyms) and "root" in acronyms
-
-    def _flatmap_region_selection_for_clustering(
-        self,
-    ) -> ClusterRegionSelection | None:
-        """Return selected region filter for flatmap clustering, or None for all."""
-        region_selection = self._selected_cluster_region_selection()
-        if self._region_selection_is_all_flatmap_space(region_selection):
-            return None
-        if not region_selection.represented_region_ids:
-            self._progress_label.setText(
-                "Selected region(s) have no represented dataset regions."
-            )
-            return None
-        return region_selection
+        self._populate_flatmap_style_combo(styles)
+        self._update_clustering_visibility()
 
     def _selected_regions(
         self,
@@ -1307,48 +1366,66 @@ class AnalysisTabWidget(QWidget):
         """Keep the heatmap region summary in sync with tree selection."""
         self._update_region_summary_labels()
 
-    def _on_clustering_method_changed(self, text: str) -> None:
-        """Show/hide UI rows based on the selected clustering method."""
-        is_soma = text == _CLUSTER_METHOD_SOMA
-        is_flatmap = text == _CLUSTER_METHOD_FLATMAP
-        flatmap_source = self._current_flatmap_correlation_source()
-        flatmap_available = self._flatmap_correlation_source_is_complete(
-            flatmap_source
-        )
+    def _on_coordinate_space_changed(self, _text: str) -> None:
+        """Update visible controls when the coordinate space changes."""
+        self._update_clustering_visibility()
 
-        status_label = getattr(self, "_flatmap_correlation_status_label", None)
+    def _on_clustering_method_changed(self, _text: str) -> None:
+        """Update visible controls when the clustering method changes."""
+        self._update_clustering_visibility()
+
+    def _update_clustering_visibility(self) -> None:
+        """Show/hide clustering controls for the coord space + method combo."""
+        is_flatmap = self._current_coordinate_space() == _COORD_SPACE_FLATMAP
+        method = self._clustering_method_combo.currentText()
+        is_soma = method == _CLUSTER_METHOD_SOMA
+
+        status_label = getattr(self, "_flatmap_coords_status_label", None)
         if status_label is not None:
-            if is_flatmap:
-                status_label.setText(_FLATMAP_CORRELATION_AVAILABLE_TEXT)
-                status_label.setVisible(True)
-            elif not flatmap_available:
-                status_label.setText(_FLATMAP_CORRELATION_UNAVAILABLE_TEXT)
-                status_label.setVisible(True)
-            else:
-                status_label.setText("")
-                status_label.setVisible(False)
+            status_label.setVisible(is_flatmap)
 
+        # CCFv3-only region + dilation controls (region filtering in flat map
+        # space is handled separately and not yet available).
         for widget in (
             getattr(self, "_cluster_region_scope_label", None),
             getattr(self, "_cluster_region_scope_combo", None),
-        ):
-            if widget is not None:
-                widget.setVisible(not is_flatmap)
-        for widget in (
+            getattr(self, "_cluster_region_target_label", None),
+            getattr(self, "_cluster_region_summary_label", None),
+            getattr(self, "_cluster_region_section", None),
             getattr(self, "_dilation_label", None),
             getattr(self, "_dilation_spin", None),
         ):
             if widget is not None:
                 widget.setVisible(not is_flatmap)
 
-        # Algorithm row: only for soma
+        # Flatmap style selector (both flatmap methods need the column family).
+        for widget in (
+            getattr(self, "_flatmap_style_label", None),
+            getattr(self, "_flatmap_style_combo", None),
+        ):
+            if widget is not None:
+                widget.setVisible(is_flatmap)
+
+        # Flatmap binning controls only matter for voxel correlation.
+        flatmap_voxel = is_flatmap and not is_soma
+        for widget in (
+            getattr(self, "_flatmap_xy_bins_label", None),
+            getattr(self, "_flatmap_xy_bins_spin", None),
+            getattr(self, "_flatmap_depth_bin_label", None),
+            getattr(self, "_flatmap_depth_bin_spin", None),
+            getattr(self, "_flatmap_include_depth_minus_one_cb", None),
+        ):
+            if widget is not None:
+                widget.setVisible(flatmap_voxel)
+
+        # Algorithm row: only for soma (in either coordinate space).
         self._algorithm_label.setVisible(is_soma)
         self._algorithm_combo.setVisible(is_soma)
 
         if is_soma:
             self._on_algorithm_changed(self._algorithm_combo.currentText())
         else:
-            # Voxel correlation methods: show linkage + clusters, hide DBSCAN params.
+            # Voxel correlation: show linkage + clusters, hide DBSCAN params.
             self._linkage_label.setVisible(True)
             self._method_combo.setVisible(True)
             self._clusters_label.setVisible(True)
@@ -1382,6 +1459,10 @@ class AnalysisTabWidget(QWidget):
 
         clustering_method = self._clustering_method_combo.currentText()
 
+        if self._current_coordinate_space() == _COORD_SPACE_FLATMAP:
+            self._run_flatmap_clustering(clustering_method)
+            return
+
         if clustering_method == _CLUSTER_METHOD_SOMA:
             proceed, base_file_ids, _scope_label, _input_count = (
                 self._resolve_cluster_query_file_scope()
@@ -1401,28 +1482,6 @@ class AnalysisTabWidget(QWidget):
                 region_selection,
                 self._dilation_spin.value() / 100.0,
                 file_ids=base_file_ids,
-            )
-            return
-
-        if clustering_method == _CLUSTER_METHOD_FLATMAP:
-            flatmap_source = self._current_flatmap_correlation_source()
-            if not self._flatmap_correlation_source_is_complete(flatmap_source):
-                self.refresh_flatmap_correlation_option()
-                self._progress_label.setText(
-                    _FLATMAP_CORRELATION_UNAVAILABLE_TEXT
-                )
-                return
-            region_selection = self._flatmap_region_selection_for_clustering()
-            selected = self._selected_cluster_region_selection()
-            if (
-                selected is not None
-                and not self._region_selection_is_all_flatmap_space(selected)
-                and region_selection is None
-            ):
-                return
-            self._run_flatmap_correlation_clustering(
-                flatmap_source,
-                region_selection,
             )
             return
 
@@ -1473,21 +1532,62 @@ class AnalysisTabWidget(QWidget):
 
         self._start_background_worker(worker, self._on_correlation_finished)
 
-    def _run_flatmap_correlation_clustering(
-        self,
-        flatmap_source,
-        region_selection: ClusterRegionSelection | None,
-    ) -> None:
-        """Start flatmap-space voxel correlation + clustering."""
-        from ..workers import FlatmapCorrelationWorker
+    def _run_flatmap_clustering(self, clustering_method: str) -> None:
+        """Dispatch a Flat map + Depth clustering run from Parquet columns.
 
-        worker = FlatmapCorrelationWorker(
-            source=flatmap_source,
-            atlas=self._atlas,
+        Region filtering in flat map space is not yet available, so clustering
+        runs over every neuron with valid flatmap/depth coordinates.
+        """
+        style = self._selected_flatmap_style()
+        if style is None:
+            self._progress_label.setText(
+                "No flatmap style available in the loaded Parquet."
+            )
+            return
+
+        if clustering_method == _CLUSTER_METHOD_SOMA:
+            self._run_flatmap_soma_clustering(style)
+        else:
+            self._run_flatmap_correlation_clustering(style)
+
+    def _run_flatmap_correlation_clustering(self, style: str) -> None:
+        """Start flatmap-space voxel correlation clustering from Parquet."""
+        from ..workers import FlatmapParquetCorrelationWorker
+
+        worker = FlatmapParquetCorrelationWorker(
             parquet_path=self._parquet_path,
-            region_selection=region_selection,
+            atlas=self._atlas,
+            style=style,
+            xy_bins=self._flatmap_xy_bins_spin.value(),
+            depth_bin_um=self._flatmap_depth_bin_spin.value(),
+            include_depth_minus_one=(
+                self._flatmap_include_depth_minus_one_cb.isChecked()
+            ),
             linkage_method=self._method_combo.currentText(),
             n_clusters=self._n_clusters_spin.value(),
+        )
+        self._start_background_worker(worker, self._on_correlation_finished)
+
+    def _run_flatmap_soma_clustering(self, style: str) -> None:
+        """Start flatmap-space soma-location clustering from Parquet."""
+        from ..workers import FlatmapSomaClusterWorker
+
+        algorithm_map = {
+            "Hierarchical": "hierarchical",
+            "K-Means": "kmeans",
+            "DBSCAN": "dbscan",
+        }
+        algorithm = algorithm_map[self._algorithm_combo.currentText()]
+
+        worker = FlatmapSomaClusterWorker(
+            parquet_path=self._parquet_path,
+            atlas=self._atlas,
+            style=style,
+            algorithm=algorithm,
+            linkage_method=self._method_combo.currentText(),
+            n_clusters=self._n_clusters_spin.value(),
+            eps=self._eps_spin.value(),
+            min_samples=self._min_samples_spin.value(),
         )
         self._start_background_worker(worker, self._on_correlation_finished)
 
