@@ -572,6 +572,10 @@ class NeuronTableWidget(QWidget):
         """Return a mapping of all file_ids to their current RGBA colors."""
         return {fid: list(e.color) for fid, e in self._entries.items()}
 
+    def get_cluster_map(self) -> dict[object, int | None]:
+        """Return a mapping of all file_ids to their current cluster assignment."""
+        return {fid: e.cluster_id for fid, e in self._entries.items()}
+
     def get_visibility_map(self) -> dict[str, bool]:
         """Return a mapping of all file_ids to their visibility state."""
         return {fid: e.visible for fid, e in self._entries.items()}
@@ -926,16 +930,33 @@ class NeuronTableWidget(QWidget):
             Clustering result containing neuron_ids and labels.
         """
         row_map = self._file_id_to_row_map()
+        row_map_by_string = {str(file_id): row for file_id, row in row_map.items()}
+        entries_by_string = {
+            str(file_id): entry for file_id, entry in self._entries.items()
+        }
 
         sorting_enabled = self._table.isSortingEnabled()
         self._table.setSortingEnabled(False)
         try:
+            for neuron_id in getattr(result, "unassigned_neuron_ids", []) or []:
+                entry = self._entries.get(neuron_id)
+                if entry is None:
+                    entry = entries_by_string.get(str(neuron_id))
+                if entry is None:
+                    continue
+                entry.cluster_id = None
+                row = row_map.get(neuron_id, row_map_by_string.get(str(neuron_id)))
+                if row is not None:
+                    self._set_cluster_cell(row, entry.cluster_id)
+
             for neuron_id, label in zip(result.neuron_ids, result.labels):
                 entry = self._entries.get(neuron_id)
                 if entry is None:
+                    entry = entries_by_string.get(str(neuron_id))
+                if entry is None:
                     continue
                 entry.cluster_id = int(label)
-                row = row_map.get(neuron_id)
+                row = row_map.get(neuron_id, row_map_by_string.get(str(neuron_id)))
                 if row is not None:
                     self._set_cluster_cell(row, entry.cluster_id)
         finally:

@@ -295,6 +295,39 @@ class NeuronDatabase:
             """
             return self.conn.execute(query).fetchdf()
 
+    def get_soma_nodes_for_rendering(
+        self,
+        file_ids: list[str],
+    ) -> pd.DataFrame:
+        """Get full soma node rows for rendering/projection.
+
+        Like :meth:`get_neurons_for_rendering` but filtered to soma nodes
+        (``type = 1``) inside DuckDB, so only soma rows are materialized
+        instead of every node of every neuron. All columns are returned,
+        preserving any precomputed flatmap/depth columns.
+
+        Parameters
+        ----------
+        file_ids : list[str]
+            List of file IDs to retrieve soma nodes for.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with all node columns for soma nodes only.
+        """
+        if not file_ids:
+            return pd.DataFrame()
+
+        placeholders = ", ".join(["?"] * len(file_ids))
+        query = f"""
+            SELECT *
+            FROM neurons
+            WHERE type = 1 AND file_id IN ({placeholders})
+            ORDER BY file_id, node_id
+        """
+        return self.conn.execute(query, file_ids).fetchdf()
+
     def get_soma_points(
         self,
         file_ids: list[str],

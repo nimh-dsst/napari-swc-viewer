@@ -31,6 +31,7 @@ pip = ">=23.0"
 setuptools-scm = ">=8.0"
 pyqt6 = ">=6.8.1,<7"
 pyqtgraph = ">=0.13"
+pynrrd = ">=1.0"
 openpyxl = ">=3.1"
 
 [target.linux-64.dependencies]
@@ -40,6 +41,9 @@ mesalib = ">=21.0"
 [feature.dev.dependencies]
 pre-commit = ">=3.0"
 ruff = ">=0.1"
+
+[feature.ci.dependencies]
+python = "3.11.*"
 
 [feature.docs.dependencies]
 weasyprint = "*"
@@ -51,5 +55,5 @@ cpd2-pdf = { cmd = "python scripts/markdown_to_pdf.py docs/cpd2_workflow.md docs
 
 [environments]
 default = ["dev"]
-ci = { features = [], solve-group = "default" }
+ci = { features = ["ci"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }

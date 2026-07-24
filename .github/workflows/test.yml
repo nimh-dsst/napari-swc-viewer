@@ -9,20 +9,12 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.platform }} (py${{ matrix.python-version }})
+    name: ${{ matrix.platform }} (Python 3.11)
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
         platform: [windows-latest, macos-14]
-        python-version: ["3.11"]
-        include:
-          # macos-14 is ARM64 (Apple Silicon M1)
-          - platform: macos-14
-            pixi-platform: osx-arm64
-          # windows-latest is x64
-          - platform: windows-latest
-            pixi-platform: win-64
 
     steps:
       - uses: actions/checkout@v5
@@ -32,6 +24,9 @@ jobs:
         with:
           pixi-version: v0.63.2
           environments: ci
+
+      - name: Verify Python version
+        run: pixi run -e ci python -c "import sys; assert sys.version_info[:2] == (3, 11), sys.version"
 
       - name: Install package in development mode
         run: pixi run -e ci pip install -e . --no-deps
@@ -41,12 +36,8 @@ jobs:
 
   # Separate job for Linux with xvfb for headless display
   test-linux:
-    name: ubuntu-latest (py${{ matrix.python-version }})
+    name: ubuntu-latest (Python 3.11)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11"]
 
     steps:
       - uses: actions/checkout@v5
@@ -56,6 +47,9 @@ jobs:
         with:
           pixi-version: v0.63.2
           environments: ci
+
+      - name: Verify Python version
+        run: pixi run -e ci python -c "import sys; assert sys.version_info[:2] == (3, 11), sys.version"
 
       - name: Install package in development mode
         run: pixi run -e ci pip install -e . --no-deps

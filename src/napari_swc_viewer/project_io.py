@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
+from uuid import uuid4
 
 import duckdb
 import numpy as np
@@ -57,6 +58,7 @@ class ProjectBundle:
     source_parquet_path: Path
     table_state: dict[str, Any]
     layers: tuple[ProjectLayer, ...]
+    flatmap_cache_reference: dict[str, Any] | None = None
 
 
 def _json_safe(value: Any) -> Any:
@@ -352,6 +354,54 @@ def _source_parquet_provenance(path: Path) -> dict[str, Any]:
     }
 
 
+def _preserve_source_parquet_schema_metadata(
+    parquet_path: Path,
+    source_schema: pa.Schema,
+) -> None:
+    """Reattach source Arrow metadata after DuckDB writes a filtered file.
+
+    DuckDB preserves the selected columns and values, but its Parquet ``COPY``
+    does not retain Arrow schema metadata. Flatmap Parquet provenance lives in
+    that metadata, so rewrite the DuckDB result in bounded record batches with
+    the source file-level metadata and matching source field metadata.
+    """
+    parquet_file = pq.ParquetFile(parquet_path)
+    written_schema = parquet_file.schema_arrow
+    source_fields = {field.name: field for field in source_schema}
+    fields: list[pa.Field] = []
+    for field in written_schema:
+        source_field = source_fields.get(field.name)
+        field_metadata = source_field.metadata if source_field is not None else None
+        fields.append(
+            pa.field(
+                field.name,
+                field.type,
+                nullable=field.nullable,
+                metadata=field_metadata,
+            )
+        )
+    preserved_schema = pa.schema(fields, metadata=source_schema.metadata)
+    if preserved_schema.equals(written_schema, check_metadata=True):
+        parquet_file.close()
+        return
+
+    temp_path = parquet_path.with_name(
+        f".{parquet_path.name}.{uuid4().hex}.metadata.tmp"
+    )
+    try:
+        with pq.ParquetWriter(temp_path, preserved_schema, compression="snappy") as writer:
+            for batch in parquet_file.iter_batches(batch_size=65_536):
+                writer.write_batch(
+                    pa.RecordBatch.from_arrays(batch.columns, schema=preserved_schema)
+                )
+        parquet_file.close()
+        temp_path.replace(parquet_path)
+    finally:
+        parquet_file.close()
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 def export_filtered_project_neuron_parquet(
     source_parquet_path: str | Path,
     output_path: str | Path,
@@ -414,6 +464,7 @@ def export_filtered_project_neuron_parquet(
     finally:
         conn.close()
 
+    _preserve_source_parquet_schema_metadata(write_target, schema)
     if replace_output:
         write_target.replace(output)
     return output
@@ -734,9 +785,10 @@ def save_project_bundle(
     layers: Iterable[Any] = (),
     atlas_name: str | None = None,
     analysis_metadata: Mapping[str, Any] | None = None,
+    flatmap_cache_reference: Mapping[str, Any] | None = None,
     progress_callback: _ProgressCallback | None = None,
 ) -> Path:
-    """Save a project bundle directory for app-created layer state."""
+    """Save layer state and an optional external flatmap-cache reference."""
     bundle = Path(bundle_path)
     app_layers = [layer for layer in layers if _is_app_created_layer(layer)]
     total_steps = 4 + len(app_layers)
@@ -825,6 +877,10 @@ def save_project_bundle(
         "analysis_metadata": dict(analysis_metadata or {}),
         "layers": manifest_layers,
     }
+    if flatmap_cache_reference:
+        # Keep the potentially large region cache external to the project.
+        # The reference is informational and may be relocated by the user.
+        manifest["flatmap_cache"] = dict(flatmap_cache_reference)
     _write_json(bundle / "manifest.json", manifest)
     _emit_progress(progress_callback, "Done", total_steps, total_steps)
     return bundle
@@ -872,6 +928,11 @@ def load_project_bundle(bundle_path: str | Path) -> ProjectBundle:
         source_parquet_path=source_parquet,
         table_state=table_state,
         layers=tuple(loaded_layers),
+        flatmap_cache_reference=(
+            dict(manifest["flatmap_cache"])
+            if isinstance(manifest.get("flatmap_cache"), Mapping)
+            else None
+        ),
     )
 
 

@@ -1,8 +1,9 @@
-"""napari reader hook implementation for SWC and Parquet files.
+"""napari reader hook implementation for SWC, Parquet, and NRRD files.
 
 This module provides napari reader hooks for:
 1. SWC files - rendered as shapes (lines) or points
 2. Parquet files - rendered with neurons as shapes layers
+3. Flatmap/depth NRRD files - rendered as image layers
 """
 
 from __future__ import annotations
@@ -12,6 +13,11 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
+from .flatmap_loader import (
+    _read_nrrd,
+    normalize_depth_volume,
+    normalize_flatmap_volume,
+)
 from .swc import NodeType, parse_swc
 
 if TYPE_CHECKING:
@@ -42,6 +48,8 @@ def napari_get_reader(
             return read_swc_files
         if suffixes == {".parquet"}:
             return read_parquet_file
+        if suffixes == {".nrrd"}:
+            return read_nrrd_files
 
         return None
 
@@ -52,6 +60,8 @@ def napari_get_reader(
         return read_swc_file
     if suffix == ".parquet":
         return read_parquet_file
+    if suffix == ".nrrd":
+        return read_nrrd_file
 
     return None
 
@@ -191,6 +201,112 @@ def read_parquet_file(path: str | list[str]) -> list[LayerDataTuple]:
     )
 
     return [layer_data]
+
+
+def read_nrrd_file(path: str | list[str]) -> list[LayerDataTuple]:
+    """Read one flatmap or depth NRRD and return napari image layer data.
+
+    Flatmap NRRDs are detected as 4D arrays with a length-2 coordinate axis
+    and are split into ``X`` and ``Y`` scalar image layers. Depth NRRDs are
+    detected as 3D arrays and are emitted as one scalar image layer.
+    """
+    if isinstance(path, list):
+        return read_nrrd_files(path)
+
+    filepath = Path(path)
+    data, _header = _read_nrrd(filepath)
+    source_shape = tuple(int(size) for size in data.shape)
+
+    if data.ndim == 3:
+        depth = normalize_depth_volume(data)
+        return [
+            _nrrd_image_layer_data(
+                depth,
+                filepath=filepath,
+                source_shape=source_shape,
+                role="depth",
+                name=f"Depth: {filepath.stem}",
+            )
+        ]
+
+    if data.ndim == 4:
+        try:
+            flatmap = normalize_flatmap_volume(data)
+        except ValueError as exc:
+            raise ValueError(
+                _unsupported_nrrd_shape_message(filepath, source_shape)
+            ) from exc
+        return [
+            _nrrd_image_layer_data(
+                flatmap[..., channel_index],
+                filepath=filepath,
+                source_shape=source_shape,
+                role="flatmap",
+                name=f"Flatmap {channel_label}: {filepath.stem}",
+                flatmap_channel=channel_label.lower(),
+                flatmap_channel_index=channel_index,
+                normalized_shape=flatmap.shape,
+            )
+            for channel_index, channel_label in enumerate(("X", "Y"))
+        ]
+
+    raise ValueError(_unsupported_nrrd_shape_message(filepath, source_shape))
+
+
+def read_nrrd_files(paths: str | list[str]) -> list[LayerDataTuple]:
+    """Read one or more flatmap/depth NRRD files as napari image layers."""
+    if isinstance(paths, str):
+        paths = [paths]
+
+    layers: list[LayerDataTuple] = []
+    for path in paths:
+        layers.extend(read_nrrd_file(path))
+    return layers
+
+
+def _nrrd_image_layer_data(
+    data: np.ndarray,
+    *,
+    filepath: Path,
+    source_shape: tuple[int, ...],
+    role: str,
+    name: str,
+    flatmap_channel: str | None = None,
+    flatmap_channel_index: int | None = None,
+    normalized_shape: tuple[int, ...] | None = None,
+) -> LayerDataTuple:
+    metadata: dict[str, object] = {
+        "nrrd_role": role,
+        "source_path": str(filepath),
+        "source_shape": source_shape,
+        "normalized_shape": (
+            tuple(int(size) for size in data.shape)
+            if normalized_shape is None
+            else tuple(int(size) for size in normalized_shape)
+        ),
+    }
+    if flatmap_channel is not None:
+        metadata["flatmap_channel"] = flatmap_channel
+    if flatmap_channel_index is not None:
+        metadata["flatmap_channel_index"] = int(flatmap_channel_index)
+
+    layer_data: LayerDataTuple = (
+        data,
+        {
+            "name": name,
+            "metadata": metadata,
+        },
+        "image",
+    )
+    return layer_data
+
+
+def _unsupported_nrrd_shape_message(filepath: Path, shape: tuple[int, ...]) -> str:
+    return (
+        "Unsupported NRRD shape for direct flatmap/depth loading "
+        f"in {filepath}: {shape}. Expected a 4D flatmap volume with a "
+        "length-2 coordinate axis or a 3D depth volume."
+    )
 
 
 def swc_to_shapes_data(

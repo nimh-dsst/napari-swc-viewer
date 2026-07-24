@@ -6,6 +6,7 @@
 
 - Opening `.swc` neuron morphology files directly
 - Opening annotated `.parquet` neuron datasets
+- Opening flatmap/depth `.nrrd` lookup files directly
 - Filtering neurons by Allen brain regions
 - Rendering neurons as lines, points, or both
 - Showing Allen reference layers (template, outline, region meshes, segmentation)
@@ -13,7 +14,7 @@
 
 The plugin adds:
 
-- A file reader for `*.swc` and `*.parquet`
+- A file reader for `*.swc`, `*.parquet`, and flatmap/depth `*.nrrd`
 - A dock widget named **Neuron Viewer**
 
 ## Prerequisites
@@ -37,7 +38,7 @@ pixi run napari
 
 When napari is open, launch the widget from the Plugins menu and choose **Neuron Viewer**.
 
-To enable debug-level plugin logging for large clustering runs:
+To enable debug-level plugin logging for runtime diagnostics:
 
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
@@ -48,6 +49,69 @@ Optional custom log file:
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
 ```
+
+Without an override, logs are written to
+`~/.napari-swc-viewer/debug.log`. The file rotates at 10 MB and retains three
+backups. Plugin DEBUG output is written to both the file and console. Focused
+napari layer-slicer DEBUG output is captured in the file only.
+
+### Detached flatmap window diagnostics
+
+1. Launch napari with `NAPARI_SWC_VIEWER_DEBUG=1` and a dedicated
+   `NAPARI_SWC_VIEWER_LOG_FILE`.
+2. Open the plugin, project data into the detached **SWC Viewer Flatmap**
+   window, use the operating-system control to close that window, and accept
+   napari's close confirmation. Cancelling the confirmation must leave the
+   existing viewer and layers usable.
+3. Wait at least two seconds so the bounded post-close checkpoints run, then
+   project again and confirm that exactly one fresh detached window opens.
+   Close it again, then close the main napari window and retain the complete
+   log.
+
+The trace records `flatmap_viewer_lifecycle event=qt_close`, close checkpoints
+at 0, 250, and 2000 ms, `event=qt_deferreddelete`, registered napari viewers,
+retained plugin references, flatmap worker states, and Python thread names.
+Before these close records, a successful first display records
+`event=created_hidden`, `event=first_layer_ready`, `event=show_scheduled`, and
+`event=shown`. The window should not become visible before `event=shown`, and
+that record should report `pending_first_show=false`.
+After destruction, three additional `event=post_destroy_checkpoint` records
+capture matching QWidget and native QWindow state. Napari's
+`_LayerSlicer.shutdown` records show when full viewer cleanup actually occurs.
+A successful accepted close has `event=cleanup_complete`,
+`cleanup_trigger=deferred_delete`, `cleanup_status=ok`,
+`cleanup_status_thread=stopped` (napari's StatusChecker QThread is stopped
+during teardown so the window is never destroyed with it still running),
+`cleanup_qt_viewer=closed`, `layer_count=0`,
+`napari_viewer_registered=false`, `owner_ref_is_viewer=false`,
+`tab_ref_is_viewer=false`, and `slicer_executor_shutdown=true`. At the 2000 ms
+post-destroy checkpoint, `qt_matching_top_level_widgets=empty` and
+`qt_matching_native_windows=empty`. Any `event=cleanup_failure` record
+identifies the teardown stage that could not be completed.
+
+### macOS fullscreen diagnostics
+
+On macOS napari reapplies its app-wide saved geometry — including fullscreen —
+to every viewer shown through `Window.show()`, and, on close, runs a blocking
+`showNormal`/`processEvents` cycle while the window is fullscreen. The plugin
+works around both for the detached viewer. Each lifecycle snapshot reports
+`qt_fullscreen`, `qt_window_state`, `napari_saved_fullscreen`, and
+`fullscreen_close_state`.
+
+- On show, the guarded normal-window path records `event=normal_show_requested`
+  and `event=fullscreen_restore_suppressed`, and `event=shown` reports
+  `show_path=normal_qt`. On other platforms `event=shown` reports
+  `show_path=napari`. The detached window must open normally even when the main
+  napari window is in macOS Full Screen.
+- When a manually fullscreened detached window is closed, the close is deferred
+  and retried after the window returns to normal: `event=fullscreen_close_deferred`
+  → `event=fullscreen_exit_requested` → `event=fullscreen_exit_complete` →
+  `event=fullscreen_close_retried`. The retry still presents napari's
+  confirmation; cancelling leaves the viewer usable in normal window mode.
+- `event=fullscreen_guard_failure` marks any guarded fallback — a missing
+  Qt/napari private interface (`reason=confirm_need_unavailable`) or a
+  fullscreen-exit timeout (`reason=exit_timed_out`); in the former case the
+  window is left open in normal mode and must be closed again.
 
 ## Quick validation commands
 
@@ -83,6 +147,89 @@ Recommended Parquet schema columns:
 - `file_id`, `node_id`, `type`, `x`, `y`, `z`, `radius`, `parent_id`
 - `region_id`, `region_name`, `region_acronym`
 - `subject`, `neuron_id`
+
+### Flatmap and depth NRRD files
+
+- Open through napari File Open dialog (`.nrrd`) or drag-and-drop
+- 4D flatmap lookup volumes with a length-2 coordinate axis are split into
+  `Flatmap X: <stem>` and `Flatmap Y: <stem>` image layers
+- 3D depth lookup volumes are loaded as `Depth: <stem>` image layers
+- Direct NRRD image layers use voxel/pixel space to match the plugin's reference
+  image layers
+- Unsupported NRRD shapes are rejected instead of being guessed
+
+### Precomputed flatmap Parquet files
+
+- In **Flatmap**, use **Lookup directory...** to select a directory containing
+  `flatmap_both_shaped.nrrd`, `flatmap_both_square.nrrd`, and `depth.nrrd`, then
+  click **Prepare Whole Parquet...**
+- Preprocessing reads every row from the source file, independent of the
+  current query or table selection. It preserves custom columns and Arrow
+  schema metadata and suggests `<source>_flatmap.parquet`.
+- Replacing the source requires explicit confirmation. Work is published by an
+  atomic same-directory replacement; cancellation and failure remove temporary
+  artifacts and leave an existing destination untouched.
+- The version-3 Parquet retains `x`, `y`, and `z`. It adds
+  `x_flat_shaped`, `y_flat_shaped`, shaped validity/provenance columns,
+  corresponding square columns, and shared `depth_um`, `depth_valid`,
+  `depth_invalid_code`, and `depth_lookup_mode` columns.
+- Shaped and square XY values always come from the original CCFv3 voxel. If
+  direct depth is invalid, depth alone may be read from the voxel mirrored
+  across the configured hemisphere axis. An invalid bilateral XY remains
+  unmapped.
+- Metadata records the lookup-set ID, source NRRD hashes, both style
+  definitions, shared depth definition, canonical bounds, transform/resolution,
+  column mapping, and algorithm versions.
+- Command-line equivalent for the bilateral lookup set:
+
+```bash
+pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neurons_flatmap.parquet --lookup-dir /path/to/lookups
+```
+
+The legacy `--flatmap ... --depth ...` single-style command remains supported
+for version-1/2 workflows. If the NRRD headers do not contain a usable spatial
+transform, bilateral preprocessing requires an explicit lookup resolution; it
+does not assume 10 µm.
+
+In **Data** > **Convert SWC to Parquet**, enable **Add bilateral flatmap/depth
+columns** and select **Lookup directory...** to combine SWC conversion and
+version-3 augmentation in one cancellable, atomic background operation.
+
+### Flatmap region cache and overlays
+
+- Cache generation records the BrainGlobe atlas name and version as profile
+  identity, and requires its resolution and annotation shape to exactly match
+  the lookup grid. It memory-maps the atlas annotation and lookup arrays and
+  processes them in bounded chunks.
+- In **Flatmap**, use **Build Cache Profile...** to choose a cache directory and
+  build one shaped/square profile pair. The default fixed grid is 256 XY bins
+  with 25 µm depth bins.
+- The root `flatmap-region-cache.json` manifest can reference multiple profiles.
+  Profile identity includes the lookup-set ID, exact atlas provenance, grid
+  settings, bounds, output shape, and algorithm versions.
+- Each style stores sparse region occupancy and source-voxel counts, closed
+  voxel-faithful surface triangles, and per-depth XY perimeter vectors. Parent
+  region geometry is precomputed as the union of its descendants.
+- New arrays are published before the manifest is atomically replaced. A
+  cancelled or failed build does not invalidate existing profiles.
+- For viewing, choose **Precomputed Parquet + Cache**, click **Choose Cache
+  Directory...**, and select a compatible profile. Profile selection locks XY
+  bins, depth bins, canonical bounds, and exclusion of the depth `-1` plane.
+- **Show Region Labels** creates **Flatmap Region Labels** from the
+  Include-child-expanded region IDs and
+  preserves majority-region collision handling with smaller-ID tie-breaking.
+  **Show Region Surfaces** and **Show Region Outlines** create the corresponding
+  flatmap layers from each directly selected parent's cached descendant union
+  and atlas color.
+- A loaded atlas with the same atlas/version structure catalog supplies region
+  selection and colors during viewing. Its voxel resolution may differ because
+  the precomputed path does not read `atlas.annotation` or meshes.
+- Missing, corrupt, or incompatible profiles show the exact mismatch and never
+  trigger conversion. Choose **Recompute from NRRDs** explicitly for the legacy
+  runtime path.
+- Project bundles store the external cache path and profile ID but do not copy
+  cache arrays. Enhanced and project-filtered Parquets retain version-3 schema
+  metadata.
 
 ### Standard point Parquet files
 
@@ -287,9 +434,12 @@ Data tab, **Convert SWC to Parquet**:
 - `From Directory...` recursively finds `*.swc`
 - `From Files...` selects explicit SWC files
 - Set atlas annotation resolution (10-100 µm, default 25)
+- Optionally enable **Add bilateral flatmap/depth columns** and select a
+  **Lookup directory...** containing the shaped, square, and depth NRRDs
 - Choose output `.parquet`
 
-Conversion runs in a background worker with progress updates.
+Conversion runs in a background worker with progress updates. With flatmap
+augmentation enabled, both phases form one cancellable atomic pipeline.
 
 ## CSV to standard point Parquet conversion
 

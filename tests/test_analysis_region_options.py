@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 
 from napari_swc_viewer.analysis.clustering import (
     ClusterRegionSelection,
@@ -1224,6 +1225,208 @@ def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -
         selection,
         0.35,
         file_ids=["n1", "n2"],
+    )
+
+
+def _enable_flatmap_coords(widget, styles=("both_shaped", "both_square")):
+    """Force the widget to treat the loaded Parquet as flatmap-capable."""
+    widget._detect_flatmap_coordinates = lambda: (True, styles)
+    widget.refresh_flatmap_coordinate_availability()
+
+
+def _coord_space_items(widget):
+    return [item["text"] for item in widget._coordinate_space_combo._items]
+
+
+def test_flatmap_space_hidden_without_coordinates() -> None:
+    """Flat map + Depth must not appear when the Parquet lacks coordinates."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    assert _coord_space_items(widget) == ["CCFv3 Coordinates"]
+
+
+def test_flatmap_space_appears_when_coordinates_present() -> None:
+    """Flat map + Depth appears and styles populate when coords are present."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    _enable_flatmap_coords(widget)
+
+    assert "Flat map + Depth" in _coord_space_items(widget)
+    style_keys = [item["data"] for item in widget._flatmap_style_combo._items]
+    assert style_keys == ["both_shaped", "both_square"]
+
+
+def test_flatmap_space_removed_when_coordinates_absent() -> None:
+    """Losing flatmap coords removes the option and resets to CCFv3 space."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    assert widget._current_coordinate_space() == "Flat map + Depth"
+
+    widget._detect_flatmap_coordinates = lambda: (False, ())
+    widget.refresh_flatmap_coordinate_availability()
+
+    assert "Flat map + Depth" not in _coord_space_items(widget)
+    assert widget._current_coordinate_space() == "CCFv3 Coordinates"
+
+
+def test_flatmap_voxel_hides_region_controls_and_shows_binning() -> None:
+    """Flat map + Depth voxel mode hides CCFv3 controls and shows binning."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+
+    assert widget._cluster_region_scope_label._visible is False
+    assert widget._cluster_region_scope_combo._visible is False
+    assert widget._dilation_label._visible is False
+    assert widget._dilation_spin._visible is False
+    assert widget._flatmap_style_combo._visible is True
+    assert widget._flatmap_xy_bins_spin._visible is True
+    assert widget._flatmap_depth_bin_spin._visible is True
+    assert widget._flatmap_include_depth_minus_one_cb._visible is True
+    assert widget._flatmap_coords_status_label._visible is True
+
+
+def test_flatmap_soma_hides_binning_and_shows_algorithm() -> None:
+    """Flat map + Depth soma mode hides binning and shows the algorithm row."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+
+    assert widget._algorithm_combo._visible is True
+    assert widget._flatmap_style_combo._visible is True
+    assert widget._flatmap_xy_bins_spin._visible is False
+    assert widget._flatmap_depth_bin_spin._visible is False
+    assert widget._flatmap_include_depth_minus_one_cb._visible is False
+
+
+def test_ccf_voxel_correlation_unaffected_by_flatmap_availability() -> None:
+    """CCFv3 space still runs atlas voxel correlation even when coords exist."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    _enable_flatmap_coords(widget)
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._run_correlation_clustering = MagicMock()
+    widget._run_flatmap_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    widget._run_correlation_clustering.assert_called_once_with(
+        selection,
+        0.0,
+        file_ids=None,
+    )
+    widget._run_flatmap_correlation_clustering.assert_not_called()
+
+
+def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
+    """Flat map voxel correlation launches FlatmapParquetCorrelationWorker."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    widget._method_combo.setCurrentText("complete")
+    widget._n_clusters_spin.setValue(7)
+    widget._flatmap_xy_bins_spin.setValue(128)
+    widget._flatmap_depth_bin_spin.setValue(50.0)
+    widget._flatmap_include_depth_minus_one_cb.setChecked(False)
+    widget._start_background_worker = MagicMock()
+
+    created_workers = []
+
+    class _FakeFlatmapParquetCorrelationWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapParquetCorrelationWorker = (
+        _FakeFlatmapParquetCorrelationWorker
+    )
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+    widget._run_clustering_pipeline()
+
+    assert len(created_workers) == 1
+    assert created_workers[0].kwargs == {
+        "parquet_path": "neurons.parquet",
+        "atlas": widget._atlas,
+        "style": "both_shaped",
+        "xy_bins": 128,
+        "depth_bin_um": 50.0,
+        "include_depth_minus_one": False,
+        "linkage_method": "complete",
+        "n_clusters": 7,
+    }
+    widget._start_background_worker.assert_called_once_with(
+        created_workers[0],
+        widget._on_correlation_finished,
+    )
+
+
+def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
+    """Flat map soma clustering launches FlatmapSomaClusterWorker."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    widget._algorithm_combo.setCurrentText("K-Means")
+    widget._method_combo.setCurrentText("ward")
+    widget._n_clusters_spin.setValue(4)
+    widget._eps_spin.setValue(120.0)
+    widget._min_samples_spin.setValue(6)
+    widget._start_background_worker = MagicMock()
+
+    created_workers = []
+
+    class _FakeFlatmapSomaClusterWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+    widget._run_clustering_pipeline()
+
+    assert len(created_workers) == 1
+    assert created_workers[0].kwargs == {
+        "parquet_path": "neurons.parquet",
+        "atlas": widget._atlas,
+        "style": "both_shaped",
+        "algorithm": "kmeans",
+        "linkage_method": "ward",
+        "n_clusters": 4,
+        "eps": 120.0,
+        "min_samples": 6,
+    }
+    widget._start_background_worker.assert_called_once_with(
+        created_workers[0],
+        widget._on_correlation_finished,
     )
 
 

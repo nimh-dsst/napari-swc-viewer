@@ -86,6 +86,7 @@ class ClusterRunMetadata:
     atlas_resolution_um: tuple[float, ...] = ()
     source_parquet_path: str | None = None
     dendrogram_leaf_order: list[int] = field(default_factory=list)
+    extra_metadata: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_region_selection(
@@ -106,6 +107,7 @@ class ClusterRunMetadata:
         atlas_resolution_um: tuple[float, ...],
         source_parquet_path: str | None,
         dendrogram_leaf_order: list[int],
+        extra_metadata: dict[str, object] | None = None,
     ) -> "ClusterRunMetadata":
         """Build metadata from a worker-region selection payload."""
         return cls(
@@ -137,6 +139,7 @@ class ClusterRunMetadata:
             dendrogram_leaf_order=[
                 int(value) for value in dendrogram_leaf_order
             ],
+            extra_metadata=dict(extra_metadata or {}),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -172,6 +175,7 @@ class ClusterRunMetadata:
             "dendrogram_leaf_order": [
                 int(value) for value in self.dendrogram_leaf_order
             ],
+            "extra_metadata": dict(self.extra_metadata),
         }
 
 
@@ -188,6 +192,7 @@ class ClusterResult:
         default_factory=lambda: np.array([], dtype=np.int32)
     )
     metadata: ClusterRunMetadata | None = None
+    unassigned_neuron_ids: list[str] = field(default_factory=list)
 
     def neuron_ids_in_leaf_order(self) -> list[str]:
         """Return neuron IDs in dendrogram leaf order."""

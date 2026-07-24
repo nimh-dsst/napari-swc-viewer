@@ -31,7 +31,8 @@ pixi run napari
 
 This command will automatically build the package (if needed) before launching napari.
 
-To enable plugin debug logging for clustering diagnostics:
+To enable plugin debug logging for runtime diagnostics, including detached
+flatmap viewer lifecycle events:
 
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
@@ -42,6 +43,42 @@ To write the debug trace to a custom file:
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
 ```
+
+The default file is `~/.napari-swc-viewer/debug.log`. It rotates at 10 MB and
+keeps three backups. Plugin DEBUG records are written to the file and console;
+focused napari layer-slicer DEBUG records are added to the file only.
+
+Detached viewers are created hidden in 3D and shown only after their first
+flatmap layer is configured. A normal first render records
+`event=created_hidden`, `event=first_layer_ready`, `event=show_scheduled`, and
+`event=shown` in that order. `pending_first_show=false` on the final record
+confirms that the viewer left its hidden setup state.
+
+On macOS the detached window is shown through a guarded normal-window path so
+it never inherits napari's app-wide saved fullscreen state. A normal render
+there reports `event=normal_show_requested`, `event=fullscreen_restore_suppressed`,
+and `show_path=normal_qt` on `event=shown` (other platforms report
+`show_path=napari`). If a user manually places the detached window in fullscreen
+and closes it, the close is briefly deferred so the native surface can return to
+normal before teardown: search for `event=fullscreen_close_deferred`,
+`event=fullscreen_exit_requested`, `event=fullscreen_exit_complete`, and
+`event=fullscreen_close_retried`. An `event=fullscreen_guard_failure` record
+marks any guarded fallback (missing Qt/napari private interface or a
+fullscreen-exit timeout). Each snapshot also reports `qt_fullscreen`,
+`qt_window_state`, `napari_saved_fullscreen`, and `fullscreen_close_state`.
+
+To diagnose a detached flatmap window that does not close, launch with a custom
+log path, create a projection, close **SWC Viewer Flatmap**, wait at least two
+seconds, and then close the main napari window. Search the retained trace for
+`flatmap_viewer_lifecycle event=qt_close`, the subsequent
+`event=close_checkpoint` records, `event=qt_deferreddelete`,
+`_LayerSlicer.shutdown`, `event=cleanup_complete`, and the three
+`event=post_destroy_checkpoint` records. A successful accepted close reports
+`cleanup_trigger=deferred_delete`, `cleanup_qt_viewer=closed`, zero retained
+layers, `napari_viewer_registered=false`, both plugin viewer-reference fields
+as `false`, and `slicer_executor_shutdown=true`. At the 2000 ms post-destroy
+checkpoint, both `qt_matching_top_level_widgets` and
+`qt_matching_native_windows` should be `empty`.
 
 For a complete CPD2 walkthrough covering clone/install, `pixi run napari`,
 left-hemisphere SWC-to-Parquet conversion, atlas loading, region queries, soma
@@ -69,6 +106,68 @@ Brain Image Library. The committed fixture files live under
 `tests/data/hemisphere/`.
 
 Source dataset DOI: https://doi.org/10.35077/g.73
+
+## Direct Flatmap/Depth NRRD Loading
+
+Flatmap and depth lookup NRRD files can be opened directly through napari's
+File Open dialog or drag-and-drop. Shape-based detection is used:
+
+- A 4D flatmap volume with a length-2 coordinate axis is split into two scalar
+  image layers: `Flatmap X: <stem>` and `Flatmap Y: <stem>`.
+- A 3D depth volume is loaded as one scalar image layer: `Depth: <stem>`.
+
+Unsupported NRRD shapes are rejected with a clear error. Direct NRRD image
+layers are displayed in voxel/pixel space, matching the plugin's reference
+image layers.
+
+The primary flatmap workflow preprocesses an entire neuron Parquet once. In the
+Flatmap tab, choose the directory containing `flatmap_both_shaped.nrrd`,
+`flatmap_both_square.nrrd`, and `depth.nrrd`, then use **Prepare Whole
+Parquet...**. The suggested output is `<source>_flatmap.parquet`; replacing the
+source requires explicit confirmation. Table queries and selections do not
+limit preprocessing. The same bilateral conversion is available from the
+command line:
+
+```bash
+pixi run python scripts/add_flatmap_columns_to_parquet.py neurons.parquet neurons_flatmap.parquet --lookup-dir /path/to/lookups
+```
+
+The version-3 output preserves CCFv3 coordinates, custom columns, and schema
+metadata. It appends independent `x_flat_*`, `y_flat_*`, validity, invalid-code,
+and lookup-mode columns for shaped and square bilateral maps, plus shared
+`depth_um` validity/provenance columns. XY always comes from the original voxel;
+when necessary, only depth is recovered from the mirrored voxel. Metadata
+records canonical bounds, transforms, source hashes, and a portable lookup-set
+ID. The old `--flatmap`/`--depth` single-style command remains available for
+legacy files.
+
+SWC conversion can perform both steps as one atomic background operation:
+enable **Add bilateral flatmap/depth columns** and select **Lookup directory...**
+before choosing SWC files. Cancellation or failure removes the temporary output
+and does not replace an existing Parquet.
+
+## Precomputed Flatmap Region Cache
+
+Use **Build Cache Profile...** to project an exactly matching BrainGlobe atlas
+annotation into fixed shaped and square render grids. A cache directory has a
+`flatmap-region-cache.json` manifest and may hold multiple atlas/lookup/grid
+profiles. Each profile stores memory-mappable sparse label occupancy, closed
+voxel-faithful surfaces, and per-depth outlines. The defaults are 256 XY bins
+and 25 µm depth bins.
+
+For viewing, select **Precomputed Parquet + Cache**, click **Choose Cache
+Directory...**, and choose a compatible profile. The selected profile fixes and
+locks the render bounds and binning, so a small neuron query still overlays the
+global region grid exactly. The plugin reads stored neuron columns and cached
+region arrays without loading NRRDs, `atlas.annotation`, or BrainGlobe meshes.
+It requires a matching atlas/version structure catalog for region selection and
+colors, but that viewing atlas may have a different voxel resolution.
+
+Missing or incompatible cache data reports the specific mismatch and never
+recomputes automatically. Select **Recompute from NRRDs** explicitly to use the
+legacy runtime conversion path. Saved project bundles retain version-3 Parquet
+metadata and reference the external cache path/profile; they do not copy the
+large cache directory.
 
 ## Standard Point Parquet Workflow
 

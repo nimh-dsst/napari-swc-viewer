@@ -12,6 +12,9 @@ import numpy as np
 import pandas as pd
 
 from napari_swc_viewer.analysis.clustering import ClusterRegionSelection, ClusterResult
+from napari_swc_viewer.analysis.flatmap_correlation import (
+    FlatmapVoxelCorrelationSource,
+)
 from napari_swc_viewer.point_import import PointParquetAppendSummary
 from napari_swc_viewer.parquet import BatchParquetConversionSummary
 
@@ -106,20 +109,74 @@ def test_cached_brainglobe_atlas_dir_finds_single_cache(tmp_path):
     atlas_dir = tmp_path / "allen_mouse_25um_v1.2"
     atlas_dir.mkdir()
 
-    assert workers.cached_brainglobe_atlas_dir(
-        "allen_mouse_25um",
-        brainglobe_dir=tmp_path,
-    ) == atlas_dir
-    assert workers.cached_brainglobe_atlas_dir(
-        "allen_mouse_10um",
-        brainglobe_dir=tmp_path,
-    ) is None
+    assert (
+        workers.cached_brainglobe_atlas_dir(
+            "allen_mouse_25um",
+            brainglobe_dir=tmp_path,
+        )
+        == atlas_dir
+    )
+    assert (
+        workers.cached_brainglobe_atlas_dir(
+            "allen_mouse_10um",
+            brainglobe_dir=tmp_path,
+        )
+        is None
+    )
 
     (tmp_path / "allen_mouse_25um_v1.3").mkdir()
-    assert workers.cached_brainglobe_atlas_dir(
-        "allen_mouse_25um",
-        brainglobe_dir=tmp_path,
-    ) is None
+    assert (
+        workers.cached_brainglobe_atlas_dir(
+            "allen_mouse_25um",
+            brainglobe_dir=tmp_path,
+        )
+        is None
+    )
+
+
+def test_region_cache_open_worker_emits_validated_cache(monkeypatch, tmp_path):
+    workers = _import_workers_module()
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    cache = object()
+    opened = []
+
+    def fake_open(path):
+        opened.append(Path(path))
+        return cache
+
+    monkeypatch.setattr(cache_module, "open_region_cache", fake_open)
+    worker = workers.RegionCacheOpenWorker(tmp_path)
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert opened == [tmp_path]
+    assert finished == [cache]
+    assert errors == []
+
+
+def test_region_cache_open_worker_emits_validation_error(monkeypatch, tmp_path):
+    workers = _import_workers_module()
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    def fail_open(_path):
+        raise ValueError("manifest is corrupt")
+
+    monkeypatch.setattr(cache_module, "open_region_cache", fail_open)
+    worker = workers.RegionCacheOpenWorker(tmp_path)
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert finished == []
+    assert errors == ["manifest is corrupt"]
 
 
 def test_cached_atlas_load_worker_uses_local_loader(monkeypatch, tmp_path):
@@ -402,7 +459,9 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
     finished: list[tuple[str, BatchParquetConversionSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -479,6 +538,139 @@ def test_convert_worker_passes_cached_atlas_inputs(monkeypatch, tmp_path):
     assert calls["region_lookup"][5]["acronym"] == "CR"
     assert not errors
     assert finished[0][1].processed_files == 1
+
+
+def test_convert_worker_chains_atomic_v3_flatmap_preparation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    workers = _import_workers_module()
+    calls: dict[str, object] = {}
+
+    def fake_batch(_input, output_path, *, progress_callback, **_kwargs):
+        staged = Path(output_path)
+        calls["conversion_output"] = staged
+        staged.write_bytes(b"intermediate")
+        progress_callback("Converted SWCs", 1, 1)
+        return BatchParquetConversionSummary(
+            discovered_files=1,
+            processed_files=1,
+            rows_written=2,
+        )
+
+    lookup_set = object()
+
+    def fake_discover(path, **kwargs):
+        calls["lookup_dir"] = Path(path)
+        calls["lookup_resolution_um"] = kwargs["lookup_resolution_um"]
+        return lookup_set
+
+    def fake_augment(source, output, received_lookup_set, **kwargs):
+        calls["augment_source"] = Path(source)
+        calls["augment_output"] = Path(output)
+        calls["lookup_set"] = received_lookup_set
+        assert Path(source).read_bytes() == b"intermediate"
+        assert kwargs["cancel_callback"]() is False
+        Path(output).write_bytes(b"version-3")
+        return types.SimpleNamespace(rows=2, output_parquet=Path(output))
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        fake_batch,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.flatmap_profiles.discover_flatmap_lookup_set",
+        fake_discover,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.flatmap_parquet.augment_neuron_parquet_with_flatmaps",
+        fake_augment,
+    )
+    output = tmp_path / "neurons.parquet"
+    worker = workers.ConvertWorker(
+        ["a.swc"],
+        str(output),
+        flatmap_lookup_dir=tmp_path / "lookups",
+        flatmap_lookup_resolution_um=10.0,
+    )
+    errors: list[str] = []
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert not errors
+    assert output.read_bytes() == b"version-3"
+    assert calls["conversion_output"] != output
+    assert calls["augment_source"] == calls["conversion_output"]
+    assert calls["augment_output"] == output
+    assert calls["lookup_dir"] == tmp_path / "lookups"
+    assert calls["lookup_resolution_um"] == 10.0
+    assert calls["lookup_set"] is lookup_set
+    assert not Path(calls["conversion_output"]).exists()
+
+
+def test_flatmap_preparation_worker_reuses_cache_and_finishes_after_publication_cancel(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    workers = _import_workers_module()
+    output = tmp_path / "neurons_flatmap.parquet"
+    expected_cache_dir = tmp_path / ".flatmap-lookup-arrays"
+    lookup_set = object()
+    summary = types.SimpleNamespace(rows=2, output_parquet=output)
+    calls: dict[str, object] = {}
+    worker = workers.FlatmapParquetPreparationWorker(
+        tmp_path / "neurons.parquet",
+        output,
+        tmp_path / "lookups",
+        lookup_resolution_um=10.0,
+    )
+
+    def fake_discover(path, **kwargs):
+        cache_dir = Path(kwargs["npy_cache_dir"])
+        cache_dir.mkdir()
+        (cache_dir / "reuse.marker").write_text("ready")
+        calls["discover_lookup_dir"] = Path(path)
+        calls["discover_cache_dir"] = cache_dir
+        assert kwargs["cancel_callback"]() is False
+        return lookup_set
+
+    def fake_augment(source, destination, received_lookup_set, **kwargs):
+        cache_dir = Path(kwargs["npy_cache_dir"])
+        calls["augment_source"] = Path(source)
+        calls["augment_destination"] = Path(destination)
+        calls["augment_cache_dir"] = cache_dir
+        assert received_lookup_set is lookup_set
+        assert (cache_dir / "reuse.marker").read_text() == "ready"
+        Path(destination).write_bytes(b"published-v3")
+        # The destination has already been atomically published. A late cancel
+        # request must not convert this completed run into an error.
+        worker.cancel()
+        return summary
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.flatmap_profiles.discover_flatmap_lookup_set",
+        fake_discover,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.flatmap_parquet.augment_neuron_parquet_with_flatmaps",
+        fake_augment,
+    )
+    finished: list[object] = []
+    errors: list[str] = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert output.read_bytes() == b"published-v3"
+    assert calls["discover_lookup_dir"] == tmp_path / "lookups"
+    assert calls["discover_cache_dir"] == expected_cache_dir
+    assert calls["augment_cache_dir"] == expected_cache_dir
+    assert calls["augment_source"] == tmp_path / "neurons.parquet"
+    assert calls["augment_destination"] == output
+    assert finished == [summary]
+    assert errors == []
 
 
 def test_heatmap_worker_forwards_node_type_and_radius_filters(monkeypatch):
@@ -589,7 +781,9 @@ def test_convert_worker_accepts_directory_source(monkeypatch, tmp_path):
     finished: list[tuple[str, BatchParquetConversionSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -714,7 +908,9 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
     CorrelationWorker = workers.CorrelationWorker
     calls: dict[str, object] = {}
 
-    def fake_get_expanded_region_voxel_ids_for_regions(atlas, acronyms, increase_fraction):
+    def fake_get_expanded_region_voxel_ids_for_regions(
+        atlas, acronyms, increase_fraction
+    ):
         calls["atlas"] = atlas
         calls["acronyms"] = list(acronyms)
         calls["increase_fraction"] = float(increase_fraction)
@@ -811,6 +1007,191 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
     assert metadata.dendrogram_leaf_order == [1, 0]
 
 
+def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
+    monkeypatch,
+) -> None:
+    """Flatmap region filters should align with heatmaps that include depth -1."""
+    workers = _import_workers_module()
+    source = FlatmapVoxelCorrelationSource(
+        projected_nodes=pd.DataFrame(),
+        volume_shape=(2, 2, 2),
+        input_file_ids=("n1", "n2"),
+        xy_bins=2,
+        depth_bin_um=25.0,
+        include_depth_minus_one=True,
+        flatmap_path="flatmap.nrrd",
+        depth_path="depth.nrrd",
+    )
+    atlas = types.SimpleNamespace(annotation=np.zeros((1, 1, 1), dtype=np.int32))
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+
+    import napari_swc_viewer.flatmap_labels as labels_module
+    import napari_swc_viewer.flatmap_loader as loader_module
+
+    monkeypatch.setattr(
+        loader_module,
+        "load_flatmap_volume_set",
+        lambda _flatmap_path, _depth_path: types.SimpleNamespace(
+            flatmap=np.zeros((1, 1, 1, 2), dtype=np.float32),
+            depth=np.zeros((1, 1, 1), dtype=np.float32),
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_build_labels(*_args, **kwargs):
+        captured["selected_region_ids"] = kwargs["selected_region_ids"]
+        captured["mirror_depth_fallback"] = kwargs["mirror_depth_fallback"]
+        captured["mirror_coord_axis"] = kwargs["mirror_coord_axis"]
+        return types.SimpleNamespace(
+            labels=np.array([[[1, 0], [0, 1]]], dtype=np.int32),
+            summary=types.SimpleNamespace(
+                labeled_voxels=2,
+                valid_source_voxels=2,
+                collision_voxels=0,
+            ),
+            represented_region_ids=[68],
+        )
+
+    monkeypatch.setattr(
+        labels_module,
+        "build_flatmap_region_label_volume",
+        fake_build_labels,
+    )
+    worker = workers.FlatmapCorrelationWorker(
+        source=source,
+        atlas=atlas,
+        parquet_path="neurons.parquet",
+        region_selection=selection,
+    )
+
+    mask, metadata = worker._build_region_mask()
+
+    assert captured["selected_region_ids"] == [68]
+    assert captured["mirror_depth_fallback"] is True
+    assert captured["mirror_coord_axis"] == 2
+    assert mask.shape == (2, 2, 2)
+    assert mask[0].sum() == 0
+    assert bool(mask[1, 0, 0]) is True
+    assert metadata["flatmap_region_labeled_voxels"] == 2
+    assert metadata["flatmap_region_mirrored_depth_source_voxels"] == 0
+
+
+def test_flatmap_correlation_worker_uses_cache_without_nrrd_or_annotation(
+    monkeypatch,
+) -> None:
+    workers = _import_workers_module()
+    source = FlatmapVoxelCorrelationSource(
+        projected_nodes=pd.DataFrame(),
+        volume_shape=(1, 2, 2),
+        input_file_ids=("n1", "n2"),
+        xy_bins=2,
+        depth_bin_um=25.0,
+        include_depth_minus_one=False,
+        coordinate_mode="parquet_columns",
+        cache_dir="cache",
+        cache_profile_id="profile",
+        cache_style="both_square",
+    )
+
+    class _AtlasWithoutAnnotation:
+        atlas_name = "allen_mouse_25um"
+
+        @property
+        def annotation(self):
+            raise AssertionError("precomputed analysis must not access annotation")
+
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    import napari_swc_viewer.flatmap_loader as loader_module
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    monkeypatch.setattr(
+        loader_module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("precomputed analysis must not load NRRDs")
+        ),
+    )
+    profile = object()
+    cache_closed: list[bool] = []
+
+    cached_labels = np.array([[[68, 0], [0, 0]]], dtype=np.int32)
+
+    def close_cache():
+        cache_closed.append(True)
+        cached_labels.fill(0)
+
+    cache = types.SimpleNamespace(
+        profile=lambda _profile_id: profile,
+        close=close_cache,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "open_region_cache",
+        lambda _path: cache,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_selection",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            labels=cached_labels,
+            represented_region_ids=(68,),
+            summary=types.SimpleNamespace(
+                labeled_bins=1,
+                collision_bins=0,
+                source_voxel_count=3,
+            ),
+        ),
+    )
+    worker = workers.FlatmapCorrelationWorker(
+        source=source,
+        atlas=_AtlasWithoutAnnotation(),
+        parquet_path="neurons.parquet",
+        region_selection=selection,
+    )
+
+    mask, metadata = worker._build_region_mask()
+
+    assert mask.tolist() == [[[True, False], [False, False]]]
+    assert metadata["flatmap_region_source"] == "precomputed_cache"
+    assert metadata["flatmap_region_cache_profile_id"] == "profile"
+    assert cache_closed == [True]
+
+
+def test_flatmap_correlation_worker_counts_lookup_modes_for_metadata() -> None:
+    workers = _import_workers_module()
+
+    counts = workers.FlatmapCorrelationWorker._lookup_mode_counts(
+        pd.DataFrame(
+            {
+                "flatmap_lookup_mode": [
+                    "direct",
+                    "mirrored_depth",
+                    "mirrored",
+                    "mirrored",
+                    "unmapped",
+                ]
+            }
+        )
+    )
+
+    assert counts == {
+        "flatmap_direct_lookup_node_count": 1,
+        "flatmap_mirrored_depth_lookup_node_count": 1,
+        "flatmap_mirrored_lookup_node_count": 2,
+        "flatmap_unmapped_lookup_node_count": 1,
+    }
+
+
 def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
     """Hierarchical soma clustering should record the chosen linkage for clustering and dendrograms."""
     workers = _import_workers_module()
@@ -822,22 +1203,29 @@ def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
     )
     monkeypatch.setattr(
         "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
-        lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(neuron_ids, [1, 2]),
+        lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(
+            neuron_ids, [1, 2]
+        ),
     )
-    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
-        pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "x": [0.0, 25.0],
-                "y": [0.0, 25.0],
-                "z": [0.0, 25.0],
-            }
-        )
-    ))
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2"],
+                    "x": [0.0, 25.0],
+                    "y": [0.0, 25.0],
+                    "z": [0.0, 25.0],
+                }
+            )
+        ),
+    )
 
     worker = SomaClusterWorker(
         parquet_path="neurons.parquet",
-        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
         region_selection=ClusterRegionSelection(
             selected_region_ids=[184],
             selected_region_acronyms=["FRP"],
@@ -938,20 +1326,25 @@ def test_soma_cluster_worker_kmeans_uses_synthesized_dendrogram_linkage(monkeypa
         "napari_swc_viewer.analysis.clustering.cluster_somas_kmeans",
         lambda coords, neuron_ids, n_clusters: _make_cluster_result(neuron_ids, [1, 1]),
     )
-    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
-        pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "x": [0.0, 25.0],
-                "y": [0.0, 25.0],
-                "z": [0.0, 25.0],
-            }
-        )
-    ))
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2"],
+                    "x": [0.0, 25.0],
+                    "y": [0.0, 25.0],
+                    "z": [0.0, 25.0],
+                }
+            )
+        ),
+    )
 
     worker = SomaClusterWorker(
         parquet_path="neurons.parquet",
-        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
         region_selection=ClusterRegionSelection(
             selected_region_ids=[184, 500],
             selected_region_acronyms=["FRP", "CP"],
@@ -985,22 +1378,29 @@ def test_soma_cluster_worker_dbscan_records_dbscan_parameters(monkeypatch):
     )
     monkeypatch.setattr(
         "napari_swc_viewer.analysis.clustering.cluster_somas_dbscan",
-        lambda coords, neuron_ids, eps, min_samples: _make_cluster_result(neuron_ids, [1, 2]),
+        lambda coords, neuron_ids, eps, min_samples: _make_cluster_result(
+            neuron_ids, [1, 2]
+        ),
     )
-    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection(
-        pd.DataFrame(
-            {
-                "file_id": ["n1", "n2"],
-                "x": [0.0, 25.0],
-                "y": [0.0, 25.0],
-                "z": [0.0, 25.0],
-            }
-        )
-    ))
+    monkeypatch.setattr(
+        "duckdb.connect",
+        lambda: _FakeDuckConnection(
+            pd.DataFrame(
+                {
+                    "file_id": ["n1", "n2"],
+                    "x": [0.0, 25.0],
+                    "y": [0.0, 25.0],
+                    "z": [0.0, 25.0],
+                }
+            )
+        ),
+    )
 
     worker = SomaClusterWorker(
         parquet_path="neurons.parquet",
-        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"),
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
         region_selection=ClusterRegionSelection(
             selected_region_ids=[184],
             selected_region_acronyms=["FRP"],
@@ -1059,7 +1459,9 @@ def test_append_point_file_worker_routes_csv_to_append_helper(monkeypatch, tmp_p
     finished: list[tuple[str, PointParquetAppendSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -1078,7 +1480,9 @@ def test_append_point_file_worker_routes_csv_to_append_helper(monkeypatch, tmp_p
     assert finished[0][1].total_rows == 5
 
 
-def test_append_point_file_worker_routes_parquet_to_append_helper(monkeypatch, tmp_path):
+def test_append_point_file_worker_routes_parquet_to_append_helper(
+    monkeypatch, tmp_path
+):
     """AppendPointFileWorker should route Parquet input to the Parquet append helper."""
     workers = _import_workers_module()
     AppendPointFileWorker = workers.AppendPointFileWorker
@@ -1109,7 +1513,9 @@ def test_append_point_file_worker_routes_parquet_to_append_helper(monkeypatch, t
     finished: list[tuple[str, PointParquetAppendSummary]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -1196,7 +1602,9 @@ def test_convert_point_csv_worker_delegates_to_batch_helper(monkeypatch, tmp_pat
     finished: list[tuple[str, object]] = []
     errors: list[str] = []
     worker.progress.connect(
-        lambda message, current, total: progress_events.append((message, current, total))
+        lambda message, current, total: progress_events.append(
+            (message, current, total)
+        )
     )
     worker.finished.connect(lambda path, summary: finished.append((path, summary)))
     worker.error.connect(lambda message: errors.append(message))
@@ -1245,3 +1653,111 @@ def test_convert_point_csv_worker_emits_error(monkeypatch, tmp_path):
 
     assert not finished
     assert errors == ["bad headers"]
+
+
+def _write_flatmap_v3_parquet(path: Path) -> None:
+    rng = np.random.default_rng(3)
+    n = 1500
+    x = rng.uniform(0.0, 100.0, n).astype(np.float32)
+    y = rng.uniform(0.0, 80.0, n).astype(np.float32)
+    depth = rng.uniform(0.0, 700.0, n).astype(np.float32)
+    frame = pd.DataFrame(
+        {
+            "file_id": [f"neuron_{i % 4}" for i in range(n)],
+            "node_id": np.arange(n, dtype=np.int32),
+            "parent_id": np.full(n, -1, dtype=np.int32),
+            "type": np.full(n, 3, dtype=np.int32),
+            "x_flat_shaped": x,
+            "y_flat_shaped": y,
+            "x_flat_square": x,
+            "y_flat_square": y,
+            "depth_um": depth,
+            "flatmap_shaped_valid": np.ones(n, dtype=bool),
+            "flatmap_square_valid": np.ones(n, dtype=bool),
+            "depth_valid": np.ones(n, dtype=bool),
+        }
+    )
+    frame.to_parquet(path, index=False)
+
+
+def test_flatmap_heatmap_worker_emits_single_volume(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "flatmap_v3.parquet"
+    _write_flatmap_v3_parquet(path)
+
+    worker = workers.FlatmapHeatmapWorker(
+        str(path),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=(0.0, 100.0),
+        y_bounds=(0.0, 80.0),
+        depth_range_um=(0.0, 700.0),
+        xy_bins=16,
+        depth_bin_um=50.0,
+        include_depth_minus_one=False,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert errors == []
+    assert len(finished) == 1
+    result = finished[0]
+    assert result.volume is not None
+    assert result.render_summary.rendered_nodes == 1500
+    assert float(result.volume.sum()) == 1500.0
+
+
+def test_flatmap_heatmap_worker_derives_bounds_when_missing(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "flatmap_v3.parquet"
+    _write_flatmap_v3_parquet(path)
+
+    worker = workers.FlatmapHeatmapWorker(
+        str(path),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=None,
+        y_bounds=None,
+        depth_range_um=None,
+        xy_bins=16,
+        depth_bin_um=50.0,
+        include_depth_minus_one=False,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert errors == []
+    assert len(finished) == 1
+    assert float(finished[0].volume.sum()) == 1500.0
+
+
+def test_flatmap_heatmap_worker_reports_error(tmp_path):
+    workers = _import_workers_module()
+    worker = workers.FlatmapHeatmapWorker(
+        str(tmp_path / "does_not_exist.parquet"),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=(0.0, 1.0),
+        y_bounds=(0.0, 1.0),
+        depth_range_um=(0.0, 1.0),
+        xy_bins=8,
+        depth_bin_um=10.0,
+        include_depth_minus_one=False,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert finished == []
+    assert len(errors) == 1

@@ -13,6 +13,7 @@ from typing import Any, Iterator
 _DEBUG_ENV_VAR = "NAPARI_SWC_VIEWER_DEBUG"
 _LOG_FILE_ENV_VAR = "NAPARI_SWC_VIEWER_LOG_FILE"
 _LOGGER_NAME = "napari_swc_viewer"
+_NAPARI_DEBUG_LOGGER_NAMES = ("napari.components._layer_slicer",)
 _DEFAULT_LOG_FILE = Path.home() / ".napari-swc-viewer" / "debug.log"
 _LOG_FORMAT = (
     "%(asctime)s %(process)d %(threadName)s "
@@ -76,6 +77,14 @@ def configure_debug_logging() -> Path | None:
     logger.propagate = False
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
+    for logger_name in _NAPARI_DEBUG_LOGGER_NAMES:
+        napari_logger = logging.getLogger(logger_name)
+        napari_logger.setLevel(logging.DEBUG)
+        if not any(handler is file_handler for handler in napari_logger.handlers):
+            # Keep napari's existing propagation behavior intact.  The focused
+            # napari trace is written only to the file so routine slicing does
+            # not overwhelm the console stream.
+            napari_logger.addHandler(file_handler)
     logger._napari_swc_viewer_debug_configured = True
     logger._napari_swc_viewer_log_path = str(log_path)
     logger.debug("Configured debug logging at %s", log_path)

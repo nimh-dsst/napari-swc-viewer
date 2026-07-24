@@ -10,15 +10,19 @@ This widget provides a unified interface for:
 from __future__ import annotations
 
 import colorsys
+from importlib.metadata import version as package_version
 import logging
 from pathlib import Path
+import platform
+import threading
 from time import perf_counter
 from typing import TYPE_CHECKING
+import weakref
 
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info, show_warning
-from qtpy.QtCore import QEvent, Qt, QThread, QTimer, Signal
+from qtpy.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -60,6 +64,7 @@ from ..auto_center import (
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
 from ..neuron_table_ops import ClusterFilterSelection
+from ..flatmap_parquet import read_flatmap_parquet_transform_info
 from ..point_import import (
     POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
@@ -97,6 +102,164 @@ if TYPE_CHECKING:
     import napari
 
 logger = logging.getLogger(__name__)
+
+_FLATMAP_DEBUG_EVENT_NAMES = (
+    "Show",
+    "Close",
+    "Hide",
+    "WindowStateChange",
+    "DeferredDelete",
+    "Destroy",
+)
+_FLATMAP_CLOSE_CHECKPOINTS_MS = (0, 250, 2000)
+_FLATMAP_POST_DESTROY_CHECKPOINTS_MS = (0, 250, 2000)
+
+# macOS reapplies the app-wide saved window geometry (including fullscreen) to
+# every napari viewer shown through ``Window.show()`` and, on close, forces a
+# blocking ``showNormal``/``processEvents`` cycle while the window is fullscreen.
+# Both misbehave for a detached viewer, so the workarounds below are gated on it.
+_IS_MACOS = platform.system() == "Darwin"
+
+# Bounded poll of ``isFullScreen()`` while the detached window returns to normal
+# before we retry its close.  Kept short so a wedged transition surfaces a guard
+# failure instead of hanging.
+_FLATMAP_FULLSCREEN_EXIT_POLL_MS = 25
+_FLATMAP_FULLSCREEN_EXIT_MAX_TICKS = 40
+_FLATMAP_FULLSCREEN_EXIT_SETTLE_MS = 50
+
+
+def _debug_field_value(value: object) -> str:
+    """Return a compact value for one structured lifecycle log field."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "none"
+    if isinstance(value, (list, tuple, set)):
+        return "|".join(_debug_field_value(item) for item in value) or "empty"
+    return str(value).replace(" ", "_").replace("\n", "\\n")
+
+
+def _log_flatmap_lifecycle(event: str, **fields: object) -> None:
+    """Emit one searchable, structured detached-viewer lifecycle record."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    suffix = " ".join(
+        f"{key}={_debug_field_value(value)}" for key, value in fields.items()
+    )
+    logger.debug(
+        "flatmap_viewer_lifecycle event=%s%s",
+        event,
+        f" {suffix}" if suffix else "",
+    )
+
+
+def _qevent_type(name: str):
+    """Resolve a QEvent member across Qt5/Qt6-compatible qtpy APIs."""
+    direct = getattr(QEvent, name, None)
+    if direct is not None:
+        return direct
+    return getattr(getattr(QEvent, "Type", None), name, None)
+
+
+def _flatmap_window_no_state():
+    """Resolve ``Qt.WindowNoState`` across Qt5/Qt6-compatible qtpy APIs."""
+    direct = getattr(Qt, "WindowNoState", None)
+    if direct is not None:
+        return direct
+    return getattr(getattr(Qt, "WindowState", None), "WindowNoState", None)
+
+
+class _FlatmapWindowLifecycleEventFilter(QObject):
+    """Observe detached-window events without accepting or consuming them."""
+
+    def __init__(self, viewer_token: str, callback, parent=None) -> None:
+        super().__init__(parent)
+        self._viewer_token = viewer_token
+        self._callback = callback
+        self._event_types = {
+            event_type: name
+            for name in _FLATMAP_DEBUG_EVENT_NAMES
+            if (event_type := _qevent_type(name)) is not None
+        }
+
+    def eventFilter(self, watched, event) -> bool:
+        event_name = self._event_types.get(event.type())
+        if event_name is not None:
+            try:
+                self._callback(self._viewer_token, event_name, watched, event)
+            except Exception:
+                logger.debug(
+                    "Failed to record detached flatmap Qt event.",
+                    exc_info=True,
+                )
+        return False
+
+
+class _FlatmapWindowCleanupEventFilter(QObject):
+    """Finalize one detached viewer when Qt commits to deleting its window."""
+
+    def __init__(self, viewer_token: str, viewer, callback, parent=None) -> None:
+        super().__init__(parent)
+        self._viewer_token = viewer_token
+        try:
+            self._viewer_ref = weakref.ref(viewer)
+        except TypeError:
+            self._viewer_ref = lambda: None
+        self._callback = callback
+        self._deferred_delete_type = _qevent_type("DeferredDelete")
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == self._deferred_delete_type:
+            try:
+                self._callback(
+                    self._viewer_token,
+                    self._viewer_ref(),
+                    watched,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to clean up detached flatmap Qt window.",
+                    exc_info=True,
+                )
+        return False
+
+
+class _FlatmapFullscreenCloseGuard(QObject):
+    """Intercept a fullscreen detached-window close on macOS.
+
+    When the detached viewer is fullscreen, napari's own ``closeEvent`` runs a
+    blocking ``showNormal``/``sleep``/``processEvents`` cycle mid-teardown that
+    crashes the native OpenGL surface.  This filter consumes the initial close,
+    lets the window return to a normal state, then hands control back to the
+    caller so napari can close it cleanly.  ``Close`` events for a window that is
+    already normal are never consumed.
+    """
+
+    def __init__(self, viewer_token: str, callback, parent=None) -> None:
+        super().__init__(parent)
+        self._viewer_token = viewer_token
+        self._callback = callback
+        self._close_type = _qevent_type("Close")
+
+    def eventFilter(self, watched, event) -> bool:
+        if self._close_type is None or event.type() != self._close_type:
+            return False
+        is_fullscreen = getattr(watched, "isFullScreen", None)
+        try:
+            fullscreen = bool(is_fullscreen()) if callable(is_fullscreen) else False
+        except (RuntimeError, TypeError):
+            return False
+        if not fullscreen:
+            return False
+        try:
+            return bool(self._callback(self._viewer_token, watched, event))
+        except Exception:
+            logger.debug(
+                "Failed to guard fullscreen detached flatmap close.",
+                exc_info=True,
+            )
+            return False
+
 
 _SomaSelectionKey = tuple[int, frozenset[int], tuple[object, ...]]
 
@@ -558,6 +721,29 @@ class NeuronViewerWidget(QWidget):
                 int,
                 tuple[object, object, object],
             ] = {}
+            self._flatmap_viewer = None
+            self._flatmap_pending_show_token: str | None = None
+            self._flatmap_show_scheduled_tokens: set[str] = set()
+            self._flatmap_debug_sequence = 0
+            self._flatmap_debug_tokens: dict[int, str] = {}
+            self._flatmap_debug_filters: dict[
+                str,
+                _FlatmapWindowLifecycleEventFilter,
+            ] = {}
+            self._flatmap_cleanup_filters: dict[
+                str,
+                _FlatmapWindowCleanupEventFilter,
+            ] = {}
+            self._flatmap_close_guard_filters: dict[
+                str,
+                _FlatmapFullscreenCloseGuard,
+            ] = {}
+            self._flatmap_fullscreen_close_state: dict[str, str] = {}
+            self._flatmap_cleanup_states: dict[
+                tuple[str, int],
+                dict[str, object],
+            ] = {}
+            self._log_flatmap_runtime_environment()
 
             with startup_timing(
                 logger,
@@ -641,6 +827,1685 @@ class NeuronViewerWidget(QWidget):
             ):
                 QTimer.singleShot(0, self._start_cached_template_autoload)
 
+    def _get_or_create_flatmap_viewer(self, *, create: bool = True):
+        """Return the detached napari viewer used for flatmap display layers."""
+        viewer = getattr(self, "_flatmap_viewer", None)
+        viewer_token = self._flatmap_debug_token_for(viewer)
+        is_open = self._flatmap_viewer_is_open(viewer)
+        self._log_flatmap_viewer_snapshot(
+            "request",
+            viewer_token,
+            viewer=viewer,
+            create=create,
+            is_open=is_open,
+        )
+        if is_open:
+            self._log_flatmap_viewer_snapshot(
+                "reuse",
+                viewer_token,
+                viewer=viewer,
+                create=create,
+            )
+            return viewer
+
+        if viewer is not None:
+            self._log_flatmap_viewer_snapshot(
+                "replace_stale",
+                viewer_token,
+                viewer=viewer,
+                create=create,
+            )
+        self._flatmap_viewer = None
+        if not create:
+            return None
+
+        import napari
+
+        viewer = napari.Viewer(
+            title="SWC Viewer Flatmap",
+            ndisplay=3,
+            show=False,
+        )
+
+        self._flatmap_viewer = viewer
+        viewer_token = self._flatmap_debug_token_for(viewer, create=True)
+        self._flatmap_pending_show_token = viewer_token
+        qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+        self._log_flatmap_viewer_snapshot(
+            "created_hidden",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+        self._connect_flatmap_viewer_destroyed(viewer, viewer_token=viewer_token)
+        self._install_flatmap_cleanup_event_filter(
+            viewer,
+            viewer_token=viewer_token,
+        )
+        self._install_flatmap_fullscreen_close_guard(
+            viewer,
+            viewer_token=viewer_token,
+        )
+        self._install_flatmap_debug_event_filter(
+            viewer,
+            viewer_token=viewer_token,
+        )
+        return viewer
+
+    @staticmethod
+    def _flatmap_layer_belongs_to_viewer(viewer, layer) -> bool:
+        if viewer is None or layer is None:
+            return False
+        try:
+            return any(candidate is layer for candidate in viewer.layers)
+        except Exception:
+            return False
+
+    def _on_flatmap_display_viewer_ready(self, viewer, layer) -> None:
+        """Show a pending detached viewer after its first layer is configured."""
+        viewer_token = self._flatmap_debug_token_for(viewer)
+        layer_name = str(getattr(layer, "name", type(layer).__name__))
+        if getattr(self, "_flatmap_viewer", None) is not viewer:
+            self._log_flatmap_viewer_snapshot(
+                "show_skipped",
+                viewer_token,
+                viewer=viewer,
+                reason="stale_viewer",
+            )
+            return
+        if getattr(self, "_flatmap_pending_show_token", None) != viewer_token:
+            self._log_flatmap_viewer_snapshot(
+                "show_skipped",
+                viewer_token,
+                viewer=viewer,
+                reason="already_shown",
+            )
+            return
+        if not self._flatmap_layer_belongs_to_viewer(viewer, layer):
+            self._log_flatmap_viewer_snapshot(
+                "show_skipped",
+                viewer_token,
+                viewer=viewer,
+                reason="layer_not_in_viewer",
+            )
+            return
+
+        self._log_flatmap_viewer_snapshot(
+            "first_layer_ready",
+            viewer_token,
+            viewer=viewer,
+            layer_name=layer_name,
+        )
+
+        scheduled = getattr(self, "_flatmap_show_scheduled_tokens", None)
+        if scheduled is None:
+            scheduled = set()
+            self._flatmap_show_scheduled_tokens = scheduled
+        if viewer_token in scheduled:
+            self._log_flatmap_viewer_snapshot(
+                "show_skipped",
+                viewer_token,
+                viewer=viewer,
+                reason="show_already_scheduled",
+            )
+            return
+        scheduled.add(viewer_token)
+
+        viewer_ref = self._flatmap_debug_weak_ref(viewer)
+        layer_object_id = id(layer)
+        self._log_flatmap_viewer_snapshot(
+            "show_scheduled",
+            viewer_token,
+            viewer=viewer,
+            layer_name=layer_name,
+        )
+
+        def show_when_ready(
+            *,
+            token=viewer_token,
+            vref=viewer_ref,
+            expected_layer_id=layer_object_id,
+            expected_layer_name=layer_name,
+        ) -> None:
+            scheduled_tokens = getattr(
+                self,
+                "_flatmap_show_scheduled_tokens",
+                set(),
+            )
+            scheduled_tokens.discard(token)
+            ready_viewer = vref()
+            reason = None
+            if ready_viewer is None:
+                reason = "viewer_unavailable"
+            elif getattr(self, "_flatmap_viewer", None) is not ready_viewer:
+                reason = "stale_viewer"
+            elif getattr(self, "_flatmap_pending_show_token", None) != token:
+                reason = "no_longer_pending"
+            elif not self._flatmap_viewer_is_open(ready_viewer):
+                reason = "viewer_not_open"
+            else:
+                try:
+                    layer_is_present = any(
+                        id(candidate) == expected_layer_id
+                        for candidate in ready_viewer.layers
+                    )
+                except Exception:
+                    layer_is_present = False
+                if not layer_is_present:
+                    reason = "layer_not_in_viewer"
+
+            if reason is not None:
+                self._log_flatmap_viewer_snapshot(
+                    "show_skipped",
+                    token,
+                    viewer=ready_viewer,
+                    reason=reason,
+                    layer_name=expected_layer_name,
+                )
+                return
+
+            show = getattr(ready_viewer, "show", None)
+            if not callable(show):
+                self._log_flatmap_viewer_snapshot(
+                    "show_skipped",
+                    token,
+                    viewer=ready_viewer,
+                    reason="show_unavailable",
+                    layer_name=expected_layer_name,
+                )
+                self._discard_pending_flatmap_viewer(
+                    ready_viewer,
+                    reason="show_unavailable",
+                )
+                return
+            try:
+                show_path = self._show_flatmap_viewer_window(ready_viewer, token)
+            except Exception as error:
+                self._log_flatmap_cleanup_failure(
+                    token,
+                    "show_pending_viewer",
+                    error,
+                )
+                self._discard_pending_flatmap_viewer(
+                    ready_viewer,
+                    reason="show_failed",
+                )
+                return
+
+            if getattr(self, "_flatmap_pending_show_token", None) == token:
+                self._flatmap_pending_show_token = None
+            self._log_flatmap_viewer_snapshot(
+                "shown",
+                token,
+                viewer=ready_viewer,
+                layer_name=expected_layer_name,
+                show_path=show_path,
+            )
+
+        QTimer.singleShot(0, show_when_ready)
+
+    def _show_flatmap_viewer_window(self, viewer, viewer_token: str) -> str:
+        """Show a pending detached viewer, suppressing macOS fullscreen restore.
+
+        Returns ``"normal_qt"`` when the guarded macOS normal-window path was
+        used and ``"napari"`` when napari's own ``Window.show()`` ran.
+        """
+        if not _IS_MACOS:
+            viewer.show()
+            return "napari"
+
+        window = getattr(viewer, "window", None)
+        qt_window = getattr(window, "_qt_window", None)
+        set_state = getattr(qt_window, "setWindowState", None)
+        show_normal = getattr(qt_window, "showNormal", None)
+        if not (callable(set_state) and callable(show_normal)):
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_guard_failure",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                stage="normal_show",
+                reason="qt_window_unavailable",
+            )
+            viewer.show()
+            return "napari"
+
+        self._log_flatmap_viewer_snapshot(
+            "normal_show_requested",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+        try:
+            set_state(_flatmap_window_no_state())
+            show_normal()
+        except Exception as error:
+            self._log_flatmap_cleanup_failure(viewer_token, "normal_show", error)
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_guard_failure",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                stage="normal_show",
+                reason="show_normal_failed",
+            )
+            viewer.show()
+            return "napari"
+
+        # ``Window.show()`` performs this after showing; reproduce it since we
+        # deliberately bypass ``Window.show()`` to avoid its geometry restore.
+        resize = getattr(
+            getattr(getattr(window, "_qt_viewer", None), "dims", None),
+            "_resize_axis_labels",
+            None,
+        )
+        if callable(resize):
+            try:
+                resize()
+            except Exception:
+                logger.debug(
+                    "Failed to resize detached flatmap axis labels.",
+                    exc_info=True,
+                )
+        for method_name in ("raise_", "activateWindow"):
+            method = getattr(qt_window, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    logger.debug(
+                        "Failed to activate detached flatmap window.",
+                        exc_info=True,
+                    )
+
+        self._log_flatmap_viewer_snapshot(
+            "fullscreen_restore_suppressed",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+        return "normal_qt"
+
+    def _on_flatmap_display_viewer_failed(self, viewer, reason: str) -> None:
+        """Discard a hidden viewer whose first display operation failed."""
+        self._discard_pending_flatmap_viewer(viewer, reason=reason)
+
+    def _discard_pending_flatmap_viewer(self, viewer, *, reason: str) -> bool:
+        """Close and release one active viewer that has never been shown."""
+        viewer_token = self._flatmap_debug_token_for(viewer)
+        if (
+            getattr(self, "_flatmap_viewer", None) is not viewer
+            or getattr(self, "_flatmap_pending_show_token", None) != viewer_token
+        ):
+            self._log_flatmap_viewer_snapshot(
+                "show_skipped",
+                viewer_token,
+                viewer=viewer,
+                reason=f"discard_{reason}_not_pending",
+            )
+            return False
+
+        self._flatmap_pending_show_token = None
+        scheduled = getattr(self, "_flatmap_show_scheduled_tokens", None)
+        if scheduled is not None:
+            scheduled.discard(viewer_token)
+        qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+        close_status = "closed"
+        try:
+            viewer.close()
+        except Exception as error:
+            close_status = "viewer_close_failed"
+            self._log_flatmap_cleanup_failure(
+                viewer_token,
+                "close_pending_viewer",
+                error,
+            )
+            close_qt_window = getattr(qt_window, "close", None)
+            if callable(close_qt_window):
+                try:
+                    close_qt_window()
+                    close_status = "qt_window_closed"
+                except Exception as qt_error:
+                    self._log_flatmap_cleanup_failure(
+                        viewer_token,
+                        "close_pending_qt_window",
+                        qt_error,
+                    )
+            self._cleanup_flatmap_viewer(
+                viewer,
+                qt_window,
+                viewer_token=viewer_token,
+                trigger="pending_discard_fallback",
+                allow_qt_cleanup=True,
+            )
+        else:
+            self._release_flatmap_viewer_references(
+                viewer,
+                viewer_token=viewer_token,
+            )
+
+        self._log_flatmap_viewer_snapshot(
+            "pending_viewer_discarded",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+            reason=reason,
+            close_status=close_status,
+        )
+        return True
+
+    def _log_flatmap_runtime_environment(self) -> None:
+        """Log runtime versions relevant to detached napari-window behavior."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            import napari
+
+            napari_version = getattr(napari, "__version__", "unknown")
+        except Exception:
+            napari_version = "unavailable"
+        try:
+            import qtpy
+
+            qt_api = getattr(qtpy, "API_NAME", "unknown")
+            qt_version = getattr(qtpy, "QT_VERSION", "unknown")
+            binding_version = getattr(
+                qtpy,
+                "PYQT_VERSION",
+                getattr(qtpy, "PYSIDE_VERSION", "unknown"),
+            )
+        except Exception:
+            qt_api = "unavailable"
+            qt_version = "unavailable"
+            binding_version = "unavailable"
+        try:
+            plugin_version = package_version("napari-swc-viewer")
+        except Exception:
+            plugin_version = "unknown"
+
+        _log_flatmap_lifecycle(
+            "environment",
+            plugin_version=plugin_version,
+            napari_version=napari_version,
+            python_version=platform.python_version(),
+            platform=platform.platform(),
+            qt_api=qt_api,
+            qt_version=qt_version,
+            qt_binding_version=binding_version,
+        )
+
+    def _flatmap_debug_token_for(
+        self,
+        viewer,
+        *,
+        create: bool = False,
+    ) -> str:
+        """Return a session-local diagnostic token without retaining a viewer."""
+        if viewer is None:
+            return "none"
+        tokens = getattr(self, "_flatmap_debug_tokens", None)
+        if tokens is None:
+            return "untracked"
+        object_id = id(viewer)
+        token = tokens.get(object_id)
+        if token is None and create:
+            self._flatmap_debug_sequence = (
+                int(getattr(self, "_flatmap_debug_sequence", 0)) + 1
+            )
+            token = f"flatmap-{self._flatmap_debug_sequence}"
+            tokens[object_id] = token
+        return token or "untracked"
+
+    @staticmethod
+    def _flatmap_debug_call(obj, name: str):
+        """Safely read or invoke one Qt/napari diagnostic attribute."""
+        if obj is None:
+            return "unavailable"
+        try:
+            value = getattr(obj, name)
+            return value() if callable(value) else value
+        except Exception:
+            return "unavailable"
+
+    @classmethod
+    def _flatmap_debug_thread_state(cls, thread) -> str:
+        if thread is None:
+            return "absent"
+        running = cls._flatmap_debug_call(thread, "isRunning")
+        if isinstance(running, bool):
+            return "running" if running else "stopped"
+        return "unavailable"
+
+    @classmethod
+    def _flatmap_debug_qt_object_details(
+        cls,
+        obj,
+        *,
+        existing_native: bool = False,
+    ) -> dict[str, object]:
+        """Return guarded identity and visibility fields for a Qt window."""
+        parent = cls._flatmap_debug_call(obj, "parentWidget")
+        if parent == "unavailable":
+            parent = cls._flatmap_debug_call(obj, "parent")
+        parent_available = parent not in (None, "unavailable")
+        title = cls._flatmap_debug_call(obj, "windowTitle")
+        if title == "unavailable":
+            title = cls._flatmap_debug_call(obj, "title")
+        details: dict[str, object] = {
+            "python_id": hex(id(obj)),
+            "class": type(obj).__name__,
+            "object_name": cls._flatmap_debug_call(obj, "objectName"),
+            "title": title,
+            "visible": cls._flatmap_debug_call(obj, "isVisible"),
+            "hidden": cls._flatmap_debug_call(obj, "isHidden"),
+            "parent_class": type(parent).__name__ if parent_available else "none",
+            "parent_title": (
+                cls._flatmap_debug_call(parent, "windowTitle")
+                if parent_available
+                else "none"
+            ),
+        }
+        widget_attribute = getattr(Qt, "WidgetAttribute", None)
+        delete_on_close = getattr(widget_attribute, "WA_DeleteOnClose", None)
+        if delete_on_close is None:
+            delete_on_close = getattr(Qt, "WA_DeleteOnClose", None)
+        test_attribute = getattr(obj, "testAttribute", None)
+        if delete_on_close is not None and callable(test_attribute):
+            try:
+                details["delete_on_close"] = bool(
+                    test_attribute(delete_on_close)
+                )
+            except Exception:
+                details["delete_on_close"] = "unavailable"
+        else:
+            details["delete_on_close"] = "unavailable"
+
+        # QWidget.winId() can create a native handle. Only inspect an existing
+        # QWindow returned by windowHandle().
+        if existing_native:
+            details["native_window_id"] = cls._flatmap_debug_call(
+                obj,
+                "winId",
+            )
+        else:
+            window_handle = cls._flatmap_debug_call(obj, "windowHandle")
+        if not existing_native and window_handle not in (None, "unavailable"):
+            details["native_window_id"] = cls._flatmap_debug_call(
+                window_handle,
+                "winId",
+            )
+        elif not existing_native:
+            details["native_window_id"] = "unavailable"
+        return details
+
+    @staticmethod
+    def _flatmap_debug_is_matching_window(details: dict[str, object]) -> bool:
+        title = details.get("title")
+        return isinstance(title, str) and title == "SWC Viewer Flatmap"
+
+    def _log_flatmap_viewer_snapshot(
+        self,
+        event: str,
+        viewer_token: str,
+        *,
+        viewer=None,
+        qt_window=None,
+        **fields: object,
+    ) -> None:
+        """Log a guarded snapshot of detached viewer, Qt, and worker state."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        if qt_window is None and viewer is not None:
+            qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+
+        current_viewer = getattr(self, "_flatmap_viewer", None)
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        layers = getattr(viewer, "layers", None) if viewer is not None else None
+        try:
+            layer_list = list(layers) if layers is not None else []
+            layer_names = [
+                str(getattr(layer, "name", type(layer).__name__))
+                for layer in layer_list
+            ]
+            layer_count: object = len(layer_list)
+        except Exception:
+            layer_names = ["unavailable"]
+            layer_count = "unavailable"
+
+        try:
+            import napari
+
+            viewer_class = getattr(napari, "Viewer", type(viewer))
+            viewer_instances = list(getattr(viewer_class, "_instances", ()))
+            if not viewer_instances and viewer is not None:
+                viewer_instances = list(getattr(type(viewer), "_instances", ()))
+            napari_viewer_count: object = len(viewer_instances)
+            napari_viewer_registered: object = any(
+                candidate is viewer for candidate in viewer_instances
+            )
+        except Exception:
+            napari_viewer_count = "unavailable"
+            napari_viewer_registered = "unavailable"
+
+        try:
+            top_level_widgets = list(QApplication.topLevelWidgets())
+            top_level_titles = [
+                str(self._flatmap_debug_call(widget, "windowTitle"))
+                for widget in top_level_widgets
+            ]
+            matching_top_level_widgets = [
+                details
+                for widget in top_level_widgets
+                if (
+                    (details := self._flatmap_debug_qt_object_details(widget))
+                    and (
+                        widget is qt_window
+                        or self._flatmap_debug_is_matching_window(details)
+                    )
+                )
+            ]
+            top_level_count: object = len(top_level_widgets)
+        except Exception:
+            top_level_titles = ["unavailable"]
+            matching_top_level_widgets = ["unavailable"]
+            top_level_count = "unavailable"
+
+        try:
+            top_level_windows = getattr(QApplication, "topLevelWindows")()
+            matching_native_windows = [
+                details
+                for window in list(top_level_windows)
+                if self._flatmap_debug_is_matching_window(
+                    details := self._flatmap_debug_qt_object_details(
+                        window,
+                        existing_native=True,
+                    )
+                )
+            ]
+        except Exception:
+            matching_native_windows = ["unavailable"]
+
+        slicer = getattr(viewer, "_layer_slicer", None) if viewer is not None else None
+        slicer_tasks = getattr(slicer, "_layers_to_task", None)
+        try:
+            slicer_task_count: object = (
+                len(slicer_tasks) if slicer_tasks is not None else 0
+            )
+        except Exception:
+            slicer_task_count = "unavailable"
+        executor = getattr(slicer, "_executor", None)
+        executor_shutdown = getattr(executor, "_shutdown", "unavailable")
+
+        python_threads = threading.enumerate()
+        qt_visible = self._flatmap_debug_call(qt_window, "isVisible")
+        qt_hidden = self._flatmap_debug_call(qt_window, "isHidden")
+        qt_active = self._flatmap_debug_call(qt_window, "isActiveWindow")
+        qt_title = self._flatmap_debug_call(qt_window, "windowTitle")
+        qt_fullscreen = self._flatmap_debug_call(qt_window, "isFullScreen")
+        qt_window_state = self._flatmap_debug_call(qt_window, "windowState")
+        snapshot_fields: dict[str, object] = {
+            "viewer_token": viewer_token,
+            "viewer_object_id": hex(id(viewer)) if viewer is not None else "none",
+            "qt_window_object_id": (
+                hex(id(qt_window)) if qt_window is not None else "none"
+            ),
+            "viewer_available": viewer is not None,
+            "qt_window_available": qt_window is not None,
+            "qt_window_accessible": any(
+                value != "unavailable"
+                for value in (qt_visible, qt_hidden, qt_active, qt_title)
+            ),
+            "qt_visible": qt_visible,
+            "qt_hidden": qt_hidden,
+            "qt_active": qt_active,
+            "qt_title": qt_title,
+            "qt_fullscreen": qt_fullscreen,
+            "qt_window_state": qt_window_state,
+            "napari_saved_fullscreen": self._flatmap_saved_fullscreen_setting(),
+            "fullscreen_close_state": (
+                getattr(self, "_flatmap_fullscreen_close_state", {}) or {}
+            ).get(viewer_token, "none"),
+            "layer_count": layer_count,
+            "layer_names": layer_names,
+            "napari_viewer_count": napari_viewer_count,
+            "napari_viewer_registered": napari_viewer_registered,
+            "owner_ref_is_viewer": current_viewer is viewer and viewer is not None,
+            "tab_ref_is_viewer": (
+                getattr(flatmap_tab, "_last_display_viewer", None) is viewer
+                and viewer is not None
+            ),
+            "pending_first_show": (
+                getattr(self, "_flatmap_pending_show_token", None)
+                == viewer_token
+            ),
+            "show_scheduled": viewer_token
+            in (
+                getattr(self, "_flatmap_show_scheduled_tokens", None) or ()
+            ),
+            "projection_layer_ref": bool(
+                getattr(flatmap_tab, "_projection_layer", None)
+            ),
+            "region_labels_layer_ref": bool(
+                getattr(flatmap_tab, "_region_labels_layer", None)
+            ),
+            "region_surface_layer_refs": len(
+                getattr(flatmap_tab, "_region_surfaces_layers", ()) or ()
+            ),
+            "region_outline_layer_refs": len(
+                getattr(flatmap_tab, "_region_outlines_layers", ()) or ()
+            ),
+            "cache_open_thread": self._flatmap_debug_thread_state(
+                getattr(flatmap_tab, "_cache_open_thread", None)
+            ),
+            "cache_build_thread": self._flatmap_debug_thread_state(
+                getattr(flatmap_tab, "_cache_build_thread", None)
+            ),
+            "atlas_load_thread": self._flatmap_debug_thread_state(
+                getattr(flatmap_tab, "_region_label_atlas_load_thread", None)
+            ),
+            "parquet_prepare_thread": self._flatmap_debug_thread_state(
+                getattr(flatmap_tab, "_augment_thread", None)
+            ),
+            "slicer_available": slicer is not None,
+            "slicer_task_count": slicer_task_count,
+            "slicer_executor_shutdown": executor_shutdown,
+            "qt_top_level_count": top_level_count,
+            "qt_top_level_titles": top_level_titles,
+            "qt_matching_top_level_widgets": matching_top_level_widgets,
+            "qt_matching_native_windows": matching_native_windows,
+            "python_thread_count": len(python_threads),
+            "python_thread_names": [thread.name for thread in python_threads],
+        }
+        snapshot_fields.update(fields)
+        _log_flatmap_lifecycle(event, **snapshot_fields)
+
+    @staticmethod
+    def _flatmap_debug_weak_ref(value):
+        if value is None:
+            return lambda: None
+        try:
+            return weakref.ref(value)
+        except TypeError:
+            return lambda: None
+
+    def _on_flatmap_debug_qt_event(
+        self,
+        viewer_token: str,
+        event_name: str,
+        qt_window,
+        event,
+    ) -> None:
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if self._flatmap_debug_token_for(viewer) != viewer_token:
+            viewer = None
+        self._log_flatmap_viewer_snapshot(
+            f"qt_{event_name.lower()}",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+            event_spontaneous=self._flatmap_debug_call(event, "spontaneous"),
+            event_accepted=self._flatmap_debug_call(event, "isAccepted"),
+        )
+        if event_name != "Close":
+            return
+
+        viewer_ref = self._flatmap_debug_weak_ref(viewer)
+        qt_window_ref = self._flatmap_debug_weak_ref(qt_window)
+        for delay_ms in _FLATMAP_CLOSE_CHECKPOINTS_MS:
+            QTimer.singleShot(
+                delay_ms,
+                lambda token=viewer_token, delay=delay_ms, vref=viewer_ref, wref=qt_window_ref: (
+                    self._log_flatmap_viewer_snapshot(
+                        "close_checkpoint",
+                        token,
+                        viewer=vref(),
+                        qt_window=wref(),
+                        delay_ms=delay,
+                    )
+                ),
+            )
+
+    def _on_flatmap_cleanup_deferred_delete(
+        self,
+        viewer_token: str,
+        viewer,
+        qt_window,
+    ) -> None:
+        """Clean the model and Qt children before the top-level is deleted."""
+        if viewer is None:
+            self._log_flatmap_viewer_snapshot(
+                "cleanup_skipped",
+                viewer_token,
+                qt_window=qt_window,
+                cleanup_trigger="deferred_delete",
+                reason="viewer_unavailable",
+            )
+            return
+        self._cleanup_flatmap_viewer(
+            viewer,
+            qt_window,
+            viewer_token=viewer_token,
+            trigger="deferred_delete",
+            allow_qt_cleanup=True,
+        )
+
+    def _install_flatmap_cleanup_event_filter(
+        self,
+        viewer,
+        *,
+        viewer_token: str,
+    ) -> None:
+        """Install the always-active committed-close cleanup filter."""
+        qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+        install = getattr(qt_window, "installEventFilter", None)
+        if not callable(install):
+            self._log_flatmap_viewer_snapshot(
+                "cleanup_event_filter_unavailable",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+            )
+            return
+        event_filter = _FlatmapWindowCleanupEventFilter(
+            viewer_token,
+            viewer,
+            self._on_flatmap_cleanup_deferred_delete,
+            parent=self,
+        )
+        filters = getattr(self, "_flatmap_cleanup_filters", None)
+        if filters is None:
+            filters = {}
+            self._flatmap_cleanup_filters = filters
+        previous = filters.get(viewer_token)
+        if previous is not None:
+            self._log_flatmap_viewer_snapshot(
+                "cleanup_event_filter_reused",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+            )
+            return
+        filters[viewer_token] = event_filter
+        install(event_filter)
+        self._log_flatmap_viewer_snapshot(
+            "cleanup_event_filter_installed",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+
+    def _install_flatmap_fullscreen_close_guard(
+        self,
+        viewer,
+        *,
+        viewer_token: str,
+    ) -> None:
+        """Install the macOS-only fullscreen-close guard filter."""
+        if not _IS_MACOS:
+            return
+        qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+        install = getattr(qt_window, "installEventFilter", None)
+        if not callable(install):
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_guard_failure",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                stage="install_close_guard",
+                reason="qt_window_unavailable",
+            )
+            return
+        filters = getattr(self, "_flatmap_close_guard_filters", None)
+        if filters is None:
+            filters = {}
+            self._flatmap_close_guard_filters = filters
+        if filters.get(viewer_token) is not None:
+            return
+        event_filter = _FlatmapFullscreenCloseGuard(
+            viewer_token,
+            self._on_flatmap_fullscreen_close,
+            parent=self,
+        )
+        filters[viewer_token] = event_filter
+        install(event_filter)
+        self._log_flatmap_viewer_snapshot(
+            "fullscreen_close_guard_installed",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+
+    def _on_flatmap_fullscreen_close(self, viewer_token: str, qt_window, event) -> bool:
+        """Defer a fullscreen detached-window close until it returns to normal.
+
+        Returns ``True`` to consume the initial close so napari's fullscreen
+        ``closeEvent`` workaround (a blocking ``sleep``/``processEvents`` loop
+        that crashes the OpenGL surface) never runs.  The window is returned to
+        a normal state, then the close is retried through napari's confirmation.
+        """
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if (
+            viewer is None
+            or self._flatmap_debug_token_for(viewer) != viewer_token
+            or getattr(getattr(viewer, "window", None), "_qt_window", None)
+            is not qt_window
+        ):
+            # Stale or replaced viewer: do not consume the event.
+            return False
+
+        states = self._flatmap_fullscreen_close_state
+        if states.get(viewer_token) == "exiting":
+            # A transition is already scheduled; swallow duplicate close requests
+            # without arming another timer.
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_close_deferred",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                fullscreen_close_state="exiting",
+                reason="already_exiting",
+            )
+            return True
+
+        states[viewer_token] = "exiting"
+        self._log_flatmap_viewer_snapshot(
+            "fullscreen_close_deferred",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+            fullscreen_close_state="exiting",
+        )
+
+        qt_window_ref = self._flatmap_debug_weak_ref(qt_window)
+
+        def request_exit(*, token=viewer_token, wref=qt_window_ref) -> None:
+            if not self._flatmap_fullscreen_transition_valid(token, wref):
+                return
+            window = wref()
+            show_normal = getattr(window, "showNormal", None)
+            if callable(show_normal):
+                try:
+                    show_normal()
+                except Exception as error:
+                    self._log_flatmap_cleanup_failure(token, "fullscreen_exit", error)
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_exit_requested",
+                token,
+                viewer=getattr(self, "_flatmap_viewer", None),
+                qt_window=window,
+            )
+            self._poll_flatmap_fullscreen_exit(token, wref, ticks=0)
+
+        QTimer.singleShot(0, request_exit)
+        return True
+
+    def _flatmap_fullscreen_transition_valid(self, token: str, qt_window_ref) -> bool:
+        """Return whether a pending fullscreen transition should still proceed."""
+        if self._flatmap_fullscreen_close_state.get(token) != "exiting":
+            return False
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if viewer is None or self._flatmap_debug_token_for(viewer) != token:
+            self._flatmap_fullscreen_close_state.pop(token, None)
+            return False
+        window = qt_window_ref()
+        if window is None:
+            self._flatmap_fullscreen_close_state.pop(token, None)
+            return False
+        if getattr(getattr(viewer, "window", None), "_qt_window", None) is not window:
+            self._flatmap_fullscreen_close_state.pop(token, None)
+            return False
+        cleanup_states = getattr(self, "_flatmap_cleanup_states", None) or {}
+        if any(
+            key[0] == token and state.get("status") in {"in_progress", "complete"}
+            for key, state in cleanup_states.items()
+        ):
+            self._flatmap_fullscreen_close_state.pop(token, None)
+            return False
+        return True
+
+    def _poll_flatmap_fullscreen_exit(
+        self,
+        token: str,
+        qt_window_ref,
+        *,
+        ticks: int,
+    ) -> None:
+        """Poll ``isFullScreen`` until the window is normal, then retry close."""
+        if not self._flatmap_fullscreen_transition_valid(token, qt_window_ref):
+            return
+        window = qt_window_ref()
+        is_fullscreen = getattr(window, "isFullScreen", None)
+        try:
+            still_fullscreen = bool(is_fullscreen()) if callable(is_fullscreen) else False
+        except (RuntimeError, TypeError):
+            self._flatmap_fullscreen_close_state.pop(token, None)
+            return
+
+        if still_fullscreen:
+            if ticks >= _FLATMAP_FULLSCREEN_EXIT_MAX_TICKS:
+                self._log_flatmap_viewer_snapshot(
+                    "fullscreen_guard_failure",
+                    token,
+                    viewer=getattr(self, "_flatmap_viewer", None),
+                    qt_window=window,
+                    stage="fullscreen_exit",
+                    reason="exit_timed_out",
+                )
+                self._flatmap_fullscreen_close_state.pop(token, None)
+                return
+            QTimer.singleShot(
+                _FLATMAP_FULLSCREEN_EXIT_POLL_MS,
+                lambda: self._poll_flatmap_fullscreen_exit(
+                    token,
+                    qt_window_ref,
+                    ticks=ticks + 1,
+                ),
+            )
+            return
+
+        self._log_flatmap_viewer_snapshot(
+            "fullscreen_exit_complete",
+            token,
+            viewer=getattr(self, "_flatmap_viewer", None),
+            qt_window=window,
+        )
+        # Allow the Cocoa/OpenGL surface a brief nonblocking settle before close.
+        QTimer.singleShot(
+            _FLATMAP_FULLSCREEN_EXIT_SETTLE_MS,
+            lambda: self._retry_flatmap_fullscreen_close(token, qt_window_ref),
+        )
+
+    def _retry_flatmap_fullscreen_close(self, token: str, qt_window_ref) -> None:
+        """Retry the deferred close once the window is back to a normal state."""
+        if not self._flatmap_fullscreen_transition_valid(token, qt_window_ref):
+            return
+        window = qt_window_ref()
+        self._flatmap_fullscreen_close_state.pop(token, None)
+
+        close = getattr(window, "close", None)
+        supports_confirm = self._flatmap_close_supports_confirm(close)
+        if not supports_confirm:
+            # Without napari's private confirm_need interface we cannot retry the
+            # close without risking a second fullscreen round-trip.  Leave the
+            # now-normal window open and ask the user to close it again.
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_guard_failure",
+                token,
+                viewer=getattr(self, "_flatmap_viewer", None),
+                qt_window=window,
+                stage="retry_close",
+                reason="confirm_need_unavailable",
+            )
+            show_warning(
+                "The flatmap window left fullscreen. Close it again to dismiss it."
+            )
+            return
+
+        try:
+            close(confirm_need=True)
+        except Exception as error:
+            self._log_flatmap_cleanup_failure(token, "fullscreen_close_retry", error)
+            self._log_flatmap_viewer_snapshot(
+                "fullscreen_guard_failure",
+                token,
+                viewer=getattr(self, "_flatmap_viewer", None),
+                qt_window=window,
+                stage="retry_close",
+                reason="close_raised",
+            )
+            return
+
+        self._log_flatmap_viewer_snapshot(
+            "fullscreen_close_retried",
+            token,
+            viewer=getattr(self, "_flatmap_viewer", None),
+            qt_window=window,
+        )
+
+    @staticmethod
+    def _flatmap_saved_fullscreen_setting() -> object:
+        """Return napari's global saved fullscreen flag, read-only and guarded."""
+        try:
+            from napari.settings import get_settings
+
+            return bool(get_settings().application.window_fullscreen)
+        except Exception:
+            return "unavailable"
+
+    @staticmethod
+    def _flatmap_close_supports_confirm(close) -> bool:
+        """Return whether ``close`` accepts napari's ``confirm_need`` keyword."""
+        if not callable(close):
+            return False
+        try:
+            import inspect
+
+            return "confirm_need" in inspect.signature(close).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _install_flatmap_debug_event_filter(
+        self,
+        viewer,
+        *,
+        viewer_token: str,
+    ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+        install = getattr(qt_window, "installEventFilter", None)
+        if not callable(install):
+            self._log_flatmap_viewer_snapshot(
+                "event_filter_unavailable",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+            )
+            return
+        event_filter = _FlatmapWindowLifecycleEventFilter(
+            viewer_token,
+            self._on_flatmap_debug_qt_event,
+            parent=self,
+        )
+        filters = getattr(self, "_flatmap_debug_filters", None)
+        if filters is None:
+            filters = {}
+            self._flatmap_debug_filters = filters
+        filters[viewer_token] = event_filter
+        install(event_filter)
+        self._log_flatmap_viewer_snapshot(
+            "event_filter_installed",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+
+    def _flatmap_viewer_is_open(self, viewer) -> bool:
+        if viewer is None:
+            return False
+
+        window = getattr(viewer, "window", None)
+        qt_window = getattr(window, "_qt_window", None)
+        if qt_window is None:
+            return False
+
+        is_visible = getattr(qt_window, "isVisible", None)
+        if callable(is_visible):
+            try:
+                if bool(is_visible()):
+                    return True
+            except (RuntimeError, TypeError):
+                return False
+
+        viewer_token = self._flatmap_debug_token_for(viewer)
+        is_pending = (
+            getattr(self, "_flatmap_viewer", None) is viewer
+            and getattr(self, "_flatmap_pending_show_token", None) == viewer_token
+        )
+        if not is_pending:
+            return False
+        _instances, registered = self._flatmap_viewer_registration(viewer)
+        return registered is not False
+
+    @staticmethod
+    def _flatmap_viewer_registration(viewer) -> tuple[object | None, bool | None]:
+        """Return napari's viewer registry and this viewer's membership."""
+        instances = getattr(type(viewer), "_instances", None)
+        if instances is None:
+            return None, None
+        try:
+            return instances, viewer in instances
+        except Exception:
+            return instances, None
+
+    @staticmethod
+    def _flatmap_layer_count(viewer) -> int | None:
+        layers = getattr(viewer, "layers", None)
+        try:
+            return len(layers) if layers is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _flatmap_slicer_is_shutdown(viewer) -> bool | None:
+        slicer = getattr(viewer, "_layer_slicer", None)
+        executor = getattr(slicer, "_executor", None)
+        shutdown = getattr(executor, "_shutdown", None)
+        return shutdown if isinstance(shutdown, bool) else None
+
+    def _discard_flatmap_viewer_registration(
+        self,
+        instances,
+        viewer,
+        *,
+        viewer_token: str,
+    ) -> str:
+        discard = getattr(instances, "discard", None)
+        try:
+            if callable(discard):
+                discard(viewer)
+                return "discarded"
+            if isinstance(instances, list):
+                while viewer in instances:
+                    instances.remove(viewer)
+                return "discarded"
+            return "unavailable"
+        except Exception as error:
+            self._log_flatmap_cleanup_failure(
+                viewer_token,
+                "unregister_viewer",
+                error,
+            )
+            return "failed"
+
+    def _log_flatmap_cleanup_failure(
+        self,
+        viewer_token: str,
+        stage: str,
+        error: Exception,
+    ) -> None:
+        _log_flatmap_lifecycle(
+            "cleanup_failure",
+            viewer_token=viewer_token,
+            stage=stage,
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+
+    def _release_flatmap_viewer_references(
+        self,
+        viewer,
+        *,
+        viewer_token: str,
+    ) -> tuple[bool, bool]:
+        """Release plugin references that still target one destroyed viewer."""
+        owner_released = getattr(self, "_flatmap_viewer", None) is viewer
+        if owner_released:
+            self._flatmap_viewer = None
+        if getattr(self, "_flatmap_pending_show_token", None) == viewer_token:
+            self._flatmap_pending_show_token = None
+        scheduled = getattr(self, "_flatmap_show_scheduled_tokens", None)
+        if scheduled is not None:
+            scheduled.discard(viewer_token)
+        close_state = getattr(self, "_flatmap_fullscreen_close_state", None)
+        if close_state is not None:
+            close_state.pop(viewer_token, None)
+
+        tab_released = False
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        release = getattr(flatmap_tab, "_release_display_viewer", None)
+        if callable(release):
+            try:
+                tab_released = bool(release(viewer))
+            except Exception as error:
+                self._log_flatmap_cleanup_failure(
+                    viewer_token,
+                    "release_tab_references",
+                    error,
+                )
+        elif getattr(flatmap_tab, "_last_display_viewer", None) is viewer:
+            # Compatibility fallback for alternate or partially initialized tabs.
+            flatmap_tab._last_display_viewer = None
+            flatmap_tab._projection_layer = None
+            flatmap_tab._region_labels_layer = None
+            flatmap_tab._region_surfaces_layers = []
+            flatmap_tab._region_outlines_layers = []
+            tab_released = True
+
+        return owner_released, tab_released
+
+    def _stop_flatmap_status_thread(self, status_thread, *, viewer_token: str) -> str:
+        """Terminate and join napari's StatusChecker QThread, guarded."""
+        if status_thread is None:
+            return "unavailable"
+        is_running = getattr(status_thread, "isRunning", None)
+        try:
+            running = bool(is_running()) if callable(is_running) else False
+        except (RuntimeError, TypeError):
+            return "unavailable"
+        if not running:
+            return "already_stopped"
+        # ``close_terminate`` also blocks napari from restarting the thread while
+        # we tear the window down; fall back to ``terminate`` if it is absent.
+        stop = getattr(status_thread, "close_terminate", None)
+        if not callable(stop):
+            stop = getattr(status_thread, "terminate", None)
+        wait = getattr(status_thread, "wait", None)
+        if not callable(stop):
+            return "unavailable"
+        try:
+            stop()
+            if callable(wait):
+                wait()
+            return "stopped"
+        except Exception as error:
+            self._log_flatmap_cleanup_failure(
+                viewer_token,
+                "status_thread_stop",
+                error,
+            )
+            return "failed"
+
+    def _finalize_flatmap_viewer_model(
+        self,
+        viewer,
+        *,
+        viewer_token: str,
+        qt_window=None,
+        allow_qt_cleanup: bool = False,
+        prior_stages: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Mirror napari viewer teardown without re-closing the top-level."""
+        stages: dict[str, str] = dict(prior_stages or {})
+
+        def stage_needs_run(name: str) -> bool:
+            return stages.get(name) in (None, "failed", "unavailable")
+
+        instances, registered = self._flatmap_viewer_registration(viewer)
+        layer_count = self._flatmap_layer_count(viewer)
+        slicer_shutdown = self._flatmap_slicer_is_shutdown(viewer)
+        prior_model_stages = set(prior_stages or {}) - {"references"}
+        if (
+            slicer_shutdown is True
+            and layer_count == 0
+            and not prior_model_stages
+        ):
+            _log_flatmap_lifecycle(
+                "cleanup_skipped",
+                viewer_token=viewer_token,
+                reason="napari_model_already_closed",
+                viewer_registered=registered,
+            )
+            stages["model"] = "already_closed"
+            stages.setdefault("slicer", "already_shutdown")
+            stages.setdefault("dims", "already_disconnected")
+            stages.setdefault("layers", "already_empty")
+            stages.setdefault("status_thread", "already_stopped")
+            stages.setdefault("window", "already_torn_down")
+            stages.setdefault("qt_viewer", "already_closed")
+        else:
+            slicer = getattr(viewer, "_layer_slicer", None)
+            shutdown = getattr(slicer, "shutdown", None)
+            if stage_needs_run("slicer"):
+                if slicer_shutdown is True:
+                    stages["slicer"] = "already_shutdown"
+                elif callable(shutdown):
+                    try:
+                        shutdown()
+                        stages["slicer"] = "shutdown"
+                    except Exception as error:
+                        stages["slicer"] = "failed"
+                        self._log_flatmap_cleanup_failure(
+                            viewer_token,
+                            "slicer_shutdown",
+                            error,
+                        )
+                else:
+                    stages["slicer"] = "unavailable"
+
+            if stage_needs_run("dims"):
+                dims_events = getattr(
+                    getattr(viewer, "dims", None),
+                    "events",
+                    None,
+                )
+                if dims_events is None:
+                    stages["dims"] = "unavailable"
+                else:
+                    try:
+                        from napari.utils.events.event_utils import (
+                            disconnect_events,
+                        )
+
+                        disconnect_events(dims_events, viewer)
+                        stages["dims"] = "disconnected"
+                    except Exception as error:
+                        stages["dims"] = "failed"
+                        self._log_flatmap_cleanup_failure(
+                            viewer_token,
+                            "disconnect_dims",
+                            error,
+                        )
+
+            if stage_needs_run("layers"):
+                layers = getattr(viewer, "layers", None)
+                clear_layers = getattr(layers, "clear", None)
+                if not callable(clear_layers):
+                    stages["layers"] = "unavailable"
+                elif layer_count == 0:
+                    stages["layers"] = "already_empty"
+                else:
+                    try:
+                        clear_layers()
+                        stages["layers"] = "cleared"
+                    except Exception as error:
+                        stages["layers"] = "failed"
+                        self._log_flatmap_cleanup_failure(
+                            viewer_token,
+                            "clear_layers",
+                            error,
+                        )
+
+            if stage_needs_run("status_thread"):
+                # napari only stops its StatusChecker QThread inside
+                # ``_QtMainWindow.closeEvent``.  On macOS a detached window that
+                # is closed while fullscreen can reach DeferredDelete without
+                # that closeEvent completing, so the thread is still running
+                # when Qt destroys the window ("QThread: Destroyed while thread
+                # is still running" → crash).  Stop it here as part of teardown.
+                stages["status_thread"] = self._stop_flatmap_status_thread(
+                    getattr(qt_window, "status_thread", None),
+                    viewer_token=viewer_token,
+                )
+
+            window = getattr(viewer, "window", None)
+            if stage_needs_run("window"):
+                teardown = getattr(window, "_teardown", None)
+                if callable(teardown):
+                    try:
+                        teardown()
+                        stages["window"] = "torn_down"
+                    except Exception as error:
+                        stages["window"] = "failed"
+                        self._log_flatmap_cleanup_failure(
+                            viewer_token,
+                            "window_teardown",
+                            error,
+                        )
+                else:
+                    stages["window"] = "unavailable"
+
+            if stage_needs_run("qt_viewer"):
+                qt_viewer = getattr(qt_window, "_qt_viewer", None)
+                close_qt_viewer = getattr(qt_viewer, "close", None)
+                if not allow_qt_cleanup:
+                    stages.setdefault("qt_viewer", "unavailable")
+                elif callable(close_qt_viewer):
+                    try:
+                        close_qt_viewer()
+                        stages["qt_viewer"] = "closed"
+                    except Exception as error:
+                        stages["qt_viewer"] = "failed"
+                        self._log_flatmap_cleanup_failure(
+                            viewer_token,
+                            "qt_viewer_close",
+                            error,
+                        )
+                else:
+                    stages["qt_viewer"] = "unavailable"
+
+        if stage_needs_run("registry"):
+            if registered is False:
+                stages["registry"] = "already_discarded"
+            else:
+                stages["registry"] = self._discard_flatmap_viewer_registration(
+                    instances,
+                    viewer,
+                    viewer_token=viewer_token,
+                )
+
+        return stages
+
+    def _cleanup_flatmap_viewer(
+        self,
+        viewer,
+        qt_window,
+        *,
+        viewer_token: str,
+        trigger: str,
+        allow_qt_cleanup: bool,
+    ) -> dict[str, str]:
+        """Run one guarded, idempotent detached-viewer cleanup transaction."""
+        cleanup_key = (viewer_token, id(viewer))
+        states = getattr(self, "_flatmap_cleanup_states", None)
+        if states is None:
+            states = {}
+            self._flatmap_cleanup_states = states
+        state = states.get(cleanup_key)
+        if state is not None and state.get("status") in {
+            "in_progress",
+            "complete",
+        }:
+            self._log_flatmap_viewer_snapshot(
+                "cleanup_skipped",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                cleanup_trigger=trigger,
+                reason=f"cleanup_{state['status']}",
+            )
+            return dict(state.get("stages", {}))
+
+        prior_stages = dict(state.get("stages", {})) if state else {}
+        state = {"status": "in_progress", "stages": prior_stages}
+        states[cleanup_key] = state
+        self._log_flatmap_viewer_snapshot(
+            "cleanup_start",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+            cleanup_trigger=trigger,
+        )
+
+        try:
+            if "references" not in prior_stages:
+                owner_released, tab_released = (
+                    self._release_flatmap_viewer_references(
+                        viewer,
+                        viewer_token=viewer_token,
+                    )
+                )
+                prior_stages["references"] = "released"
+            else:
+                owner_released = False
+                tab_released = False
+            self._log_flatmap_viewer_snapshot(
+                "references_released",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                cleanup_trigger=trigger,
+                owner_released=owner_released,
+                tab_released=tab_released,
+            )
+            stages = self._finalize_flatmap_viewer_model(
+                viewer,
+                viewer_token=viewer_token,
+                qt_window=qt_window,
+                allow_qt_cleanup=allow_qt_cleanup,
+                prior_stages=prior_stages,
+            )
+            cleanup_status = "partial" if "failed" in stages.values() else "ok"
+            state["stages"] = stages
+            state["status"] = (
+                "partial" if cleanup_status == "partial" else "complete"
+            )
+            self._log_flatmap_viewer_snapshot(
+                "cleanup_complete",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+                cleanup_trigger=trigger,
+                cleanup_status=cleanup_status,
+                **{f"cleanup_{key}": value for key, value in stages.items()},
+            )
+            return stages
+        except Exception as error:
+            state["status"] = "partial"
+            state["stages"] = prior_stages
+            self._log_flatmap_cleanup_failure(
+                viewer_token,
+                "unexpected_cleanup",
+                error,
+            )
+            return prior_stages
+
+    def _discard_flatmap_diagnostic_state(
+        self,
+        viewer,
+        *,
+        viewer_token: str,
+    ) -> None:
+        filters = getattr(self, "_flatmap_debug_filters", None)
+        if filters is not None:
+            filters.pop(viewer_token, None)
+        cleanup_filters = getattr(self, "_flatmap_cleanup_filters", None)
+        if cleanup_filters is not None:
+            cleanup_filters.pop(viewer_token, None)
+        close_guards = getattr(self, "_flatmap_close_guard_filters", None)
+        if close_guards is not None:
+            close_guards.pop(viewer_token, None)
+        close_state = getattr(self, "_flatmap_fullscreen_close_state", None)
+        if close_state is not None:
+            close_state.pop(viewer_token, None)
+        scheduled = getattr(self, "_flatmap_show_scheduled_tokens", None)
+        if scheduled is not None:
+            scheduled.discard(viewer_token)
+        if getattr(self, "_flatmap_pending_show_token", None) == viewer_token:
+            self._flatmap_pending_show_token = None
+        tokens = getattr(self, "_flatmap_debug_tokens", None)
+        if tokens is not None:
+            tokens.pop(id(viewer), None)
+
+    def _schedule_flatmap_post_destroy_snapshots(
+        self,
+        viewer,
+        qt_window,
+        *,
+        viewer_token: str,
+    ) -> None:
+        """Record bounded post-destruction state without retaining the viewer."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            self._discard_flatmap_diagnostic_state(
+                viewer,
+                viewer_token=viewer_token,
+            )
+            return
+        single_shot = getattr(QTimer, "singleShot", None)
+        if not callable(single_shot):
+            self._discard_flatmap_diagnostic_state(
+                viewer,
+                viewer_token=viewer_token,
+            )
+            return
+
+        viewer_ref = self._flatmap_debug_weak_ref(viewer)
+        qt_window_ref = self._flatmap_debug_weak_ref(qt_window)
+        viewer_id = id(viewer)
+        last_delay = _FLATMAP_POST_DESTROY_CHECKPOINTS_MS[-1]
+        for delay_ms in _FLATMAP_POST_DESTROY_CHECKPOINTS_MS:
+            def log_checkpoint(
+                *,
+                token=viewer_token,
+                delay=delay_ms,
+                vref=viewer_ref,
+                wref=qt_window_ref,
+                object_id=viewer_id,
+            ) -> None:
+                self._log_flatmap_viewer_snapshot(
+                    "post_destroy_checkpoint",
+                    token,
+                    viewer=vref(),
+                    qt_window=wref(),
+                    delay_ms=delay,
+                )
+                if delay == last_delay:
+                    filters = getattr(self, "_flatmap_debug_filters", None)
+                    if filters is not None:
+                        filters.pop(token, None)
+                    cleanup_filters = getattr(
+                        self,
+                        "_flatmap_cleanup_filters",
+                        None,
+                    )
+                    if cleanup_filters is not None:
+                        cleanup_filters.pop(token, None)
+                    tokens = getattr(self, "_flatmap_debug_tokens", None)
+                    if tokens is not None:
+                        tokens.pop(object_id, None)
+
+            single_shot(delay_ms, log_checkpoint)
+
+    def _connect_flatmap_viewer_destroyed(
+        self,
+        viewer,
+        *,
+        viewer_token: str = "untracked",
+    ) -> None:
+        window = getattr(viewer, "window", None)
+        qt_window = getattr(window, "_qt_window", None)
+        destroyed = getattr(qt_window, "destroyed", None)
+        connect = getattr(destroyed, "connect", None)
+        if not callable(connect):
+            self._log_flatmap_viewer_snapshot(
+                "destroyed_signal_unavailable",
+                viewer_token,
+                viewer=viewer,
+                qt_window=qt_window,
+            )
+            return
+
+        viewer_ref = self._flatmap_debug_weak_ref(viewer)
+        qt_window_ref = self._flatmap_debug_weak_ref(qt_window)
+
+        def finalize_viewer(*_args) -> None:
+            destroyed_viewer = viewer_ref()
+            destroyed_qt_window = qt_window_ref()
+            if destroyed_viewer is None:
+                self._log_flatmap_viewer_snapshot(
+                    "destroyed_viewer_unavailable",
+                    viewer_token,
+                    qt_window=destroyed_qt_window,
+                )
+                return
+            self._log_flatmap_viewer_snapshot(
+                "destroyed",
+                viewer_token,
+                viewer=destroyed_viewer,
+                qt_window=destroyed_qt_window,
+            )
+            self._cleanup_flatmap_viewer(
+                destroyed_viewer,
+                destroyed_qt_window,
+                viewer_token=viewer_token,
+                trigger="destroyed_fallback",
+                allow_qt_cleanup=False,
+            )
+            window = getattr(destroyed_viewer, "window", None)
+            try:
+                if getattr(window, "_qt_window", None) is destroyed_qt_window:
+                    delattr(window, "_qt_window")
+                    qt_window_reference = "removed"
+                else:
+                    qt_window_reference = "not_owned"
+            except Exception as error:
+                qt_window_reference = "failed"
+                self._log_flatmap_cleanup_failure(
+                    viewer_token,
+                    "discard_qt_window_reference",
+                    error,
+                )
+            self._log_flatmap_viewer_snapshot(
+                "destroyed_complete",
+                viewer_token,
+                viewer=destroyed_viewer,
+                qt_window=destroyed_qt_window,
+                qt_window_reference=qt_window_reference,
+            )
+            self._schedule_flatmap_post_destroy_snapshots(
+                destroyed_viewer,
+                destroyed_qt_window,
+                viewer_token=viewer_token,
+            )
+
+        connect(finalize_viewer)
+        self._log_flatmap_viewer_snapshot(
+            "destroyed_signal_connected",
+            viewer_token,
+            viewer=viewer,
+            qt_window=qt_window,
+        )
+
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
         layout = QVBoxLayout(self)
@@ -668,6 +2533,32 @@ class NeuronViewerWidget(QWidget):
             tabs.addTab(viz_tab, "Visualization")
             self._setup_viz_tab(viz_tab)
 
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Flatmap"):
+            from .flatmap import FlatmapProjectionWidget
+
+            self._flatmap_tab = FlatmapProjectionWidget(
+                self.viewer,
+                database_provider=lambda: self._db,
+                selected_file_ids_provider=self._neuron_table.get_selected_file_ids,
+                table_file_ids_provider=self._neuron_table.file_ids,
+                color_map_provider=self._neuron_table.get_full_color_map,
+                cluster_map_provider=self._neuron_table.get_cluster_map,
+                atlas_provider=lambda: self._atlas,
+                selected_region_ids_provider=self._active_flatmap_region_ids,
+                selected_parent_region_ids_provider=(
+                    self._active_flatmap_parent_region_ids
+                ),
+                selected_region_acronyms_provider=self._active_flatmap_region_acronyms,
+                display_viewer_provider=self._get_or_create_flatmap_viewer,
+                display_viewer_ready_callback=(
+                    self._on_flatmap_display_viewer_ready
+                ),
+                display_viewer_failed_callback=(
+                    self._on_flatmap_display_viewer_failed
+                ),
+            )
+            tabs.addTab(self._flatmap_tab, "Flatmap")
+
         with startup_timing(logger, "neuron_viewer_setup_tab", tab="Reference"):
             ref_tab = QWidget()
             tabs.addTab(ref_tab, "Reference")
@@ -678,6 +2569,12 @@ class NeuronViewerWidget(QWidget):
             self._analysis_tab.set_slice_projector(self._slice_projector)
             self._analysis_tab.set_current_table_file_ids_provider(
                 self._current_table_file_ids
+            )
+            self._analysis_tab.set_flatmap_correlation_source_provider(
+                self._flatmap_tab.latest_flatmap_correlation_source
+            )
+            self._flatmap_tab.set_flatmap_correlation_source_changed_callback(
+                self._analysis_tab.refresh_flatmap_coordinate_availability
             )
             self._analysis_tab.cluster_colors_updated.connect(
                 self._on_cluster_colors_updated
@@ -716,13 +2613,13 @@ class NeuronViewerWidget(QWidget):
         convert_layout = convert_section.content_layout()
 
         convert_btn_row = QHBoxLayout()
-        convert_dir_btn = QPushButton("From Directory...")
-        convert_dir_btn.clicked.connect(self._convert_from_directory)
-        convert_btn_row.addWidget(convert_dir_btn)
+        self._convert_dir_btn = QPushButton("From Directory...")
+        self._convert_dir_btn.clicked.connect(self._convert_from_directory)
+        convert_btn_row.addWidget(self._convert_dir_btn)
 
-        convert_files_btn = QPushButton("From Files...")
-        convert_files_btn.clicked.connect(self._convert_from_files)
-        convert_btn_row.addWidget(convert_files_btn)
+        self._convert_files_btn = QPushButton("From Files...")
+        self._convert_files_btn.clicked.connect(self._convert_from_files)
+        convert_btn_row.addWidget(self._convert_files_btn)
         convert_layout.addLayout(convert_btn_row)
 
         res_row = QHBoxLayout()
@@ -741,6 +2638,38 @@ class NeuronViewerWidget(QWidget):
         self._convert_hemisphere_combo.addItem("Right", "right")
         hemisphere_row.addWidget(self._convert_hemisphere_combo)
         convert_layout.addLayout(hemisphere_row)
+
+        self._convert_add_flatmap_cb = QCheckBox(
+            "Add bilateral flatmap/depth columns"
+        )
+        convert_layout.addWidget(self._convert_add_flatmap_cb)
+
+        lookup_row = QHBoxLayout()
+        self._convert_lookup_dir_label = QLabel("No lookup directory selected")
+        self._convert_lookup_dir_label.setWordWrap(True)
+        lookup_row.addWidget(self._convert_lookup_dir_label, stretch=1)
+        self._convert_lookup_dir_btn = QPushButton("Lookup directory...")
+        self._convert_lookup_dir_btn.clicked.connect(
+            self._choose_conversion_lookup_directory
+        )
+        lookup_row.addWidget(self._convert_lookup_dir_btn)
+        convert_layout.addLayout(lookup_row)
+
+        lookup_resolution_row = QHBoxLayout()
+        lookup_resolution_row.addWidget(QLabel("Lookup resolution:"))
+        self._convert_lookup_resolution_spin = QSpinBox()
+        self._convert_lookup_resolution_spin.setRange(0, 100)
+        self._convert_lookup_resolution_spin.setSpecialValueText(
+            "From NRRD header"
+        )
+        self._convert_lookup_resolution_spin.setSuffix(" μm")
+        lookup_resolution_row.addWidget(self._convert_lookup_resolution_spin)
+        convert_layout.addLayout(lookup_resolution_row)
+
+        self._convert_cancel_btn = QPushButton("Cancel conversion")
+        self._convert_cancel_btn.setEnabled(False)
+        self._convert_cancel_btn.clicked.connect(self._cancel_conversion)
+        convert_layout.addWidget(self._convert_cancel_btn)
 
         self._convert_progress = QProgressBar()
         self._convert_progress.setVisible(False)
@@ -803,6 +2732,10 @@ class NeuronViewerWidget(QWidget):
         # Stats
         self._stats_label = QLabel("")
         file_layout.addWidget(self._stats_label)
+
+        self._flatmap_transform_status_label = QLabel("")
+        self._flatmap_transform_status_label.setWordWrap(True)
+        file_layout.addWidget(self._flatmap_transform_status_label)
 
         layout.addWidget(file_section)
 
@@ -1669,14 +3602,82 @@ class NeuronViewerWidget(QWidget):
         enhanced_count = self._load_enhanced_table_state(filepath)
         if enhanced_count:
             stats_text += f" | Enhanced labels: {enhanced_count:,}"
+        transform_info = self._load_flatmap_transform_status(filepath)
+        if transform_info:
+            stats_text += f" | Transform: {transform_info}"
         self._stats_label.setText(stats_text)
 
         self._set_region_query_buttons_enabled(True)
         self._analysis_tab.set_database(self._db)
         self._regions_status_label.setText("")
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        invalidate_flatmap = getattr(
+            flatmap_tab,
+            "invalidate_loaded_parquet_projection",
+            None,
+        )
+        if callable(invalidate_flatmap):
+            invalidate_flatmap()
+        refresh_cache = getattr(flatmap_tab, "refresh_cache_profiles", None)
+        if callable(refresh_cache):
+            refresh_cache()
         saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
         if callable(saved_state_applier):
             saved_state_applier()
+
+    def _load_flatmap_transform_status(self, filepath: str | Path) -> str:
+        """Display whether the loaded parquet has reusable flatmap/depth columns."""
+        label = getattr(self, "_flatmap_transform_status_label", None)
+        try:
+            info = read_flatmap_parquet_transform_info(filepath)
+        except Exception:
+            logger.debug(
+                "No readable flatmap transform metadata for %s",
+                filepath,
+                exc_info=True,
+            )
+            if label is not None:
+                label.setText("")
+            return ""
+
+        transform_text = info.present_transform_text
+        if not transform_text:
+            if label is not None:
+                label.setText("")
+            return ""
+
+        if info.has_full_transform:
+            if int(getattr(info, "format_version", 0) or 0) >= 3:
+                message = (
+                    "Loaded version-3 Parquet contains bilateral shaped, square, "
+                    "and depth transform columns "
+                    f"(lookup set {getattr(info, 'lookup_set_id', None)}). "
+                    "The Flatmap tab uses them by default; NRRD conversion only "
+                    "runs when Recompute from NRRDs is selected explicitly."
+                )
+            else:
+                message = (
+                    f"Loaded Parquet contains {transform_text} transform columns. "
+                    "The Flatmap tab can render it without loading NRRD files."
+                )
+        else:
+            message = (
+                f"Loaded Parquet contains {transform_text} transform columns. "
+                "Flatmap rendering without NRRDs requires x_flat, y_flat, and "
+                "depth_um columns."
+            )
+        if info.uses_legacy_mirror_fallback:
+            warning = (
+                " Warning: this version-1 transform used the legacy full-mirror "
+                "fallback, so mirrored rows may be placed in the opposite flatmap "
+                "hemisphere. Regenerate the augmented Parquet or select the original "
+                "flatmap/depth NRRDs to recompute corrected coordinates."
+            )
+            message += warning
+            logger.warning("%s: %s", Path(filepath).name, warning.strip())
+        if label is not None:
+            label.setText(message)
+        return transform_text
 
     def _load_enhanced_table_state(self, filepath: str | Path) -> int:
         """Read enhanced parquet table metadata without making it mandatory."""
@@ -1776,6 +3777,9 @@ class NeuronViewerWidget(QWidget):
                 layers=self._iter_viewer_layers(),
                 atlas_name=self._current_atlas_name(),
                 analysis_metadata=self._analysis_project_metadata(),
+                flatmap_cache_reference=(
+                    self._flatmap_tab.active_cache_reference()
+                ),
                 progress_callback=_on_save_progress,
             )
         except Exception as exc:
@@ -1862,6 +3866,18 @@ class NeuronViewerWidget(QWidget):
         """Restore a loaded project bundle into the current widget/viewer."""
         self._load_parquet_path(bundle.source_parquet_path)
         self._saved_table_state = dict(bundle.table_state)
+        cache_reference = getattr(bundle, "flatmap_cache_reference", None)
+        if cache_reference:
+            try:
+                self._flatmap_tab.restore_cache_reference(cache_reference)
+            except Exception as exc:
+                logger.warning(
+                    "Could not restore external flatmap cache reference: %s",
+                    exc,
+                )
+                self._regions_status_label.setText(
+                    f"Project loaded; flatmap cache unavailable: {exc}"
+                )
 
         importer = getattr(self._neuron_table, "import_state", None)
         if callable(importer):
@@ -2268,6 +4284,20 @@ class NeuronViewerWidget(QWidget):
             atlas=atlas_name,
         ):
             self._analysis_tab.set_atlas(atlas)
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        refresh_cache_profiles = getattr(
+            flatmap_tab,
+            "refresh_cache_profiles",
+            None,
+        )
+        if callable(refresh_cache_profiles):
+            with startup_timing(
+                logger,
+                "load_atlas_phase",
+                phase="refresh_flatmap_cache_profiles",
+                atlas=atlas_name,
+            ):
+                refresh_cache_profiles()
         with startup_timing(
             logger,
             "load_atlas_phase",
@@ -4897,6 +6927,55 @@ class NeuronViewerWidget(QWidget):
             return []
         return list(get_selected(include_children=False))
 
+    def _active_region_include_children(self) -> bool:
+        """Return the active atlas selector's include-children state."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return True
+
+        include_children = getattr(selector, "include_children_enabled", None)
+        if callable(include_children):
+            return bool(include_children())
+        return True
+
+    def _active_flatmap_region_ids(self) -> list[int]:
+        """Return selected atlas IDs for flatmap region-label overlays."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+
+        get_selected = getattr(selector, "get_selected_ids", None)
+        if not callable(get_selected):
+            return []
+        return [
+            int(region_id)
+            for region_id in get_selected(include_children=True)
+        ]
+
+    def _active_flatmap_parent_region_ids(self) -> list[int]:
+        """Return directly selected atlas IDs for cached union geometry."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+        get_selected = getattr(selector, "get_selected_ids", None)
+        if not callable(get_selected):
+            return []
+        return [int(region_id) for region_id in get_selected(include_children=False)]
+
+    def _active_flatmap_region_acronyms(self) -> list[str]:
+        """Return selected atlas acronyms for flatmap region-label metadata."""
+        selector = self._active_region_selector()
+        if selector is None:
+            return []
+
+        get_selected = getattr(selector, "get_selected_acronyms", None)
+        if not callable(get_selected):
+            return []
+        return [
+            str(acronym)
+            for acronym in get_selected(include_children=True)
+        ]
+
     def _sync_region_query_scope_selector(self) -> None:
         """Show the atlas selector that matches the active query scope."""
         stack = getattr(self, "_atlas_region_scope_stack", None)
@@ -6618,6 +8697,42 @@ class NeuronViewerWidget(QWidget):
 
     # --- SWC-to-Parquet conversion ---
 
+    def _choose_conversion_lookup_directory(self) -> None:
+        """Choose bilateral shaped/square/depth lookup files for conversion."""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Flatmap Lookup Directory",
+        )
+        if not directory:
+            return
+        self._convert_lookup_dir = Path(directory)
+        self._convert_lookup_dir_label.setText(str(self._convert_lookup_dir))
+        self._convert_add_flatmap_cb.setChecked(True)
+
+    def _cancel_conversion(self) -> None:
+        """Request cancellation of the active conversion pipeline."""
+        worker = getattr(self, "_convert_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel()
+            self._convert_status_label.setText("Cancelling conversion...")
+            self._convert_cancel_btn.setEnabled(False)
+
+    def _set_conversion_controls_enabled(self, enabled: bool) -> None:
+        """Prevent overlapping SWC conversion/augmentation pipelines."""
+        for name in (
+            "_convert_dir_btn",
+            "_convert_files_btn",
+            "_convert_resolution_spin",
+            "_convert_hemisphere_combo",
+            "_convert_add_flatmap_cb",
+            "_convert_lookup_dir_btn",
+            "_convert_lookup_resolution_spin",
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setEnabled(bool(enabled))
+
     def _convert_from_directory(self) -> None:
         """Pick a directory of SWC files and convert to Parquet."""
         dialog_start = perf_counter()
@@ -6806,9 +8921,37 @@ class NeuronViewerWidget(QWidget):
         """Launch the background conversion worker."""
         from ..workers import ConvertWorker
 
+        active_thread = getattr(self, "_convert_thread", None)
+        is_running = getattr(active_thread, "isRunning", None)
+        if active_thread is not None and (
+            not callable(is_running) or bool(is_running())
+        ):
+            show_warning("An SWC conversion is already running.")
+            return
+
         resolution = self._convert_resolution_spin.value()
         hemisphere = self._convert_hemisphere_combo.currentData()
         atlas_name = self._atlas_combo.currentText()
+        add_flatmaps_control = getattr(self, "_convert_add_flatmap_cb", None)
+        add_flatmaps = bool(
+            add_flatmaps_control is not None
+            and add_flatmaps_control.isChecked()
+        )
+        lookup_dir = getattr(self, "_convert_lookup_dir", None)
+        lookup_resolution_control = getattr(
+            self, "_convert_lookup_resolution_spin", None
+        )
+        raw_lookup_resolution = (
+            int(lookup_resolution_control.value())
+            if lookup_resolution_control is not None
+            else 0
+        )
+        if add_flatmaps and lookup_dir is None:
+            show_warning(
+                "Choose a lookup directory before enabling bilateral "
+                "flatmap/depth preprocessing."
+            )
+            return
         known_count = len(swc_paths) if isinstance(swc_paths, list) else None
         cached_atlas, use_cached_annotation = self._conversion_cached_atlas_inputs(
             atlas_name,
@@ -6858,6 +9001,10 @@ class NeuronViewerWidget(QWidget):
             self._convert_progress.setRange(0, known_count)
         self._convert_progress.setValue(0)
         self._convert_status_label.setText(status)
+        cancel_button = getattr(self, "_convert_cancel_btn", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(True)
+        self._set_conversion_controls_enabled(False)
 
         thread = QThread()
         worker = ConvertWorker(
@@ -6870,6 +9017,12 @@ class NeuronViewerWidget(QWidget):
             source_mode=source_mode,
             cached_atlas=cached_atlas,
             use_cached_annotation=use_cached_annotation,
+            flatmap_lookup_dir=lookup_dir if add_flatmaps else None,
+            flatmap_lookup_resolution_um=(
+                float(raw_lookup_resolution)
+                if add_flatmaps and raw_lookup_resolution > 0
+                else None
+            ),
         )
         self._convert_thread = thread
         self._convert_worker = worker
@@ -6942,6 +9095,9 @@ class NeuronViewerWidget(QWidget):
         self._convert_progress.setVisible(False)
         self._convert_progress.setRange(0, 1)
         self._convert_progress.setValue(0)
+        cancel_button = getattr(self, "_convert_cancel_btn", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(False)
         summary_parts = [f"Converted {summary.processed_files} file(s)"]
         if summary.failed_files:
             summary_parts.append(f"skipped {summary.failed_files}")
@@ -6971,6 +9127,9 @@ class NeuronViewerWidget(QWidget):
         self._convert_progress.setVisible(False)
         self._convert_progress.setRange(0, 1)
         self._convert_progress.setValue(0)
+        cancel_button = getattr(self, "_convert_cancel_btn", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(False)
         self._convert_status_label.setText(f"Error: {error_msg}")
         logger.error(f"SWC-to-Parquet conversion failed: {error_msg}")
 
@@ -6996,5 +9155,6 @@ class NeuronViewerWidget(QWidget):
             self._convert_thread = None
         if self._convert_worker is worker:
             self._convert_worker = None
+        self._set_conversion_controls_enabled(True)
         self._convert_source_mode = None
         self._convert_ui_start_time = None

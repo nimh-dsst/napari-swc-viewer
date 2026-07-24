@@ -33,6 +33,7 @@ dependencies = [
     "xlsxwriter>=3.2",
     "qtpy>=2.0",
     "pyqtgraph>=0.13",
+    "pynrrd>=1.0",
     "scikit-learn>=1.2",
     "scipy>=1.10",
     "seaborn>=0.13",
@@ -56,4 +57,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    "ignore:datetime\\.datetime\\.utcnow\\(\\) is deprecated and scheduled for removal in a future version\\.:DeprecationWarning:nrrd\\.writer",
+]
