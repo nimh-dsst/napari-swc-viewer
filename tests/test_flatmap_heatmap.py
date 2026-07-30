@@ -10,6 +10,10 @@ from napari_swc_viewer.flatmap_heatmap import (
     FLATMAP_HEATMAP_COLOR_INDIVIDUAL,
     FLATMAP_HEATMAP_COLOR_SINGLE,
     MAX_FLATMAP_HEATMAP_VOXELS,
+    build_allen_layer_cluster_volumes,
+    build_allen_layer_file_id_volumes,
+    build_allen_layer_heatmap_volume_result,
+    build_allen_layer_stack_from_projected_nodes,
     build_flatmap_cluster_volumes,
     build_flatmap_file_id_volumes,
     build_flatmap_heatmap_volume_result,
@@ -20,6 +24,7 @@ from napari_swc_viewer.flatmap_heatmap import (
     compute_flatmap_lookup_stats,
     compute_flatmap_xy_bounds,
 )
+from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
 
 
 def _lookup_volumes() -> tuple[np.ndarray, np.ndarray]:
@@ -149,7 +154,9 @@ def test_flatmap_heatmap_includes_depth_minus_one_in_sentinel_plane() -> None:
     assert result.volume[3, 1, 1] == 1.0
     np.testing.assert_array_equal(
         result.points,
-        np.asarray([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 3.0, 3.0], [3.0, 1.0, 1.0]]),
+        np.asarray(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 3.0, 3.0], [3.0, 1.0, 1.0]]
+        ),
     )
     assert result.point_file_ids == ["a.swc", "a.swc", "b.swc", "c.swc"]
 
@@ -332,7 +339,9 @@ def test_build_flatmap_file_id_volumes_splits_rendered_node_counts() -> None:
     assert sum(float(group.volume.sum()) for group in groups) == 4.0
 
 
-def test_build_flatmap_cluster_volumes_groups_by_cluster_with_unclustered_last() -> None:
+def test_build_flatmap_cluster_volumes_groups_by_cluster_with_unclustered_last() -> (
+    None
+):
     groups = build_flatmap_cluster_volumes(
         _binned_projected_nodes(),
         (2, 3, 3),
@@ -353,6 +362,125 @@ def test_build_flatmap_cluster_volumes_groups_by_cluster_with_unclustered_last()
     assert groups[0].volume[1, 2, 0] == 1.0
     assert groups[1].volume[0, 1, 2] == 2.0
     assert groups[2].volume[1, 0, 1] == 1.0
+
+
+def _allen_layer_map() -> AllenIsocortexLayerMap:
+    region_ids = (101, 102, 103, 104, 105, 106)
+    return AllenIsocortexLayerMap(
+        atlas_name="allen_mouse_25um",
+        isocortex_region_id=315,
+        region_to_layer_index={
+            region_id: index for index, region_id in enumerate(region_ids)
+        },
+        region_ids_by_layer=tuple((region_id,) for region_id in region_ids),
+    )
+
+
+def _allen_layer_nodes() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "file_id": [
+                "a.swc",
+                "a.swc",
+                "b.swc",
+                "b.swc",
+                "c.swc",
+                "d.swc",
+                "e.swc",
+                "f.swc",
+            ],
+            "x_flat": [0.0, 0.0, 9.9, 5.0, 2.0, 3.0, 4.0, np.nan],
+            "y_flat": [0.0, 0.0, 9.9, 5.0, 2.0, 3.0, 4.0, 1.0],
+            "flatmap_valid": [True, True, True, True, True, True, True, True],
+            "region_id": [101, 101, 102, 104, 105, 106, 999, 103],
+        }
+    )
+
+
+def test_build_allen_layer_stack_counts_and_excludes_nodes() -> None:
+    result = build_allen_layer_stack_from_projected_nodes(
+        _allen_layer_nodes(),
+        _allen_layer_map(),
+        xy_bins=10,
+        x_bounds=(0.0, 10.0),
+        y_bounds=(0.0, 10.0),
+    )
+
+    assert result.volume.shape == (6, 10, 10)
+    assert tuple(result.volume.sum(axis=(1, 2)).astype(int)) == (
+        2,
+        1,
+        0,
+        1,
+        1,
+        1,
+    )
+    assert result.volume[0, 0, 0] == 2.0
+    assert result.volume[1, 9, 9] == 1.0
+    assert result.summary.rendered_nodes == 6
+    assert result.summary.excluded_nodes == 2
+    assert result.summary.invalid_flatmap_nodes == 1
+    assert result.summary.excluded_non_layer_nodes == 1
+    assert result.summary.layer_node_counts == (2, 1, 0, 1, 1, 1)
+    assert result.summary.to_dict()["excluded_nodes"] == 2
+    assert result.projected_nodes["allen_layer_label"].tolist()[:4] == [
+        "L1",
+        "L1",
+        "L2/3",
+        "L5",
+    ]
+    assert result.projected_nodes["render_valid"].sum() == 6
+
+
+def test_allen_layer_grouped_volumes_preserve_counts() -> None:
+    result = build_allen_layer_stack_from_projected_nodes(
+        _allen_layer_nodes(),
+        _allen_layer_map(),
+        xy_bins=10,
+        x_bounds=(0.0, 10.0),
+        y_bounds=(0.0, 10.0),
+    )
+
+    individual = build_allen_layer_file_id_volumes(
+        result.projected_nodes,
+        result.volume.shape,
+    )
+    clusters = build_allen_layer_cluster_volumes(
+        result.projected_nodes,
+        result.volume.shape,
+        {"a.swc": 1, "b.swc": 2},
+    )
+
+    assert sum(float(group.volume.sum()) for group in individual) == 6.0
+    assert [group.label for group in clusters] == [
+        "Cluster 1",
+        "Cluster 2",
+        "Unclustered",
+    ]
+    assert sum(float(group.volume.sum()) for group in clusters) == 6.0
+
+
+def test_allen_layer_stack_clips_xy_bins_to_canonical_bounds() -> None:
+    nodes = pd.DataFrame(
+        {
+            "file_id": ["low.swc", "high.swc"],
+            "x_flat": [-100.0, 100.0],
+            "y_flat": [-100.0, 100.0],
+            "flatmap_valid": [True, True],
+            "region_id": [101, 101],
+        }
+    )
+
+    result = build_allen_layer_stack_from_projected_nodes(
+        nodes,
+        _allen_layer_map(),
+        xy_bins=4,
+        x_bounds=(0.0, 10.0),
+        y_bounds=(0.0, 10.0),
+    )
+
+    assert result.volume[0, 0, 0] == 1.0
+    assert result.volume[0, 3, 3] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +556,12 @@ def _flatmap_parquet(tmp_path):
 
 
 @pytest.mark.parametrize("include", [False, True])
-@pytest.mark.parametrize("style_key,suffix", [("both_shaped", "shaped"), ("both_square", "square")])
-def test_duckdb_single_volume_matches_pandas(_flatmap_parquet, include, style_key, suffix):
+@pytest.mark.parametrize(
+    "style_key,suffix", [("both_shaped", "shaped"), ("both_square", "square")]
+)
+def test_duckdb_single_volume_matches_pandas(
+    _flatmap_parquet, include, style_key, suffix
+):
     _frame, path = _flatmap_parquet
     x_bounds, y_bounds, depth_range = (0.0, 118.0), (0.0, 88.0), (0.0, 890.0)
     reference = _pandas_reference_volume(
@@ -463,8 +595,13 @@ def test_duckdb_single_volume_matches_pandas(_flatmap_parquet, include, style_ke
     np.testing.assert_array_equal(result.volume, reference.volume)
     assert result.render_summary.rendered_nodes == reference.summary.rendered_nodes
     assert result.render_summary.nonzero_voxels == reference.summary.nonzero_voxels
-    assert result.render_summary.flatmap_valid_nodes == reference.summary.flatmap_valid_nodes
-    assert result.render_summary.depth_valid_nodes == reference.summary.depth_valid_nodes
+    assert (
+        result.render_summary.flatmap_valid_nodes
+        == reference.summary.flatmap_valid_nodes
+    )
+    assert (
+        result.render_summary.depth_valid_nodes == reference.summary.depth_valid_nodes
+    )
 
 
 @pytest.mark.parametrize("include", [False, True])
@@ -531,7 +668,9 @@ def test_duckdb_grouped_volumes_sum_to_single(_flatmap_parquet, include):
 
 def test_duckdb_file_id_subset_and_empty_selection(_flatmap_parquet):
     _frame, path = _flatmap_parquet
-    bounds = dict(x_bounds=(0.0, 118.0), y_bounds=(0.0, 88.0), depth_range_um=(0.0, 890.0))
+    bounds = dict(
+        x_bounds=(0.0, 118.0), y_bounds=(0.0, 88.0), depth_range_um=(0.0, 890.0)
+    )
     conn = duckdb.connect()
     try:
         subset = build_flatmap_heatmap_volume_result(
@@ -592,9 +731,167 @@ def test_duckdb_voxel_guard_rejects_oversized_grid(_flatmap_parquet):
                 x_bounds=(0.0, 118.0),
                 y_bounds=(0.0, 88.0),
                 depth_range_um=(0.0, 890.0),
-                xy_bins=int(MAX_FLATMAP_HEATMAP_VOXELS ** 0.5) + 1000,
+                xy_bins=int(MAX_FLATMAP_HEATMAP_VOXELS**0.5) + 1000,
                 depth_bin_um=1.0,
                 include_depth_minus_one=False,
             )
     finally:
         conn.close()
+
+
+def test_duckdb_allen_layer_stack_matches_pandas(tmp_path) -> None:
+    frame = _v3_flatmap_frame(n=600)
+    layer_regions = np.asarray([101, 102, 103, 104, 105, 106, 999])
+    frame["region_id"] = np.resize(layer_regions, len(frame))
+    path = tmp_path / "allen_layers.parquet"
+    frame.to_parquet(path, index=False)
+    layer_map = _allen_layer_map()
+    projected = pd.DataFrame(
+        {
+            "file_id": frame["file_id"],
+            "x_flat": frame["x_flat_shaped"],
+            "y_flat": frame["y_flat_shaped"],
+            "flatmap_valid": frame["flatmap_shaped_valid"],
+            "region_id": frame["region_id"],
+        }
+    )
+    reference = build_allen_layer_stack_from_projected_nodes(
+        projected,
+        layer_map,
+        xy_bins=20,
+        x_bounds=(0.0, 118.0),
+        y_bounds=(0.0, 88.0),
+    )
+
+    conn = duckdb.connect()
+    try:
+        single = build_allen_layer_heatmap_volume_result(
+            conn,
+            str(path),
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            layer_map=layer_map,
+            x_bounds=(0.0, 118.0),
+            y_bounds=(0.0, 88.0),
+            xy_bins=20,
+        )
+        individual = build_allen_layer_heatmap_volume_result(
+            conn,
+            str(path),
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_INDIVIDUAL,
+            layer_map=layer_map,
+            x_bounds=(0.0, 118.0),
+            y_bounds=(0.0, 88.0),
+            xy_bins=20,
+        )
+        cluster = build_allen_layer_heatmap_volume_result(
+            conn,
+            str(path),
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_CLUSTER,
+            layer_map=layer_map,
+            x_bounds=(0.0, 118.0),
+            y_bounds=(0.0, 88.0),
+            xy_bins=20,
+            cluster_map={f"neuron_{index}": index % 2 for index in range(6)},
+        )
+    finally:
+        conn.close()
+
+    np.testing.assert_array_equal(single.volume, reference.volume)
+    assert single.summary.layer_node_counts == reference.summary.layer_node_counts
+    assert single.summary.excluded_non_layer_nodes == (
+        reference.summary.excluded_non_layer_nodes
+    )
+    for grouped in (individual, cluster):
+        combined = np.zeros(grouped.volume_shape, dtype=np.float32)
+        for group in grouped.grouped_volumes:
+            combined += group.volume
+        np.testing.assert_array_equal(combined, reference.volume)
+
+
+def test_duckdb_allen_layer_stack_requires_region_id(
+    _flatmap_parquet,
+) -> None:
+    _frame, path = _flatmap_parquet
+    conn = duckdb.connect()
+    try:
+        with pytest.raises(ValueError, match="region_id"):
+            build_allen_layer_heatmap_volume_result(
+                conn,
+                path,
+                style_key="both_shaped",
+                color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+                layer_map=_allen_layer_map(),
+                x_bounds=(0.0, 118.0),
+                y_bounds=(0.0, 88.0),
+                xy_bins=20,
+            )
+    finally:
+        conn.close()
+
+
+def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
+    tmp_path,
+) -> None:
+    frame = _v3_flatmap_frame(n=300)
+    frame["region_id"] = np.resize(
+        np.asarray([101, 102, 103, 104, 105, 106, 999]),
+        len(frame),
+    )
+    path = tmp_path / "allen_layer_selection.parquet"
+    frame.to_parquet(path, index=False)
+    selected_ids = ["neuron_0", "neuron_1"]
+    reference_nodes = pd.DataFrame(
+        {
+            "file_id": frame["file_id"],
+            "x_flat": frame["x_flat_shaped"],
+            "y_flat": frame["y_flat_shaped"],
+            "flatmap_valid": frame["flatmap_shaped_valid"],
+            "region_id": frame["region_id"],
+        }
+    )
+    reference_nodes = reference_nodes[
+        reference_nodes["file_id"].isin(selected_ids)
+    ].reset_index(drop=True)
+    reference = build_allen_layer_stack_from_projected_nodes(
+        reference_nodes,
+        _allen_layer_map(),
+        xy_bins=12,
+        x_bounds=(0.0, 118.0),
+        y_bounds=(0.0, 88.0),
+    )
+
+    conn = duckdb.connect()
+    try:
+        selected = build_allen_layer_heatmap_volume_result(
+            conn,
+            str(path),
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            layer_map=_allen_layer_map(),
+            x_bounds=(0.0, 118.0),
+            y_bounds=(0.0, 88.0),
+            xy_bins=12,
+            file_ids=selected_ids,
+        )
+        empty = build_allen_layer_heatmap_volume_result(
+            conn,
+            str(path),
+            style_key="both_shaped",
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            layer_map=_allen_layer_map(),
+            x_bounds=(0.0, 118.0),
+            y_bounds=(0.0, 88.0),
+            xy_bins=12,
+            file_ids=[],
+        )
+    finally:
+        conn.close()
+
+    np.testing.assert_array_equal(selected.volume, reference.volume)
+    assert selected.summary.traces_represented <= 2
+    assert empty.volume.shape == (6, 12, 12)
+    assert float(empty.volume.sum()) == 0.0
+    assert empty.summary.rendered_nodes == 0

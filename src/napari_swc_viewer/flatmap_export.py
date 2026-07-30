@@ -37,6 +37,8 @@ FLATMAP_EXPORT_COLUMNS = [
     "y_flat_bin",
     "depth_bin",
     "depth_bin_label",
+    "allen_layer_index",
+    "allen_layer_label",
 ]
 
 

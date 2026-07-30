@@ -15,6 +15,7 @@ from napari_swc_viewer.analysis.clustering import ClusterRegionSelection, Cluste
 from napari_swc_viewer.analysis.flatmap_correlation import (
     FlatmapVoxelCorrelationSource,
 )
+from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
 from napari_swc_viewer.point_import import PointParquetAppendSummary
 from napari_swc_viewer.parquet import BatchParquetConversionSummary
 
@@ -1761,3 +1762,48 @@ def test_flatmap_heatmap_worker_reports_error(tmp_path):
 
     assert finished == []
     assert len(errors) == 1
+
+
+def test_flatmap_heatmap_worker_emits_allen_layer_stack(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "flatmap_v3.parquet"
+    _write_flatmap_v3_parquet(path)
+    frame = pd.read_parquet(path)
+    region_ids = (101, 102, 103, 104, 105, 106)
+    frame["region_id"] = np.resize(region_ids, len(frame))
+    frame.to_parquet(path, index=False)
+    layer_map = AllenIsocortexLayerMap(
+        atlas_name="allen_mouse_25um",
+        isocortex_region_id=315,
+        region_to_layer_index={
+            region_id: index for index, region_id in enumerate(region_ids)
+        },
+        region_ids_by_layer=tuple((region_id,) for region_id in region_ids),
+    )
+
+    worker = workers.FlatmapHeatmapWorker(
+        str(path),
+        style_key="both_shaped",
+        color_mode="single",
+        x_bounds=(0.0, 100.0),
+        y_bounds=(0.0, 80.0),
+        depth_range_um=None,
+        xy_bins=16,
+        depth_bin_um=50.0,
+        include_depth_minus_one=False,
+        plane_mode="allen_layers",
+        allen_layer_map=layer_map,
+    )
+    finished = []
+    errors = []
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert errors == []
+    assert len(finished) == 1
+    result = finished[0]
+    assert result.volume.shape == (6, 16, 16)
+    assert result.summary.rendered_nodes == 1500
+    assert float(result.volume.sum()) == 1500.0

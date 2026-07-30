@@ -195,6 +195,26 @@ In **Data** > **Convert SWC to Parquet**, enable **Add bilateral flatmap/depth
 columns** and select **Lookup directory...** to combine SWC conversion and
 version-3 augmentation in one cancellable, atomic background operation.
 
+### Allen Isocortex layer flatmap stack
+
+- In **Flatmap**, choose **Allen Layer Heatmap (2D stack)** under **Render** to
+  create six raw node-count images ordered `L1`, `L2/3`, `L4`, `L5`, `L6a`,
+  and `L6b`.
+- Load the Allen atlas used to annotate the input and provide a Parquet with
+  `region_id`. Membership is derived from terminal regions in the loaded
+  atlas's **Isocortex** hierarchy; numeric depth does not assign layers.
+- Flatmap-invalid nodes, non-Isocortex annotations, parent regions,
+  unannotated nodes, and non-laminar regions are excluded. Cortical areas
+  without layer 4 remain empty on the `L4` plane.
+- **XY bins**, shaped/square style, neuron selection, and heatmap color mode
+  continue to apply. Depth-bin controls and cached region overlays are
+  unavailable while this categorical mode is selected.
+- Single color creates one six-plane image stack. Individual and cluster color
+  modes create one stack per neuron or cluster.
+- CSV export is available for materialized NRRD recomputation and includes
+  `allen_layer_index` and `allen_layer_label`. The fast precomputed,
+  volume-only path remains non-exportable.
+
 ### Flatmap region cache and overlays
 
 - Cache generation records the BrainGlobe atlas name and version as profile

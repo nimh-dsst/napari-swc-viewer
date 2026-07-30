@@ -30,6 +30,7 @@ Unless a use case says otherwise:
 | [UC-002](#uc-002-convert-swc-files-to-parquet) | Convert a folder or selected SWC files into one Parquet file | Not run |
 | [UC-003](#uc-003-prepare-a-whole-neuron-parquet-for-flatmap-viewing) | Append bilateral shaped/square flatmap and depth coordinates to a whole Parquet | Not run |
 | [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
+| [UC-005](#uc-005-view-an-allen-isocortex-layer-flatmap-stack) | View flatmap node counts as six Allen Isocortex layer images | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -436,6 +437,80 @@ projecting meshes, or converting region coordinates while viewing.
   close confirmation left the viewer usable, and reopening produced exactly one
   fresh detached window. This remains a macOS-specific workaround for
   napari 0.6.6 whose Qt-dependent behavior can only be validated manually.
+
+### UC-005: View an Allen Isocortex Layer Flatmap Stack
+
+**Capability**
+
+The user can view selected neuron morphology nodes as six planar flatmap
+heatmaps, one for each Allen Isocortex layer group: `L1`, `L2/3`, `L4`, `L5`,
+`L6a`, and `L6b`. Layer membership comes from each node's Allen `region_id`,
+not from a numeric flatmap-depth interval. Each image pixel is the number of
+matching nodes in that flatmap XY bin.
+
+The six images are one napari image stack, ordered from superficial to deep.
+The default single-color mode creates one stack; the existing individual and
+cluster color modes create one six-plane stack per color group.
+
+**Prerequisites**
+
+- Load a supported Allen mouse atlas in **Data** > **Atlas**.
+- Load a neuron Parquet with Allen `region_id` annotations and valid flatmap
+  coordinates. For **Precomputed Parquet + Cache**, use a version-3 Parquet
+  produced by UC-003.
+- Include neurons with nodes in at least two Allen Isocortex layers. Include an
+  agranular cortical area without layer 4 when test data is available.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** In the neuron table, select one or more rows. Open **Flatmap**,
+   choose **Precomputed Parquet + Cache**, select **Both hemispheres, shaped**,
+   and set **Render** to **Allen Layer Heatmap (2D stack)**.
+   **Expected:** **XY bins** remains available unless locked by the active
+   cache profile. **Depth bin** and **Exclude depth -1 nodes** are disabled
+   because numeric depth does not assign Allen layers. Cached region label,
+   surface, and outline actions are unavailable in this mode.
+2. **Action:** Keep **Heatmap colors** at **Single color** and click **Project
+   to Flatmap**.
+   **Expected:** The detached **SWC Viewer Flatmap** opens in 2D with one image
+   layer named **Isocortex Flatmap Allen Layers**. Its first axis identifies
+   indices `0` through `5` as `L1`, `L2/3`, `L4`, `L5`, `L6a`, and `L6b`.
+3. **Action:** Move the first-axis slider through all six positions.
+   **Expected:** Each position shows only nodes whose `region_id` belongs to
+   that terminal Allen Isocortex layer. A cortical area without layer 4 is
+   blank in that area on the `L4` plane; it is not filled by a depth estimate.
+4. **Action:** Compare the projection summary with an independent count of the
+   selected Parquet rows by the corresponding Allen layer region IDs.
+   **Expected:** The total rendered-node count and all six per-layer counts
+   agree. Flatmap-invalid, non-Isocortex, parent-level, unannotated, and
+   otherwise non-laminar nodes are reported as excluded and do not appear.
+5. **Action:** Repeat with **Both hemispheres, square**, **All table rows**,
+   **Individual neurons**, and **Cluster**.
+   **Expected:** Shaped and square stacks use their recorded canonical XY
+   grids. Input selection is respected. Individual and cluster modes create
+   one synchronized six-plane stack per neuron or cluster using existing
+   colors.
+6. **Action:** Choose **Recompute from NRRDs**, select the matching flatmap and
+   depth NRRDs, and project the same neurons.
+   **Expected:** The materialized result has the same layer assignments and
+   node-count semantics. **Export CSV...** includes `allen_layer_index` and
+   `allen_layer_label` for every classified node.
+7. **Action:** Switch **Render** back to **3D Heatmap**.
+   **Expected:** The categorical stack is removed, numeric depth controls and
+   compatible cached-region actions return, and a new projection uses the
+   original depth-binned behavior.
+8. **Action:** Retry layer rendering without a loaded atlas, then with a
+   Parquet missing `region_id`, and finally with selected neurons that have no
+   flatmap-valid terminal Isocortex-layer nodes.
+   **Expected:** Each attempt reports a specific corrective message and does
+   not leave a blank detached flatmap window.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
 
 ## Use-Case Template
 

@@ -181,6 +181,7 @@ class _DummyLayer:
         self.blending = kwargs.get("blending")
         self.rendering = kwargs.get("rendering")
         self.opacity = kwargs.get("opacity")
+        self.axis_labels = kwargs.get("axis_labels")
         self.ndim = self.data.ndim if self.data.ndim else 0
         self.contrast_limits_range = kwargs.get(
             "contrast_limits_range",
@@ -486,8 +487,8 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     widget._clear_region_geometry_btn = _DummyButton()
     atlas_holder = {"atlas": None}
     widget._atlas_provider = lambda: atlas_holder["atlas"]
-    widget._request_cache_directory_open = (
-        lambda path, profile_id=None: widget.set_cache_directory(
+    widget._request_cache_directory_open = lambda path, profile_id=None: (
+        widget.set_cache_directory(
             path,
             profile_id=profile_id,
         )
@@ -587,8 +588,8 @@ def test_cache_build_finished_closes_worker_returned_profile(monkeypatch) -> Non
     )
     widget._region_cache_dir = Path("cache")
     requests: list[tuple[Path, str | None]] = []
-    widget._request_cache_directory_open = (
-        lambda path, profile_id=None: requests.append((Path(path), profile_id))
+    widget._request_cache_directory_open = lambda path, profile_id=None: (
+        requests.append((Path(path), profile_id))
     )
     widget._cache_status_label = _DummyLabel()
 
@@ -670,8 +671,8 @@ def test_choose_cache_directory_only_schedules_background_open(monkeypatch) -> N
     )
     widget._viewer.layers.append(layer)
     requests = []
-    widget._request_cache_directory_open = (
-        lambda path, profile_id=None: requests.append((path, profile_id))
+    widget._request_cache_directory_open = lambda path, profile_id=None: (
+        requests.append((path, profile_id))
     )
     monkeypatch.setattr(
         module.QFileDialog,
@@ -1357,9 +1358,7 @@ def test_add_soma_uses_duckdb_soma_query_not_full_node_scan(monkeypatch) -> None
 
     def _get_soma(file_ids):
         calls["soma"] += 1
-        return soma_nodes[soma_nodes["file_id"].isin(file_ids)].reset_index(
-            drop=True
-        )
+        return soma_nodes[soma_nodes["file_id"].isin(file_ids)].reset_index(drop=True)
 
     def _get_full(_file_ids):
         calls["full"] += 1
@@ -1373,18 +1372,12 @@ def test_add_soma_uses_duckdb_soma_query_not_full_node_scan(monkeypatch) -> None
     )
     widget._table_file_ids_provider = lambda: ["a.swc", "b.swc"]
     widget._selected_file_ids_provider = lambda: []
-    widget._source_combo = types.SimpleNamespace(
-        currentData=lambda: module._SOURCE_ALL
-    )
+    widget._source_combo = types.SimpleNamespace(currentData=lambda: module._SOURCE_ALL)
     widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 4)
     widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
-    widget._exclude_depth_minus_one_cb = types.SimpleNamespace(
-        isChecked=lambda: False
-    )
+    widget._exclude_depth_minus_one_cb = types.SimpleNamespace(isChecked=lambda: False)
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
-    widget._coordinate_mode_combo = types.SimpleNamespace(
-        currentData=lambda: "microns"
-    )
+    widget._coordinate_mode_combo = types.SimpleNamespace(currentData=lambda: "microns")
     captured = {}
 
     def fake_lookup(self, nodes, **_kwargs):
@@ -1953,8 +1946,8 @@ def test_display_failure_callback_receives_current_viewer(monkeypatch) -> None:
     display_viewer = _DummyViewer()
     widget._display_viewer_provider = lambda create=True: display_viewer
     calls = []
-    widget._display_viewer_failed_callback = (
-        lambda viewer, reason: calls.append((viewer, reason))
+    widget._display_viewer_failed_callback = lambda viewer, reason: calls.append(
+        (viewer, reason)
     )
 
     widget._notify_display_viewer_failed("projection_failed")
@@ -2030,6 +2023,141 @@ def _simple_render_summary(
         25.0,
         includes_depth_minus_one_plane,
     )
+
+
+def _simple_allen_layer_summary(module, total_nodes: int = 2):
+    return module.AllenLayerStackSummary(
+        total_nodes=total_nodes,
+        flatmap_valid_nodes=total_nodes,
+        layer_classified_nodes=total_nodes,
+        rendered_nodes=total_nodes,
+        excluded_non_layer_nodes=0,
+        nonzero_voxels=2,
+        traces_represented=1,
+        xy_bins=4,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        layer_labels=("L1", "L2/3", "L4", "L5", "L6a", "L6b"),
+        layer_node_counts=(1, 1, 0, 0, 0, 0),
+        atlas_name="allen_mouse_25um",
+        atlas_version="1.2.3",
+    )
+
+
+def test_allen_layer_stack_uses_one_2d_categorical_image(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc"],
+            "render_valid": [True, True],
+            "allen_layer_index": [0, 1],
+            "allen_layer_label": ["L1", "L2/3"],
+            "y_flat_bin": [1, 2],
+            "x_flat_bin": [2, 3],
+        }
+    )
+    volume = np.zeros((6, 4, 4), dtype=np.float32)
+    volume[0, 1, 2] = 1.0
+    volume[1, 2, 3] = 1.0
+    stack = module.AllenLayerStackResult(
+        projected_nodes=projected,
+        volume=volume,
+        summary=_simple_allen_layer_summary(module),
+    )
+
+    layer = widget._create_or_update_allen_layer_stack(
+        stack,
+        _simple_projection_summary(module, total_nodes=2),
+        flatmap_style="both_shaped",
+        coordinate_mode="parquet_columns",
+    )
+
+    assert layer.name == module._ALLEN_LAYER_HEATMAP_LAYER_NAME
+    assert widget._viewer.layers == [layer]
+    assert widget._viewer.dims.ndisplay == 2
+    assert layer.axis_labels[0].startswith("Allen layer (0:L1")
+    assert layer.metadata["flatmap_plane_mode"] == "allen_layers"
+    assert layer.metadata["allen_layer_labels"] == [
+        "L1",
+        "L2/3",
+        "L4",
+        "L5",
+        "L6a",
+        "L6b",
+    ]
+    assert layer.metadata["allen_atlas_name"] == "allen_mouse_25um"
+    assert layer.metadata["allen_atlas_identity"] == {
+        "name": "allen_mouse_25um",
+        "version": "1.2.3",
+    }
+    assert layer.metadata["flatmap_projection_source"] == "legacy_auto"
+
+
+def test_allen_layer_mode_disables_depth_and_cached_region_controls(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._cache_grid_locked = False
+    widget._xy_bins_spin = _DummyValueControl()
+    widget._depth_bin_spin = _DummyValueControl()
+    widget._exclude_depth_minus_one_cb = _DummyValueControl()
+    widget._negative_one_sentinel_cb = _DummyValueControl()
+    widget._zero_sentinel_cb = _DummyValueControl()
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._active_cache_profile = object()
+    widget._region_surfaces_btn = _DummyButton()
+    widget._region_outlines_btn = _DummyButton()
+    widget._clear_region_geometry_btn = _DummyButton()
+    widget._region_labels_btn = _DummyButton()
+    widget._region_label_atlas_combo = _DummyCombo()
+
+    widget._update_render_mode_controls()
+    widget._update_cached_region_controls()
+
+    assert widget._xy_bins_spin.enabled is True
+    assert widget._depth_bin_spin.enabled is False
+    assert widget._exclude_depth_minus_one_cb.enabled is False
+    assert widget._negative_one_sentinel_cb.enabled is True
+    assert widget._region_labels_btn.enabled is False
+    assert widget._region_surfaces_btn.enabled is False
+    assert widget._region_outlines_btn.enabled is False
+
+
+def test_allen_layer_map_requires_loaded_atlas(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._atlas_provider = lambda: None
+
+    with pytest.raises(RuntimeError, match="Load an Allen mouse atlas"):
+        widget._current_allen_layer_map()
+
+
+def test_allen_layer_nrrd_projection_requires_region_id(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+
+    with pytest.raises(RuntimeError, match="requires a region_id column"):
+        widget._project_from_lookup_files(
+            pd.DataFrame({"file_id": ["a.swc"]}),
+        )
 
 
 def _binned_render_result(module):
@@ -2742,6 +2870,8 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
             "y_flat_bin": [20],
             "depth_bin": [1],
             "depth_bin_label": ["0-25 um"],
+            "allen_layer_index": [0],
+            "allen_layer_label": ["L1"],
         }
     )
 
@@ -2755,6 +2885,8 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
     assert exported["flatmap_lookup_mode"].tolist() == ["mirrored_depth"]
     assert "render_valid" in exported.columns
     assert exported["x_flat_bin"].tolist() == [10]
+    assert exported["allen_layer_index"].tolist() == [0]
+    assert exported["allen_layer_label"].tolist() == ["L1"]
     assert "Exported flatmap projection" in widget._status_label.text
 
 
@@ -2898,3 +3030,110 @@ def test_apply_precomputed_heatmap_result_grouped_creates_layer_per_group(
     assert len(grouped_layers) == 2
     assert widget._export_btn.enabled is False
     assert widget._last_projected_nodes is None
+
+
+def test_apply_precomputed_allen_layer_result_uses_2d_stack(
+    monkeypatch,
+) -> None:
+    from napari_swc_viewer import flatmap_heatmap as fh
+
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._summary_label = _DummyLabel()
+    widget._export_btn = _DummyButton()
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._active_cache_profile = None
+    widget._region_cache_dir = None
+    widget._cache_profile_id = lambda _profile: None
+    widget._precomputed_heatmap_file_ids = ["a.swc"]
+    widget._notify_flatmap_correlation_source_changed = lambda: None
+    volume = np.zeros((6, 4, 4), dtype=np.float32)
+    volume[0, 1, 2] = 1.0
+    volume[1, 2, 3] = 1.0
+    stats = fh.AllenLayerAggregateStats(
+        total_nodes=2,
+        total_traces=1,
+        flatmap_valid_nodes=2,
+        layer_classified_nodes=2,
+        rendered_nodes=2,
+        traces_represented=1,
+    )
+    result = fh.AllenLayerHeatmapVolumeResult(
+        color_mode=module._HEATMAP_COLOR_SINGLE,
+        volume=volume,
+        grouped_volumes=(),
+        summary=_simple_allen_layer_summary(module),
+        stats=stats,
+        volume_shape=(6, 4, 4),
+    )
+
+    widget._apply_precomputed_allen_layer_result(result)
+
+    assert widget._last_render_mode == module._RENDER_ALLEN_LAYERS
+    assert widget._last_projected_nodes is None
+    assert widget._export_btn.enabled is False
+    assert widget._viewer.dims.ndisplay == 2
+    assert widget._projection_layer.name == module._ALLEN_LAYER_HEATMAP_LAYER_NAME
+    assert widget._projection_layer.metadata["flatmap_plane_mode"] == "allen_layers"
+    assert widget.latest_flatmap_correlation_source() is None
+
+
+def test_apply_precomputed_allen_layer_result_rejects_no_mapped_nodes(
+    monkeypatch,
+) -> None:
+    from napari_swc_viewer import flatmap_heatmap as fh
+
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._summary_label = _DummyLabel()
+    widget._export_btn = _DummyButton()
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._active_cache_profile = None
+    widget._region_cache_dir = None
+    widget._cache_profile_id = lambda _profile: None
+    widget._precomputed_heatmap_file_ids = ["outside.swc"]
+    widget._notify_flatmap_correlation_source_changed = lambda: None
+    stats = fh.AllenLayerAggregateStats(
+        total_nodes=1,
+        total_traces=1,
+        flatmap_valid_nodes=1,
+        layer_classified_nodes=0,
+        rendered_nodes=0,
+        traces_represented=0,
+    )
+    summary = module.AllenLayerStackSummary(
+        total_nodes=1,
+        flatmap_valid_nodes=1,
+        layer_classified_nodes=0,
+        rendered_nodes=0,
+        excluded_non_layer_nodes=1,
+        nonzero_voxels=0,
+        traces_represented=0,
+        xy_bins=4,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        layer_labels=("L1", "L2/3", "L4", "L5", "L6a", "L6b"),
+        layer_node_counts=(0, 0, 0, 0, 0, 0),
+        atlas_name="allen_mouse_25um",
+    )
+    result = fh.AllenLayerHeatmapVolumeResult(
+        color_mode=module._HEATMAP_COLOR_SINGLE,
+        volume=np.zeros((6, 4, 4), dtype=np.float32),
+        grouped_volumes=(),
+        summary=summary,
+        stats=stats,
+        volume_shape=(6, 4, 4),
+    )
+
+    with pytest.raises(RuntimeError, match="No selected flatmap-valid nodes"):
+        widget._apply_precomputed_allen_layer_result(result)
+
+    assert widget._viewer.layers == []
