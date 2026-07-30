@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from brainglobe_atlasapi import BrainGlobeAtlas
 
     from .analysis.clustering import ClusterRegionSelection, ClusterResult
+    from .isocortex_layers import AllenIsocortexLayerMap
 
 logger = logging.getLogger(__name__)
 
@@ -1279,9 +1280,7 @@ class FlatmapParquetCorrelationWorker(QObject):
             )
 
             total = 3
-            self.progress.emit(
-                "Binning flatmap coordinates in DuckDB...", 1, total
-            )
+            self.progress.emit("Binning flatmap coordinates in DuckDB...", 1, total)
             result, count_data, provenance = (
                 compute_flatmap_voxel_correlation_from_parquet(
                     self._parquet_path,
@@ -1304,9 +1303,7 @@ class FlatmapParquetCorrelationWorker(QObject):
                 "flatmap_include_depth_minus_one": bool(
                     provenance.include_depth_minus_one
                 ),
-                "flatmap_volume_shape": [
-                    int(size) for size in provenance.volume_shape
-                ],
+                "flatmap_volume_shape": [int(size) for size in provenance.volume_shape],
                 "flatmap_input_neuron_count": int(
                     len(result.neuron_ids) + len(result.unassigned_neuron_ids)
                 ),
@@ -1392,9 +1389,7 @@ class FlatmapSomaClusterWorker(QObject):
             )
 
             total = 3
-            self.progress.emit(
-                "Querying soma flatmap coordinates...", 1, total
-            )
+            self.progress.emit("Querying soma flatmap coordinates...", 1, total)
             filtered_ids, filtered_coords = query_flatmap_soma_coordinates(
                 self._parquet_path,
                 style=self._style,
@@ -1822,6 +1817,8 @@ class FlatmapHeatmapWorker(QObject):
         include_depth_minus_one: bool,
         file_ids: list[object] | None = None,
         cluster_map: dict[object, int | None] | None = None,
+        plane_mode: str = "depth",
+        allen_layer_map: AllenIsocortexLayerMap | None = None,
     ):
         super().__init__()
         self._parquet_path = str(parquet_path)
@@ -1835,6 +1832,8 @@ class FlatmapHeatmapWorker(QObject):
         self._include_depth_minus_one = bool(include_depth_minus_one)
         self._file_ids = file_ids
         self._cluster_map = cluster_map
+        self._plane_mode = str(plane_mode)
+        self._allen_layer_map = allen_layer_map
 
     def run(self) -> None:
         """Execute the DuckDB flatmap heatmap pipeline."""
@@ -1842,6 +1841,8 @@ class FlatmapHeatmapWorker(QObject):
             import duckdb
 
             from .flatmap_heatmap import (
+                FLATMAP_PLANE_MODE_ALLEN_LAYERS,
+                build_allen_layer_heatmap_volume_result,
                 build_flatmap_heatmap_volume_result,
                 compute_flatmap_bounds_from_parquet,
             )
@@ -1852,10 +1853,13 @@ class FlatmapHeatmapWorker(QObject):
                 x_bounds = self._x_bounds
                 y_bounds = self._y_bounds
                 depth_range_um = self._depth_range_um
-                if x_bounds is None or y_bounds is None or depth_range_um is None:
-                    self.progress.emit(
-                        "Deriving flatmap bounds...", 1, total_steps
-                    )
+                needs_depth_bounds = self._plane_mode != FLATMAP_PLANE_MODE_ALLEN_LAYERS
+                if (
+                    x_bounds is None
+                    or y_bounds is None
+                    or (needs_depth_bounds and depth_range_um is None)
+                ):
+                    self.progress.emit("Deriving flatmap bounds...", 1, total_steps)
                     bounds = compute_flatmap_bounds_from_parquet(
                         conn,
                         self._parquet_path,
@@ -1866,22 +1870,43 @@ class FlatmapHeatmapWorker(QObject):
                     y_bounds = bounds["y_bounds"]
                     depth_range_um = bounds["depth_range_um"]
 
-                result = build_flatmap_heatmap_volume_result(
-                    conn,
-                    self._parquet_path,
-                    style_key=self._style_key,
-                    color_mode=self._color_mode,
-                    x_bounds=x_bounds,
-                    y_bounds=y_bounds,
-                    depth_range_um=depth_range_um,
-                    xy_bins=self._xy_bins,
-                    depth_bin_um=self._depth_bin_um,
-                    include_depth_minus_one=self._include_depth_minus_one,
-                    file_ids=self._file_ids,
-                    cluster_map=self._cluster_map,
-                    progress_callback=self.progress.emit,
-                    progress_total=total_steps,
-                )
+                if self._plane_mode == FLATMAP_PLANE_MODE_ALLEN_LAYERS:
+                    if self._allen_layer_map is None:
+                        raise ValueError(
+                            "Allen layer rendering requires an atlas-derived "
+                            "Isocortex layer mapping."
+                        )
+                    result = build_allen_layer_heatmap_volume_result(
+                        conn,
+                        self._parquet_path,
+                        style_key=self._style_key,
+                        color_mode=self._color_mode,
+                        layer_map=self._allen_layer_map,
+                        x_bounds=x_bounds,
+                        y_bounds=y_bounds,
+                        xy_bins=self._xy_bins,
+                        file_ids=self._file_ids,
+                        cluster_map=self._cluster_map,
+                        progress_callback=self.progress.emit,
+                        progress_total=total_steps,
+                    )
+                else:
+                    result = build_flatmap_heatmap_volume_result(
+                        conn,
+                        self._parquet_path,
+                        style_key=self._style_key,
+                        color_mode=self._color_mode,
+                        x_bounds=x_bounds,
+                        y_bounds=y_bounds,
+                        depth_range_um=depth_range_um,
+                        xy_bins=self._xy_bins,
+                        depth_bin_um=self._depth_bin_um,
+                        include_depth_minus_one=self._include_depth_minus_one,
+                        file_ids=self._file_ids,
+                        cluster_map=self._cluster_map,
+                        progress_callback=self.progress.emit,
+                        progress_total=total_steps,
+                    )
             finally:
                 conn.close()
 

@@ -39,6 +39,7 @@ from .flatmap_loader import (
     FlatmapLookupLoadCancelledError,
     load_flatmap_volume_set,
 )
+from .isocortex_layers import AllenIsocortexLayerMap
 
 REGION_CACHE_MANIFEST_FILENAME = "flatmap-region-cache.json"
 REGION_CACHE_FORMAT = "napari_swc_viewer.flatmap_region_cache"
@@ -227,6 +228,55 @@ class CachedRegionSelection:
     surfaces: tuple[CachedRegionSurface, ...]
     outlines: tuple[CachedRegionOutlines, ...]
     summary: CachedRegionSelectionSummary
+    grid_spec: Mapping[str, Any]
+    style: str
+    profile_id: str
+
+
+@dataclass(frozen=True)
+class CachedAllenLayerRegionSelectionSummary:
+    """Counts for a region selection collapsed into Allen layer planes."""
+
+    selected_region_count: int
+    layer_mapped_region_count: int
+    represented_region_count: int
+    labeled_bins: int
+    collision_bins: int
+    source_voxel_count: int
+    output_shape: tuple[int, int, int]
+    layer_labels: tuple[str, ...]
+
+    @property
+    def excluded_non_layer_region_count(self) -> int:
+        """Return selected IDs that do not map to an Allen layer plane."""
+        return max(0, self.selected_region_count - self.layer_mapped_region_count)
+
+    def to_dict(self) -> dict[str, int | list[int] | list[str]]:
+        return {
+            "selected_region_count": int(self.selected_region_count),
+            "layer_mapped_region_count": int(self.layer_mapped_region_count),
+            "represented_region_count": int(self.represented_region_count),
+            "excluded_non_layer_region_count": int(
+                self.excluded_non_layer_region_count
+            ),
+            "labeled_bins": int(self.labeled_bins),
+            "collision_bins": int(self.collision_bins),
+            "source_voxel_count": int(self.source_voxel_count),
+            "output_shape": [int(size) for size in self.output_shape],
+            "layer_labels": list(self.layer_labels),
+        }
+
+
+@dataclass(frozen=True)
+class CachedAllenLayerRegionSelection:
+    """Cache-backed atlas labels collapsed into categorical Allen planes."""
+
+    labels: np.ndarray
+    selected_region_ids: tuple[int, ...]
+    layer_mapped_region_ids: tuple[int, ...]
+    represented_region_ids: tuple[int, ...]
+    layer_labels: tuple[str, ...]
+    summary: CachedAllenLayerRegionSelectionSummary
     grid_spec: Mapping[str, Any]
     style: str
     profile_id: str
@@ -2586,9 +2636,11 @@ def materialize_region_selection(
 ) -> CachedRegionSelection:
     """Materialise majority labels and parent-union geometry from cached arrays.
 
-    ``region_ids`` should be the Include-child-expanded annotation IDs used for
-    labels.  ``direct_region_ids`` should contain the parents selected in the
-    UI; their precomputed descendant-union surfaces and outlines are returned.
+    ``region_ids`` should be the annotation IDs used for labels. Atlas-region
+    selections normally provide their Include-child-expanded IDs, while custom
+    selections provide exact terminal IDs. ``direct_region_ids`` contains the
+    geometry roots selected in the UI; each root may be an atlas parent with a
+    precomputed descendant union or an exact terminal region.
     """
     profile = _profile_from_value(cache_or_profile, profile_id)
     style_cache = profile.style(style)
@@ -2658,6 +2710,119 @@ def materialize_region_selection(
         outlines=tuple(outlines),
         summary=summary,
         grid_spec=style_cache.grid_spec,
+        style=style_cache.style,
+        profile_id=profile.profile_id,
+    )
+
+
+def materialize_allen_layer_region_selection(
+    cache_or_profile: FlatmapRegionCache | FlatmapRegionCacheProfile | str | Path,
+    region_ids: Iterable[int],
+    *,
+    style: str,
+    layer_map: AllenIsocortexLayerMap,
+    profile_id: str | None = None,
+) -> CachedAllenLayerRegionSelection:
+    """Collapse cached depth occupancy into categorical Allen layer labels.
+
+    Source-voxel counts are first summed across depth for each region and XY
+    bin. Competing regions in one Allen plane use the cache's normal majority
+    rule, with the smaller region ID winning equal-count ties.
+    """
+    profile = _profile_from_value(cache_or_profile, profile_id)
+    style_cache = profile.style(style)
+    selected = _normalise_region_ids(region_ids)
+    layer_labels = tuple(str(label) for label in layer_map.layer_labels)
+    if not layer_labels:
+        raise ValueError("Allen layer labels cannot be empty.")
+
+    plane_count = len(layer_labels)
+    depth_shape = style_cache.output_shape
+    y_bins, x_bins = int(depth_shape[1]), int(depth_shape[2])
+    plane_size = y_bins * x_bins
+    output_shape = (plane_count, y_bins, x_bins)
+    labels = np.zeros(output_shape, dtype=np.int32)
+
+    mapped: list[int] = []
+    represented: list[int] = []
+    pair_bins: list[np.ndarray] = []
+    pair_counts: list[np.ndarray] = []
+    pair_ids: list[np.ndarray] = []
+    source_voxel_count = 0
+    for region_id in selected:
+        raw_layer_index = layer_map.region_to_layer_index.get(region_id)
+        if raw_layer_index is None:
+            continue
+        layer_index = int(raw_layer_index)
+        if layer_index < 0 or layer_index >= plane_count:
+            raise ValueError(
+                f"Region ID {region_id} maps to invalid Allen layer index "
+                f"{layer_index}; expected 0 through {plane_count - 1}."
+            )
+        mapped.append(region_id)
+        occupancy = style_cache.occupancy_slice(region_id)
+        if occupancy is None:
+            continue
+        depth_linear_bins, source_counts = occupancy
+        if not len(depth_linear_bins):
+            continue
+
+        planar_bins = np.asarray(depth_linear_bins, dtype=np.int64) % plane_size
+        counts = np.asarray(source_counts, dtype=np.int64)
+        unique_planar_bins, inverse = np.unique(planar_bins, return_inverse=True)
+        collapsed_counts = np.zeros(len(unique_planar_bins), dtype=np.int64)
+        np.add.at(collapsed_counts, inverse, counts)
+        output_bins = layer_index * plane_size + unique_planar_bins
+
+        pair_bins.append(output_bins)
+        pair_counts.append(collapsed_counts)
+        pair_ids.append(np.full(len(unique_planar_bins), region_id, dtype=np.int32))
+        source_voxel_count += int(counts.sum())
+        represented.append(region_id)
+
+    collision_bins = 0
+    if pair_bins:
+        bins = np.concatenate(pair_bins)
+        counts = np.concatenate(pair_counts)
+        ids = np.concatenate(pair_ids)
+        order = np.lexsort((ids, -counts, bins))
+        sorted_bins = bins[order]
+        sorted_ids = ids[order]
+        _unique, first, competing = np.unique(
+            sorted_bins,
+            return_index=True,
+            return_counts=True,
+        )
+        labels.reshape(-1)[sorted_bins[first]] = sorted_ids[first]
+        collision_bins = int(np.count_nonzero(competing > 1))
+
+    summary = CachedAllenLayerRegionSelectionSummary(
+        selected_region_count=len(selected),
+        layer_mapped_region_count=len(mapped),
+        represented_region_count=len(represented),
+        labeled_bins=int(np.count_nonzero(labels)),
+        collision_bins=collision_bins,
+        source_voxel_count=source_voxel_count,
+        output_shape=output_shape,
+        layer_labels=layer_labels,
+    )
+    grid_spec = {
+        "coordinate_order": ["allen_layer", "y", "x"],
+        "plane_mode": "allen_layers",
+        "layer_labels": list(layer_labels),
+        "xy_bins": int(style_cache.grid_spec["xy_bins"]),
+        "x_bounds": list(style_cache.grid_spec["x_bounds"]),
+        "y_bounds": list(style_cache.grid_spec["y_bounds"]),
+        "output_shape": [int(size) for size in output_shape],
+    }
+    return CachedAllenLayerRegionSelection(
+        labels=labels,
+        selected_region_ids=selected,
+        layer_mapped_region_ids=tuple(mapped),
+        represented_region_ids=tuple(represented),
+        layer_labels=layer_labels,
+        summary=summary,
+        grid_spec=grid_spec,
         style=style_cache.style,
         profile_id=profile.profile_id,
     )

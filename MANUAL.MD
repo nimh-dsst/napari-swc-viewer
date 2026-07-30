@@ -195,6 +195,37 @@ In **Data** > **Convert SWC to Parquet**, enable **Add bilateral flatmap/depth
 columns** and select **Lookup directory...** to combine SWC conversion and
 version-3 augmentation in one cancellable, atomic background operation.
 
+### Allen Isocortex layer flatmap stack
+
+- In **Flatmap**, choose **Allen Layer Heatmap (2D stack)** under **Render** to
+  create six raw node-count images ordered `L1`, `L2/3`, `L4`, `L5`, `L6a`,
+  and `L6b`.
+- Load the Allen atlas used to annotate the input and provide a Parquet with
+  `region_id`. Membership is derived from terminal regions in the loaded
+  atlas's **Isocortex** hierarchy; numeric depth does not assign layers.
+- Flatmap-invalid nodes, non-Isocortex annotations, parent regions,
+  unannotated nodes, and non-laminar regions are excluded. Cortical areas
+  without layer 4 remain empty on the `L4` plane.
+- **XY bins**, shaped/square style, neuron selection, and heatmap color mode
+  continue to apply. Depth-bin controls and cached surfaces/outlines are
+  unavailable while this categorical mode is selected.
+- With **Precomputed Parquet + Cache** and a compatible cache profile active,
+  select **Atlas Regions** or **Custom Regions** and click **Show Region
+  Labels** to create a cache-backed six-plane **Flatmap Region Labels** stack.
+  It uses the same Allen layer order and XY grid as the heatmap, so napari's
+  first-axis slider changes both layers together. The labels may also be shown
+  before projecting neurons.
+- Planar labels contain an Atlas selection's terminal Allen-layer descendants
+  or the exact checked Custom Region terminal IDs. Cached source-voxel counts
+  are summed across depth for each region/XY bin; greatest occupancy wins
+  collisions, with smaller region ID as the tie-breaker. The viewing path does
+  not load NRRDs or `atlas.annotation`.
+- Single color creates one six-plane image stack. Individual and cluster color
+  modes create one stack per neuron or cluster.
+- CSV export is available for materialized NRRD recomputation and includes
+  `allen_layer_index` and `allen_layer_label`. The fast precomputed,
+  volume-only path remains non-exportable.
+
 ### Flatmap region cache and overlays
 
 - Cache generation records the BrainGlobe atlas name and version as profile
@@ -215,12 +246,21 @@ version-3 augmentation in one cancellable, atomic background operation.
 - For viewing, choose **Precomputed Parquet + Cache**, click **Choose Cache
   Directory...**, and select a compatible profile. Profile selection locks XY
   bins, depth bins, canonical bounds, and exclusion of the depth `-1` plane.
-- **Show Region Labels** creates **Flatmap Region Labels** from the
-  Include-child-expanded region IDs and
-  preserves majority-region collision handling with smaller-ID tie-breaking.
-  **Show Region Surfaces** and **Show Region Outlines** create the corresponding
-  flatmap layers from each directly selected parent's cached descendant union
-  and atlas color.
+- Flatmap region actions follow the active **Query source** and **Search
+  scope**. For **Atlas Regions**, **Show Region Labels** uses the
+  Include-child-expanded IDs while surfaces and outlines use each directly
+  selected parent's cached descendant union. For **Custom Regions**, labels,
+  surfaces, and outlines use exactly the checked terminal Allen IDs, with one
+  acronym/ID-named, atlas-colored geometry layer per terminal region.
+- In **3D Heatmap** mode, cached labels use the depth grid; recomputed labels
+  also accept the active Atlas or Custom selection. In **Allen Layer Heatmap
+  (2D stack)** mode, cached labels collapse the same version-1 occupancy into
+  six synchronized Allen planes. Existing caches do not need to be rebuilt,
+  and surfaces/outlines remain unavailable in the planar mode because their
+  geometry is depth-based.
+- Label paths preserve majority-region collision handling with smaller-ID
+  tie-breaking. **Mask Layer** is not an atlas-region source and reports an
+  actionable error instead of reusing a retained Atlas selection.
 - A loaded atlas with the same atlas/version structure catalog supplies region
   selection and colors during viewing. Its voxel resolution may differ because
   the precomputed path does not read `atlas.annotation` or meshes.
@@ -284,13 +324,39 @@ Notes:
 
 ### 3. Select regions (Regions tab)
 
-1. Choose `Query source`
-2. For `Atlas Regions`, use search to find structures, check regions in the tree, and optionally enable/disable `Include child regions`
-3. Choose `Node types`; leave `All node types` selected for the previous any-node behavior, or select one or more of `Soma`, `Axon`, `Basal dendrite`, and `Apical dendrite`
-4. For `Mask Layer`, check one or more generated mask layers
-5. Click the query button for the active source
+1. Choose `Query source`: `Atlas Regions`, `Custom Regions`, or `Mask Layer`
+2. For `Atlas Regions`, use search to find structures, check regions in the
+   tree, and optionally enable/disable `Include child regions`
+3. For `Custom Regions`, first load a compatible Allen atlas. Expand
+   `Isocortex Layers`, then check the root, a layer group (`L1`, `L2/3`, `L4`,
+   `L5`, `L6a`, or `L6b`), or individual terminal regions. Searches match the
+   full atlas name, acronym, or numeric region ID. Group checks select exactly
+   the terminal leaves shown beneath them; partially selected groups display a
+   partial check state.
+4. Choose `Search scope`: `Whole Parquet` or `Current Table`. Atlas and custom
+   selections are kept separately for the two scopes.
+5. Choose `Node types`; leave `All node types` selected for the previous
+   any-node behavior, or select one or more of `Soma`, `Axon`,
+   `Basal dendrite`, and `Apical dendrite`
+6. For `Mask Layer`, check one or more generated mask layers
+7. Click the query button for the active source
 
 This fills the **Selected Neurons** table in the Data tab.
+
+`Custom Regions` currently contains only the atlas-derived
+`Isocortex Layers` hierarchy. Its leaves are the terminal Allen Isocortex
+regions used by the flatmap layer classifier; parent atlas regions and
+unlisted descendants are never added to the query. A `region_id` column is
+required in the loaded Parquet. When `Custom Regions` is the active query
+source, the **Reference** tab's selected-region controls use the active custom
+scope: meshes are combined into at most one `Region: Custom <layer>` surface
+per selected Isocortex layer, while `Region Segmentation` contains exactly the
+checked terminal IDs. In **Flatmap**, the label, cached surface, and cached
+outline actions also use those exact terminal IDs; geometry remains one
+atlas-colored layer per terminal region rather than a synthetic layer union.
+Flatmap overlays update only when their **Show** action is clicked. Switching
+back to `Atlas Regions` restores include-child labels and parent-union cached
+geometry without discarding either selector's retained checks.
 
 ### 4. Generate blurred heatmaps (Tools tab)
 
@@ -382,6 +448,10 @@ Notes:
 
 - Mesh display auto-switches napari to 3D mode
 - Segmentation is intended for 2D context overlays
+- With **Custom Regions** active, selected terminal meshes are grouped into at
+  most six `Region: Custom <layer>` surfaces, preserving each terminal
+  region's Allen color. Segmentation includes only the exact checked terminal
+  IDs and does not expand descendants.
 
 ### 9. Run analysis (Analysis tab)
 

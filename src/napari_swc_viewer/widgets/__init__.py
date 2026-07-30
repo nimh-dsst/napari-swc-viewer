@@ -10,12 +10,17 @@ logger = logging.getLogger(__name__)
 with startup_timing(logger, "widget_package_import", module="reference_layers"):
     from .reference_layers import (
         add_allen_template,
+        add_region_id_segmentation,
         add_region_mesh,
+        add_region_mesh_group,
         add_region_segmentation,
     )
 
 with startup_timing(logger, "widget_package_import", module="region_selector"):
     from .region_selector import RegionSelectorWidget
+
+with startup_timing(logger, "widget_package_import", module="custom_region_selector"):
+    from .custom_region_selector import CustomRegionSelectorWidget
 
 with startup_timing(logger, "widget_package_import", module="slice_projection"):
     from .slice_projection import NeuronSliceProjector, SomaSliceProjector
@@ -31,12 +36,15 @@ with startup_timing(logger, "widget_package_import", module="neuron_viewer"):
 
 __all__ = [
     "AnalysisTabWidget",
+    "CustomRegionSelectorWidget",
     "NeuronTableWidget",
     "RegionSelectorWidget",
     "NeuronViewerWidget",
     "NeuronSliceProjector",
     "SomaSliceProjector",
     "add_allen_template",
+    "add_region_id_segmentation",
     "add_region_mesh",
+    "add_region_mesh_group",
     "add_region_segmentation",
 ]
