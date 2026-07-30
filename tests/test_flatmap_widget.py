@@ -708,6 +708,32 @@ def test_matching_cache_profile_preserves_live_heatmap(monkeypatch) -> None:
     assert "matching heatmap kept" in widget._cache_status_label.text
 
 
+def test_matching_cache_profile_preserves_live_allen_layer_stack(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _configure_cache_activation_widget(widget, module)
+    layer.name = module._ALLEN_LAYER_HEATMAP_LAYER_NAME
+    layer.data = np.ones((6, 4, 4), dtype=np.float32)
+    layer.metadata = {"flatmap_render_mode": module._RENDER_ALLEN_LAYERS}
+    widget._last_render_summary = _simple_allen_layer_summary(module)
+    widget._last_render_mode = module._RENDER_ALLEN_LAYERS
+    widget._last_volume_shape = (6, 4, 4)
+    profile = _CacheProfile("matching-planar-profile")
+    queued = []
+    widget._queue_gui_callback = queued.append
+
+    widget._activate_cache_profile(profile, force_transition=True)
+
+    assert widget._viewer.layers == [layer]
+    assert layer.visible is True
+    assert queued == []
+    assert widget._last_cache_profile_id == "matching-planar-profile"
+    assert layer.metadata["cache_profile_id"] == "matching-planar-profile"
+    assert "matching heatmap kept" in widget._cache_status_label.text
+
+
 def test_matching_cache_profile_only_retires_other_profile_annotations(
     monkeypatch,
 ) -> None:
@@ -938,6 +964,9 @@ def test_create_region_labels_uses_flatmap_selected_atlas_not_main_loaded_atlas(
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
     _configure_region_label_creation_widget(widget)
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._selected_region_scope_provider = lambda: "current_table"
+    widget._selected_region_acronyms_provider = lambda: ["C7"]
     atlas10 = types.SimpleNamespace(
         atlas_name="allen_mouse_10um",
         annotation=np.asarray([[[10]]], dtype=np.int32),
@@ -976,7 +1005,12 @@ def test_create_region_labels_uses_flatmap_selected_atlas_not_main_loaded_atlas(
     np.testing.assert_array_equal(captured["annotation"], atlas10.annotation)
     assert captured["mirror_depth_fallback"] is True
     assert captured["mirror_coord_axis"] == 2
-    assert widget._viewer.layers[-1].metadata["atlas_name"] == "allen_mouse_10um"
+    metadata = widget._viewer.layers[-1].metadata
+    assert metadata["atlas_name"] == "allen_mouse_10um"
+    assert metadata["selected_region_ids"] == [7]
+    assert metadata["selected_region_acronyms"] == ["C7"]
+    assert metadata["region_selection_source"] == "custom_regions"
+    assert metadata["region_selection_scope"] == "current_table"
 
 
 def _install_fake_region_label_atlas_worker(monkeypatch, module):
@@ -2102,7 +2136,7 @@ def test_allen_layer_stack_uses_one_2d_categorical_image(monkeypatch) -> None:
     assert layer.metadata["flatmap_projection_source"] == "legacy_auto"
 
 
-def test_allen_layer_mode_disables_depth_and_cached_region_controls(
+def test_allen_layer_mode_enables_cached_labels_but_disables_depth_and_geometry(
     monkeypatch,
 ) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
@@ -2133,6 +2167,29 @@ def test_allen_layer_mode_disables_depth_and_cached_region_controls(
     assert widget._depth_bin_spin.enabled is False
     assert widget._exclude_depth_minus_one_cb.enabled is False
     assert widget._negative_one_sentinel_cb.enabled is True
+    assert widget._region_labels_btn.enabled is True
+    assert widget._region_surfaces_btn.enabled is False
+    assert widget._region_outlines_btn.enabled is False
+
+
+def test_allen_layer_mode_requires_active_cache_for_region_labels(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._active_cache_profile = None
+    widget._region_surfaces_btn = _DummyButton()
+    widget._region_outlines_btn = _DummyButton()
+    widget._clear_region_geometry_btn = _DummyButton()
+    widget._region_labels_btn = _DummyButton()
+    widget._region_label_atlas_combo = _DummyCombo()
+
+    widget._update_cached_region_controls()
+
     assert widget._region_labels_btn.enabled is False
     assert widget._region_surfaces_btn.enabled is False
     assert widget._region_outlines_btn.enabled is False
@@ -2501,7 +2558,10 @@ def test_cached_region_labels_do_not_access_nrrd_or_atlas_annotation(
     widget._region_cache_dir = Path("cache")
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
     widget._selected_region_ids_provider = lambda: [10, 11]
-    widget._selected_parent_region_ids_provider = lambda: [10]
+    widget._selected_geometry_region_ids_provider = lambda: [10, 11]
+    widget._selected_region_acronyms_provider = lambda: ["R10", "R11"]
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._selected_region_scope_provider = lambda: "current_table"
 
     class _AtlasWithoutAnnotation:
         structures = {}
@@ -2543,12 +2603,13 @@ def test_cached_region_labels_do_not_access_nrrd_or_atlas_annotation(
             AssertionError("cached labels must not load NRRDs")
         ),
     )
-    widget._create_or_update_region_labels_layer = (
-        lambda received, _metadata, **_kwargs: types.SimpleNamespace(
-            data=received.labels
-        )
-    )
-    widget._focus_projection_view = lambda *_args: None
+
+    def _capture_layer(received, metadata, **_kwargs):
+        captured["metadata"] = metadata
+        return types.SimpleNamespace(data=received.labels)
+
+    widget._create_or_update_region_labels_layer = _capture_layer
+    widget._focus_projection_view = lambda *_args, **_kwargs: None
     widget._set_region_labels_status = lambda message: captured.update(message=message)
 
     actual = widget._create_cached_region_labels()
@@ -2556,9 +2617,238 @@ def test_cached_region_labels_do_not_access_nrrd_or_atlas_annotation(
     assert actual is result
     assert captured["profile"] is profile
     assert captured["region_ids"] == [10, 11]
-    assert captured["kwargs"]["direct_region_ids"] == [10]
+    assert captured["kwargs"]["direct_region_ids"] == [10, 11]
     assert captured["kwargs"]["include_surfaces"] is False
     assert captured["kwargs"]["include_outlines"] is False
+    assert captured["metadata"]["region_selection_source"] == "custom_regions"
+    assert captured["metadata"]["region_selection_scope"] == "current_table"
+    assert captured["metadata"]["selected_region_acronyms"] == ["R10", "R11"]
+
+
+def test_cached_allen_layer_labels_create_synchronized_planar_stack(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._active_cache_profile = profile
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._selected_region_ids_provider = lambda: [1, 10, 11]
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._selected_region_scope_provider = lambda: "whole_parquet"
+
+    class _AtlasWithoutAnnotation:
+        atlas_name = "allen_mouse_25um"
+        structures = {}
+
+        @property
+        def annotation(self):
+            raise AssertionError("cached planar labels must not access annotation")
+
+    atlas = _AtlasWithoutAnnotation()
+    widget._atlas_provider = lambda: atlas
+    layer_map = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        atlas_version="1.2.3",
+        layer_labels=("L1", "L2/3", "L4", "L5", "L6a", "L6b"),
+    )
+    widget._current_allen_layer_map = lambda: layer_map
+    summary = types.SimpleNamespace(
+        labeled_bins=2,
+        to_dict=lambda: {
+            "labeled_bins": 2,
+            "output_shape": [6, 2, 2],
+        },
+    )
+    result = types.SimpleNamespace(
+        labels=np.asarray(
+            [
+                [[10, 0], [0, 0]],
+                [[0, 0], [0, 11]],
+                [[0, 0], [0, 0]],
+                [[0, 0], [0, 0]],
+                [[0, 0], [0, 0]],
+                [[0, 0], [0, 0]],
+            ],
+            dtype=np.int32,
+        ),
+        profile_id="profile-1",
+        selected_region_ids=(1, 10, 11),
+        layer_mapped_region_ids=(10, 11),
+        represented_region_ids=(10, 11),
+        layer_labels=layer_map.layer_labels,
+        summary=summary,
+    )
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    captured = {}
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_allen_layer_region_selection",
+        lambda received_profile, region_ids, **kwargs: (
+            captured.update(
+                profile=received_profile,
+                region_ids=region_ids,
+                kwargs=kwargs,
+            )
+            or result
+        ),
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_selection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("planar labels must use the Allen-layer materializer")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached planar labels must not load NRRDs")
+        ),
+    )
+
+    actual = widget._create_cached_region_labels()
+
+    assert actual is result
+    assert captured["profile"] is profile
+    assert captured["region_ids"] == [1, 10, 11]
+    assert captured["kwargs"]["style"] == "both_shaped"
+    assert captured["kwargs"]["layer_map"] is layer_map
+    layer = widget._region_labels_layer
+    assert layer.name == "Flatmap Region Labels"
+    np.testing.assert_array_equal(layer.data, result.labels)
+    assert layer.axis_labels == widget._allen_layer_axis_labels()
+    assert layer.metadata["flatmap_plane_mode"] == "allen_layers"
+    assert layer.metadata["allen_layer_labels"] == list(layer_map.layer_labels)
+    assert layer.metadata["allen_atlas_identity"] == {
+        "name": "allen_mouse_25um",
+        "version": "1.2.3",
+    }
+    assert layer.metadata["layer_mapped_region_ids"] == [10, 11]
+    assert layer.metadata["region_selection_source"] == "custom_regions"
+    assert layer.metadata["region_selection_scope"] == "whole_parquet"
+    assert widget._viewer.dims.ndisplay == 2
+    assert layer.slice_dims_calls[-1] == (widget._viewer.dims, True)
+    assert "6 Allen layer planes" in widget._region_labels_status_label.text
+
+
+def test_cached_allen_layer_labels_reject_unmapped_and_clear_empty_results(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._active_cache_profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._selected_region_ids_provider = lambda: [99]
+    widget._current_allen_layer_map = lambda: object()
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    result = types.SimpleNamespace(
+        labels=np.zeros((6, 2, 2), dtype=np.int32),
+        layer_mapped_region_ids=(),
+        represented_region_ids=(),
+        summary=types.SimpleNamespace(labeled_bins=0),
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_allen_layer_region_selection",
+        lambda *_args, **_kwargs: result,
+    )
+
+    with pytest.raises(RuntimeError, match="no terminal Allen Isocortex"):
+        widget._create_cached_region_labels()
+
+    stale = _DummyLayer(
+        np.ones((6, 2, 2), dtype=np.int32),
+        name="Flatmap Region Labels",
+    )
+    widget._viewer.layers.append(stale)
+    widget._region_labels_layer = stale
+    result.layer_mapped_region_ids = (99,)
+
+    with pytest.raises(RuntimeError, match="no occupancy"):
+        widget._create_cached_region_labels()
+
+    assert stale not in widget._viewer.layers
+    assert widget._region_labels_layer is None
+
+
+def test_cached_depth_labels_clear_stale_layer_when_selection_has_no_occupancy(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._active_cache_profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._selected_region_ids_provider = lambda: [101]
+    widget._selected_geometry_region_ids_provider = lambda: [101]
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    stale = _DummyLayer(
+        np.ones((1, 2, 2), dtype=np.int32),
+        name="Flatmap Region Labels",
+    )
+    widget._viewer.layers.append(stale)
+    widget._region_labels_layer = stale
+    result = types.SimpleNamespace(
+        labels=np.zeros((1, 2, 2), dtype=np.int32),
+        selected_region_ids=(101,),
+        represented_region_ids=(),
+        summary=types.SimpleNamespace(labeled_bins=0),
+    )
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_selection",
+        lambda *_args, **_kwargs: result,
+    )
+
+    with pytest.raises(RuntimeError, match="no occupancy"):
+        widget._create_cached_region_labels()
+
+    assert stale not in widget._viewer.layers
+    assert widget._region_labels_layer is None
+
+
+def test_flatmap_region_selection_errors_are_source_aware(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._selected_region_ids_provider = lambda: []
+    widget._selected_region_source_provider = lambda: "custom_regions"
+
+    with pytest.raises(RuntimeError, match="Custom Region"):
+        widget._selected_region_ids_for_labels()
+
+    message = "The loaded atlas cannot provide Custom Isocortex Layers."
+    widget._selected_region_error_provider = lambda: message
+    with pytest.raises(RuntimeError, match=message):
+        widget._selected_region_ids_for_labels()
+
+    widget._selected_region_error_provider = lambda: None
+    widget._selected_region_source_provider = lambda: "mask_layer"
+    with pytest.raises(RuntimeError, match="do not support Mask Layer"):
+        widget._selected_region_ids_for_labels()
+
+    widget._active_cache_profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._selected_geometry_region_ids_provider = lambda: []
+    widget._atlas_provider = lambda: types.SimpleNamespace(structures={})
+    with pytest.raises(RuntimeError, match="Custom Region"):
+        widget._cached_geometry_inputs()
 
 
 def test_cached_region_geometry_uses_only_materialized_cache_arrays(
@@ -2570,7 +2860,10 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     widget._active_cache_profile = profile
     widget._region_cache_dir = Path("cache")
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
-    widget._selected_parent_region_ids_provider = lambda: [10]
+    widget._selected_geometry_region_ids_provider = lambda: [11, 10, 10]
+    widget._selected_region_acronyms_provider = lambda: ["VISp", "MOp"]
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._selected_region_scope_provider = lambda: "current_table"
     widget._region_surfaces_layers = []
     widget._region_outlines_layers = []
 
@@ -2579,8 +2872,15 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
             10: {
                 "id": 10,
                 "acronym": "VISp",
+                "name": "Primary visual area",
                 "rgb_triplet": [12, 34, 56],
-            }
+            },
+            11: {
+                "id": 11,
+                "acronym": "MOp",
+                "name": "Primary motor area",
+                "rgb_triplet": [78, 90, 123],
+            },
         }
 
         @property
@@ -2599,6 +2899,8 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
 
     import napari_swc_viewer.flatmap_region_cache as cache_module
 
+    materialized_surfaces = []
+    materialized_outlines = []
     surface = types.SimpleNamespace(
         vertices=np.asarray(
             [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -2616,12 +2918,18 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     monkeypatch.setattr(
         cache_module,
         "materialize_region_surface",
-        lambda received_profile, region_id, **kwargs: surface,
+        lambda received_profile, region_id, **kwargs: (
+            materialized_surfaces.append((received_profile, region_id, kwargs["style"]))
+            or surface
+        ),
     )
     monkeypatch.setattr(
         cache_module,
         "materialize_region_outlines",
-        lambda received_profile, region_id, **kwargs: outlines,
+        lambda received_profile, region_id, **kwargs: (
+            materialized_outlines.append((received_profile, region_id, kwargs["style"]))
+            or outlines
+        ),
     )
     monkeypatch.setattr(
         module,
@@ -2635,11 +2943,83 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     widget._create_region_outlines()
 
     assert [layer.name for layer in widget._viewer.layers] == [
-        "Flatmap Region Surfaces",
-        "Flatmap Region Outlines",
+        "Flatmap Region Surfaces: VISp (10)",
+        "Flatmap Region Surfaces: MOp (11)",
+        "Flatmap Region Outlines: VISp (10)",
+        "Flatmap Region Outlines: MOp (11)",
     ]
-    assert widget._viewer.layers[0].metadata["source"] == "precomputed_cache"
-    assert widget._viewer.layers[1].metadata["source"] == "precomputed_cache"
+    assert materialized_surfaces == [
+        (profile, 10, "both_shaped"),
+        (profile, 11, "both_shaped"),
+    ]
+    assert materialized_outlines == [
+        (profile, 10, "both_shaped"),
+        (profile, 11, "both_shaped"),
+    ]
+    expected_visp = np.asarray([12, 34, 56, 255], dtype=float) / 255
+    np.testing.assert_allclose(widget._viewer.layers[0].colormap[0], expected_visp)
+    np.testing.assert_allclose(widget._viewer.layers[2].edge_color, expected_visp)
+    for layer in widget._viewer.layers:
+        assert layer.metadata["source"] == "precomputed_cache"
+        assert layer.metadata["region_selection_source"] == "custom_regions"
+        assert layer.metadata["region_selection_scope"] == "current_table"
+        assert layer.metadata["selected_region_ids"] == [10, 11]
+        assert layer.metadata["selected_region_acronyms"] == ["VISp", "MOp"]
+    assert widget._viewer.layers[0].metadata["region_name"] == "Primary visual area"
+    assert widget._viewer.layers[1].metadata["region_acronym"] == "MOp"
+
+
+def test_empty_custom_geometry_replaces_stale_layer_families(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._active_cache_profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._selected_geometry_region_ids_provider = lambda: [101]
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._atlas_provider = lambda: types.SimpleNamespace(
+        structures={
+            101: {
+                "id": 101,
+                "acronym": "C101",
+                "rgb_triplet": [1, 2, 3],
+            }
+        }
+    )
+    stale_surface = _DummyLayer(
+        np.zeros((1, 3), dtype=np.float32),
+        name="Flatmap Region Surfaces: OLD (1)",
+    )
+    stale_outline = _DummyLayer(
+        np.zeros((1, 2, 3), dtype=np.float32),
+        name="Flatmap Region Outlines: OLD (1)",
+    )
+    widget._viewer.layers.extend([stale_surface, stale_outline])
+    widget._region_surfaces_layers = [stale_surface]
+    widget._region_outlines_layers = [stale_outline]
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_surface",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_region_outlines",
+        lambda *_args, **_kwargs: None,
+    )
+
+    widget._create_region_surfaces()
+
+    assert stale_surface not in widget._viewer.layers
+    assert stale_outline in widget._viewer.layers
+    assert widget._region_surfaces_layers == []
+
+    widget._create_region_outlines()
+
+    assert stale_outline not in widget._viewer.layers
+    assert widget._region_outlines_layers == []
 
 
 def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> None:

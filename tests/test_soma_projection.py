@@ -2949,6 +2949,30 @@ def _bind_region_query_scope_helpers(widget) -> None:
         NeuronViewerWidget._active_custom_region_groups,
         widget,
     )
+    widget._active_flatmap_region_ids = types.MethodType(
+        NeuronViewerWidget._active_flatmap_region_ids,
+        widget,
+    )
+    widget._active_flatmap_parent_region_ids = types.MethodType(
+        NeuronViewerWidget._active_flatmap_parent_region_ids,
+        widget,
+    )
+    widget._active_flatmap_region_acronyms = types.MethodType(
+        NeuronViewerWidget._active_flatmap_region_acronyms,
+        widget,
+    )
+    widget._active_flatmap_region_source = types.MethodType(
+        NeuronViewerWidget._active_flatmap_region_source,
+        widget,
+    )
+    widget._active_flatmap_region_scope = types.MethodType(
+        NeuronViewerWidget._active_flatmap_region_scope,
+        widget,
+    )
+    widget._active_flatmap_region_error = types.MethodType(
+        NeuronViewerWidget._active_flatmap_region_error,
+        widget,
+    )
     widget._active_region_preview_acronyms = types.MethodType(
         NeuronViewerWidget._active_region_preview_acronyms,
         widget,
@@ -4307,9 +4331,7 @@ def test_custom_region_scope_change_updates_scope_specific_reference_layers() ->
     widget._update_region_meshes.assert_not_called()
     widget._update_region_segmentation.assert_not_called()
     widget._update_custom_region_meshes.assert_called_once_with((current_group,))
-    widget._update_custom_region_segmentation.assert_called_once_with(
-        (current_group,)
-    )
+    widget._update_custom_region_segmentation.assert_called_once_with((current_group,))
 
 
 def test_custom_selection_change_refreshes_only_when_custom_source_is_active() -> None:
@@ -4328,6 +4350,97 @@ def test_custom_selection_change_refreshes_only_when_custom_source_is_active() -
     widget._sync_active_region_reference_layers.reset_mock()
     NeuronViewerWidget._on_custom_regions_selected(widget, [101])
     widget._sync_active_region_reference_layers.assert_not_called()
+
+
+def test_flatmap_region_selection_follows_active_source_and_scope() -> None:
+    whole_group = CustomRegionSelectionGroup(
+        label="L1",
+        region_ids=(102, 101),
+        acronyms=("C102", "C101"),
+    )
+    current_group = CustomRegionSelectionGroup(
+        label="L2/3",
+        region_ids=(202,),
+        acronyms=("C202",),
+    )
+    widget = types.SimpleNamespace(
+        _region_query_source="Atlas Regions",
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _whole_parquet_region_selector=_DummyRegionSelector(
+            direct_ids=[10],
+            query_ids=[12, 10, 11],
+            direct_acronyms=["PARENT"],
+            query_acronyms=["R12", "PARENT", "R11"],
+        ),
+        _current_table_region_selector=_DummyRegionSelector(
+            direct_ids=[20],
+            query_ids=[21, 20],
+            direct_acronyms=["CURRENT"],
+            query_acronyms=["R21", "CURRENT"],
+        ),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector(
+            [102, 101, 101],
+            region_groups=(whole_group,),
+        ),
+        _current_table_custom_region_selector=_DummyCustomRegionSelector(
+            [202],
+            region_groups=(current_group,),
+        ),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    assert widget._active_flatmap_region_ids() == [10, 11, 12]
+    assert widget._active_flatmap_parent_region_ids() == [10]
+    assert widget._active_flatmap_region_acronyms() == [
+        "R12",
+        "PARENT",
+        "R11",
+    ]
+    assert widget._active_flatmap_region_source() == "atlas_regions"
+    assert widget._active_flatmap_region_scope() == "whole_parquet"
+    assert widget._active_flatmap_region_error() is None
+
+    widget._region_query_source = "Custom Regions"
+
+    assert widget._active_flatmap_region_ids() == [101, 102]
+    assert widget._active_flatmap_parent_region_ids() == [101, 102]
+    assert widget._active_flatmap_region_acronyms() == ["C101", "C102"]
+    assert widget._active_flatmap_region_source() == "custom_regions"
+    assert widget._active_flatmap_region_error() is None
+
+    widget._region_query_scope_combo = _DummyComboBox(
+        "Current Table",
+        data="current",
+    )
+
+    assert widget._active_flatmap_region_ids() == [202]
+    assert widget._active_flatmap_parent_region_ids() == [202]
+    assert widget._active_flatmap_region_acronyms() == ["C202"]
+    assert widget._active_flatmap_region_scope() == "current_table"
+
+    widget._region_query_source = "Mask Layer"
+
+    assert widget._active_flatmap_region_ids() == []
+    assert widget._active_flatmap_parent_region_ids() == []
+    assert widget._active_flatmap_region_acronyms() == []
+    assert widget._active_flatmap_region_source() == "mask_layer"
+    assert "do not support Mask Layer" in widget._active_flatmap_region_error()
+
+
+def test_flatmap_custom_region_error_preserves_hierarchy_message() -> None:
+    message = "The loaded atlas has no compatible terminal layer hierarchy."
+    widget = types.SimpleNamespace(
+        _region_query_source="Custom Regions",
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector(
+            has_hierarchy=False,
+            unavailable_message=message,
+        ),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    assert widget._active_flatmap_region_ids() == []
+    assert widget._active_flatmap_region_error() == message
 
 
 def test_update_custom_region_meshes_creates_at_most_one_layer_per_group(
@@ -4396,9 +4509,7 @@ def test_update_custom_region_segmentation_passes_exact_terminal_ids(
     atlas = object()
     add_segmentation = MagicMock()
     remove_segmentation = MagicMock()
-    globals_dict = (
-        NeuronViewerWidget._update_custom_region_segmentation.__globals__
-    )
+    globals_dict = NeuronViewerWidget._update_custom_region_segmentation.__globals__
     monkeypatch.setitem(
         globals_dict,
         "add_region_id_segmentation",

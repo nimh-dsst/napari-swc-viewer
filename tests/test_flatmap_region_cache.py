@@ -15,12 +15,14 @@ from napari_swc_viewer.flatmap_region_cache import (
     RegionCacheCancelled,
     RegionCacheValidationError,
     build_region_cache_profile,
+    materialize_allen_layer_region_selection,
     materialize_region_outlines,
     materialize_region_selection,
     materialize_region_surface,
     open_region_cache,
     structure_catalog_id,
 )
+from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
 
 
 def _lookup_arrays():
@@ -73,6 +75,57 @@ def _build(cache_dir: Path, **kwargs):
         depth_bin_um=10,
         chunk_voxels=2,
         **kwargs,
+    )
+
+
+def _allen_layer_map() -> AllenIsocortexLayerMap:
+    return AllenIsocortexLayerMap(
+        atlas_name="test_mouse",
+        isocortex_region_id=1,
+        region_to_layer_index={10: 0, 11: 0, 12: 1, 13: 2},
+        region_ids_by_layer=((10, 11), (12,), (13,), (), (), ()),
+    )
+
+
+def _build_planar_cache(cache_dir: Path):
+    shape = (2, 2, 2)
+    shaped = np.full((*shape, 2), 0.25, dtype=np.float32)
+    square = np.full((*shape, 2), 0.25, dtype=np.float32)
+    depth = np.asarray(
+        [
+            [[0.0, 10.0], [0.0, 10.0]],
+            [[0.0, 0.0], [0.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    annotation = np.asarray(
+        [
+            [[10, 10], [11, 11]],
+            [[12, 0], [0, 0]],
+        ],
+        dtype=np.int32,
+    )
+    bounds = {
+        style: {
+            "x_bounds": (0.0, 1.0),
+            "y_bounds": (0.0, 1.0),
+            "depth_bounds_um": (0.0, 20.0),
+        }
+        for style in ("shaped", "square")
+    }
+    return build_region_cache_profile(
+        cache_dir,
+        annotation=annotation,
+        shaped_flatmap=shaped,
+        square_flatmap=square,
+        depth=depth,
+        lookup_set_id="planar-lookup-set",
+        atlas_name="test_mouse",
+        atlas_resolution_um=10,
+        xy_bins=2,
+        depth_bin_um=10,
+        bounds_by_style=bounds,
+        chunk_voxels=2,
     )
 
 
@@ -183,6 +236,57 @@ def test_region_cache_round_trip_and_parent_geometry(tmp_path):
     assert materialize_region_outlines(profile, 1, style="shaped").vectors.shape[
         1:
     ] == (2, 3)
+
+
+@pytest.mark.parametrize("style", ["shaped", "square"])
+def test_allen_layer_region_selection_collapses_depth_and_resolves_collisions(
+    tmp_path,
+    style,
+):
+    profile = _build_planar_cache(tmp_path / "cache")
+
+    result = materialize_allen_layer_region_selection(
+        profile,
+        [1, 10, 11, 12],
+        style=style,
+        layer_map=_allen_layer_map(),
+    )
+
+    assert result.labels.shape == (6, 2, 2)
+    assert result.labels.dtype == np.int32
+    # Regions 10 and 11 each contribute two source voxels after depth
+    # collapse, so the smaller region ID wins their shared planar bin.
+    assert result.labels[0, 0, 0] == 10
+    # Region 12 occupies the same XY bin in another Allen plane.
+    assert result.labels[1, 0, 0] == 12
+    assert np.count_nonzero(result.labels) == 2
+    assert result.selected_region_ids == (1, 10, 11, 12)
+    assert result.layer_mapped_region_ids == (10, 11, 12)
+    assert result.represented_region_ids == (10, 11, 12)
+    assert result.layer_labels == ("L1", "L2/3", "L4", "L5", "L6a", "L6b")
+    assert result.summary.collision_bins == 1
+    assert result.summary.source_voxel_count == 5
+    assert result.summary.excluded_non_layer_region_count == 1
+    assert result.summary.to_dict()["output_shape"] == [6, 2, 2]
+    assert result.grid_spec["coordinate_order"] == ["allen_layer", "y", "x"]
+    assert result.grid_spec["plane_mode"] == "allen_layers"
+    assert result.style == style
+
+
+def test_allen_layer_region_selection_reports_mapped_but_empty_regions(tmp_path):
+    profile = _build_planar_cache(tmp_path / "cache")
+
+    result = materialize_allen_layer_region_selection(
+        profile,
+        [13],
+        style="shaped",
+        layer_map=_allen_layer_map(),
+    )
+
+    assert result.layer_mapped_region_ids == (13,)
+    assert result.represented_region_ids == ()
+    assert result.summary.labeled_bins == 0
+    assert not np.any(result.labels)
 
 
 def test_region_cache_close_releases_loaded_maps_and_is_terminal(tmp_path):

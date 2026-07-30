@@ -354,10 +354,14 @@ projecting meshes, or converting region coordinates while viewing.
    removed and the status asks the user to click **Project to Flatmap** again.
 5. **Action:** Select a parent region, enable child regions, then click **Show
    Region Labels**, **Show Region Surfaces**, and **Show Region Outlines**.
+   Then choose **Custom Regions**, select two terminal leaves, and click the
+   same actions again.
    **Expected:** Labels apply the include-child-expanded selection. The surface
    and outlines use the selected parent's cached descendant union and atlas
-   color. The resulting **Flatmap Region Labels**, **Flatmap Region Surfaces**,
-   and **Flatmap Region Outlines** layers align with the neuron heatmap.
+   color. With Custom Regions active, labels and one atlas-colored
+   surface/outline layer per exact terminal ID replace the Atlas selection.
+   The resulting **Flatmap Region Labels**, **Flatmap Region Surfaces**, and
+   **Flatmap Region Outlines** layers align with the neuron heatmap.
 6. **Action:** Switch between **Both hemispheres, shaped** and **Both
    hemispheres, square** without changing the Parquet or cache directory, then
    project and show the desired cached region layers again.
@@ -459,6 +463,9 @@ cluster color modes create one six-plane stack per color group.
 - Load a neuron Parquet with Allen `region_id` annotations and valid flatmap
   coordinates. For **Precomputed Parquet + Cache**, use a version-3 Parquet
   produced by UC-003.
+- Complete UC-004 and keep a compatible flatmap region cache. Select at least
+  one Atlas Regions parent or Custom Regions terminal leaf so the planar label
+  overlay can be checked.
 - Include neurons with nodes in at least two Allen Isocortex layers. Include an
   agranular cortical area without layer 4 when test data is available.
 - Start from a clean napari session with the **SWC Viewer** plugin open.
@@ -467,45 +474,68 @@ cluster color modes create one six-plane stack per color group.
 
 1. **Action:** In the neuron table, select one or more rows. Open **Flatmap**,
    choose **Precomputed Parquet + Cache**, select **Both hemispheres, shaped**,
-   and set **Render** to **Allen Layer Heatmap (2D stack)**.
+   choose the compatible cache directory/profile, and set **Render** to
+   **Allen Layer Heatmap (2D stack)**.
    **Expected:** **XY bins** remains available unless locked by the active
    cache profile. **Depth bin** and **Exclude depth -1 nodes** are disabled
-   because numeric depth does not assign Allen layers. Cached region label,
-   surface, and outline actions are unavailable in this mode.
-2. **Action:** Keep **Heatmap colors** at **Single color** and click **Project
+   because numeric depth does not assign Allen layers. **Show Region Labels**
+   is available for the active cache, while cached surfaces and outlines
+   remain unavailable because their geometry is depth-based.
+2. **Action:** In **Regions**, choose **Atlas Regions**, select a cortical
+   parent region, return to **Flatmap**, and click **Show Region Labels**
+   before projecting neurons.
+   **Expected:** The detached **SWC Viewer Flatmap** can open with a label-only
+   2D stack named **Flatmap Region Labels**. It has six planes ordered `L1`,
+   `L2/3`, `L4`, `L5`, `L6a`, `L6b`, contains only the selected region's
+   terminal Allen-layer descendants, uses atlas colors, and reads only the
+   active cache arrays and structure catalog—not NRRDs or `atlas.annotation`.
+3. **Action:** Keep **Heatmap colors** at **Single color** and click **Project
    to Flatmap**.
    **Expected:** The detached **SWC Viewer Flatmap** opens in 2D with one image
    layer named **Isocortex Flatmap Allen Layers**. Its first axis identifies
    indices `0` through `5` as `L1`, `L2/3`, `L4`, `L5`, `L6a`, and `L6b`.
-3. **Action:** Move the first-axis slider through all six positions.
-   **Expected:** Each position shows only nodes whose `region_id` belongs to
-   that terminal Allen Isocortex layer. A cortical area without layer 4 is
-   blank in that area on the `L4` plane; it is not filled by a depth estimate.
-4. **Action:** Compare the projection summary with an independent count of the
+   The existing **Flatmap Region Labels** layer remains aligned with it.
+4. **Action:** Move the first-axis slider through all six positions.
+   **Expected:** The heatmap and Labels layer change planes together. Each
+   position shows only nodes and region labels assigned to that terminal Allen
+   Isocortex layer. A cortical area without layer 4 is blank in that area on
+   the `L4` plane; it is not filled by a depth estimate.
+5. **Action:** Choose **Custom Regions**, select terminal leaves from two
+   layers, and click **Show Region Labels** again.
+   **Expected:** The existing Labels layer is updated rather than duplicated.
+   Only the exact checked terminal IDs are included and each appears on its
+   mapped Allen plane; the retained Atlas Regions selection does not contribute.
+   Regions competing for one plane/XY bin use greatest source-voxel occupancy,
+   with the smaller region ID winning ties.
+6. **Action:** Compare the projection summary with an independent count of the
    selected Parquet rows by the corresponding Allen layer region IDs.
    **Expected:** The total rendered-node count and all six per-layer counts
    agree. Flatmap-invalid, non-Isocortex, parent-level, unannotated, and
    otherwise non-laminar nodes are reported as excluded and do not appear.
-5. **Action:** Repeat with **Both hemispheres, square**, **All table rows**,
+7. **Action:** Repeat with **Both hemispheres, square**, **All table rows**,
    **Individual neurons**, and **Cluster**.
    **Expected:** Shaped and square stacks use their recorded canonical XY
    grids. Input selection is respected. Individual and cluster modes create
    one synchronized six-plane stack per neuron or cluster using existing
-   colors.
-6. **Action:** Choose **Recompute from NRRDs**, select the matching flatmap and
+   colors. Stale labels from the prior style are removed; showing them again
+   uses the new style's cache grid.
+8. **Action:** Choose **Recompute from NRRDs**, select the matching flatmap and
    depth NRRDs, and project the same neurons.
    **Expected:** The materialized result has the same layer assignments and
    node-count semantics. **Export CSV...** includes `allen_layer_index` and
-   `allen_layer_label` for every classified node.
-7. **Action:** Switch **Render** back to **3D Heatmap**.
+   `allen_layer_label` for every classified node. Planar cached labels,
+   surfaces, and outlines are unavailable in this explicit fallback mode.
+9. **Action:** Switch **Render** back to **3D Heatmap**.
    **Expected:** The categorical stack is removed, numeric depth controls and
    compatible cached-region actions return, and a new projection uses the
    original depth-binned behavior.
-8. **Action:** Retry layer rendering without a loaded atlas, then with a
-   Parquet missing `region_id`, and finally with selected neurons that have no
-   flatmap-valid terminal Isocortex-layer nodes.
+10. **Action:** Retry layer rendering without a loaded atlas, then with a
+    Parquet missing `region_id`, and finally with selected neurons that have no
+    flatmap-valid terminal Isocortex-layer nodes. Also try **Show Region
+    Labels** with no active Atlas/Custom selection, a non-Isocortex-only Atlas
+    selection, and terminal layer regions with no occupancy in the active cache.
    **Expected:** Each attempt reports a specific corrective message and does
-   not leave a blank detached flatmap window.
+   not leave a blank detached flatmap window or a stale Labels overlay.
 
 **Manual verification**
 
@@ -521,8 +551,9 @@ The user can visually inspect the terminal Allen regions assigned to each of
 the six Isocortex layer groups and query neurons using exactly those displayed
 `region_id` values. The synthetic hierarchy is computed from the currently
 loaded atlas and remains independent of the ordinary atlas-region selection
-and flatmap overlays. While Custom Regions is active, its checked terminal
-regions can also drive the Reference-tab meshes and segmentation preview.
+while retaining the same Allen identities. While Custom Regions is active, its
+checked terminal regions can drive Reference-tab previews and flatmap labels,
+surfaces, and outlines.
 
 **Prerequisites**
 
@@ -533,6 +564,8 @@ regions can also drive the Reference-tab meshes and segmentation preview.
   layers and at least one non-Isocortex region.
 - Put a strict subset of the Parquet's neurons in **Selected Neurons** so the
   two search scopes can be distinguished.
+- Complete UC-004 and keep its compatible version-3 Parquet and flatmap region
+  cache so cached labels, surfaces, and outlines can be exercised.
 - From the repository root, optionally run
   `pixi run python scripts/audit_allen_isocortex_layers.py` to print the
   independently inspectable region list and counts for `allen_mouse_25um`.
@@ -589,17 +622,48 @@ regions can also drive the Reference-tab meshes and segmentation preview.
 8. **Action:** Switch **Query source** between **Atlas Regions** and
    **Custom Regions** while both Reference controls remain enabled.
    **Expected:** The existing preview layers are replaced using the active
-   source and scope. Both selectors retain their own selections. Custom
-   selections do not change Flatmap Region Labels, cached surfaces, or
-   outlines, which remain Atlas Regions-only.
-9. **Action:** Exercise the error cases: query with no custom leaf selected;
-   use an empty Current Table; load a Parquet without `region_id`; and load an
-   atlas whose structure catalog cannot produce all six Isocortex layers.
-   **Expected:** Each case reports an actionable message and does not perform a
-   misleading query. An incompatible or missing atlas leaves the Custom
-   Regions page in an explanatory empty state and does not open or download a
-   second atlas. A valid selection with no matching neurons reports zero
-   results without error.
+   source and scope. Both selectors retain their own selections.
+9. **Action:** Keep **Custom Regions** active, select two terminal leaves, open
+   **Flatmap**, choose **Precomputed Parquet + Cache**, activate the compatible
+   profile, set **Render** to **3D Heatmap**, and click **Show Region Labels**,
+   **Show Region Surfaces**, and **Show Region Outlines**.
+   **Expected:** **Flatmap Region Labels** contains exactly the checked
+   terminal IDs. One atlas-colored surface and one outline layer are created
+   per selected terminal region, with its acronym and numeric ID in the layer
+   name. No unchecked descendant, synthetic layer union, or Atlas Regions
+   selection contributes. Viewing reads cache arrays and the atlas structure
+   catalog without loading NRRDs, `atlas.annotation`, or BrainGlobe meshes.
+10. **Action:** Change the Custom Regions selection and click each **Show**
+    action again; then switch between **Whole Parquet** and **Current Table**
+    and repeat with the different retained selection.
+    **Expected:** The existing Labels layer is updated instead of duplicated.
+    Each geometry family is replaced with one layer per terminal ID from the
+    active scope. Selection changes do not rebuild flatmap layers until the
+    corresponding **Show** action is clicked.
+11. **Action:** Set **Render** to **Allen Layer Heatmap (2D stack)** and click
+    **Show Region Labels**, then project neurons and move the first-axis slider.
+    Repeat after switching between shaped and square styles.
+    **Expected:** The selected custom terminal regions appear only on their
+    corresponding `L1`, `L2/3`, `L4`, `L5`, `L6a`, or `L6b` planes. The
+    labels and heatmap remain synchronized and aligned on each style's grid.
+    Cached surfaces and outlines remain disabled because they are depth-based.
+12. **Action:** Switch **Query source** to **Atlas Regions**, show its
+    overlays, then switch to **Mask Layer** and try the same actions.
+    **Expected:** Atlas actions retain include-child labels and parent-union
+    geometry. Mask selections never fall back to a retained Atlas selection
+    and instead report that flatmap atlas overlays require Atlas or Custom
+    Regions.
+13. **Action:** Exercise the error cases: query or render with no custom leaf
+    selected; use an empty Current Table; load a Parquet without `region_id`;
+    load an atlas whose structure catalog cannot produce all six Isocortex
+    layers; and select a valid terminal region with no occupancy or geometry
+    in the active cache.
+    **Expected:** Each case reports an actionable message and does not perform
+    a misleading query. An incompatible or missing atlas leaves the Custom
+    Regions page in an explanatory empty state and does not open or download a
+    second atlas. A valid query selection with no matching neurons reports zero
+    results without error. A valid render selection with no cached data clears
+    the stale overlay family and reports that nothing was represented.
 
 **Manual verification**
 

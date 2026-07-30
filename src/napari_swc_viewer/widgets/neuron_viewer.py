@@ -2542,10 +2542,13 @@ class NeuronViewerWidget(QWidget):
                 cluster_map_provider=self._neuron_table.get_cluster_map,
                 atlas_provider=lambda: self._atlas,
                 selected_region_ids_provider=self._active_flatmap_region_ids,
-                selected_parent_region_ids_provider=(
+                selected_geometry_region_ids_provider=(
                     self._active_flatmap_parent_region_ids
                 ),
                 selected_region_acronyms_provider=self._active_flatmap_region_acronyms,
+                selected_region_source_provider=(self._active_flatmap_region_source),
+                selected_region_scope_provider=self._active_flatmap_region_scope,
+                selected_region_error_provider=self._active_flatmap_region_error,
                 display_viewer_provider=self._get_or_create_flatmap_viewer,
                 display_viewer_ready_callback=(self._on_flatmap_display_viewer_ready),
                 display_viewer_failed_callback=(self._on_flatmap_display_viewer_failed),
@@ -7069,7 +7072,25 @@ class NeuronViewerWidget(QWidget):
         return True
 
     def _active_flatmap_region_ids(self) -> list[int]:
-        """Return selected atlas IDs for flatmap region-label overlays."""
+        """Return active-source atlas IDs for flatmap region-label overlays."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_CUSTOM:
+            selector = self._active_custom_region_selector()
+            if selector is None:
+                return []
+            get_selected = getattr(selector, "get_selected_region_ids", None)
+            if not callable(get_selected):
+                return []
+            return sorted(
+                {int(region_id) for region_id in get_selected() if int(region_id) > 0}
+            )
+        if source != _REGION_QUERY_SOURCE_ATLAS:
+            return []
+
         selector = self._active_region_selector()
         if selector is None:
             return []
@@ -7077,20 +7098,64 @@ class NeuronViewerWidget(QWidget):
         get_selected = getattr(selector, "get_selected_ids", None)
         if not callable(get_selected):
             return []
-        return [int(region_id) for region_id in get_selected(include_children=True)]
+        return sorted(
+            {
+                int(region_id)
+                for region_id in get_selected(include_children=True)
+                if int(region_id) > 0
+            }
+        )
 
     def _active_flatmap_parent_region_ids(self) -> list[int]:
-        """Return directly selected atlas IDs for cached union geometry."""
+        """Return active-source IDs for cached flatmap geometry."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_CUSTOM:
+            return self._active_flatmap_region_ids()
+        if source != _REGION_QUERY_SOURCE_ATLAS:
+            return []
+
         selector = self._active_region_selector()
         if selector is None:
             return []
         get_selected = getattr(selector, "get_selected_ids", None)
         if not callable(get_selected):
             return []
-        return [int(region_id) for region_id in get_selected(include_children=False)]
+        return sorted(
+            {
+                int(region_id)
+                for region_id in get_selected(include_children=False)
+                if int(region_id) > 0
+            }
+        )
 
     def _active_flatmap_region_acronyms(self) -> list[str]:
-        """Return selected atlas acronyms for flatmap region-label metadata."""
+        """Return active-source acronyms for flatmap-region metadata."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_CUSTOM:
+            acronym_by_id: dict[int, str] = {}
+            for group in self._active_custom_region_groups():
+                for region_id, acronym in zip(
+                    group.region_ids,
+                    group.acronyms,
+                    strict=True,
+                ):
+                    acronym_by_id.setdefault(int(region_id), str(acronym))
+            return [
+                acronym_by_id[region_id]
+                for region_id in self._active_flatmap_region_ids()
+                if region_id in acronym_by_id
+            ]
+        if source != _REGION_QUERY_SOURCE_ATLAS:
+            return []
+
         selector = self._active_region_selector()
         if selector is None:
             return []
@@ -7099,6 +7164,55 @@ class NeuronViewerWidget(QWidget):
         if not callable(get_selected):
             return []
         return [str(acronym) for acronym in get_selected(include_children=True)]
+
+    def _active_flatmap_region_source(self) -> str:
+        """Return the normalized Regions source used by flatmap actions."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        return {
+            _REGION_QUERY_SOURCE_ATLAS: "atlas_regions",
+            _REGION_QUERY_SOURCE_CUSTOM: "custom_regions",
+            _REGION_QUERY_SOURCE_MASK: "mask_layer",
+        }.get(source, "atlas_regions")
+
+    def _active_flatmap_region_scope(self) -> str:
+        """Return the normalized selector scope used by flatmap actions."""
+        return (
+            "current_table"
+            if self._selected_region_query_scope() == _REGION_QUERY_SCOPE_CURRENT
+            else "whole_parquet"
+        )
+
+    def _active_flatmap_region_error(self) -> str | None:
+        """Return an actionable error for an unavailable selection source."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_MASK:
+            return (
+                "Flatmap atlas overlays do not support Mask Layer selections. "
+                "Choose Atlas Regions or Custom Regions."
+            )
+        if source != _REGION_QUERY_SOURCE_CUSTOM:
+            return None
+
+        selector = self._active_custom_region_selector()
+        if selector is None:
+            return "Custom Isocortex Layers are unavailable for the loaded atlas."
+        has_hierarchy = getattr(selector, "has_hierarchy", None)
+        if callable(has_hierarchy) and not has_hierarchy():
+            unavailable_message = getattr(selector, "unavailable_message", None)
+            if callable(unavailable_message):
+                message = str(unavailable_message()).strip()
+                if message:
+                    return message
+            return "Custom Isocortex Layers are unavailable for the loaded atlas."
+        return None
 
     def _sync_region_query_scope_selector(self) -> None:
         """Show the atlas and custom selectors matching the query scope."""
@@ -7145,9 +7259,7 @@ class NeuronViewerWidget(QWidget):
             _REGION_QUERY_SOURCE_ATLAS,
         )
         if source == _REGION_QUERY_SOURCE_CUSTOM:
-            self._update_custom_region_segmentation(
-                self._active_custom_region_groups()
-            )
+            self._update_custom_region_segmentation(self._active_custom_region_groups())
             return
         self._update_region_segmentation(self._active_region_preview_acronyms())
 
@@ -8977,9 +9089,7 @@ class NeuronViewerWidget(QWidget):
             if self._atlas_load_running():
                 self._pending_reference_action = _REFERENCE_ACTION_SEGMENTATION
                 return
-            self._load_atlas(
-                pending_reference_action=_REFERENCE_ACTION_SEGMENTATION
-            )
+            self._load_atlas(pending_reference_action=_REFERENCE_ACTION_SEGMENTATION)
             return
 
         remove_region_segmentation(self.viewer)
@@ -8987,11 +9097,7 @@ class NeuronViewerWidget(QWidget):
             return
 
         region_ids = sorted(
-            {
-                int(region_id)
-                for group in groups
-                for region_id in group.region_ids
-            }
+            {int(region_id) for group in groups for region_id in group.region_ids}
         )
         if not region_ids:
             return
