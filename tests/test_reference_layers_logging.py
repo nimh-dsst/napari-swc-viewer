@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import types
 from pathlib import Path
+import sys
+import types
 
 import numpy as np
+
+from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
 
 
 def _import_reference_layers_module():
@@ -45,6 +48,73 @@ class _FakeViewer:
         return types.SimpleNamespace(data=data, kwargs=kwargs)
 
 
+class _FakeReferenceViewer:
+    def __init__(self) -> None:
+        self.surface_calls = []
+        self.labels_calls = []
+
+    def add_surface(self, data, **kwargs):
+        layer = types.SimpleNamespace(data=data, **kwargs)
+        self.surface_calls.append((data, kwargs))
+        return layer
+
+    def add_labels(self, data, **kwargs):
+        layer = types.SimpleNamespace(data=data, **kwargs)
+        self.labels_calls.append((data, kwargs))
+        return layer
+
+
+class _FakeMesh:
+    def __init__(self, points: np.ndarray, faces: np.ndarray) -> None:
+        self.points = np.asarray(points, dtype=np.float32)
+        self.cells = [types.SimpleNamespace(data=np.asarray(faces, dtype=np.int32))]
+
+
+class _FakeReferenceAtlas:
+    resolution = (25.0, 25.0, 25.0)
+
+    def __init__(self) -> None:
+        region_a = {
+            "id": 101,
+            "acronym": "AAA1",
+            "rgb_triplet": [255, 0, 0],
+        }
+        region_b = {
+            "id": 102,
+            "acronym": "BBB1",
+            "rgb_triplet": [0, 255, 0],
+        }
+        unrelated = {
+            "id": 999,
+            "acronym": "OTHER",
+            "rgb_triplet": [0, 0, 255],
+        }
+        self.structures = {
+            101: region_a,
+            102: region_b,
+            999: unrelated,
+            "AAA1": region_a,
+            "BBB1": region_b,
+            "OTHER": unrelated,
+        }
+        self.annotation = np.asarray([[[101, 102, 999, 0]]], dtype=np.int32)
+        self._meshes = {
+            "AAA1": _FakeMesh(
+                [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+                [[0, 1, 2]],
+            ),
+            "BBB1": _FakeMesh(
+                [[2, 0, 0], [3, 0, 0], [2, 1, 0]],
+                [[0, 1, 2]],
+            ),
+        }
+
+    def mesh_from_structure(self, acronym: str):
+        if acronym not in self._meshes:
+            raise FileNotFoundError(acronym)
+        return self._meshes[acronym]
+
+
 def test_add_allen_template_logs_reference_and_add_image_timings(caplog):
     """Template timing should isolate atlas access from napari layer creation."""
     module = _import_reference_layers_module()
@@ -72,3 +142,91 @@ def test_add_allen_template_logs_reference_and_add_image_timings(caplog):
         and "dtype=float32" in message
         for message in messages
     )
+
+
+def test_add_region_mesh_group_offsets_faces_and_preserves_colors() -> None:
+    module = _import_reference_layers_module()
+    viewer = _FakeReferenceViewer()
+    atlas = _FakeReferenceAtlas()
+    group = CustomRegionSelectionGroup(
+        label="L1",
+        region_ids=(101, 102),
+        acronyms=("AAA1", "BBB1"),
+    )
+
+    layer, missing = module.add_region_mesh_group(viewer, atlas, group)
+
+    assert missing == ()
+    assert layer is not None
+    assert len(viewer.surface_calls) == 1
+    vertices, faces = viewer.surface_calls[0][0]
+    np.testing.assert_array_equal(
+        faces,
+        np.asarray([[0, 1, 2], [3, 4, 5]], dtype=np.int32),
+    )
+    assert vertices.shape == (6, 3)
+    kwargs = viewer.surface_calls[0][1]
+    np.testing.assert_allclose(
+        kwargs["vertex_colors"][:3],
+        np.asarray([[1, 0, 0, 1]] * 3),
+    )
+    np.testing.assert_allclose(
+        kwargs["vertex_colors"][3:],
+        np.asarray([[0, 1, 0, 1]] * 3),
+    )
+    assert kwargs["name"] == "Region: Custom L1"
+    assert kwargs["scale"] == [0.04, 0.04, 0.04]
+    assert kwargs["metadata"]["selected_region_ids"] == [101, 102]
+
+
+def test_add_region_mesh_group_skips_unavailable_terminal_meshes() -> None:
+    module = _import_reference_layers_module()
+    viewer = _FakeReferenceViewer()
+    atlas = _FakeReferenceAtlas()
+    group = CustomRegionSelectionGroup(
+        label="L1",
+        region_ids=(101, 103),
+        acronyms=("AAA1", "MISSING1"),
+    )
+
+    layer, missing = module.add_region_mesh_group(viewer, atlas, group)
+
+    assert layer is not None
+    assert missing == ("MISSING1",)
+    assert layer.metadata["selected_region_ids"] == [101]
+    assert layer.metadata["missing_region_acronyms"] == ["MISSING1"]
+
+
+def test_add_region_id_segmentation_keeps_exact_ids_and_atlas_colors(
+    monkeypatch,
+) -> None:
+    module = _import_reference_layers_module()
+    viewer = _FakeReferenceViewer()
+    atlas = _FakeReferenceAtlas()
+
+    class _DirectLabelColormap:
+        def __init__(self, *, color_dict) -> None:
+            self.color_dict = color_dict
+
+    fake_napari_utils = types.ModuleType("napari.utils")
+    fake_napari_utils.DirectLabelColormap = _DirectLabelColormap
+    monkeypatch.setitem(sys.modules, "napari.utils", fake_napari_utils)
+
+    layer = module.add_region_id_segmentation(
+        viewer,
+        atlas,
+        [102, 101, 102],
+    )
+
+    assert layer is not None
+    np.testing.assert_array_equal(
+        layer.data,
+        np.asarray([[[101, 102, 0, 0]]], dtype=np.int32),
+    )
+    assert layer.metadata == {
+        "region_selection_source": "custom",
+        "selected_region_ids": [101, 102],
+        "exact_region_ids": True,
+    }
+    np.testing.assert_allclose(layer.colormap.color_dict[101], [1, 0, 0, 1])
+    np.testing.assert_allclose(layer.colormap.color_dict[102], [0, 1, 0, 1])

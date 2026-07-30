@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
 from napari_swc_viewer.neuron_table_ops import ClusterFilterSelection
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -27,6 +28,7 @@ _PATCHED_MODULE_NAMES = [
     "qtpy.QtWidgets",
     "napari_swc_viewer.widgets",
     "napari_swc_viewer.widgets.analysis_tab",
+    "napari_swc_viewer.widgets.custom_region_selector",
     "napari_swc_viewer.widgets.mask_layer_selector",
     "napari_swc_viewer.widgets.neuron_table",
     "napari_swc_viewer.widgets.region_selector",
@@ -34,9 +36,7 @@ _PATCHED_MODULE_NAMES = [
     "napari_swc_viewer.widgets.neuron_viewer",
     "napari_swc_viewer.widgets.slice_projection",
 ]
-_ORIGINAL_MODULES = {
-    name: sys.modules.get(name) for name in _PATCHED_MODULE_NAMES
-}
+_ORIGINAL_MODULES = {name: sys.modules.get(name) for name in _PATCHED_MODULE_NAMES}
 
 
 class _DummyAnalysisSignal:
@@ -190,6 +190,14 @@ fake_analysis_module = types.ModuleType("napari_swc_viewer.widgets.analysis_tab"
 fake_analysis_module.AnalysisTabWidget = _FakeAnalysisTabWidget
 sys.modules["napari_swc_viewer.widgets.analysis_tab"] = fake_analysis_module
 
+fake_custom_region_selector_module = types.ModuleType(
+    "napari_swc_viewer.widgets.custom_region_selector"
+)
+fake_custom_region_selector_module.CustomRegionSelectorWidget = _FakeWidget
+sys.modules["napari_swc_viewer.widgets.custom_region_selector"] = (
+    fake_custom_region_selector_module
+)
+
 fake_mask_selector_module = types.ModuleType(
     "napari_swc_viewer.widgets.mask_layer_selector"
 )
@@ -212,7 +220,9 @@ fake_reference_layers_module = types.ModuleType(
 for _name in (
     "add_allen_template",
     "add_brain_outline",
+    "add_region_id_segmentation",
     "add_region_mesh",
+    "add_region_mesh_group",
     "add_region_segmentation",
     "remove_region_layers",
     "remove_region_segmentation",
@@ -223,12 +233,7 @@ sys.modules["napari_swc_viewer.widgets.reference_layers"] = fake_reference_layer
 sys.modules.pop("napari_swc_viewer.widgets.neuron_viewer", None)
 widgets_package = types.ModuleType("napari_swc_viewer.widgets")
 widgets_package.__path__ = [
-    str(
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "napari_swc_viewer"
-        / "widgets"
-    )
+    str(Path(__file__).resolve().parents[1] / "src" / "napari_swc_viewer" / "widgets")
 ]
 sys.modules["napari_swc_viewer.widgets"] = widgets_package
 
@@ -494,6 +499,46 @@ class _DummyRegionSelector:
 
     def include_children_enabled(self) -> bool:
         return self._include_children
+
+
+class _DummyCustomRegionSelector:
+    def __init__(
+        self,
+        region_ids: list[int] | None = None,
+        *,
+        region_groups: tuple[CustomRegionSelectionGroup, ...] | None = None,
+        has_hierarchy: bool = True,
+        unavailable_message: str = "Custom regions unavailable.",
+    ) -> None:
+        self._region_ids = list(region_ids or [])
+        self._region_groups = tuple(region_groups or ())
+        self._has_hierarchy = bool(has_hierarchy)
+        self._unavailable_message = unavailable_message
+        self.hierarchies: list[object] = []
+        self.clear_messages: list[str] = []
+
+    def get_selected_region_ids(self) -> list[int]:
+        return list(self._region_ids)
+
+    def get_selected_region_groups(
+        self,
+    ) -> tuple[CustomRegionSelectionGroup, ...]:
+        return self._region_groups
+
+    def has_hierarchy(self) -> bool:
+        return self._has_hierarchy
+
+    def unavailable_message(self) -> str:
+        return self._unavailable_message
+
+    def set_hierarchy(self, hierarchy: object) -> None:
+        self.hierarchies.append(hierarchy)
+        self._has_hierarchy = True
+
+    def clear_with_message(self, message: str) -> None:
+        self.clear_messages.append(message)
+        self._has_hierarchy = False
+        self._unavailable_message = message
 
 
 class _DummyLabel:
@@ -993,11 +1038,9 @@ def test_flatmap_debug_event_filter_observes_without_consuming_event() -> None:
 
 
 def test_flatmap_cleanup_event_filter_only_handles_deferred_delete() -> None:
-    filter_class = (
-        NeuronViewerWidget._install_flatmap_cleanup_event_filter.__globals__[
-            "_FlatmapWindowCleanupEventFilter"
-        ]
-    )
+    filter_class = NeuronViewerWidget._install_flatmap_cleanup_event_filter.__globals__[
+        "_FlatmapWindowCleanupEventFilter"
+    ]
     viewer = _LifecycleViewer(_LifecycleWindow())
     calls = []
     lifecycle_filter = filter_class(
@@ -1046,9 +1089,7 @@ def test_flatmap_deferred_delete_closes_qt_children_before_destroyed_signal(
     _LifecycleViewer._instances = [main_viewer, viewer]
     tab = _LifecycleTab(viewer)
     widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__[
-        "logger"
-    ]
+    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__["logger"]
     widget._connect_flatmap_viewer_destroyed(
         viewer,
         viewer_token="flatmap-1",
@@ -1114,7 +1155,9 @@ def test_flatmap_cleanup_stops_napari_status_thread(
 
     assert qt_window.status_thread.isRunning() is True
     with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        cleanup_filter.eventFilter(qt_window, _LifecycleEvent(_FakeQEvent.DeferredDelete))
+        cleanup_filter.eventFilter(
+            qt_window, _LifecycleEvent(_FakeQEvent.DeferredDelete)
+        )
 
     assert qt_window.status_thread.close_terminate_calls == 1
     assert qt_window.status_thread.wait_calls == 1
@@ -1330,8 +1373,7 @@ def test_flatmap_first_layer_schedules_one_show_after_focus_turn(
     assert any("event=show_scheduled" in message for message in messages)
     assert any("event=shown" in message for message in messages)
     assert any(
-        "event=show_skipped" in message
-        and "reason=show_already_scheduled" in message
+        "event=show_skipped" in message and "reason=show_already_scheduled" in message
         for message in messages
     )
     _LifecycleViewer._instances = []
@@ -1664,9 +1706,7 @@ def test_flatmap_qt_viewer_close_failure_does_not_repeat_after_destroy(
     _LifecycleViewer._instances = [viewer]
     tab = _LifecycleTab(viewer)
     widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__[
-        "logger"
-    ]
+    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__["logger"]
     widget._connect_flatmap_viewer_destroyed(
         viewer,
         viewer_token="flatmap-1",
@@ -1962,9 +2002,9 @@ def test_flatmap_debug_snapshot_handles_deleted_qt_wrapper(
     widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
     widget._flatmap_viewer = None
     widget._flatmap_tab = None
-    lifecycle_logger = (
-        NeuronViewerWidget._log_flatmap_viewer_snapshot.__globals__["logger"]
-    )
+    lifecycle_logger = NeuronViewerWidget._log_flatmap_viewer_snapshot.__globals__[
+        "logger"
+    ]
 
     with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
         widget._log_flatmap_viewer_snapshot(
@@ -2100,9 +2140,11 @@ def test_flatmap_normal_close_is_not_consumed_by_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_immediate_timer(monkeypatch)
-    guard_class = NeuronViewerWidget._install_flatmap_fullscreen_close_guard.__globals__[
-        "_FlatmapFullscreenCloseGuard"
-    ]
+    guard_class = (
+        NeuronViewerWidget._install_flatmap_fullscreen_close_guard.__globals__[
+            "_FlatmapFullscreenCloseGuard"
+        ]
+    )
     qt_window = _FullscreenWindow(fullscreen=False)
     widget, viewer = _fullscreen_widget(qt_window)
     guard = guard_class("flatmap-1", widget._on_flatmap_fullscreen_close)
@@ -2279,9 +2321,11 @@ def test_flatmap_fullscreen_exit_times_out_without_closing(
 
 
 def test_flatmap_close_guard_filter_only_consumes_fullscreen_close() -> None:
-    guard_class = NeuronViewerWidget._install_flatmap_fullscreen_close_guard.__globals__[
-        "_FlatmapFullscreenCloseGuard"
-    ]
+    guard_class = (
+        NeuronViewerWidget._install_flatmap_fullscreen_close_guard.__globals__[
+            "_FlatmapFullscreenCloseGuard"
+        ]
+    )
     calls = []
     guard = guard_class(
         "flatmap-1",
@@ -2289,22 +2333,18 @@ def test_flatmap_close_guard_filter_only_consumes_fullscreen_close() -> None:
     )
 
     normal_window = _FullscreenWindow(fullscreen=False)
-    assert (
-        guard.eventFilter(normal_window, _LifecycleEvent(_FakeQEvent.Close)) is False
-    )
+    assert guard.eventFilter(normal_window, _LifecycleEvent(_FakeQEvent.Close)) is False
     assert calls == []
 
     fullscreen_window = _FullscreenWindow(fullscreen=True)
     assert (
-        guard.eventFilter(fullscreen_window, _LifecycleEvent(_FakeQEvent.Close))
-        is True
+        guard.eventFilter(fullscreen_window, _LifecycleEvent(_FakeQEvent.Close)) is True
     )
     assert calls == [("flatmap-1", fullscreen_window)]
 
     # Non-close events are ignored regardless of fullscreen state.
     assert (
-        guard.eventFilter(fullscreen_window, _LifecycleEvent(_FakeQEvent.Show))
-        is False
+        guard.eventFilter(fullscreen_window, _LifecycleEvent(_FakeQEvent.Show)) is False
     )
 
 
@@ -2897,6 +2937,18 @@ def _bind_region_query_scope_helpers(widget) -> None:
         NeuronViewerWidget._active_region_selector,
         widget,
     )
+    widget._custom_region_selector_for_scope = types.MethodType(
+        NeuronViewerWidget._custom_region_selector_for_scope,
+        widget,
+    )
+    widget._active_custom_region_selector = types.MethodType(
+        NeuronViewerWidget._active_custom_region_selector,
+        widget,
+    )
+    widget._active_custom_region_groups = types.MethodType(
+        NeuronViewerWidget._active_custom_region_groups,
+        widget,
+    )
     widget._active_region_preview_acronyms = types.MethodType(
         NeuronViewerWidget._active_region_preview_acronyms,
         widget,
@@ -2909,10 +2961,20 @@ def _bind_region_query_scope_helpers(widget) -> None:
         NeuronViewerWidget._sync_active_region_reference_layers,
         widget,
     )
+    widget._sync_active_region_meshes = types.MethodType(
+        NeuronViewerWidget._sync_active_region_meshes,
+        widget,
+    )
+    widget._sync_active_region_segmentation = types.MethodType(
+        NeuronViewerWidget._sync_active_region_segmentation,
+        widget,
+    )
 
 
 @pytest.mark.parametrize("slice_axis", [0, 1, 2])
-def test_soma_slice_projector_flattens_points_onto_active_slice(slice_axis: int) -> None:
+def test_soma_slice_projector_flattens_points_onto_active_slice(
+    slice_axis: int,
+) -> None:
     viewer = _DummyViewer()
     projector = _make_soma_projector(viewer, tolerance=1.5)
     coords_a = np.array([[10.0, 20.0, 30.0], [11.0, 21.0, 31.0]])
@@ -3174,7 +3236,9 @@ def test_remove_selected_neurons_preserves_remaining_render_modes() -> None:
     widget._clear_neuron_layers.assert_not_called()
 
 
-def test_clear_all_neuron_layers_ignores_qt_checked_argument_and_resets_scene_state() -> None:
+def test_clear_all_neuron_layers_ignores_qt_checked_argument_and_resets_scene_state() -> (
+    None
+):
     viewer = _DummyViewer(ndisplay=3)
     soma_layer = _DummyPointsLayer(
         np.array([[0.0, 0.0, 0.0]]),
@@ -3186,9 +3250,7 @@ def test_clear_all_neuron_layers_ignores_qt_checked_argument_and_resets_scene_st
         viewer=viewer,
         _current_neuron_layers=[soma_layer],
         _scene_render_modes={"n1": "soma"},
-        _scene_display_state={
-            "n1": {"color": [1.0, 0.0, 0.0, 1.0], "visible": True}
-        },
+        _scene_display_state={"n1": {"color": [1.0, 0.0, 0.0, 1.0], "visible": True}},
         _slice_projector=MagicMock(),
         _soma_slice_projector=MagicMock(),
         _neuron_table=types.SimpleNamespace(set_added_file_ids=MagicMock()),
@@ -3299,9 +3361,7 @@ def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> No
         "Soma Labels",
     }
     soma_layer = next(
-        layer
-        for layer in widget._current_neuron_layers
-        if layer.name == "Soma Labels"
+        layer for layer in widget._current_neuron_layers if layer.name == "Soma Labels"
     )
     assert soma_layer.text == {
         "string": ["N1", "N2"],
@@ -3311,7 +3371,9 @@ def test_render_scene_queries_full_trace_data_only_for_full_mode_neurons() -> No
     }
 
 
-def test_apply_layer_visibility_hides_duplicate_soma_markers_in_2d_points_mode() -> None:
+def test_apply_layer_visibility_hides_duplicate_soma_markers_in_2d_points_mode() -> (
+    None
+):
     viewer = _DummyViewer(ndisplay=2)
     neuron_points = _DummyPointsLayer(
         np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]),
@@ -3369,7 +3431,9 @@ def test_apply_layer_visibility_hides_duplicate_soma_markers_in_2d_points_mode()
     )
 
 
-def test_toggle_slice_projection_updates_both_projectors_and_reapplies_2d_visibility() -> None:
+def test_toggle_slice_projection_updates_both_projectors_and_reapplies_2d_visibility() -> (
+    None
+):
     viewer = _DummyViewer(ndisplay=2)
     line_projector = types.SimpleNamespace(enabled=False)
     soma_projector = types.SimpleNamespace(enabled=False)
@@ -3482,7 +3546,9 @@ def test_on_soma_selected_same_indices_from_different_layers_are_not_noop() -> N
     ]
 
 
-def test_on_soma_selected_reprocesses_same_projected_indices_after_metadata_change() -> None:
+def test_on_soma_selected_reprocesses_same_projected_indices_after_metadata_change() -> (
+    None
+):
     table = MagicMock()
     widget = types.SimpleNamespace(_last_soma_selection=set(), _neuron_table=table)
     layer = types.SimpleNamespace(
@@ -3604,6 +3670,12 @@ def test_mask_query_handlers_set_wait_message_before_dispatch(
             "atlas",
         ),
         (
+            "Custom Regions",
+            "Searching for neurons with basal dendrite or apical dendrite nodes "
+            "in selected custom regions. Please wait...",
+            "custom",
+        ),
+        (
             "Mask Layer",
             "Searching for neurons with basal dendrite or apical dendrite nodes "
             "in selected mask layers. Please wait...",
@@ -3635,7 +3707,13 @@ def test_active_region_query_dispatches_selected_node_types(
         observed["soma_only"] = soma_only
         observed["node_types"] = node_types
 
+    def _record_custom(*, soma_only: bool = False, node_types=None) -> None:
+        observed["target"] = "custom"
+        observed["soma_only"] = soma_only
+        observed["node_types"] = node_types
+
     widget._query_neurons_by_region = _record_atlas
+    widget._query_neurons_by_custom_region = _record_custom
     widget._query_neurons_by_mask = _record_mask
 
     NeuronViewerWidget._query_neurons_for_active_region_source(widget)
@@ -3665,8 +3743,9 @@ def test_resolve_region_query_file_scope_defaults_to_whole_parquet() -> None:
     )
 
 
-def test_query_neurons_by_region_uses_current_table_scope_without_inheriting_whole_selection(
-) -> None:
+def test_query_neurons_by_region_uses_current_table_scope_without_inheriting_whole_selection() -> (
+    None
+):
     result = pd.DataFrame(
         {
             "file_id": ["n1"],
@@ -4004,7 +4083,9 @@ def test_update_mask_query_summary_counts_unique_selected_source_neurons() -> No
     )
 
 
-def test_update_mask_query_summary_handles_empty_selection_and_missing_sources() -> None:
+def test_update_mask_query_summary_handles_empty_selection_and_missing_sources() -> (
+    None
+):
     layer_a = types.SimpleNamespace(name="Mask A", metadata={})
     layer_b = types.SimpleNamespace(name="Mask B", metadata={})
     label = _DummyLabel()
@@ -4042,11 +4123,12 @@ def test_update_mask_query_summary_handles_empty_selection_and_missing_sources()
     assert label.text == "No generated mask layers are available."
 
 
-def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
+def test_on_region_query_source_changed_uses_named_pages_and_scope_stacks() -> None:
     widget = types.SimpleNamespace(
         _region_query_source="Atlas Regions",
         _region_query_stack=_DummyStack(),
         _atlas_region_scope_stack=_DummyStack(),
+        _custom_region_scope_stack=_DummyStack(),
         _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
         _regions_status_label=_DummyLabel(),
         _atlas_query_any_node_btn=_DummyButton(),
@@ -4072,6 +4154,15 @@ def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
 
     assert widget._region_query_stack.index == 0
     assert widget._atlas_region_scope_stack.index == 1
+    assert widget._custom_region_scope_stack.index == 1
+    assert widget._atlas_query_any_node_btn.visible is True
+    assert widget._atlas_query_soma_btn.visible is True
+    assert widget._mask_query_any_node_btn.visible is False
+    assert widget._mask_query_soma_btn.visible is False
+
+    NeuronViewerWidget._on_region_query_source_changed(widget, "Custom Regions")
+
+    assert widget._region_query_stack.index == 1
     assert widget._atlas_query_any_node_btn.visible is True
     assert widget._atlas_query_soma_btn.visible is True
     assert widget._mask_query_any_node_btn.visible is False
@@ -4079,11 +4170,56 @@ def test_on_region_query_source_changed_shows_relevant_button_pair() -> None:
 
     NeuronViewerWidget._on_region_query_source_changed(widget, "Mask Layer")
 
-    assert widget._region_query_stack.index == 1
+    assert widget._region_query_stack.index == 2
     assert widget._atlas_query_any_node_btn.visible is False
     assert widget._atlas_query_soma_btn.visible is False
     assert widget._mask_query_any_node_btn.visible is True
     assert widget._mask_query_soma_btn.visible is True
+
+
+def test_custom_region_source_sets_button_text_and_updates_custom_previews() -> None:
+    group = CustomRegionSelectionGroup(
+        label="L1",
+        region_ids=(101,),
+        acronyms=("R1",),
+    )
+    widget = types.SimpleNamespace(
+        _region_query_source="Atlas Regions",
+        _region_query_stack=_DummyStack(),
+        _atlas_region_scope_stack=_DummyStack(),
+        _custom_region_scope_stack=_DummyStack(),
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _region_query_find_btn=_DummyButton(),
+        _whole_parquet_region_selector=_DummyRegionSelector(direct_acronyms=["R1"]),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector(
+            [101],
+            region_groups=(group,),
+        ),
+        _show_region_meshes_cb=_DummyCheckBox(True),
+        _show_region_seg_cb=_DummyCheckBox(True),
+        _update_region_meshes=MagicMock(),
+        _update_region_segmentation=MagicMock(),
+        _update_custom_region_meshes=MagicMock(),
+        _update_custom_region_segmentation=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._on_region_query_source_changed(widget, "Custom Regions")
+
+    assert widget._region_query_stack.index == 1
+    assert (
+        widget._region_query_find_btn.text == "Find Neurons in Selected Custom Regions"
+    )
+    widget._update_region_meshes.assert_not_called()
+    widget._update_region_segmentation.assert_not_called()
+    widget._update_custom_region_meshes.assert_called_once_with((group,))
+    widget._update_custom_region_segmentation.assert_called_once_with((group,))
+
+    NeuronViewerWidget._on_region_query_source_changed(widget, "Atlas Regions")
+
+    widget._update_region_meshes.assert_called_once_with(["R1"])
+    widget._update_region_segmentation.assert_called_once_with(["R1"])
 
 
 def test_on_region_query_scope_changed_switches_preview_to_active_selector() -> None:
@@ -4127,6 +4263,444 @@ def test_on_region_query_scope_changed_switches_preview_to_active_selector() -> 
     assert widget._atlas_region_scope_stack.index == 0
     widget._update_region_meshes.assert_called_once_with(["ROOT"])
     widget._update_region_segmentation.assert_called_once_with(["ROOT"])
+
+
+def test_custom_region_scope_change_updates_scope_specific_reference_layers() -> None:
+    whole_group = CustomRegionSelectionGroup(
+        label="L1",
+        region_ids=(101,),
+        acronyms=("R1",),
+    )
+    current_group = CustomRegionSelectionGroup(
+        label="L2/3",
+        region_ids=(202,),
+        acronyms=("R2",),
+    )
+    widget = types.SimpleNamespace(
+        _region_query_source="Custom Regions",
+        _region_query_scope="whole",
+        _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
+        _atlas_region_scope_stack=_DummyStack(),
+        _custom_region_scope_stack=_DummyStack(),
+        _regions_status_label=_DummyLabel(),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector(
+            [101],
+            region_groups=(whole_group,),
+        ),
+        _current_table_custom_region_selector=_DummyCustomRegionSelector(
+            [202],
+            region_groups=(current_group,),
+        ),
+        _show_region_meshes_cb=_DummyCheckBox(True),
+        _show_region_seg_cb=_DummyCheckBox(True),
+        _update_region_meshes=MagicMock(),
+        _update_region_segmentation=MagicMock(),
+        _update_custom_region_meshes=MagicMock(),
+        _update_custom_region_segmentation=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._on_region_query_scope_changed(widget, "Current Table")
+
+    assert widget._atlas_region_scope_stack.index == 1
+    assert widget._custom_region_scope_stack.index == 1
+    widget._update_region_meshes.assert_not_called()
+    widget._update_region_segmentation.assert_not_called()
+    widget._update_custom_region_meshes.assert_called_once_with((current_group,))
+    widget._update_custom_region_segmentation.assert_called_once_with(
+        (current_group,)
+    )
+
+
+def test_custom_selection_change_refreshes_only_when_custom_source_is_active() -> None:
+    widget = types.SimpleNamespace(
+        _region_query_source="Custom Regions",
+        _regions_status_label=_DummyLabel(),
+        _sync_active_region_reference_layers=MagicMock(),
+    )
+
+    NeuronViewerWidget._on_custom_regions_selected(widget, [101])
+
+    assert widget._regions_status_label.text == ""
+    widget._sync_active_region_reference_layers.assert_called_once_with()
+
+    widget._region_query_source = "Atlas Regions"
+    widget._sync_active_region_reference_layers.reset_mock()
+    NeuronViewerWidget._on_custom_regions_selected(widget, [101])
+    widget._sync_active_region_reference_layers.assert_not_called()
+
+
+def test_update_custom_region_meshes_creates_at_most_one_layer_per_group(
+    monkeypatch,
+) -> None:
+    groups = (
+        CustomRegionSelectionGroup(
+            label="L1",
+            region_ids=(101, 102),
+            acronyms=("R1", "R2"),
+        ),
+        CustomRegionSelectionGroup(
+            label="L2/3",
+            region_ids=(202,),
+            acronyms=("R3",),
+        ),
+    )
+    viewer = _DummyViewer(ndisplay=2)
+    atlas = object()
+    add_group = MagicMock(
+        side_effect=[
+            (object(), ()),
+            (None, ("R3",)),
+        ]
+    )
+    remove_layers = MagicMock()
+    warnings = []
+    globals_dict = NeuronViewerWidget._update_custom_region_meshes.__globals__
+    monkeypatch.setitem(globals_dict, "add_region_mesh_group", add_group)
+    monkeypatch.setitem(globals_dict, "remove_region_layers", remove_layers)
+    monkeypatch.setitem(globals_dict, "show_warning", warnings.append)
+    widget = types.SimpleNamespace(
+        _atlas=atlas,
+        viewer=viewer,
+        _show_region_meshes_cb=_DummyCheckBox(True),
+        _mesh_opacity_slider=_DummyValueControl(30),
+    )
+
+    NeuronViewerWidget._update_custom_region_meshes(widget, groups)
+
+    remove_layers.assert_called_once_with(viewer)
+    assert viewer.dims.ndisplay == 3
+    assert add_group.call_count == 2
+    add_group.assert_any_call(viewer, atlas, groups[0], opacity=0.3)
+    add_group.assert_any_call(viewer, atlas, groups[1], opacity=0.3)
+    assert len(warnings) == 1
+    assert "R3" in warnings[0]
+
+
+def test_update_custom_region_segmentation_passes_exact_terminal_ids(
+    monkeypatch,
+) -> None:
+    groups = (
+        CustomRegionSelectionGroup(
+            label="L1",
+            region_ids=(102, 101),
+            acronyms=("R2", "R1"),
+        ),
+        CustomRegionSelectionGroup(
+            label="L2/3",
+            region_ids=(202,),
+            acronyms=("R3",),
+        ),
+    )
+    viewer = _DummyViewer()
+    atlas = object()
+    add_segmentation = MagicMock()
+    remove_segmentation = MagicMock()
+    globals_dict = (
+        NeuronViewerWidget._update_custom_region_segmentation.__globals__
+    )
+    monkeypatch.setitem(
+        globals_dict,
+        "add_region_id_segmentation",
+        add_segmentation,
+    )
+    monkeypatch.setitem(
+        globals_dict,
+        "remove_region_segmentation",
+        remove_segmentation,
+    )
+    widget = types.SimpleNamespace(
+        _atlas=atlas,
+        viewer=viewer,
+        _show_region_seg_cb=_DummyCheckBox(True),
+        _seg_opacity_slider=_DummyValueControl(40),
+    )
+
+    NeuronViewerWidget._update_custom_region_segmentation(widget, groups)
+
+    remove_segmentation.assert_called_once_with(viewer)
+    add_segmentation.assert_called_once_with(
+        viewer,
+        atlas,
+        [101, 102, 202],
+        opacity=0.4,
+    )
+
+
+def test_empty_custom_selection_clears_existing_reference_layers(
+    monkeypatch,
+) -> None:
+    viewer = _DummyViewer()
+    remove_meshes = MagicMock()
+    remove_segmentation = MagicMock()
+    add_meshes = MagicMock()
+    add_segmentation = MagicMock()
+    monkeypatch.setitem(
+        NeuronViewerWidget._update_custom_region_meshes.__globals__,
+        "remove_region_layers",
+        remove_meshes,
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._update_custom_region_meshes.__globals__,
+        "add_region_mesh_group",
+        add_meshes,
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._update_custom_region_segmentation.__globals__,
+        "remove_region_segmentation",
+        remove_segmentation,
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._update_custom_region_segmentation.__globals__,
+        "add_region_id_segmentation",
+        add_segmentation,
+    )
+    widget = types.SimpleNamespace(
+        _atlas=object(),
+        viewer=viewer,
+        _show_region_meshes_cb=_DummyCheckBox(True),
+        _show_region_seg_cb=_DummyCheckBox(True),
+    )
+
+    NeuronViewerWidget._update_custom_region_meshes(widget, ())
+    NeuronViewerWidget._update_custom_region_segmentation(widget, ())
+
+    remove_meshes.assert_called_once_with(viewer)
+    remove_segmentation.assert_called_once_with(viewer)
+    add_meshes.assert_not_called()
+    add_segmentation.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("action", "sync_method"),
+    [
+        ("meshes", "_sync_active_region_meshes"),
+        ("segmentation", "_sync_active_region_segmentation"),
+    ],
+)
+def test_pending_reference_action_uses_source_aware_sync(
+    action: str,
+    sync_method: str,
+) -> None:
+    checkbox = _DummyCheckBox(True)
+    widget = types.SimpleNamespace(
+        _reference_action_checkbox=lambda _action: checkbox,
+        _sync_active_region_meshes=MagicMock(),
+        _sync_active_region_segmentation=MagicMock(),
+    )
+
+    NeuronViewerWidget._complete_pending_reference_action(widget, action)
+
+    getattr(widget, sync_method).assert_called_once_with()
+
+
+def test_set_custom_region_hierarchy_populates_both_scope_selectors(
+    monkeypatch,
+) -> None:
+    hierarchy = object()
+    builder = MagicMock(return_value=hierarchy)
+    monkeypatch.setitem(
+        NeuronViewerWidget._set_custom_region_hierarchy_for_atlas.__globals__,
+        "isocortex_layer_hierarchy_from_atlas",
+        builder,
+    )
+    whole_selector = _DummyCustomRegionSelector()
+    current_selector = _DummyCustomRegionSelector()
+    atlas = object()
+    widget = types.SimpleNamespace(
+        _whole_parquet_custom_region_selector=whole_selector,
+        _current_table_custom_region_selector=current_selector,
+    )
+
+    NeuronViewerWidget._set_custom_region_hierarchy_for_atlas(widget, atlas)
+
+    builder.assert_called_once_with(atlas)
+    assert whole_selector.hierarchies == [hierarchy]
+    assert current_selector.hierarchies == [hierarchy]
+
+
+def test_set_custom_region_hierarchy_reports_incompatible_atlas(monkeypatch) -> None:
+    def fail(_atlas):
+        raise ValueError("missing terminal Isocortex layers")
+
+    monkeypatch.setitem(
+        NeuronViewerWidget._set_custom_region_hierarchy_for_atlas.__globals__,
+        "isocortex_layer_hierarchy_from_atlas",
+        fail,
+    )
+    whole_selector = _DummyCustomRegionSelector()
+    current_selector = _DummyCustomRegionSelector()
+    widget = types.SimpleNamespace(
+        _whole_parquet_custom_region_selector=whole_selector,
+        _current_table_custom_region_selector=current_selector,
+    )
+
+    NeuronViewerWidget._set_custom_region_hierarchy_for_atlas(widget, object())
+
+    expected = (
+        "Custom Isocortex Layers are unavailable for the loaded atlas: "
+        "missing terminal Isocortex layers"
+    )
+    assert whole_selector.clear_messages == [expected]
+    assert current_selector.clear_messages == [expected]
+
+
+def test_query_neurons_by_custom_region_uses_exact_terminal_ids_and_filters() -> None:
+    result = pd.DataFrame(
+        {
+            "file_id": ["n1", "n2"],
+            "neuron_id": ["N1", "N2"],
+        }
+    )
+    db = MagicMock()
+    db.has_column.return_value = True
+    db.get_neurons_by_region_id.return_value = result
+    widget = types.SimpleNamespace(
+        _db=db,
+        _atlas=object(),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector(
+            [302, 101, 302]
+        ),
+        _current_table_custom_region_selector=_DummyCustomRegionSelector([999]),
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: ["n1"]),
+        _populate_neuron_table=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_custom_region(
+        widget,
+        node_types=(1, 3),
+    )
+
+    db.get_neurons_by_region_id.assert_called_once_with(
+        [101, 302],
+        soma_only=False,
+        file_ids=None,
+        node_types=(1, 3),
+    )
+    widget._populate_neuron_table.assert_called_once_with(
+        result,
+        preserve_existing=False,
+    )
+    assert "2 selected terminal custom regions within whole parquet" in (
+        widget._regions_status_label.text
+    )
+
+
+def test_query_neurons_by_custom_region_preserves_current_table_scope() -> None:
+    result = pd.DataFrame({"file_id": ["n2"], "neuron_id": ["N2"]})
+    db = MagicMock()
+    db.has_column.return_value = True
+    db.get_neurons_by_region_id.return_value = result
+    widget = types.SimpleNamespace(
+        _db=db,
+        _atlas=object(),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector([101]),
+        _current_table_custom_region_selector=_DummyCustomRegionSelector([202]),
+        _region_query_scope_combo=_DummyComboBox("Current Table", data="current"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: ["n2", "n1"]),
+        _populate_neuron_table=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_custom_region(widget, soma_only=True)
+
+    db.get_neurons_by_region_id.assert_called_once_with(
+        [202],
+        soma_only=True,
+        file_ids=["n2", "n1"],
+        node_types=(1,),
+    )
+    widget._populate_neuron_table.assert_called_once_with(
+        result,
+        preserve_existing=True,
+    )
+    assert "within current table (from 2 input neurons)" in (
+        widget._regions_status_label.text
+    )
+
+
+@pytest.mark.parametrize(
+    ("atlas", "selector", "has_region_id", "expected_status"),
+    [
+        (
+            None,
+            _DummyCustomRegionSelector([101]),
+            True,
+            "Load a compatible Allen atlas",
+        ),
+        (
+            object(),
+            _DummyCustomRegionSelector(
+                has_hierarchy=False,
+                unavailable_message="Custom map is incompatible.",
+            ),
+            True,
+            "Custom map is incompatible.",
+        ),
+        (
+            object(),
+            _DummyCustomRegionSelector(),
+            True,
+            "Select at least one terminal Custom Region.",
+        ),
+        (
+            object(),
+            _DummyCustomRegionSelector([101]),
+            False,
+            "Custom Regions require a region_id column",
+        ),
+    ],
+)
+def test_query_neurons_by_custom_region_reports_actionable_errors(
+    atlas,
+    selector,
+    has_region_id,
+    expected_status,
+) -> None:
+    db = MagicMock()
+    db.has_column.return_value = has_region_id
+    widget = types.SimpleNamespace(
+        _db=db,
+        _atlas=atlas,
+        _whole_parquet_custom_region_selector=selector,
+        _current_table_custom_region_selector=_DummyCustomRegionSelector(),
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_custom_region(widget)
+
+    assert expected_status in widget._regions_status_label.text
+    db.get_neurons_by_region_id.assert_not_called()
+
+
+def test_query_neurons_by_custom_region_reports_zero_matches() -> None:
+    db = MagicMock()
+    db.has_column.return_value = True
+    db.get_neurons_by_region_id.return_value = pd.DataFrame()
+    widget = types.SimpleNamespace(
+        _db=db,
+        _atlas=object(),
+        _whole_parquet_custom_region_selector=_DummyCustomRegionSelector([101]),
+        _current_table_custom_region_selector=_DummyCustomRegionSelector(),
+        _region_query_scope_combo=_DummyComboBox("Whole Parquet", data="whole"),
+        _regions_status_label=_DummyLabel(),
+        _neuron_table=types.SimpleNamespace(file_ids=lambda: []),
+        _populate_neuron_table=MagicMock(),
+    )
+    _bind_region_query_scope_helpers(widget)
+
+    NeuronViewerWidget._query_neurons_by_custom_region(widget)
+
+    assert widget._regions_status_label.text == (
+        "No neurons found with any node in 1 selected terminal custom region "
+        "within whole parquet."
+    )
 
 
 def test_query_neurons_by_region_reports_union_details() -> None:
@@ -4365,7 +4939,9 @@ def test_refresh_apply_existing_clusters_button_visible_with_overlap() -> None:
     assert button.enabled is True
 
 
-def test_sync_after_neuron_table_membership_change_refreshes_apply_existing_clusters_button() -> None:
+def test_sync_after_neuron_table_membership_change_refreshes_apply_existing_clusters_button() -> (
+    None
+):
     widget = types.SimpleNamespace(
         _last_soma_selection={"n1"},
         _refresh_cluster_filter_controls=MagicMock(),
@@ -4404,7 +4980,9 @@ def test_apply_existing_clusters_from_analysis_updates_render_status() -> None:
     )
 
 
-def test_apply_existing_clusters_from_analysis_no_overlap_only_refreshes_button() -> None:
+def test_apply_existing_clusters_from_analysis_no_overlap_only_refreshes_button() -> (
+    None
+):
     summary = types.SimpleNamespace(
         matched_table_count=0,
         rendered_count=0,
@@ -4423,7 +5001,9 @@ def test_apply_existing_clusters_from_analysis_no_overlap_only_refreshes_button(
     widget._refresh_apply_existing_clusters_button.assert_called_once_with()
 
 
-def test_remove_unselected_from_table_keeps_selection_and_preserves_scene_state() -> None:
+def test_remove_unselected_from_table_keeps_selection_and_preserves_scene_state() -> (
+    None
+):
     table = types.SimpleNamespace(
         _entries={
             "n1": types.SimpleNamespace(
@@ -4545,7 +5125,9 @@ def test_remove_unselected_from_table_noops_when_all_rows_selected() -> None:
 
 def test_clear_neuron_table_preserves_scene_render_modes() -> None:
     table = types.SimpleNamespace(
-        _entries={"n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)},
+        _entries={
+            "n1": types.SimpleNamespace(color=[1.0, 0.0, 0.0, 1.0], visible=True)
+        },
     )
     table.clear = MagicMock(side_effect=table._entries.clear)
     table.set_added_file_ids = MagicMock()
@@ -4572,9 +5154,7 @@ def test_clear_neuron_table_preserves_scene_render_modes() -> None:
     widget._neuron_table.clear.assert_called_once_with()
     widget._refresh_cluster_filter_controls.assert_called_once_with()
     widget._refresh_neuron_table_summary.assert_called_once_with()
-    widget._update_layer_colors.assert_called_once_with(
-        {"n1": [1.0, 0.0, 0.0, 1.0]}
-    )
+    widget._update_layer_colors.assert_called_once_with({"n1": [1.0, 0.0, 0.0, 1.0]})
     assert widget._scene_render_modes == {"n1": "full"}
     assert widget._last_soma_selection == set()
     assert widget._render_status_label.text == "Cleared neuron table."
@@ -4605,13 +5185,13 @@ def test_clear_neuron_table_clears_highlight_without_recoloring_scene_to_gray() 
 
     NeuronViewerWidget._clear_neuron_table(widget)
 
-    widget._update_layer_colors.assert_called_once_with(
-        {"n1": [0.2, 0.3, 0.4, 1.0]}
-    )
+    widget._update_layer_colors.assert_called_once_with({"n1": [0.2, 0.3, 0.4, 1.0]})
     assert widget._highlighted_file_ids is None
 
 
-def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_removes_row() -> None:
+def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_removes_row() -> (
+    None
+):
     entry = types.SimpleNamespace(color=[0.2, 0.3, 0.4, 1.0], visible=True)
     table = types.SimpleNamespace(_entries={"n1": entry})
 
@@ -4652,9 +5232,7 @@ def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_remov
     assert widget._scene_display_state == {
         "n1": {"color": [0.2, 0.3, 0.4, 1.0], "visible": True}
     }
-    widget._update_layer_colors.assert_called_once_with(
-        {"n1": [0.2, 0.3, 0.4, 1.0]}
-    )
+    widget._update_layer_colors.assert_called_once_with({"n1": [0.2, 0.3, 0.4, 1.0]})
 
 
 def test_selected_neuron_heatmap_layer_name_uses_greek_identifiers() -> None:
@@ -4787,9 +5365,7 @@ def test_current_selected_neuron_heatmap_layers_ignores_analysis_heatmaps() -> N
     _bind_manual_heatmap_helpers(widget)
 
     layer_names_by_file_id = (
-        NeuronViewerWidget._current_selected_neuron_heatmap_layers_by_file_id(
-            widget
-        )
+        NeuronViewerWidget._current_selected_neuron_heatmap_layers_by_file_id(widget)
     )
 
     assert layer_names_by_file_id == {
@@ -4927,7 +5503,9 @@ def test_manual_heatmap_combo_preserves_selection_by_stable_id_after_rename() ->
     table.apply_filters.assert_not_called()
 
 
-def test_manual_heatmap_combo_lists_only_manual_heatmaps_and_preserves_selection() -> None:
+def test_manual_heatmap_combo_lists_only_manual_heatmaps_and_preserves_selection() -> (
+    None
+):
     viewer = _DummyViewer(ndisplay=3)
     viewer.layers.extend(
         [

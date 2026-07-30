@@ -50,3 +50,14 @@ def test_get_soma_nodes_for_rendering_empty_file_ids(tmp_path) -> None:
     finally:
         db.close()
     assert rows.empty
+
+
+def test_has_column_reports_parquet_schema_membership(tmp_path) -> None:
+    path = tmp_path / "neurons.parquet"
+    _write_source_parquet(path)
+    db = NeuronDatabase(path)
+    try:
+        assert db.has_column("file_id") is True
+        assert db.has_column("region_id") is False
+    finally:
+        db.close()

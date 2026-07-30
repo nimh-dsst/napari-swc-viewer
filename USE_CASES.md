@@ -31,6 +31,7 @@ Unless a use case says otherwise:
 | [UC-003](#uc-003-prepare-a-whole-neuron-parquet-for-flatmap-viewing) | Append bilateral shaped/square flatmap and depth coordinates to a whole Parquet | Not run |
 | [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
 | [UC-005](#uc-005-view-an-allen-isocortex-layer-flatmap-stack) | View flatmap node counts as six Allen Isocortex layer images | Not run |
+| [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -505,6 +506,100 @@ cluster color modes create one six-plane stack per color group.
    flatmap-valid terminal Isocortex-layer nodes.
    **Expected:** Each attempt reports a specific corrective message and does
    not leave a blank detached flatmap window.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
+
+### UC-006: Inspect and Query Custom Isocortex Layer Regions
+
+**Capability**
+
+The user can visually inspect the terminal Allen regions assigned to each of
+the six Isocortex layer groups and query neurons using exactly those displayed
+`region_id` values. The synthetic hierarchy is computed from the currently
+loaded atlas and remains independent of the ordinary atlas-region selection
+and flatmap overlays. While Custom Regions is active, its checked terminal
+regions can also drive the Reference-tab meshes and segmentation preview.
+
+**Prerequisites**
+
+- Load an Allen mouse atlas in **Data** > **Atlas**. For the count comparison,
+  use `allen_mouse_25um`.
+- Load a neuron Parquet annotated against that atlas. It must contain
+  `file_id`, `type`, and `region_id`; include neurons from several Isocortex
+  layers and at least one non-Isocortex region.
+- Put a strict subset of the Parquet's neurons in **Selected Neurons** so the
+  two search scopes can be distinguished.
+- From the repository root, optionally run
+  `pixi run python scripts/audit_allen_isocortex_layers.py` to print the
+  independently inspectable region list and counts for `allen_mouse_25um`.
+
+**Steps and expected results**
+
+1. **Action:** Open **Regions** and inspect **Query source**.
+   **Expected:** The menu is ordered **Atlas Regions**, **Custom Regions**,
+   **Mask Layer**. Existing Atlas and Mask pages remain available.
+2. **Action:** Select **Custom Regions** with **Search scope** set to
+   **Whole Parquet**, then expand **Isocortex Layers**.
+   **Expected:** The root starts expanded and the six initially collapsed
+   groups appear in the order `L1`, `L2/3`, `L4`, `L5`, `L6a`, `L6b`.
+   Root and group labels show terminal-region counts. Each leaf shows its full
+   atlas name, acronym, and numeric ID and is alphabetized within its layer.
+   For `allen_mouse_25um`, the displayed lists and counts match
+   `scripts/audit_allen_isocortex_layers.py`; no parent or unrelated region is
+   present.
+3. **Action:** Check one layer group, uncheck one leaf beneath it, and then
+   check that leaf again.
+   **Expected:** Checking the group selects all and only its displayed terminal
+   leaves. Unchecking a leaf makes the group and root partially checked;
+   restoring it makes the layer fully checked. **Selected: N terminal
+   regions** always reports the exact number of selected leaves.
+4. **Action:** Clear the selection. Search in turn by part of a full name, an
+   acronym, and a numeric region ID, then select one matching leaf and leaves
+   from a second layer.
+   **Expected:** Search retains matching leaves and their ancestors. **Clear**
+   restores the full hierarchy. **Clear Selection** removes all checks.
+   Selecting across layers yields a sorted, deduplicated set of the visible
+   terminal IDs.
+5. **Action:** Choose desired **Node types**, click **Find Neurons in Selected
+   Custom Regions**, and compare the results with an exact `region_id` query of
+   the Parquet.
+   **Expected:** The **Selected Neurons** table contains precisely the matching
+   neurons. The status reports the selected terminal-region count and node
+   membership. No unlisted descendant or parent region contributes matches,
+   and non-Isocortex rows do not match.
+6. **Action:** Change **Search scope** to **Current Table**, make a different
+   custom selection, and query. Switch back to **Whole Parquet**.
+   **Expected:** Current Table querying is restricted to the exact file IDs
+   already in the table and preserves nonmatching existing rows. The two
+   scopes retain separate custom selections, and returning to Whole Parquet
+   restores its selection.
+7. **Action:** Keep **Custom Regions** active, select a full layer and a
+   partial second layer, then enable **Show selected region meshes** and
+   **Show selected region segmentation** in **Reference**.
+   **Expected:** Napari switches to 3D for meshes and creates at most one
+   `Region: Custom <layer>` Surface per selected canonical layer. Each
+   terminal mesh retains its Allen color. `Region Segmentation` contains
+   exactly the checked terminal IDs with no unlisted descendants. Changing
+   Custom checks or Search scope refreshes both visible previews, and their
+   opacity controls continue to apply.
+8. **Action:** Switch **Query source** between **Atlas Regions** and
+   **Custom Regions** while both Reference controls remain enabled.
+   **Expected:** The existing preview layers are replaced using the active
+   source and scope. Both selectors retain their own selections. Custom
+   selections do not change Flatmap Region Labels, cached surfaces, or
+   outlines, which remain Atlas Regions-only.
+9. **Action:** Exercise the error cases: query with no custom leaf selected;
+   use an empty Current Table; load a Parquet without `region_id`; and load an
+   atlas whose structure catalog cannot produce all six Isocortex layers.
+   **Expected:** Each case reports an actionable message and does not perform a
+   misleading query. An incompatible or missing atlas leaves the Custom
+   Regions page in an explanatory empty state and does not open or download a
+   second atlas. A valid selection with no matching neurons reports zero
+   results without error.
 
 **Manual verification**
 

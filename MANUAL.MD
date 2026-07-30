@@ -304,13 +304,36 @@ Notes:
 
 ### 3. Select regions (Regions tab)
 
-1. Choose `Query source`
-2. For `Atlas Regions`, use search to find structures, check regions in the tree, and optionally enable/disable `Include child regions`
-3. Choose `Node types`; leave `All node types` selected for the previous any-node behavior, or select one or more of `Soma`, `Axon`, `Basal dendrite`, and `Apical dendrite`
-4. For `Mask Layer`, check one or more generated mask layers
-5. Click the query button for the active source
+1. Choose `Query source`: `Atlas Regions`, `Custom Regions`, or `Mask Layer`
+2. For `Atlas Regions`, use search to find structures, check regions in the
+   tree, and optionally enable/disable `Include child regions`
+3. For `Custom Regions`, first load a compatible Allen atlas. Expand
+   `Isocortex Layers`, then check the root, a layer group (`L1`, `L2/3`, `L4`,
+   `L5`, `L6a`, or `L6b`), or individual terminal regions. Searches match the
+   full atlas name, acronym, or numeric region ID. Group checks select exactly
+   the terminal leaves shown beneath them; partially selected groups display a
+   partial check state.
+4. Choose `Search scope`: `Whole Parquet` or `Current Table`. Atlas and custom
+   selections are kept separately for the two scopes.
+5. Choose `Node types`; leave `All node types` selected for the previous
+   any-node behavior, or select one or more of `Soma`, `Axon`,
+   `Basal dendrite`, and `Apical dendrite`
+6. For `Mask Layer`, check one or more generated mask layers
+7. Click the query button for the active source
 
 This fills the **Selected Neurons** table in the Data tab.
+
+`Custom Regions` currently contains only the atlas-derived
+`Isocortex Layers` hierarchy. Its leaves are the terminal Allen Isocortex
+regions used by the flatmap layer classifier; parent atlas regions and
+unlisted descendants are never added to the query. A `region_id` column is
+required in the loaded Parquet. Custom selections do not change flatmap region
+overlays. When `Custom Regions` is the active query source,
+the **Reference** tab's selected-region controls use the active custom scope:
+meshes are combined into at most one `Region: Custom <layer>` surface per
+selected Isocortex layer, while `Region Segmentation` contains exactly the
+checked terminal IDs. Switching back to `Atlas Regions` restores the ordinary
+atlas-selection preview behavior.
 
 ### 4. Generate blurred heatmaps (Tools tab)
 
@@ -402,6 +425,10 @@ Notes:
 
 - Mesh display auto-switches napari to 3D mode
 - Segmentation is intended for 2D context overlays
+- With **Custom Regions** active, selected terminal meshes are grouped into at
+  most six `Region: Custom <layer>` surfaces, preserving each terminal
+  region's Allen color. Segmentation includes only the exact checked terminal
+  IDs and does not expand descendants.
 
 ### 9. Run analysis (Analysis tab)
 

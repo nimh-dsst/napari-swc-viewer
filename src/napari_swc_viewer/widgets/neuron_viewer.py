@@ -65,6 +65,10 @@ from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
 from ..neuron_table_ops import ClusterFilterSelection
 from ..flatmap_parquet import read_flatmap_parquet_transform_info
+from ..isocortex_layers import (
+    CustomRegionSelectionGroup,
+    isocortex_layer_hierarchy_from_atlas,
+)
 from ..point_import import (
     POINT_PARQUET_ORIGIN_NOT_RECORDED,
     PointImportError,
@@ -85,13 +89,16 @@ from ..project_io import (
 from .reference_layers import (
     add_allen_template,
     add_brain_outline,
+    add_region_id_segmentation,
     add_region_mesh,
+    add_region_mesh_group,
     add_region_segmentation,
     remove_region_layers,
     remove_region_segmentation,
 )
 from .analysis_tab import AnalysisTabWidget
 from .collapsible_section import CollapsibleSection
+from .custom_region_selector import CustomRegionSelectorWidget
 from .mask_layer_selector import MaskLayerSelectorWidget
 from .neuron_table import NeuronTableWidget
 from .node_type_selector import NodeTypeSelectorComboBox
@@ -102,6 +109,14 @@ if TYPE_CHECKING:
     import napari
 
 logger = logging.getLogger(__name__)
+
+_REGION_QUERY_SOURCE_ATLAS = "Atlas Regions"
+_REGION_QUERY_SOURCE_CUSTOM = "Custom Regions"
+_REGION_QUERY_SOURCE_MASK = "Mask Layer"
+
+_REGION_QUERY_PAGE_ATLAS = 0
+_REGION_QUERY_PAGE_CUSTOM = 1
+_REGION_QUERY_PAGE_MASK = 2
 
 _FLATMAP_DEBUG_EVENT_NAMES = (
     "Show",
@@ -264,14 +279,14 @@ class _FlatmapFullscreenCloseGuard(QObject):
 _SomaSelectionKey = tuple[int, frozenset[int], tuple[object, ...]]
 
 _POINT_HEATMAP_BASE_COLORS = [
-    (1.0, 0.0, 0.0, 1.0),    # red
-    (0.0, 0.8, 0.0, 1.0),    # green
-    (1.0, 0.9, 0.0, 1.0),    # yellow
-    (0.1, 0.4, 1.0, 1.0),    # blue
-    (1.0, 0.4, 0.0, 1.0),    # orange
-    (0.8, 0.0, 0.8, 1.0),    # magenta
-    (0.0, 0.8, 0.8, 1.0),    # cyan
-    (0.6, 0.3, 0.0, 1.0),    # brown
+    (1.0, 0.0, 0.0, 1.0),  # red
+    (0.0, 0.8, 0.0, 1.0),  # green
+    (1.0, 0.9, 0.0, 1.0),  # yellow
+    (0.1, 0.4, 1.0, 1.0),  # blue
+    (1.0, 0.4, 0.0, 1.0),  # orange
+    (0.8, 0.0, 0.8, 1.0),  # magenta
+    (0.0, 0.8, 0.8, 1.0),  # cyan
+    (0.6, 0.3, 0.0, 1.0),  # brown
 ]
 
 _SOMA_SLICE_PROJECTION_POINT_SIZE = 100
@@ -425,12 +440,8 @@ def _source_heatmap_filter_metadata(source_layers: list) -> dict[str, object]:
             {
                 "layer": getattr(layer, "name", None),
                 "heatmap_node_types": metadata.get("heatmap_node_types"),
-                "heatmap_node_type_labels": metadata.get(
-                    "heatmap_node_type_labels"
-                ),
-                "heatmap_soma_radius_um": metadata.get(
-                    "heatmap_soma_radius_um"
-                ),
+                "heatmap_node_type_labels": metadata.get("heatmap_node_type_labels"),
+                "heatmap_soma_radius_um": metadata.get("heatmap_soma_radius_um"),
             }
         )
 
@@ -563,9 +574,7 @@ class _ClusterFilterComboBox(QComboBox):
         index = self.count() - 1
         self._set_item_checked(index, checked)
         item_getter = getattr(self.model(), "item", None)
-        item = (
-            item_getter(index, self.modelColumn()) if callable(item_getter) else None
-        )
+        item = item_getter(index, self.modelColumn()) if callable(item_getter) else None
         if item is not None:
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
 
@@ -707,7 +716,7 @@ class NeuronViewerWidget(QWidget):
             self._highlighted_file_ids: set[str] | None = None
             self._last_soma_selection: _SomaSelectionKey | set = set()
             self._auto_center_applied_once = False
-            self._region_query_source = "Atlas Regions"
+            self._region_query_source = _REGION_QUERY_SOURCE_ATLAS
             self._region_query_scope = _REGION_QUERY_SCOPE_WHOLE
             self._mask_bounds_source = "manual"
             self._histogram_line_sync_active = False
@@ -816,9 +825,7 @@ class NeuronViewerWidget(QWidget):
                 "neuron_viewer_init_phase",
                 phase="connect_ndisplay_event",
             ):
-                self.viewer.dims.events.ndisplay.connect(
-                    self._on_ndisplay_changed
-                )
+                self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
 
             with startup_timing(
                 logger,
@@ -1312,9 +1319,7 @@ class NeuronViewerWidget(QWidget):
         test_attribute = getattr(obj, "testAttribute", None)
         if delete_on_close is not None and callable(test_attribute):
             try:
-                details["delete_on_close"] = bool(
-                    test_attribute(delete_on_close)
-                )
+                details["delete_on_close"] = bool(test_attribute(delete_on_close))
             except Exception:
                 details["delete_on_close"] = "unavailable"
         else:
@@ -1475,13 +1480,10 @@ class NeuronViewerWidget(QWidget):
                 and viewer is not None
             ),
             "pending_first_show": (
-                getattr(self, "_flatmap_pending_show_token", None)
-                == viewer_token
+                getattr(self, "_flatmap_pending_show_token", None) == viewer_token
             ),
             "show_scheduled": viewer_token
-            in (
-                getattr(self, "_flatmap_show_scheduled_tokens", None) or ()
-            ),
+            in (getattr(self, "_flatmap_show_scheduled_tokens", None) or ()),
             "projection_layer_ref": bool(
                 getattr(flatmap_tab, "_projection_layer", None)
             ),
@@ -1776,7 +1778,9 @@ class NeuronViewerWidget(QWidget):
         window = qt_window_ref()
         is_fullscreen = getattr(window, "isFullScreen", None)
         try:
-            still_fullscreen = bool(is_fullscreen()) if callable(is_fullscreen) else False
+            still_fullscreen = (
+                bool(is_fullscreen()) if callable(is_fullscreen) else False
+            )
         except (RuntimeError, TypeError):
             self._flatmap_fullscreen_close_state.pop(token, None)
             return
@@ -2105,11 +2109,7 @@ class NeuronViewerWidget(QWidget):
         layer_count = self._flatmap_layer_count(viewer)
         slicer_shutdown = self._flatmap_slicer_is_shutdown(viewer)
         prior_model_stages = set(prior_stages or {}) - {"references"}
-        if (
-            slicer_shutdown is True
-            and layer_count == 0
-            and not prior_model_stages
-        ):
+        if slicer_shutdown is True and layer_count == 0 and not prior_model_stages:
             _log_flatmap_lifecycle(
                 "cleanup_skipped",
                 viewer_token=viewer_token,
@@ -2289,11 +2289,9 @@ class NeuronViewerWidget(QWidget):
 
         try:
             if "references" not in prior_stages:
-                owner_released, tab_released = (
-                    self._release_flatmap_viewer_references(
-                        viewer,
-                        viewer_token=viewer_token,
-                    )
+                owner_released, tab_released = self._release_flatmap_viewer_references(
+                    viewer,
+                    viewer_token=viewer_token,
                 )
                 prior_stages["references"] = "released"
             else:
@@ -2317,9 +2315,7 @@ class NeuronViewerWidget(QWidget):
             )
             cleanup_status = "partial" if "failed" in stages.values() else "ok"
             state["stages"] = stages
-            state["status"] = (
-                "partial" if cleanup_status == "partial" else "complete"
-            )
+            state["status"] = "partial" if cleanup_status == "partial" else "complete"
             self._log_flatmap_viewer_snapshot(
                 "cleanup_complete",
                 viewer_token,
@@ -2394,6 +2390,7 @@ class NeuronViewerWidget(QWidget):
         viewer_id = id(viewer)
         last_delay = _FLATMAP_POST_DESTROY_CHECKPOINTS_MS[-1]
         for delay_ms in _FLATMAP_POST_DESTROY_CHECKPOINTS_MS:
+
             def log_checkpoint(
                 *,
                 token=viewer_token,
@@ -2550,12 +2547,8 @@ class NeuronViewerWidget(QWidget):
                 ),
                 selected_region_acronyms_provider=self._active_flatmap_region_acronyms,
                 display_viewer_provider=self._get_or_create_flatmap_viewer,
-                display_viewer_ready_callback=(
-                    self._on_flatmap_display_viewer_ready
-                ),
-                display_viewer_failed_callback=(
-                    self._on_flatmap_display_viewer_failed
-                ),
+                display_viewer_ready_callback=(self._on_flatmap_display_viewer_ready),
+                display_viewer_failed_callback=(self._on_flatmap_display_viewer_failed),
             )
             tabs.addTab(self._flatmap_tab, "Flatmap")
 
@@ -2639,9 +2632,7 @@ class NeuronViewerWidget(QWidget):
         hemisphere_row.addWidget(self._convert_hemisphere_combo)
         convert_layout.addLayout(hemisphere_row)
 
-        self._convert_add_flatmap_cb = QCheckBox(
-            "Add bilateral flatmap/depth columns"
-        )
+        self._convert_add_flatmap_cb = QCheckBox("Add bilateral flatmap/depth columns")
         convert_layout.addWidget(self._convert_add_flatmap_cb)
 
         lookup_row = QHBoxLayout()
@@ -2659,9 +2650,7 @@ class NeuronViewerWidget(QWidget):
         lookup_resolution_row.addWidget(QLabel("Lookup resolution:"))
         self._convert_lookup_resolution_spin = QSpinBox()
         self._convert_lookup_resolution_spin.setRange(0, 100)
-        self._convert_lookup_resolution_spin.setSpecialValueText(
-            "From NRRD header"
-        )
+        self._convert_lookup_resolution_spin.setSpecialValueText("From NRRD header")
         self._convert_lookup_resolution_spin.setSuffix(" μm")
         lookup_resolution_row.addWidget(self._convert_lookup_resolution_spin)
         convert_layout.addLayout(lookup_resolution_row)
@@ -2716,9 +2705,7 @@ class NeuronViewerWidget(QWidget):
             "the original input Parquet for full-dataset reproduction."
         )
         self._project_io_note_label.setWordWrap(True)
-        self._project_io_note_label.setStyleSheet(
-            "color: #cc7700; font-style: italic;"
-        )
+        self._project_io_note_label.setStyleSheet("color: #cc7700; font-style: italic;")
         file_layout.addWidget(self._project_io_note_label)
 
         self._project_progress = QProgressBar()
@@ -3017,7 +3004,13 @@ class NeuronViewerWidget(QWidget):
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("Query source:"))
         self._region_query_source_combo = QComboBox()
-        self._region_query_source_combo.addItems(["Atlas Regions", "Mask Layer"])
+        self._region_query_source_combo.addItems(
+            [
+                _REGION_QUERY_SOURCE_ATLAS,
+                _REGION_QUERY_SOURCE_CUSTOM,
+                _REGION_QUERY_SOURCE_MASK,
+            ]
+        )
         self._region_query_source_combo.currentTextChanged.connect(
             self._on_region_query_source_changed
         )
@@ -3027,8 +3020,12 @@ class NeuronViewerWidget(QWidget):
         scope_row = QHBoxLayout()
         scope_row.addWidget(QLabel("Search scope:"))
         self._region_query_scope_combo = QComboBox()
-        self._region_query_scope_combo.addItem("Whole Parquet", _REGION_QUERY_SCOPE_WHOLE)
-        self._region_query_scope_combo.addItem("Current Table", _REGION_QUERY_SCOPE_CURRENT)
+        self._region_query_scope_combo.addItem(
+            "Whole Parquet", _REGION_QUERY_SCOPE_WHOLE
+        )
+        self._region_query_scope_combo.addItem(
+            "Current Table", _REGION_QUERY_SCOPE_CURRENT
+        )
         self._region_query_scope_combo.currentTextChanged.connect(
             self._on_region_query_scope_changed
         )
@@ -3071,6 +3068,35 @@ class NeuronViewerWidget(QWidget):
 
         atlas_layout.addWidget(self._atlas_region_scope_stack)
         self._region_query_stack.addWidget(atlas_page)
+
+        custom_page = QWidget()
+        custom_layout = QVBoxLayout(custom_page)
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._custom_region_scope_stack = QStackedWidget()
+
+        custom_whole_page = QWidget()
+        custom_whole_layout = QVBoxLayout(custom_whole_page)
+        custom_whole_layout.setContentsMargins(0, 0, 0, 0)
+        self._whole_parquet_custom_region_selector = CustomRegionSelectorWidget()
+        self._whole_parquet_custom_region_selector.selection_changed.connect(
+            self._on_custom_regions_selected
+        )
+        custom_whole_layout.addWidget(self._whole_parquet_custom_region_selector)
+        self._custom_region_scope_stack.addWidget(custom_whole_page)
+
+        custom_current_page = QWidget()
+        custom_current_layout = QVBoxLayout(custom_current_page)
+        custom_current_layout.setContentsMargins(0, 0, 0, 0)
+        self._current_table_custom_region_selector = CustomRegionSelectorWidget()
+        self._current_table_custom_region_selector.selection_changed.connect(
+            self._on_custom_regions_selected
+        )
+        custom_current_layout.addWidget(self._current_table_custom_region_selector)
+        self._custom_region_scope_stack.addWidget(custom_current_page)
+
+        custom_layout.addWidget(self._custom_region_scope_stack)
+        self._region_query_stack.addWidget(custom_page)
 
         mask_page = QWidget()
         mask_layout = QVBoxLayout(mask_page)
@@ -3126,7 +3152,9 @@ class NeuronViewerWidget(QWidget):
         self._regions_status_label.setWordWrap(True)
         layout.addWidget(self._regions_status_label)
         layout.addStretch()
-        self._on_region_query_source_changed(self._region_query_source_combo.currentText())
+        self._on_region_query_source_changed(
+            self._region_query_source_combo.currentText()
+        )
 
     def _setup_tools_tab(self, parent: QWidget) -> None:
         """Set up the blur-generation tools tab."""
@@ -3145,9 +3173,7 @@ class NeuronViewerWidget(QWidget):
         sources_group = QGroupBox("Heatmap Sources")
         sources_layout = QVBoxLayout(sources_group)
         self._heatmap_layer_list = QListWidget()
-        self._heatmap_layer_list.setSelectionMode(
-            QAbstractItemView.ExtendedSelection
-        )
+        self._heatmap_layer_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._heatmap_layer_list.itemSelectionChanged.connect(
             self._update_tools_controls
         )
@@ -3249,9 +3275,7 @@ class NeuronViewerWidget(QWidget):
         )
         sources_layout = self._histogram_sources_section.content_layout()
         self._histogram_layer_list = QListWidget()
-        self._histogram_layer_list.setSelectionMode(
-            QAbstractItemView.ExtendedSelection
-        )
+        self._histogram_layer_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._histogram_layer_list.itemSelectionChanged.connect(
             self._on_histogram_layer_selection_changed
         )
@@ -3437,7 +3461,9 @@ class NeuronViewerWidget(QWidget):
 
         self._show_slice_projection_cb = QCheckBox("Show in 2D slices")
         self._show_slice_projection_cb.setChecked(False)
-        self._show_slice_projection_cb.stateChanged.connect(self._toggle_slice_projection)
+        self._show_slice_projection_cb.stateChanged.connect(
+            self._toggle_slice_projection
+        )
         slice_layout.addWidget(self._show_slice_projection_cb)
 
         self._slice_warning_label = QLabel(
@@ -3499,7 +3525,9 @@ class NeuronViewerWidget(QWidget):
         self._template_opacity_slider = QSlider(Qt.Horizontal)
         self._template_opacity_slider.setRange(0, 100)
         self._template_opacity_slider.setValue(30)
-        self._template_opacity_slider.valueChanged.connect(self._update_template_opacity)
+        self._template_opacity_slider.valueChanged.connect(
+            self._update_template_opacity
+        )
         template_opacity_row.addWidget(self._template_opacity_slider)
         template_layout.addLayout(template_opacity_row)
 
@@ -3725,10 +3753,14 @@ class NeuronViewerWidget(QWidget):
         }
         labels = getattr(result, "labels", None)
         if labels is not None:
-            payload["cluster_labels"] = [int(value) for value in np.asarray(labels).reshape(-1)]
+            payload["cluster_labels"] = [
+                int(value) for value in np.asarray(labels).reshape(-1)
+            ]
         reorder = getattr(result, "reorder_indices", None)
         if reorder is not None:
-            payload["dendrogram_order"] = [int(value) for value in np.asarray(reorder).reshape(-1)]
+            payload["dendrogram_order"] = [
+                int(value) for value in np.asarray(reorder).reshape(-1)
+            ]
         return payload
 
     def _save_project_bundle_dialog(self) -> None:
@@ -3777,9 +3809,7 @@ class NeuronViewerWidget(QWidget):
                 layers=self._iter_viewer_layers(),
                 atlas_name=self._current_atlas_name(),
                 analysis_metadata=self._analysis_project_metadata(),
-                flatmap_cache_reference=(
-                    self._flatmap_tab.active_cache_reference()
-                ),
+                flatmap_cache_reference=(self._flatmap_tab.active_cache_reference()),
                 progress_callback=_on_save_progress,
             )
         except Exception as exc:
@@ -3854,7 +3884,9 @@ class NeuronViewerWidget(QWidget):
             )
         except Exception as exc:
             logger.error("Failed to export enhanced parquet: %s", exc)
-            self._regions_status_label.setText(f"Failed to export enhanced Parquet: {exc}")
+            self._regions_status_label.setText(
+                f"Failed to export enhanced Parquet: {exc}"
+            )
             show_warning(f"Failed to export enhanced Parquet: {exc}")
             return
 
@@ -4271,9 +4303,8 @@ class NeuronViewerWidget(QWidget):
                 atlas=atlas_name,
             ) as selector_timing:
                 set_atlas(atlas)
-                selector_timing.set(
-                    items=len(getattr(selector, "_items_by_id", {}))
-                )
+                selector_timing.set(items=len(getattr(selector, "_items_by_id", {})))
+        self._set_custom_region_hierarchy_for_atlas(atlas)
         self._atlas_status_label.setText(
             f"Atlas: {atlas_name} ({len(atlas.structures)} structures)"
         )
@@ -4333,6 +4364,41 @@ class NeuronViewerWidget(QWidget):
             atlas=atlas_name,
         ):
             self._update_point_import_controls()
+
+    def _set_custom_region_hierarchy_for_atlas(self, atlas: object) -> None:
+        """Populate every scope-specific custom selector from one atlas."""
+        custom_selectors = tuple(
+            selector
+            for selector in (
+                getattr(
+                    self,
+                    "_whole_parquet_custom_region_selector",
+                    None,
+                ),
+                getattr(
+                    self,
+                    "_current_table_custom_region_selector",
+                    None,
+                ),
+            )
+            if selector is not None
+        )
+        if not custom_selectors:
+            return
+
+        try:
+            hierarchy = isocortex_layer_hierarchy_from_atlas(atlas)
+        except ValueError as exc:
+            message = (
+                f"Custom Isocortex Layers are unavailable for the loaded atlas: {exc}"
+            )
+            logger.warning(message)
+            for selector in custom_selectors:
+                selector.clear_with_message(message)
+            return
+
+        for selector in custom_selectors:
+            selector.set_hierarchy(hierarchy)
 
     def _cached_atlas_autoload_running(self) -> bool:
         """Return whether a cached atlas auto-load worker is active."""
@@ -4413,9 +4479,9 @@ class NeuronViewerWidget(QWidget):
         elif action == _REFERENCE_ACTION_OUTLINE:
             self._toggle_outline(True)
         elif action == _REFERENCE_ACTION_MESHES:
-            self._update_region_meshes(self._active_region_preview_acronyms())
+            self._sync_active_region_meshes()
         elif action == _REFERENCE_ACTION_SEGMENTATION:
-            self._update_region_segmentation(self._active_region_preview_acronyms())
+            self._sync_active_region_segmentation()
 
     def _start_cached_template_autoload(self) -> None:
         """Auto-load and show the reference template only when the atlas is cached."""
@@ -4464,8 +4530,7 @@ class NeuronViewerWidget(QWidget):
     def _on_cached_template_atlas_loaded(self, atlas) -> None:
         """Apply a cached atlas loaded in the background and show the template."""
         atlas_name = str(
-            getattr(atlas, "atlas_name", None)
-            or self._atlas_combo.currentText()
+            getattr(atlas, "atlas_name", None) or self._atlas_combo.currentText()
         )
         try:
             with startup_timing(
@@ -4554,7 +4619,9 @@ class NeuronViewerWidget(QWidget):
         mapping_path: str | None = None
         if input_suffix == ".csv":
             try:
-                _standardized, source_description = load_and_standardize_point_csv(input_path)
+                _standardized, source_description = load_and_standardize_point_csv(
+                    input_path
+                )
             except PointImportError:
                 mapping_path, _ = QFileDialog.getOpenFileName(
                     self,
@@ -4654,9 +4721,7 @@ class NeuronViewerWidget(QWidget):
             return
 
         csv_paths = sorted(
-            str(path)
-            for path in Path(directory).glob("*.csv")
-            if path.is_file()
+            str(path) for path in Path(directory).glob("*.csv") if path.is_file()
         )
         if not csv_paths:
             self._point_import_status_label.setText("No CSV files found in directory.")
@@ -4760,7 +4825,9 @@ class NeuronViewerWidget(QWidget):
     def _selected_point_preview_keys(self) -> list[tuple[str, str]]:
         """Return the selected label/origin pairs from the preview table."""
 
-        rows = sorted({index.row() for index in self._point_preview_table.selectedIndexes()})
+        rows = sorted(
+            {index.row() for index in self._point_preview_table.selectedIndexes()}
+        )
         selected: list[tuple[str, str]] = []
         for row in rows:
             key = self._point_preview_key_from_row(row)
@@ -4788,7 +4855,10 @@ class NeuronViewerWidget(QWidget):
         """Return whether a point conversion or append worker is currently active."""
 
         return bool(
-            (self._point_append_thread is not None and self._point_append_thread.isRunning())
+            (
+                self._point_append_thread is not None
+                and self._point_append_thread.isRunning()
+            )
             or (
                 self._point_convert_thread is not None
                 and self._point_convert_thread.isRunning()
@@ -4970,7 +5040,9 @@ class NeuronViewerWidget(QWidget):
         self._update_point_import_controls()
         thread.start()
 
-    def _on_point_convert_progress(self, message: str, current: int, total: int) -> None:
+    def _on_point_convert_progress(
+        self, message: str, current: int, total: int
+    ) -> None:
         """Handle point-CSV conversion progress updates."""
 
         self._point_append_progress.setRange(0, max(1, total))
@@ -5006,7 +5078,9 @@ class NeuronViewerWidget(QWidget):
         self._update_point_import_controls()
         logger.error(f"Point CSV conversion failed: {error_msg}")
 
-    def _on_point_append_progress(self, message: str, _current: int, _total: int) -> None:
+    def _on_point_append_progress(
+        self, message: str, _current: int, _total: int
+    ) -> None:
         """Handle point-file append progress updates."""
 
         self._point_import_status_label.setText(message)
@@ -5120,9 +5194,7 @@ class NeuronViewerWidget(QWidget):
 
         for color_idx, (label, origin_csv) in enumerate(selected_keys):
             group_key = (
-                (label, origin_csv)
-                if self._point_parquet_has_origin_csv
-                else (label,)
+                (label, origin_csv) if self._point_parquet_has_origin_csv else (label,)
             )
             volume = grouped_heatmaps.get(group_key)
             if volume is None:
@@ -5154,7 +5226,9 @@ class NeuronViewerWidget(QWidget):
                     "source_path": self._point_parquet_path,
                     "label": label,
                     "origin_csv": origin_csv,
-                    "point_count": self._point_preview_counts.get((label, origin_csv), 0),
+                    "point_count": self._point_preview_counts.get(
+                        (label, origin_csv), 0
+                    ),
                     "nonzero_voxels": nonzero_voxels,
                     "columns": columns,
                     "color": rgba,
@@ -5291,7 +5365,8 @@ class NeuronViewerWidget(QWidget):
     def _manual_heatmap_layers(self) -> list:
         """Return selected-neuron heatmap layers created from the Data tab."""
         return [
-            layer for layer in self._iter_viewer_layers()
+            layer
+            for layer in self._iter_viewer_layers()
             if _layer_metadata(layer).get("heatmap_kind") == "selected_neurons"
         ]
 
@@ -5358,17 +5433,9 @@ class NeuronViewerWidget(QWidget):
             return None
         current_data = getattr(combo, "currentData", None)
         data = current_data() if callable(current_data) else None
-        if (
-            isinstance(data, tuple)
-            and len(data) == 2
-            and isinstance(data[0], str)
-        ):
+        if isinstance(data, tuple) and len(data) == 2 and isinstance(data[0], str):
             return data[0], self._normalise_layer_file_ids(data[1])
-        if (
-            isinstance(data, tuple)
-            and len(data) == 3
-            and isinstance(data[0], str)
-        ):
+        if isinstance(data, tuple) and len(data) == 3 and isinstance(data[0], str):
             return data[0], self._normalise_layer_file_ids(data[1])
         return None
 
@@ -5386,11 +5453,7 @@ class NeuronViewerWidget(QWidget):
             and data[2]
         ):
             return data[2]
-        if (
-            isinstance(data, tuple)
-            and len(data) == 2
-            and isinstance(data[0], str)
-        ):
+        if isinstance(data, tuple) and len(data) == 2 and isinstance(data[0], str):
             return data[0]
         return None
 
@@ -5461,10 +5524,7 @@ class NeuronViewerWidget(QWidget):
     def _selected_heatmap_running(self) -> bool:
         """Return whether a selected-neuron heatmap worker is active."""
         thread = getattr(self, "_selected_heatmap_thread", None)
-        return bool(
-            thread is not None
-            and thread.isRunning()
-        )
+        return bool(thread is not None and thread.isRunning())
 
     def _update_selected_neuron_heatmap_controls(self) -> None:
         """Enable or disable the selected-neuron heatmap action."""
@@ -5498,9 +5558,7 @@ class NeuronViewerWidget(QWidget):
                     parts.append(f"Cluster {cluster_id}: {count:,}")
             clusters_line = "Clusters: " + ", ".join(parts)
 
-        self._neuron_table_summary_label.setText(
-            f"{counts_line}\n{clusters_line}"
-        )
+        self._neuron_table_summary_label.setText(f"{counts_line}\n{clusters_line}")
 
     def _selected_neuron_heatmap_base_name(
         self,
@@ -5512,8 +5570,7 @@ class NeuronViewerWidget(QWidget):
     def _unique_layer_name(self, base_name: str) -> str:
         """Return a viewer layer name that does not collide with existing names."""
         existing_names = {
-            str(getattr(layer, "name", ""))
-            for layer in self._iter_viewer_layers()
+            str(getattr(layer, "name", "")) for layer in self._iter_viewer_layers()
         }
         if base_name not in existing_names:
             return base_name
@@ -5548,8 +5605,7 @@ class NeuronViewerWidget(QWidget):
     def _next_manual_heatmap_identifier(self) -> str:
         """Return the first Greek identifier whose layer name is unused."""
         existing_names = {
-            str(getattr(layer, "name", ""))
-            for layer in self._iter_viewer_layers()
+            str(getattr(layer, "name", "")) for layer in self._iter_viewer_layers()
         }
         index = 0
         while True:
@@ -5639,13 +5695,12 @@ class NeuronViewerWidget(QWidget):
         if not hasattr(self, "_heatmap_layer_list"):
             return
 
-        previous = {
-            item.text()
-            for item in self._heatmap_layer_list.selectedItems()
-        }
+        previous = {item.text() for item in self._heatmap_layer_list.selectedItems()}
         self._heatmap_layer_list.clear()
 
-        eligible_layers, excluded_messages = self._eligible_heatmap_layers_with_exclusions()
+        eligible_layers, excluded_messages = (
+            self._eligible_heatmap_layers_with_exclusions()
+        )
         eligible_names = [layer.name for layer in eligible_layers]
         for layer in eligible_layers:
             self._heatmap_layer_list.addItem(layer.name)
@@ -5682,13 +5737,12 @@ class NeuronViewerWidget(QWidget):
         if not hasattr(self, "_histogram_layer_list"):
             return
 
-        previous = {
-            item.text()
-            for item in self._histogram_layer_list.selectedItems()
-        }
+        previous = {item.text() for item in self._histogram_layer_list.selectedItems()}
         self._histogram_layer_list.clear()
 
-        eligible_layers, excluded_messages = self._eligible_heatmap_layers_with_exclusions()
+        eligible_layers, excluded_messages = (
+            self._eligible_heatmap_layers_with_exclusions()
+        )
         eligible_names = [layer.name for layer in eligible_layers]
         for layer in eligible_layers:
             self._histogram_layer_list.addItem(layer.name)
@@ -5819,7 +5873,10 @@ class NeuronViewerWidget(QWidget):
             return []
         layers = []
         for layer in self._iter_viewer_layers():
-            if layer.name in selected_names and self._heatmap_layer_eligibility(layer)[0]:
+            if (
+                layer.name in selected_names
+                and self._heatmap_layer_eligibility(layer)[0]
+            ):
                 layers.append(layer)
         return layers
 
@@ -5985,11 +6042,7 @@ class NeuronViewerWidget(QWidget):
 
         lower = float(self._mask_lower_threshold_spin.value())
         use_upper = bool(self._mask_use_upper_bound_cb.isChecked())
-        upper = (
-            float(self._mask_upper_threshold_spin.value())
-            if use_upper
-            else None
-        )
+        upper = float(self._mask_upper_threshold_spin.value()) if use_upper else None
 
         if which == "lower":
             lower = float(lower_line.value())
@@ -6043,9 +6096,13 @@ class NeuronViewerWidget(QWidget):
         if self._atlas is None:
             contrast_reason = "Load an atlas before syncing layer contrast."
         elif not selected_layers:
-            contrast_reason = "Select one eligible heatmap layer to sync contrast limits."
+            contrast_reason = (
+                "Select one eligible heatmap layer to sync contrast limits."
+            )
         elif len(selected_layers) != 1:
-            contrast_reason = "Select exactly one eligible heatmap layer to sync contrast limits."
+            contrast_reason = (
+                "Select exactly one eligible heatmap layer to sync contrast limits."
+            )
         elif self._layer_contrast_limits(selected_layers[0]) is None:
             contrast_reason = "The selected layer does not expose contrast limits."
 
@@ -6173,10 +6230,11 @@ class NeuronViewerWidget(QWidget):
             self._histogram_status_label.setText(message)
             return
 
-        if len(selected_layers) > 1 and self._current_histogram_create_mode() != "merged":
-            message = (
-                "Use Otsu Lower with one selected layer, or switch Create mode to Merged layer."
-            )
+        if (
+            len(selected_layers) > 1
+            and self._current_histogram_create_mode() != "merged"
+        ):
+            message = "Use Otsu Lower with one selected layer, or switch Create mode to Merged layer."
             self._histogram_status_label.setText(message)
             return
 
@@ -6204,7 +6262,9 @@ class NeuronViewerWidget(QWidget):
         """Copy the selected layer contrast limits into the mask bounds."""
         selected_layers = self._selected_histogram_layers()
         if len(selected_layers) != 1:
-            message = "Select exactly one eligible heatmap layer to sync contrast limits."
+            message = (
+                "Select exactly one eligible heatmap layer to sync contrast limits."
+            )
             self._histogram_status_label.setText(message)
             return
 
@@ -6274,10 +6334,7 @@ class NeuronViewerWidget(QWidget):
         names = set(self._mask_layer_selector.get_selected_layer_names())
         if not names:
             return []
-        return [
-            layer for layer in self._generated_mask_layers()
-            if layer.name in names
-        ]
+        return [layer for layer in self._generated_mask_layers() if layer.name in names]
 
     @staticmethod
     def _deduplicate_file_ids(file_ids: list[object]) -> list[object]:
@@ -6302,9 +6359,7 @@ class NeuronViewerWidget(QWidget):
                 "source_file_ids",
                 "file_ids",
             ):
-                file_ids.extend(
-                    self._normalise_layer_file_ids(metadata.get(key, ()))
-                )
+                file_ids.extend(self._normalise_layer_file_ids(metadata.get(key, ())))
         return NeuronViewerWidget._deduplicate_file_ids(file_ids)
 
     def _mask_source_exclusion_enabled(self) -> bool:
@@ -6336,16 +6391,10 @@ class NeuronViewerWidget(QWidget):
 
         source_file_ids = self._source_file_ids_for_layers(selected_layers)
         if not source_file_ids:
-            label.setText(
-                "Selected mask layer(s) do not record source neurons."
-            )
+            label.setText("Selected mask layer(s) do not record source neurons.")
             return
 
-        action = (
-            "excluded"
-            if self._mask_source_exclusion_enabled()
-            else "included"
-        )
+        action = "excluded" if self._mask_source_exclusion_enabled() else "included"
         label.setText(
             "Selected mask layer(s) were generated from "
             f"{len(source_file_ids)} unique source neuron(s); "
@@ -6386,7 +6435,10 @@ class NeuronViewerWidget(QWidget):
         try:
             if create_mode == "merged":
                 merged_volume = merge_heatmap_volumes(
-                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+                    [
+                        np.asarray(layer.data, dtype=np.float32)
+                        for layer in selected_layers
+                    ]
                 )
                 created_layers.append(
                     self._add_blurred_heatmap_layer(
@@ -6410,14 +6462,18 @@ class NeuronViewerWidget(QWidget):
                     )
         except Exception as e:
             logger.error("Failed to create blurred heatmap layers: %s", e)
-            self._tools_status_label.setText(f"Failed to create blurred heatmap layers: {e}")
+            self._tools_status_label.setText(
+                f"Failed to create blurred heatmap layers: {e}"
+            )
             return
 
         self._refresh_heatmap_layer_list()
         self._refresh_histogram_layer_list()
         self._select_heatmap_layer_names([layer.name for layer in created_layers])
         self._select_histogram_layer_names([layer.name for layer in created_layers])
-        nonempty = sum(int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers)
+        nonempty = sum(
+            int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers
+        )
         self._tools_status_label.setText(
             f"Created {len(created_layers)} blurred layer(s); {nonempty} contain nonzero voxels."
         )
@@ -6443,12 +6499,8 @@ class NeuronViewerWidget(QWidget):
             return
 
         selected_regions = self._selected_region_isolation_entries()
-        selected_region_ids = [
-            region_id for region_id, _acronym in selected_regions
-        ]
-        selected_region_acronyms = [
-            acronym for _region_id, acronym in selected_regions
-        ]
+        selected_region_ids = [region_id for region_id, _acronym in selected_regions]
+        selected_region_acronyms = [acronym for _region_id, acronym in selected_regions]
         region_label = self._region_isolation_label(selected_region_acronyms)
         selector = getattr(self, "_tools_region_selector", None)
         include_children = (
@@ -6462,7 +6514,10 @@ class NeuronViewerWidget(QWidget):
         try:
             if create_mode == "merged":
                 merged_volume = merge_heatmap_volumes(
-                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+                    [
+                        np.asarray(layer.data, dtype=np.float32)
+                        for layer in selected_layers
+                    ]
                 )
                 isolated = isolate_heatmap_volume_to_region_ids(
                     merged_volume,
@@ -6505,14 +6560,18 @@ class NeuronViewerWidget(QWidget):
                     )
         except Exception as e:
             logger.error("Failed to create isolated heatmap layers: %s", e)
-            self._tools_status_label.setText(f"Failed to create isolated heatmap layers: {e}")
+            self._tools_status_label.setText(
+                f"Failed to create isolated heatmap layers: {e}"
+            )
             return
 
         self._refresh_heatmap_layer_list()
         self._refresh_histogram_layer_list()
         self._select_heatmap_layer_names([layer.name for layer in created_layers])
         self._select_histogram_layer_names([layer.name for layer in created_layers])
-        nonempty = sum(int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers)
+        nonempty = sum(
+            int(np.any(np.asarray(layer.data) > 0)) for layer in created_layers
+        )
         self._tools_status_label.setText(
             f"Created {len(created_layers)} isolated heatmap layer(s); "
             f"{nonempty} contain nonzero voxels."
@@ -6543,7 +6602,10 @@ class NeuronViewerWidget(QWidget):
         try:
             if create_mode == "merged":
                 merged_volume = merge_heatmap_volumes(
-                    [np.asarray(layer.data, dtype=np.float32) for layer in selected_layers]
+                    [
+                        np.asarray(layer.data, dtype=np.float32)
+                        for layer in selected_layers
+                    ]
                 )
                 mask = build_binary_mask_from_threshold_range(
                     merged_volume,
@@ -6585,7 +6647,9 @@ class NeuronViewerWidget(QWidget):
             self._histogram_status_label.setText(f"Failed to create mask layers: {e}")
             return
 
-        nonempty = sum(int(np.asarray(layer.data).sum() > 0) for layer in created_layers)
+        nonempty = sum(
+            int(np.asarray(layer.data).sum() > 0) for layer in created_layers
+        )
         bounds_text = f"lower {lower_threshold:.4f}"
         if upper_threshold is not None:
             bounds_text += f", upper {upper_threshold:.4f}"
@@ -6614,7 +6678,9 @@ class NeuronViewerWidget(QWidget):
         rgba = _mask_layer_color(source_layers)
         source_file_ids = self._source_file_ids_for_layers(source_layers)
 
-        colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        colormap = (
+            getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        )
         if colormap is None and rgba is not None:
             colormap = Colormap(
                 colors=[[0.0, 0.0, 0.0, 0.0], list(rgba)],
@@ -6645,7 +6711,9 @@ class NeuronViewerWidget(QWidget):
             "colormap": colormap,
             "blending": getattr(first_layer, "blending", "additive"),
             "rendering": getattr(first_layer, "rendering", "mip"),
-            "opacity": getattr(first_layer, "opacity", self._opacity_slider.value() / 100.0),
+            "opacity": getattr(
+                first_layer, "opacity", self._opacity_slider.value() / 100.0
+            ),
             "visible": True,
             "metadata": metadata,
         }
@@ -6678,7 +6746,9 @@ class NeuronViewerWidget(QWidget):
         rgba = _mask_layer_color(source_layers)
         source_file_ids = self._source_file_ids_for_layers(source_layers)
 
-        colormap = getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        colormap = (
+            getattr(first_layer, "colormap", None) if len(source_layers) == 1 else None
+        )
         if colormap is None and rgba is not None:
             colormap = Colormap(
                 colors=[[0.0, 0.0, 0.0, 0.0], list(rgba)],
@@ -6725,7 +6795,9 @@ class NeuronViewerWidget(QWidget):
             "colormap": colormap,
             "blending": getattr(first_layer, "blending", "additive"),
             "rendering": getattr(first_layer, "rendering", "mip"),
-            "opacity": getattr(first_layer, "opacity", self._opacity_slider.value() / 100.0),
+            "opacity": getattr(
+                first_layer, "opacity", self._opacity_slider.value() / 100.0
+            ),
             "visible": True,
             "contrast_limits": contrast_limits,
             "metadata": metadata,
@@ -6798,27 +6870,37 @@ class NeuronViewerWidget(QWidget):
         return layer
 
     def _on_region_query_source_changed(self, text: str) -> None:
-        """Switch Regions tab between atlas and mask query modes."""
+        """Switch among atlas, custom-region, and mask query modes."""
         self._region_query_source = text
         if not hasattr(self, "_region_query_stack"):
             return
 
-        show_mask_buttons = text == "Mask Layer"
-        self._region_query_stack.setCurrentIndex(1 if show_mask_buttons else 0)
+        page_index = {
+            _REGION_QUERY_SOURCE_ATLAS: _REGION_QUERY_PAGE_ATLAS,
+            _REGION_QUERY_SOURCE_CUSTOM: _REGION_QUERY_PAGE_CUSTOM,
+            _REGION_QUERY_SOURCE_MASK: _REGION_QUERY_PAGE_MASK,
+        }.get(text, _REGION_QUERY_PAGE_ATLAS)
+        self._region_query_stack.setCurrentIndex(page_index)
         self._sync_region_query_scope_selector()
         find_button = getattr(self, "_region_query_find_btn", None)
         if find_button is not None:
-            if show_mask_buttons:
+            if text == _REGION_QUERY_SOURCE_MASK:
                 find_button.setText("Find Neurons in Selected Mask Layers")
+            elif text == _REGION_QUERY_SOURCE_CUSTOM:
+                find_button.setText("Find Neurons in Selected Custom Regions")
             else:
                 find_button.setText("Find Neurons in Selected Regions")
         else:
+            show_mask_buttons = text == _REGION_QUERY_SOURCE_MASK
             for button in self._atlas_region_query_buttons():
                 button.setVisible(not show_mask_buttons)
             for button in self._mask_layer_query_buttons():
                 button.setVisible(show_mask_buttons)
         self._regions_status_label.setText("")
-        if not show_mask_buttons:
+        if text in {
+            _REGION_QUERY_SOURCE_ATLAS,
+            _REGION_QUERY_SOURCE_CUSTOM,
+        }:
             self._sync_active_region_reference_layers()
 
     def _on_region_query_scope_changed(self, _text: str) -> None:
@@ -6827,7 +6909,14 @@ class NeuronViewerWidget(QWidget):
         self._sync_region_query_scope_selector()
         if hasattr(self, "_regions_status_label"):
             self._regions_status_label.setText("")
-        if getattr(self, "_region_query_source", "Atlas Regions") == "Atlas Regions":
+        if getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        ) in {
+            _REGION_QUERY_SOURCE_ATLAS,
+            _REGION_QUERY_SOURCE_CUSTOM,
+        }:
             self._sync_active_region_reference_layers()
 
     def _selected_region_query_scope(self) -> str:
@@ -6916,6 +7005,47 @@ class NeuronViewerWidget(QWidget):
         """Return the atlas-region selector for the current search scope."""
         return self._region_selector_for_scope()
 
+    def _custom_region_selector_for_scope(
+        self,
+        scope: str | None = None,
+    ) -> CustomRegionSelectorWidget | None:
+        """Return the custom-region selector for the requested search scope."""
+        selected_scope = scope
+        if selected_scope not in {
+            _REGION_QUERY_SCOPE_WHOLE,
+            _REGION_QUERY_SCOPE_CURRENT,
+        }:
+            selected_scope = self._selected_region_query_scope()
+        if selected_scope == _REGION_QUERY_SCOPE_CURRENT:
+            return getattr(
+                self,
+                "_current_table_custom_region_selector",
+                None,
+            )
+        return getattr(
+            self,
+            "_whole_parquet_custom_region_selector",
+            None,
+        )
+
+    def _active_custom_region_selector(
+        self,
+    ) -> CustomRegionSelectorWidget | None:
+        """Return the custom selector for the current search scope."""
+        return self._custom_region_selector_for_scope()
+
+    def _active_custom_region_groups(
+        self,
+    ) -> tuple[CustomRegionSelectionGroup, ...]:
+        """Return selected custom terminal regions grouped by layer."""
+        selector = self._active_custom_region_selector()
+        if selector is None:
+            return ()
+        get_groups = getattr(selector, "get_selected_region_groups", None)
+        if not callable(get_groups):
+            return ()
+        return tuple(get_groups())
+
     def _active_region_preview_acronyms(self) -> list[str]:
         """Return directly selected atlas acronyms for preview layers."""
         selector = self._active_region_selector()
@@ -6947,10 +7077,7 @@ class NeuronViewerWidget(QWidget):
         get_selected = getattr(selector, "get_selected_ids", None)
         if not callable(get_selected):
             return []
-        return [
-            int(region_id)
-            for region_id in get_selected(include_children=True)
-        ]
+        return [int(region_id) for region_id in get_selected(include_children=True)]
 
     def _active_flatmap_parent_region_ids(self) -> list[int]:
         """Return directly selected atlas IDs for cached union geometry."""
@@ -6971,35 +7098,58 @@ class NeuronViewerWidget(QWidget):
         get_selected = getattr(selector, "get_selected_acronyms", None)
         if not callable(get_selected):
             return []
-        return [
-            str(acronym)
-            for acronym in get_selected(include_children=True)
-        ]
+        return [str(acronym) for acronym in get_selected(include_children=True)]
 
     def _sync_region_query_scope_selector(self) -> None:
-        """Show the atlas selector that matches the active query scope."""
-        stack = getattr(self, "_atlas_region_scope_stack", None)
-        if stack is None:
-            return
-
+        """Show the atlas and custom selectors matching the query scope."""
         index = (
             1
             if self._selected_region_query_scope() == _REGION_QUERY_SCOPE_CURRENT
             else 0
         )
-        stack.setCurrentIndex(index)
+        for name in (
+            "_atlas_region_scope_stack",
+            "_custom_region_scope_stack",
+        ):
+            stack = getattr(self, name, None)
+            if stack is not None:
+                stack.setCurrentIndex(index)
 
     def _sync_active_region_reference_layers(self) -> None:
-        """Refresh region preview layers from the active atlas selector."""
-        acronyms = self._active_region_preview_acronyms()
-
+        """Refresh reference layers from the active Atlas or Custom source."""
         show_meshes = getattr(self, "_show_region_meshes_cb", None)
         if show_meshes is not None and show_meshes.isChecked():
-            self._update_region_meshes(acronyms)
+            self._sync_active_region_meshes()
 
         show_segmentation = getattr(self, "_show_region_seg_cb", None)
         if show_segmentation is not None and show_segmentation.isChecked():
-            self._update_region_segmentation(acronyms)
+            self._sync_active_region_segmentation()
+
+    def _sync_active_region_meshes(self) -> None:
+        """Refresh selected-region meshes for the current query source."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_CUSTOM:
+            self._update_custom_region_meshes(self._active_custom_region_groups())
+            return
+        self._update_region_meshes(self._active_region_preview_acronyms())
+
+    def _sync_active_region_segmentation(self) -> None:
+        """Refresh selected-region labels for the current query source."""
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_CUSTOM:
+            self._update_custom_region_segmentation(
+                self._active_custom_region_groups()
+            )
+            return
+        self._update_region_segmentation(self._active_region_preview_acronyms())
 
     @staticmethod
     def _atlas_query_details(
@@ -7083,12 +7233,25 @@ class NeuronViewerWidget(QWidget):
             getter = getattr(combo, "selected_node_types", None)
             node_types = getter() if callable(getter) else None
         membership = NodeTypeSelectorComboBox.query_text(node_types)
-        if getattr(self, "_region_query_source", "Atlas Regions") == "Mask Layer":
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        if source == _REGION_QUERY_SOURCE_MASK:
             self._regions_status_label.setText(
                 f"Searching for neurons with {membership} in selected mask layers. Please wait..."
             )
             QApplication.processEvents()
             self._query_neurons_by_mask(node_types=node_types)
+            return
+        if source == _REGION_QUERY_SOURCE_CUSTOM:
+            self._regions_status_label.setText(
+                f"Searching for neurons with {membership} in selected custom "
+                "regions. Please wait..."
+            )
+            QApplication.processEvents()
+            self._query_neurons_by_custom_region(node_types=node_types)
             return
 
         self._regions_status_label.setText(
@@ -7132,6 +7295,15 @@ class NeuronViewerWidget(QWidget):
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
         _ = acronyms
+        if (
+            getattr(
+                self,
+                "_region_query_source",
+                _REGION_QUERY_SOURCE_ATLAS,
+            )
+            != _REGION_QUERY_SOURCE_ATLAS
+        ):
+            return
         preview_acronyms = self._active_region_preview_acronyms()
 
         # Update region meshes if enabled
@@ -7141,6 +7313,116 @@ class NeuronViewerWidget(QWidget):
         # Update region segmentation if enabled
         if self._show_region_seg_cb.isChecked():
             self._update_region_segmentation(preview_acronyms)
+
+    def _on_custom_regions_selected(self, _region_ids: list[int]) -> None:
+        """Refresh reference previews for an active custom selection."""
+        if hasattr(self, "_regions_status_label"):
+            self._regions_status_label.setText("")
+        if (
+            getattr(
+                self,
+                "_region_query_source",
+                _REGION_QUERY_SOURCE_ATLAS,
+            )
+            == _REGION_QUERY_SOURCE_CUSTOM
+        ):
+            self._sync_active_region_reference_layers()
+
+    def _query_neurons_by_custom_region(
+        self,
+        soma_only: bool = False,
+        node_types: tuple[int, ...] | list[int] | None = None,
+    ) -> None:
+        """Query neurons by exactly the selected custom terminal region IDs."""
+        if self._db is None:
+            return
+        if self._atlas is None:
+            self._regions_status_label.setText(
+                "Load a compatible Allen atlas before querying Custom Regions."
+            )
+            return
+
+        selector = self._active_custom_region_selector()
+        if selector is None:
+            self._regions_status_label.setText(
+                "Custom Isocortex Layers are unavailable."
+            )
+            return
+        has_hierarchy = getattr(selector, "has_hierarchy", None)
+        if callable(has_hierarchy) and not has_hierarchy():
+            unavailable_message = getattr(selector, "unavailable_message", None)
+            message = (
+                str(unavailable_message())
+                if callable(unavailable_message)
+                else "Custom Isocortex Layers are unavailable."
+            )
+            self._regions_status_label.setText(message)
+            return
+        region_ids = sorted(
+            {int(region_id) for region_id in selector.get_selected_region_ids()}
+        )
+        if not region_ids:
+            self._regions_status_label.setText(
+                "Select at least one terminal Custom Region."
+            )
+            return
+
+        has_column = getattr(self._db, "has_column", None)
+        if callable(has_column) and not has_column("region_id"):
+            self._regions_status_label.setText(
+                "Custom Regions require a region_id column in the loaded "
+                "Parquet. Regenerate it with Allen region annotations."
+            )
+            return
+
+        try:
+            proceed, base_file_ids, scope_label, input_count = (
+                self._resolve_region_query_file_scope()
+            )
+            if not proceed:
+                return
+            effective_node_types = self._effective_query_node_types(
+                node_types,
+                soma_only,
+            )
+            result = self._db.get_neurons_by_region_id(
+                region_ids,
+                soma_only=soma_only,
+                file_ids=base_file_ids,
+                node_types=effective_node_types,
+            )
+            self._populate_neuron_table(
+                result,
+                preserve_existing=base_file_ids is not None,
+            )
+            membership = NodeTypeSelectorComboBox.query_text(effective_node_types)
+            scope_suffix = self._query_scope_status_suffix(
+                scope_label,
+                input_count,
+            )
+            region_word = "region" if len(region_ids) == 1 else "regions"
+            if result.empty:
+                self._regions_status_label.setText(
+                    f"No neurons found with {membership} in "
+                    f"{len(region_ids)} selected terminal custom {region_word}"
+                    f"{scope_suffix}."
+                )
+            else:
+                self._regions_status_label.setText(
+                    f"Found {len(result)} neuron(s) with {membership} in "
+                    f"{len(region_ids)} selected terminal custom {region_word}"
+                    f"{scope_suffix}."
+                )
+            logger.info(
+                "Found %d neurons with %s in %d terminal custom regions within %s",
+                len(result),
+                membership,
+                len(region_ids),
+                scope_label,
+            )
+        except Exception as exc:
+            logger.error("Custom region query failed: %s", exc)
+            self._regions_status_label.setText(f"Custom region query failed: {exc}")
 
     def _query_neurons_by_region(
         self,
@@ -7224,7 +7506,9 @@ class NeuronViewerWidget(QWidget):
 
         layers = self._selected_mask_query_layers()
         if not layers:
-            self._regions_status_label.setText("Select at least one generated mask layer.")
+            self._regions_status_label.setText(
+                "Select at least one generated mask layer."
+            )
             return
 
         mask = np.logical_or.reduce([np.asarray(layer.data) > 0 for layer in layers])
@@ -7267,9 +7551,7 @@ class NeuronViewerWidget(QWidget):
                 selected_names += ", ..."
             exclusion_text = ""
             if exclude_file_ids:
-                excluded_word = (
-                    "neuron" if len(exclude_file_ids) == 1 else "neurons"
-                )
+                excluded_word = "neuron" if len(exclude_file_ids) == 1 else "neurons"
                 exclusion_text = (
                     f"; excluded {len(exclude_file_ids)} source {excluded_word}"
                 )
@@ -7298,9 +7580,13 @@ class NeuronViewerWidget(QWidget):
     def _current_table_file_ids_in_scene(self) -> list[object]:
         """Return the subset of current table IDs that are rendered in the scene."""
         rendered = self._current_scene_file_ids()
-        return [file_id for file_id in self._current_table_file_ids() if file_id in rendered]
+        return [
+            file_id for file_id in self._current_table_file_ids() if file_id in rendered
+        ]
 
-    def _cache_scene_display_state(self, file_ids: list[object] | tuple[object, ...]) -> None:
+    def _cache_scene_display_state(
+        self, file_ids: list[object] | tuple[object, ...]
+    ) -> None:
         """Preserve base color and visibility for rendered neurons leaving the table."""
         scene_state = getattr(self, "_scene_display_state", None)
         if scene_state is None:
@@ -7350,7 +7636,9 @@ class NeuronViewerWidget(QWidget):
         else:
             self._highlighted_file_ids = None
 
-    def _populate_neuron_table(self, result, *, preserve_existing: bool = False) -> None:
+    def _populate_neuron_table(
+        self, result, *, preserve_existing: bool = False
+    ) -> None:
         """Populate or subset the neuron table from a query result."""
         self._cache_scene_display_state(self._current_table_file_ids_in_scene())
 
@@ -7358,10 +7646,7 @@ class NeuronViewerWidget(QWidget):
             matched_file_ids = result["file_id"].tolist()
             self._neuron_table.retain_file_ids(matched_file_ids)
         else:
-            neurons = [
-                (row["file_id"], row["subject"])
-                for _, row in result.iterrows()
-            ]
+            neurons = [(row["file_id"], row["subject"]) for _, row in result.iterrows()]
             self._neuron_table.populate(neurons)
 
         saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
@@ -7427,7 +7712,9 @@ class NeuronViewerWidget(QWidget):
         previous = self._selected_cluster_filter()
         cluster_ids = self._neuron_table.available_cluster_ids()
         has_unclustered = False
-        unclustered_getter = getattr(self._neuron_table, "has_unclustered_entries", None)
+        unclustered_getter = getattr(
+            self._neuron_table, "has_unclustered_entries", None
+        )
         if callable(unclustered_getter):
             has_unclustered = bool(unclustered_getter())
 
@@ -7506,7 +7793,9 @@ class NeuronViewerWidget(QWidget):
             self._refresh_apply_existing_clusters_button()
             return
 
-        message = f"Applied cached cluster data to {matched_table_count} table neuron(s)."
+        message = (
+            f"Applied cached cluster data to {matched_table_count} table neuron(s)."
+        )
         rendered_count = int(getattr(summary, "rendered_count", 0))
         if rendered_count > 0:
             colored_count = int(getattr(summary, "colored_count", 0))
@@ -7550,7 +7839,8 @@ class NeuronViewerWidget(QWidget):
             return
 
         rendered_selected = [
-            file_id for file_id in selected_file_ids
+            file_id
+            for file_id in selected_file_ids
             if file_id in self._current_scene_file_ids()
         ]
         self._cache_scene_display_state(rendered_selected)
@@ -7575,7 +7865,8 @@ class NeuronViewerWidget(QWidget):
         selected_file_id_set = set(selected_file_ids)
         current_file_ids = self._current_table_file_ids()
         unselected_file_ids = [
-            file_id for file_id in current_file_ids
+            file_id
+            for file_id in current_file_ids
             if file_id not in selected_file_id_set
         ]
         if not unselected_file_ids:
@@ -7586,8 +7877,7 @@ class NeuronViewerWidget(QWidget):
 
         scene_file_ids = self._current_scene_file_ids()
         rendered_unselected = [
-            file_id for file_id in unselected_file_ids
-            if file_id in scene_file_ids
+            file_id for file_id in unselected_file_ids if file_id in scene_file_ids
         ]
         self._cache_scene_display_state(rendered_unselected)
         self._neuron_table.remove_file_ids(unselected_file_ids)
@@ -7631,8 +7921,7 @@ class NeuronViewerWidget(QWidget):
             return
 
         selected_file_ids = [
-            str(file_id)
-            for file_id in self._neuron_table.get_selected_file_ids()
+            str(file_id) for file_id in self._neuron_table.get_selected_file_ids()
         ]
         if not selected_file_ids:
             self._render_status_label.setText(
@@ -7646,7 +7935,9 @@ class NeuronViewerWidget(QWidget):
         """Start the background worker that builds a selected-neuron heatmap."""
         from ..workers import HeatmapWorker
 
-        self._selected_heatmap_request_file_ids = tuple(str(file_id) for file_id in file_ids)
+        self._selected_heatmap_request_file_ids = tuple(
+            str(file_id) for file_id in file_ids
+        )
 
         self._render_progress.setVisible(True)
         self._render_progress.setRange(0, 0)
@@ -7707,9 +7998,7 @@ class NeuronViewerWidget(QWidget):
             "manual_heatmap_id": manual_heatmap_id,
             "atlas_name": self._current_atlas_name(),
             "source_path": (
-                str(self._db.parquet_path)
-                if self._db is not None
-                else None
+                str(self._db.parquet_path) if self._db is not None else None
             ),
             "file_ids": [str(file_id) for file_id in file_ids],
             "selection_count": len(file_ids),
@@ -7799,9 +8088,7 @@ class NeuronViewerWidget(QWidget):
 
         if not changed:
             mode_label = (
-                "full traces"
-                if render_mode == _SCENE_RENDER_MODE_FULL
-                else "soma only"
+                "full traces" if render_mode == _SCENE_RENDER_MODE_FULL else "soma only"
             )
             self._render_status_label.setText(
                 f"All selected neurons are already in the scene as {mode_label}."
@@ -7850,7 +8137,8 @@ class NeuronViewerWidget(QWidget):
         scene_render_modes = dict(self._scene_render_modes)
         file_ids = sorted(scene_render_modes, key=str)
         full_file_ids = [
-            fid for fid in file_ids
+            fid
+            for fid in file_ids
             if scene_render_modes.get(fid) == _SCENE_RENDER_MODE_FULL
         ]
         n = len(file_ids)
@@ -7895,7 +8183,9 @@ class NeuronViewerWidget(QWidget):
             # Single batch query for all neurons
             line_data = self._db.get_neuron_lines_batch(full_file_ids)
 
-            self._render_status_label.setText(f"Building line segments for {n} neurons...")
+            self._render_status_label.setText(
+                f"Building line segments for {n} neurons..."
+            )
             QApplication.processEvents()
 
             all_lines = []
@@ -7913,9 +8203,7 @@ class NeuronViewerWidget(QWidget):
                     continue
 
                 # Vectorized line segment building
-                segments = np.stack(
-                    [coords[edges[:, 0]], coords[edges[:, 1]]], axis=1
-                )
+                segments = np.stack([coords[edges[:, 0]], coords[edges[:, 1]]], axis=1)
                 all_lines.append(segments)
 
                 color_arr = np.empty((len(edges), 4))
@@ -8144,8 +8432,7 @@ class NeuronViewerWidget(QWidget):
             soma_points_df = points_df[points_df["type"] == 1]
 
         color_map = {
-            fid: tuple(color[:4])
-            for fid, color in zip(file_ids, neuron_colors)
+            fid: tuple(color[:4]) for fid, color in zip(file_ids, neuron_colors)
         }
         default_color = (0.5, 0.5, 0.5, 1.0)
         batch = {}
@@ -8159,7 +8446,9 @@ class NeuronViewerWidget(QWidget):
         if missing_file_ids and self._db is not None:
             missing_soma_points_df = self._db.get_soma_points(missing_file_ids)
             if not missing_soma_points_df.empty:
-                for file_id, group in missing_soma_points_df.groupby("file_id", sort=True):
+                for file_id, group in missing_soma_points_df.groupby(
+                    "file_id", sort=True
+                ):
                     coords = group[["x", "y", "z"]].values.astype(np.float64)
                     batch[file_id] = (coords, color_map.get(file_id, default_color))
 
@@ -8506,8 +8795,7 @@ class NeuronViewerWidget(QWidget):
 
             if requested:
                 existing = [
-                    layer for layer in self.viewer.layers
-                    if layer.name == layer_name
+                    layer for layer in self.viewer.layers if layer.name == layer_name
                 ]
                 timing.set(existing_template_layers=len(existing))
                 if not existing:
@@ -8572,7 +8860,7 @@ class NeuronViewerWidget(QWidget):
     def _toggle_region_meshes(self, state: int) -> None:
         """Toggle region mesh visibility."""
         if bool(state):
-            self._update_region_meshes(self._active_region_preview_acronyms())
+            self._sync_active_region_meshes()
         else:
             remove_region_layers(self.viewer)
 
@@ -8604,10 +8892,59 @@ class NeuronViewerWidget(QWidget):
         for acronym in acronyms:
             add_region_mesh(self.viewer, self._atlas, acronym, opacity=opacity)
 
+    def _update_custom_region_meshes(
+        self,
+        groups: tuple[CustomRegionSelectionGroup, ...],
+    ) -> None:
+        """Render selected custom terminal meshes in canonical layer groups."""
+        if self._atlas is None:
+            if self._atlas_load_running():
+                self._pending_reference_action = _REFERENCE_ACTION_MESHES
+                return
+            self._load_atlas(pending_reference_action=_REFERENCE_ACTION_MESHES)
+            return
+
+        remove_region_layers(self.viewer)
+        if not self._show_region_meshes_cb.isChecked() or not groups:
+            return
+
+        if self.viewer.dims.ndisplay == 2:
+            self.viewer.dims.ndisplay = 3
+            show_info("Switched to 3D view for mesh display")
+
+        opacity = self._mesh_opacity_slider.value() / 100.0
+        created_count = 0
+        missing_acronyms: list[str] = []
+        for group in groups:
+            layer, missing = add_region_mesh_group(
+                self.viewer,
+                self._atlas,
+                group,
+                opacity=opacity,
+            )
+            if layer is not None:
+                created_count += 1
+            missing_acronyms.extend(missing)
+
+        if missing_acronyms:
+            preview = ", ".join(missing_acronyms[:8])
+            suffix = "…" if len(missing_acronyms) > 8 else ""
+            unavailable_suffix = (
+                " No Custom Region mesh layers were created."
+                if created_count == 0
+                else ""
+            )
+            show_warning(
+                f"Skipped {len(missing_acronyms)} Custom Region mesh(es) "
+                f"that were unavailable: {preview}{suffix}.{unavailable_suffix}"
+            )
+        elif created_count == 0 and groups:
+            show_warning("No meshes were available for the selected Custom Regions.")
+
     def _toggle_region_segmentation(self, state: int) -> None:
         """Toggle region segmentation visibility."""
         if bool(state):
-            self._update_region_segmentation(self._active_region_preview_acronyms())
+            self._sync_active_region_segmentation()
         else:
             remove_region_segmentation(self.viewer)
 
@@ -8629,8 +8966,42 @@ class NeuronViewerWidget(QWidget):
             return
 
         opacity = self._seg_opacity_slider.value() / 100.0
-        add_region_segmentation(
-            self.viewer, self._atlas, acronyms, opacity=opacity
+        add_region_segmentation(self.viewer, self._atlas, acronyms, opacity=opacity)
+
+    def _update_custom_region_segmentation(
+        self,
+        groups: tuple[CustomRegionSelectionGroup, ...],
+    ) -> None:
+        """Render exactly the selected custom terminal IDs as labels."""
+        if self._atlas is None:
+            if self._atlas_load_running():
+                self._pending_reference_action = _REFERENCE_ACTION_SEGMENTATION
+                return
+            self._load_atlas(
+                pending_reference_action=_REFERENCE_ACTION_SEGMENTATION
+            )
+            return
+
+        remove_region_segmentation(self.viewer)
+        if not self._show_region_seg_cb.isChecked():
+            return
+
+        region_ids = sorted(
+            {
+                int(region_id)
+                for group in groups
+                for region_id in group.region_ids
+            }
+        )
+        if not region_ids:
+            return
+
+        opacity = self._seg_opacity_slider.value() / 100.0
+        add_region_id_segmentation(
+            self.viewer,
+            self._atlas,
+            region_ids,
+            opacity=opacity,
         )
 
     def _update_seg_opacity(self, value: int) -> None:
@@ -8736,9 +9107,7 @@ class NeuronViewerWidget(QWidget):
     def _convert_from_directory(self) -> None:
         """Pick a directory of SWC files and convert to Parquet."""
         dialog_start = perf_counter()
-        logger.debug(
-            "swc_conversion_ui_directory_dialog_start source_mode=directory"
-        )
+        logger.debug("swc_conversion_ui_directory_dialog_start source_mode=directory")
         directory = QFileDialog.getExistingDirectory(
             self, "Select Directory of SWC Files"
         )
@@ -8807,10 +9176,7 @@ class NeuronViewerWidget(QWidget):
         """Ask for output path and start conversion."""
         output_dialog_start = perf_counter()
         logger.debug(
-            (
-                "swc_conversion_ui_output_dialog_start "
-                "source_mode=%s recursive=%s"
-            ),
+            ("swc_conversion_ui_output_dialog_start source_mode=%s recursive=%s"),
             source_mode,
             recursive,
         )
@@ -8934,8 +9300,7 @@ class NeuronViewerWidget(QWidget):
         atlas_name = self._atlas_combo.currentText()
         add_flatmaps_control = getattr(self, "_convert_add_flatmap_cb", None)
         add_flatmaps = bool(
-            add_flatmaps_control is not None
-            and add_flatmaps_control.isChecked()
+            add_flatmaps_control is not None and add_flatmaps_control.isChecked()
         )
         lookup_dir = getattr(self, "_convert_lookup_dir", None)
         lookup_resolution_control = getattr(
@@ -8972,7 +9337,9 @@ class NeuronViewerWidget(QWidget):
             resolution,
             hemisphere,
             atlas_name,
-            swc_paths if isinstance(swc_paths, str) else f"{known_count} explicit files",
+            swc_paths
+            if isinstance(swc_paths, str)
+            else f"{known_count} explicit files",
             cached_atlas is not None,
             use_cached_annotation,
         )
@@ -9116,10 +9483,7 @@ class NeuronViewerWidget(QWidget):
             else -1.0
         )
         logger.debug(
-            (
-                "swc_conversion_ui_error source_mode=%s elapsed_s=%.6f "
-                "error=%s"
-            ),
+            ("swc_conversion_ui_error source_mode=%s elapsed_s=%.6f error=%s"),
             self._convert_source_mode,
             elapsed_s,
             error_msg,

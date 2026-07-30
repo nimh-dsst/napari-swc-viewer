@@ -56,6 +56,12 @@ class NeuronDatabase:
         """Close the database connection."""
         self.conn.close()
 
+    def has_column(self, column_name: str) -> bool:
+        """Return whether the loaded Parquet-backed view exposes a column."""
+        rows = self.conn.execute("DESCRIBE neurons").fetchall()
+        names = {str(row[0]) for row in rows}
+        return str(column_name) in names
+
     def __enter__(self):
         return self
 
@@ -175,7 +181,7 @@ class NeuronDatabase:
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
-            WHERE {' AND '.join(where_parts)}
+            WHERE {" AND ".join(where_parts)}
             ORDER BY file_id
         """
         return self.conn.execute(query, params).fetchdf()
@@ -227,7 +233,7 @@ class NeuronDatabase:
         query = f"""
             SELECT DISTINCT file_id, neuron_id, subject
             FROM neurons
-            WHERE {' AND '.join(where_parts)}
+            WHERE {" AND ".join(where_parts)}
             ORDER BY file_id
         """
         return self.conn.execute(query, params).fetchdf()
@@ -472,9 +478,7 @@ class NeuronDatabase:
                     edges.append([id_to_idx[parent_id], idx])
 
             edges_arr = (
-                np.array(edges, dtype=np.int32)
-                if edges
-                else np.array([]).reshape(0, 2)
+                np.array(edges, dtype=np.int32) if edges else np.array([]).reshape(0, 2)
             )
             result[file_id] = (coords, edges_arr)
 
@@ -568,7 +572,7 @@ class NeuronDatabase:
         query = f"""
             SELECT file_id, neuron_id, subject, x, y, z
             FROM neurons
-            WHERE {' AND '.join(where_parts)}
+            WHERE {" AND ".join(where_parts)}
             ORDER BY file_id
         """
         candidates = self.conn.execute(query, params).fetchdf()

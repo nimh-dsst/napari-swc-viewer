@@ -6,6 +6,7 @@ brain region meshes to a napari viewer.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,8 @@ from ..logging_utils import startup_timing
 if TYPE_CHECKING:
     import napari
     from brainglobe_atlasapi import BrainGlobeAtlas
+
+    from ..isocortex_layers import CustomRegionSelectionGroup
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,52 @@ def _array_startup_metadata(array) -> dict[str, object]:
     if nbytes is not None:
         metadata["size_mb"] = float(nbytes) / (1024.0 * 1024.0)
     return metadata
+
+
+def _atlas_structure_for_region_id(
+    atlas: BrainGlobeAtlas,
+    region_id: int,
+):
+    """Return one atlas structure by numeric ID across catalog variants."""
+    structures = getattr(atlas, "structures", None)
+    if structures is None:
+        return None
+    try:
+        return structures[int(region_id)]
+    except (KeyError, TypeError):
+        pass
+
+    items = getattr(structures, "items", None)
+    if not callable(items):
+        return None
+    for key, structure in items():
+        if not isinstance(structure, Mapping):
+            continue
+        try:
+            structure_id = int(structure.get("id", key))
+        except (TypeError, ValueError):
+            continue
+        if structure_id == int(region_id):
+            return structure
+    return None
+
+
+def _atlas_region_rgba(structure) -> np.ndarray:
+    """Return one structure's atlas color as float32 RGBA."""
+    rgb = (
+        structure.get("rgb_triplet", [128, 128, 128])
+        if structure is not None
+        else [128, 128, 128]
+    )
+    return np.asarray(
+        [
+            float(rgb[0]) / 255.0,
+            float(rgb[1]) / 255.0,
+            float(rgb[2]) / 255.0,
+            1.0,
+        ],
+        dtype=np.float32,
+    )
 
 
 def add_allen_template(
@@ -247,6 +296,60 @@ def add_region_segmentation(
     return layer
 
 
+def add_region_id_segmentation(
+    viewer: napari.Viewer,
+    atlas: BrainGlobeAtlas,
+    region_ids: list[int] | tuple[int, ...],
+    name: str = "Region Segmentation",
+    opacity: float = 0.3,
+    visible: bool = True,
+) -> napari.layers.Labels | None:
+    """Show exactly the requested atlas IDs without descendant expansion."""
+    selected_ids = tuple(
+        sorted({int(region_id) for region_id in region_ids if int(region_id) > 0})
+    )
+    if not selected_ids:
+        return None
+
+    annotation = atlas.annotation
+    valid_ids: list[int] = []
+    color_dict: dict[int | None, np.ndarray] = {
+        None: np.array([0, 0, 0, 0], dtype=np.float32),
+        0: np.array([0, 0, 0, 0], dtype=np.float32),
+    }
+    for region_id in selected_ids:
+        structure = _atlas_structure_for_region_id(atlas, region_id)
+        if structure is None:
+            logger.warning("Region ID %d not found in atlas structures", region_id)
+            continue
+        valid_ids.append(region_id)
+        color_dict[region_id] = _atlas_region_rgba(structure)
+
+    if not valid_ids:
+        logger.warning("No valid annotation IDs found for exact region selection")
+        return None
+
+    id_array = np.asarray(valid_ids, dtype=annotation.dtype)
+    mask = np.isin(annotation, id_array)
+    filtered = np.where(mask, annotation, np.zeros_like(annotation))
+
+    from napari.utils import DirectLabelColormap
+
+    colormap = DirectLabelColormap(color_dict=color_dict)
+    return viewer.add_labels(
+        filtered,
+        name=name,
+        opacity=opacity,
+        visible=visible,
+        colormap=colormap,
+        metadata={
+            "region_selection_source": "custom",
+            "selected_region_ids": list(valid_ids),
+            "exact_region_ids": True,
+        },
+    )
+
+
 def remove_region_segmentation(
     viewer: napari.Viewer,
     name: str = "Region Segmentation",
@@ -359,6 +462,88 @@ def add_region_mesh(
 
     logger.info(f"Added region mesh layer: {layer}")
     return layer
+
+
+def add_region_mesh_group(
+    viewer: napari.Viewer,
+    atlas: BrainGlobeAtlas,
+    group: CustomRegionSelectionGroup,
+    opacity: float = 0.4,
+    name: str | None = None,
+    visible: bool = True,
+) -> tuple[napari.layers.Surface | None, tuple[str, ...]]:
+    """Combine selected terminal atlas meshes into one colored surface layer."""
+    vertex_parts: list[np.ndarray] = []
+    face_parts: list[np.ndarray] = []
+    color_parts: list[np.ndarray] = []
+    rendered_ids: list[int] = []
+    rendered_acronyms: list[str] = []
+    missing_acronyms: list[str] = []
+    vertex_offset = 0
+
+    for region_id, acronym in zip(
+        group.region_ids,
+        group.acronyms,
+        strict=True,
+    ):
+        try:
+            structure = atlas.structures[acronym]
+            mesh = atlas.mesh_from_structure(acronym)
+            vertices = np.asarray(mesh.points, dtype=np.float32)
+            triangle_parts = [
+                np.asarray(cell.data, dtype=np.int32)
+                for cell in mesh.cells
+                if np.asarray(cell.data).ndim == 2
+                and np.asarray(cell.data).shape[1] == 3
+            ]
+            if (
+                vertices.ndim != 2
+                or vertices.shape[1] != 3
+                or not len(vertices)
+                or not triangle_parts
+            ):
+                raise ValueError("mesh has no usable vertices or triangle faces")
+            faces = np.concatenate(triangle_parts, axis=0)
+        except Exception as exc:
+            logger.warning("Could not load mesh for '%s': %s", acronym, exc)
+            missing_acronyms.append(str(acronym))
+            continue
+
+        vertex_parts.append(vertices)
+        face_parts.append(faces + vertex_offset)
+        rgba = _atlas_region_rgba(structure)
+        color_parts.append(np.repeat(rgba[None, :], len(vertices), axis=0))
+        rendered_ids.append(int(region_id))
+        rendered_acronyms.append(str(acronym))
+        vertex_offset += len(vertices)
+
+    if not vertex_parts:
+        return None, tuple(missing_acronyms)
+
+    vertices = np.concatenate(vertex_parts, axis=0)
+    faces = np.concatenate(face_parts, axis=0)
+    vertex_colors = np.concatenate(color_parts, axis=0).astype(
+        np.float32,
+        copy=False,
+    )
+    layer_name = name or f"Region: Custom {group.label}"
+    layer = viewer.add_surface(
+        (vertices, faces),
+        scale=[1.0 / float(resolution) for resolution in atlas.resolution],
+        name=layer_name,
+        opacity=opacity,
+        blending="translucent_no_depth",
+        vertex_colors=vertex_colors,
+        visible=visible,
+        metadata={
+            "region_selection_source": "custom",
+            "custom_region_group": group.label,
+            "selected_region_ids": rendered_ids,
+            "selected_region_acronyms": rendered_acronyms,
+            "missing_region_acronyms": list(missing_acronyms),
+        },
+    )
+    return layer, tuple(missing_acronyms)
 
 
 def add_region_meshes(
