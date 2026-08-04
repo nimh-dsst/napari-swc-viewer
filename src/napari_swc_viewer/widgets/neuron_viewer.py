@@ -85,6 +85,7 @@ from ..point_import import (
 from ..project_io import (
     ProjectBundle,
     export_enhanced_neuron_parquet,
+    is_recognized_project_bundle,
     load_project_bundle,
     read_enhanced_parquet_metadata,
     save_project_bundle,
@@ -740,6 +741,7 @@ class NeuronViewerWidget(QWidget):
             self._point_parquet_has_origin_csv = False
             self._point_preview_counts: dict[tuple[str, str], int] = {}
             self._saved_table_state: dict[str, object] = {}
+            self._current_project_path: Path | None = None
             self._cluster_assignment_store = ClusterAssignmentStore()
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
@@ -2722,9 +2724,17 @@ class NeuronViewerWidget(QWidget):
         file_layout.addLayout(file_row)
 
         project_io_row = QHBoxLayout()
-        self._save_project_btn = QPushButton("Save Project...")
-        self._save_project_btn.clicked.connect(self._save_project_bundle_dialog)
+        self._save_project_btn = QPushButton("Save Project")
+        self._save_project_btn.setEnabled(False)
+        self._save_project_btn.setToolTip(
+            "Load or create an SWC Viewer project before saving in place."
+        )
+        self._save_project_btn.clicked.connect(self._save_current_project)
         project_io_row.addWidget(self._save_project_btn)
+
+        self._save_project_as_btn = QPushButton("Save Project As...")
+        self._save_project_as_btn.clicked.connect(self._save_project_as_dialog)
+        project_io_row.addWidget(self._save_project_as_btn)
 
         self._load_project_btn = QPushButton("Load Project...")
         self._load_project_btn.clicked.connect(self._load_project_bundle_dialog)
@@ -3691,6 +3701,7 @@ class NeuronViewerWidget(QWidget):
                 old_db.close()
             except Exception:
                 logger.debug("Failed to close previous neuron database", exc_info=True)
+        self._set_current_project_path(None)
 
         self._file_label.setText(Path(filepath).name)
 
@@ -3871,28 +3882,121 @@ class NeuronViewerWidget(QWidget):
             ]
         return payload
 
-    def _save_project_bundle_dialog(self) -> None:
-        """Prompt for and save a lossless project bundle directory."""
+    def _set_current_project_path(self, path: str | Path | None) -> None:
+        """Set the current project target and refresh its save control."""
+        self._current_project_path = (
+            Path(path).expanduser().resolve() if path is not None else None
+        )
+        button = getattr(self, "_save_project_btn", None)
+        if button is None:
+            return
+        button.setEnabled(self._current_project_path is not None)
+        if self._current_project_path is None:
+            button.setToolTip(
+                "Load or create an SWC Viewer project before saving in place."
+            )
+        else:
+            button.setToolTip(f"Save changes to {self._current_project_path}")
+
+    def _set_project_save_in_progress(self, saving: bool) -> None:
+        """Disable save actions during synchronous project serialization."""
+        self._save_project_as_btn.setEnabled(not saving)
+        self._save_project_btn.setEnabled(
+            not saving and self._current_project_path is not None
+        )
+
+    def _save_project_as_dialog(self) -> None:
+        """Prompt for and create a new lossless project bundle directory."""
         if self._db is None:
             message = "Load a neuron Parquet before saving a project."
             self._regions_status_label.setText(message)
             show_warning(message)
             return
 
-        default_name = f"{Path(self._db.parquet_path).stem}.swcv"
+        if self._current_project_path is None:
+            default_name = f"{Path(self._db.parquet_path).stem}.swcv"
+        else:
+            default_name = str(
+                self._current_project_path.with_name(
+                    f"{self._current_project_path.stem}_copy.swcv"
+                )
+            )
         output_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save SWC Viewer Project",
+            "Save SWC Viewer Project As",
             default_name,
             "SWC Viewer Project (*.swcv);;All Files (*)",
         )
         if not output_path:
             return
         bundle_path = Path(output_path)
-        if bundle_path.suffix != ".swcv":
+        if bundle_path.suffix.lower() != ".swcv":
             bundle_path = bundle_path.with_suffix(".swcv")
+        if bundle_path.exists() or bundle_path.is_symlink():
+            message = (
+                f"Project destination already exists: {bundle_path}. "
+                "Choose a new destination. Save Project can only overwrite the "
+                "current project."
+            )
+            self._project_status_label.setText(message)
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
 
-        self._save_project_btn.setEnabled(False)
+        self._save_project_to_path(bundle_path, overwrite=False)
+
+    @staticmethod
+    def _project_overwrite_confirmation_text(bundle_path: Path) -> str:
+        """Return the destructive-save confirmation text for a project path."""
+        return (
+            "Replace the current SWC Viewer project?\n\n"
+            f"{bundle_path}\n\n"
+            "All existing contents in this project folder will be replaced. "
+            "This cannot be undone."
+        )
+
+    def _confirm_project_overwrite(self, bundle_path: Path) -> bool:
+        """Ask whether the current recognized project may be overwritten."""
+        from qtpy.QtWidgets import QMessageBox
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Overwrite SWC Viewer Project?")
+        message.setText(self._project_overwrite_confirmation_text(bundle_path))
+        overwrite_button = message.addButton("Overwrite", QMessageBox.DestructiveRole)
+        cancel_button = message.addButton("Cancel", QMessageBox.RejectRole)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is overwrite_button
+
+    def _save_current_project(self) -> None:
+        """Confirm and overwrite the project associated with this session."""
+        bundle_path = self._current_project_path
+        if bundle_path is None:
+            return
+        if not is_recognized_project_bundle(bundle_path):
+            message = (
+                "The current project is no longer available or is not a recognized "
+                f"SWC Viewer project: {bundle_path}"
+            )
+            self._set_current_project_path(None)
+            self._project_status_label.setText(message)
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+        if not self._confirm_project_overwrite(bundle_path):
+            return
+        self._save_project_to_path(bundle_path, overwrite=True)
+
+    def _save_project_to_path(self, bundle_path: Path, *, overwrite: bool) -> None:
+        """Save current session state to one new or replaceable project path."""
+        if self._db is None:
+            message = "Load a neuron Parquet before saving a project."
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+
+        self._set_project_save_in_progress(True)
         self._project_progress.setVisible(True)
         self._project_progress.setRange(0, 0)
         self._project_progress.setValue(0)
@@ -3919,10 +4023,13 @@ class NeuronViewerWidget(QWidget):
                 analysis_metadata=self._analysis_project_metadata(),
                 flatmap_cache_reference=(self._flatmap_tab.active_cache_reference()),
                 progress_callback=_on_save_progress,
+                overwrite=overwrite,
             )
         except Exception as exc:
             logger.error("Failed to save project bundle: %s", exc)
-            self._save_project_btn.setEnabled(True)
+            if overwrite and not is_recognized_project_bundle(bundle_path):
+                self._set_current_project_path(None)
+            self._set_project_save_in_progress(False)
             self._project_progress.setVisible(False)
             self._project_progress.setRange(0, 1)
             self._project_progress.setValue(0)
@@ -3931,7 +4038,8 @@ class NeuronViewerWidget(QWidget):
             show_warning(f"Failed to save project: {exc}")
             return
 
-        self._save_project_btn.setEnabled(True)
+        self._set_current_project_path(saved)
+        self._set_project_save_in_progress(False)
         self._project_progress.setVisible(False)
         self._project_progress.setRange(0, 1)
         self._project_progress.setValue(0)
@@ -4033,6 +4141,7 @@ class NeuronViewerWidget(QWidget):
         self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
         self._sync_after_neuron_table_membership_change()
+        self._set_current_project_path(bundle.path)
 
     def _restore_project_layers(self, bundle: ProjectBundle) -> None:
         """Recreate saved app-created image and label layers from bundle arrays."""

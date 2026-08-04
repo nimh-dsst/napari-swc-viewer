@@ -34,6 +34,7 @@ Unless a use case says otherwise:
 | [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
 | [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
 | [UC-008](#uc-008-create-combined-and-individual-neuron-heatmaps) | Create one combined heatmap or color-matched heatmaps for individual neurons | Not run |
+| [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -742,7 +743,7 @@ Enhanced Parquet exports preserve every assignment and its run provenance.
    dendrogram or save a single-run Analysis export.
    **Expected:** The output uses the active run. Other assignment columns are
    unaffected.
-7. **Action:** In **Data** > **SWC Parquet Data**, click **Save Project...**
+7. **Action:** In **Data** > **SWC Parquet Data**, click **Save Project As...**
    and **Export Enhanced Parquet...**. Close the session, load the saved
    project, and then load the Enhanced Parquet separately.
    **Expected:** Both reload paths restore every assignment name, sparse label
@@ -864,6 +865,68 @@ swatches, and heatmaps remain visually associated.
    **Expected:** Layer membership and names stay synchronized. Deleting a layer
    removes its membership; renaming it updates the affected row and selector
    without changing the recorded source neuron.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
+
+### UC-009: Save and Overwrite the Current Project
+
+**Capability**
+
+The user can create an SWC Viewer project and then save later table, analysis,
+and app-created layer changes back to that same project folder. Replacement is
+confirmed explicitly and publishes a complete new bundle without retaining
+stale files from the previous version.
+
+**Prerequisites**
+
+- Load a neuron Parquet containing at least two neurons into **Data** > **SWC
+  Parquet Data**.
+- Add both neurons to **Selected Neurons** and create one app-generated heatmap
+  or mask layer that will be recognizable after a project reload.
+- Choose a writable directory where a new `.swcv` project folder can be
+  created.
+
+**Steps and expected results**
+
+1. **Action:** With only the neuron Parquet loaded, inspect the project controls
+   under **Data** > **SWC Parquet Data**.
+   **Expected:** **Save Project** is disabled. **Save Project As...**, **Load
+   Project...**, and **Export Enhanced Parquet...** remain available.
+2. **Action:** Click **Save Project As...**, choose a new path named
+   `overwrite_test.swcv`, and complete the save.
+   **Expected:** The project is created and the status reports **Saved project
+   bundle: overwrite_test.swcv**. **Save Project** becomes enabled and its
+   tooltip identifies the new project's absolute path.
+3. **Action:** Change a table label or note, remove the saved heatmap or mask
+   layer, create a different app-generated layer, and click **Save Project**.
+   In **Overwrite SWC Viewer Project?**, click **Cancel**.
+   **Expected:** The dialog shows the exact current project path, warns that all
+   existing project-folder contents will be replaced, and defaults to
+   **Cancel**. Cancelling starts no save and leaves the on-disk project
+   unchanged.
+4. **Action:** Click **Save Project** again and click **Overwrite**.
+   **Expected:** Progress is shown while saving, both save actions are disabled
+   during serialization, and completion reports **Saved project bundle:
+   overwrite_test.swcv**. No save-location picker is shown.
+5. **Action:** Close the session, click **Load Project...**, select
+   `overwrite_test.swcv`, and inspect its table state and app-generated layers.
+   **Expected:** The changed table metadata and replacement layer are restored.
+   The layer removed before overwrite does not return, and no stale project
+   files affect the loaded session.
+6. **Action:** Load a standalone neuron Parquet through **Load...**.
+   **Expected:** **Save Project** becomes disabled because the session is no
+   longer associated with a current project. **Save Project As...** can create
+   another project, and doing so enables **Save Project** for that new folder.
+7. **Action:** Load `overwrite_test.swcv`, then rename or move that folder
+   outside napari and click **Save Project**.
+   **Expected:** The plugin reports that the current project is unavailable or
+   unrecognized, disables **Save Project**, and does not create or replace any
+   folder. The user can still choose a new destination with **Save Project
+   As...**.
 
 **Manual verification**
 

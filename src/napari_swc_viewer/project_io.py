@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import shutil
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ _TEXT_ENHANCED_COLUMNS = (
 )
 _SOURCE_FILE_ID_INLINE_LIMIT = 10_000
 _ProgressCallback = Callable[[str, int, int], None]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -1048,21 +1051,101 @@ def _layer_metadata_payload(
     }
 
 
-def save_project_bundle(
-    bundle_path: str | Path,
+def _recognized_project_bundle_error(bundle: Path) -> str | None:
+    """Return why *bundle* is unsafe to overwrite, or ``None`` if recognized."""
+    if bundle.is_symlink():
+        return f"Project overwrite target must not be a symlink: {bundle}"
+    if not bundle.exists():
+        return f"Project overwrite target does not exist: {bundle}"
+    if not bundle.is_dir():
+        return f"Project overwrite target is not a directory: {bundle}"
+    if bundle.suffix.lower() != ".swcv":
+        return f"Project overwrite target must end in .swcv: {bundle}"
+
+    manifest_path = bundle / "manifest.json"
+    try:
+        manifest = _read_json(manifest_path)
+    except (OSError, ValueError) as exc:
+        return f"Project overwrite target has no readable manifest: {bundle} ({exc})"
+    if manifest.get("format") != PROJECT_BUNDLE_FORMAT:
+        return f"Directory is not an SWC Viewer project: {bundle}"
+    return None
+
+
+def is_recognized_project_bundle(bundle_path: str | Path) -> bool:
+    """Return whether a directory is safe for project overwrite operations."""
+    return _recognized_project_bundle_error(Path(bundle_path)) is None
+
+
+def _temporary_bundle_sibling(bundle: Path, purpose: str) -> Path:
+    """Return a unique hidden sibling path used during project publication."""
+    return bundle.with_name(f".{bundle.name}.{uuid4().hex}.{purpose}")
+
+
+def _remove_temporary_bundle(path: Path, *, purpose: str) -> None:
+    """Best-effort cleanup for a temporary project directory."""
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError:
+        logger.warning("Could not remove %s at %s", purpose, path, exc_info=True)
+
+
+def _publish_project_bundle(
+    staged_bundle: Path,
+    bundle: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Publish a complete staged bundle, restoring the old bundle on failure."""
+    if not overwrite:
+        staged_bundle.rename(bundle)
+        return
+
+    rollback_bundle = _temporary_bundle_sibling(bundle, "rollback")
+    bundle.rename(rollback_bundle)
+    try:
+        staged_bundle.rename(bundle)
+    except Exception as publish_error:
+        try:
+            rollback_bundle.rename(bundle)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "Failed to publish the replacement project and could not restore "
+                f"the original. The original project remains at {rollback_bundle}: "
+                f"{rollback_error}"
+            ) from publish_error
+        raise
+
+    if rollback_bundle.exists():
+        try:
+            shutil.rmtree(rollback_bundle)
+        except OSError:
+            logger.warning(
+                "Saved replacement project, but could not remove the previous "
+                "project bundle at %s",
+                rollback_bundle,
+                exc_info=True,
+            )
+
+
+def _write_project_bundle_contents(
+    bundle: Path,
     *,
     source_parquet_path: str | Path,
-    table_state: Mapping[str, Any] | Sequence[Any] | None = None,
-    layers: Iterable[Any] = (),
-    atlas_name: str | None = None,
-    analysis_metadata: Mapping[str, Any] | None = None,
-    flatmap_cache_reference: Mapping[str, Any] | None = None,
-    progress_callback: _ProgressCallback | None = None,
-) -> Path:
-    """Save layer state and an optional external flatmap-cache reference."""
-    bundle = Path(bundle_path)
-    app_layers = [layer for layer in layers if _is_app_created_layer(layer)]
-    total_steps = 4 + len(app_layers)
+    table_state: Mapping[str, Any] | Sequence[Any] | None,
+    app_layers: Sequence[Any],
+    atlas_name: str | None,
+    analysis_metadata: Mapping[str, Any] | None,
+    flatmap_cache_reference: Mapping[str, Any] | None,
+    progress_callback: _ProgressCallback | None,
+    total_steps: int,
+) -> None:
+    """Write a complete project bundle into an unpublished directory."""
     _emit_progress(progress_callback, "Preparing project bundle...", 0, total_steps)
 
     source_path = Path(source_parquet_path)
@@ -1170,6 +1253,55 @@ def save_project_bundle(
         # The reference is informational and may be relocated by the user.
         manifest["flatmap_cache"] = dict(flatmap_cache_reference)
     _write_json(bundle / "manifest.json", manifest)
+
+
+def save_project_bundle(
+    bundle_path: str | Path,
+    *,
+    source_parquet_path: str | Path,
+    table_state: Mapping[str, Any] | Sequence[Any] | None = None,
+    layers: Iterable[Any] = (),
+    atlas_name: str | None = None,
+    analysis_metadata: Mapping[str, Any] | None = None,
+    flatmap_cache_reference: Mapping[str, Any] | None = None,
+    progress_callback: _ProgressCallback | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Save a complete project bundle, optionally replacing a recognized bundle."""
+    bundle = Path(bundle_path)
+    if overwrite:
+        error = _recognized_project_bundle_error(bundle)
+        if error is not None:
+            if not bundle.exists() and not bundle.is_symlink():
+                raise FileNotFoundError(error)
+            raise ValueError(error)
+    elif bundle.exists() or bundle.is_symlink():
+        raise FileExistsError(
+            f"Project destination already exists: {bundle}. "
+            "Choose a new destination or overwrite the current project."
+        )
+
+    app_layers = [layer for layer in layers if _is_app_created_layer(layer)]
+    total_steps = 4 + len(app_layers)
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    staged_bundle = _temporary_bundle_sibling(bundle, "staging")
+    try:
+        _write_project_bundle_contents(
+            staged_bundle,
+            source_parquet_path=source_parquet_path,
+            table_state=table_state,
+            app_layers=app_layers,
+            atlas_name=atlas_name,
+            analysis_metadata=analysis_metadata,
+            flatmap_cache_reference=flatmap_cache_reference,
+            progress_callback=progress_callback,
+            total_steps=total_steps,
+        )
+        _publish_project_bundle(staged_bundle, bundle, overwrite=overwrite)
+    except Exception:
+        _remove_temporary_bundle(staged_bundle, purpose="staged project bundle")
+        raise
+
     _emit_progress(progress_callback, "Done", total_steps, total_steps)
     return bundle
 
