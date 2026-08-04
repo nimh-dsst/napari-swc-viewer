@@ -32,6 +32,7 @@ Unless a use case says otherwise:
 | [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
 | [UC-005](#uc-005-view-an-allen-isocortex-layer-flatmap-stack) | View flatmap node counts as six Allen Isocortex layer images | Not run |
 | [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
+| [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -664,6 +665,98 @@ surfaces, and outlines.
     second atlas. A valid query selection with no matching neurons reports zero
     results without error. A valid render selection with no cached data clears
     the stale overlay family and reports that nothing was represented.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
+
+### UC-007: Refine and Save Multiple Cluster Assignments
+
+**Capability**
+
+The user can retain several named clustering results for the same neurons. A
+first run can group neurons by soma location; one soma cluster can then be
+selected and clustered by voxel correlation without removing other neurons or
+overwriting the soma assignments. One assignment is active at a time for
+filtering, colors, flatmap grouping, and Analysis heatmaps. Projects and
+Enhanced Parquet exports preserve every assignment and its run provenance.
+
+**Prerequisites**
+
+- Load an Allen mouse atlas and a neuron Parquet containing at least six
+  neurons with soma nodes and morphology nodes in one represented atlas region.
+- To test Flat map + Depth selected-row clustering and flatmap grouping, use a
+  version-3 Parquet with bilateral flatmap/depth columns.
+- Populate **Selected Neurons** with the full test population and leave at
+  least two neurons in each intended soma cluster.
+- Start with no prior cluster assignments or record their names so the new
+  columns can be distinguished.
+
+**Steps and expected results**
+
+1. **Action:** Open **Analysis** > **Clustering**, choose **CCFv3
+   Coordinates**, **Soma Location**, and the desired soma algorithm. Set
+   **Input neurons** to **Current Table**, select a represented target region,
+   choose at least two clusters, and click **Run Clustering**.
+   **Expected:** The run completes and creates a **Soma Location 1** column in
+   the Data-tab table. **Cluster assignment** selects **Soma Location 1**, and
+   every clustered neuron has an integer label. The cluster filter, summary,
+   rendered colors, flatmap cluster mode, and Analysis heatmap cluster choices
+   use these labels.
+2. **Action:** In **Data** > **Selected Neurons**, use **Cluster** to show one
+   soma cluster and select all of its visible rows with Ctrl+A or Cmd+A.
+   **Expected:** Only rows from that soma cluster are selected. Other neurons
+   remain in the table and retain their soma labels.
+3. **Action:** Return to **Analysis** > **Clustering**, choose **Voxel
+   Correlation**, set **Input neurons** to **Selected Rows**, select the target
+   region for this scope, and click **Run Clustering**.
+   **Expected:** Only the explicitly selected neuron IDs enter the run. A new
+   **Voxel Correlation 1** column appears and becomes active. Its selected
+   neurons receive local integer labels; every neuron outside the run is blank.
+   **Soma Location 1** remains unchanged. The saved provenance records the
+   selected cohort and its parent Soma Location assignment and cluster.
+4. **Action:** Switch **Cluster assignment** between **Soma Location 1** and
+   **Voxel Correlation 1**.
+   **Expected:** The active header, cluster filter, summary, sort target,
+   rendered colors, flatmap cluster grouping, and Analysis heatmap cluster
+   choices all follow the selected assignment. Switching does not modify any
+   saved labels. The voxel assignment's blank rows appear under
+   **Unclustered**.
+5. **Action:** Click **Rename...**, give the voxel assignment a descriptive
+   name, and confirm. Then create another selected-row run.
+   **Expected:** The table header and selector use the new display name while
+   the next run creates another independent column. Existing Enhanced Parquet
+   column identifiers remain stable.
+6. **Action:** Select an assignment with live run data and build its
+   dendrogram or save a single-run Analysis export.
+   **Expected:** The output uses the active run. Other assignment columns are
+   unaffected.
+7. **Action:** In **Data** > **SWC Parquet Data**, click **Save Project...**
+   and **Export Enhanced Parquet...**. Close the session, load the saved
+   project, and then load the Enhanced Parquet separately.
+   **Expected:** Both reload paths restore every assignment name, sparse label
+   map, active assignment, palette, cohort, parent context, and run parameters.
+   Enhanced Parquet contains one nullable integer column per assignment and a
+   backward-compatible `cluster_assignment` column matching the active set.
+   After project reload, assignment-based filters, colors, flatmap grouping,
+   and heatmaps work immediately; dendrogram and distance actions report
+   **Rerun required** because matrices are not stored.
+8. **Action:** With an assignment active, click **Delete**, cancel once, then
+   confirm deletion.
+   **Expected:** Cancelling changes nothing. Confirming removes only that
+   assignment column and its saved result; no neuron rows are removed. The
+   most recently created remaining assignment becomes active.
+9. **Action:** Set **Input neurons** to **Selected Rows** with no selected
+   rows, then with exactly one selected row, and click **Run Clustering** after
+   each change. Repeat a valid selected-row run in **Flat map + Depth** for
+   both **Soma Location** and **Voxel Correlation** when flatmap columns are
+   available.
+   **Expected:** Empty and one-row inputs produce actionable messages and do
+   not launch a worker or create a column. Valid flatmap runs use exactly the
+   selected neuron IDs and create new sparse assignments like their CCFv3
+   counterparts.
 
 **Manual verification**
 

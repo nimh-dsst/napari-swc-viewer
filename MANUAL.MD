@@ -401,7 +401,20 @@ In the table you can:
 - Select rows to choose which neurons to render
 - Toggle per-neuron visibility (`Vis`)
 - Edit per-neuron color (color swatch)
-- Inspect subject and cluster columns
+- Inspect subject and every saved cluster-assignment column; blank assignment
+  cells mean that neuron was outside the run or was not assigned
+
+Cluster assignment controls:
+
+- `Cluster assignment` chooses the active saved run used by the cluster filter,
+  summary, rendered-neuron colors, flatmap grouping, and Analysis heatmaps
+- `Rename...` changes the display name without changing its portable Parquet
+  column name
+- `Delete` removes only the saved assignment after confirmation; it never
+  removes neuron rows, and the newest remaining assignment becomes active
+- `Export Enhanced Parquet...` writes every assignment as a nullable integer
+  column and keeps the active assignment in `cluster_assignment` for older
+  readers
 
 Buttons:
 
@@ -470,17 +483,30 @@ For Soma Location, algorithm options:
 
 Common controls:
 
+- Input neurons: `Whole Parquet`, `Current Table`, or `Selected Rows`
 - Target region acronym
 - Dilation %
 - Clusters (for non-DBSCAN modes)
 - Linkage method (hierarchical modes)
 - DBSCAN `eps` and `min_samples` when DBSCAN is selected
 
+The three CCFv3 input scopes retain independent target-region selections.
+`Selected Rows` requires at least two visible selected table rows. Flat map +
+Depth clustering supports all three input scopes but does not expose region
+controls.
+
 Run:
 
-1. Click `Run Clustering`
+1. Click `Run Clustering`. Each completed run creates and activates a new named
+   assignment column, such as `Soma Location 1` or `Voxel Correlation 1`, while
+   retaining earlier columns.
 2. Optional: expand `Clustermap` and click `Build Dendrogram` to render the dendrogram and cluster map
 3. Click `Color Neurons by Cluster` to recolor rendered neuron layers
+
+Projects and Enhanced Parquet preserve assignment labels, palettes, cohorts,
+lineage, and run provenance. Projects do not store large clustering matrices,
+so dendrogram and distance exports show `Rerun required` after reload; filters,
+colors, grouping, and cluster heatmaps remain available.
 
 ### Node Count Heatmap
 

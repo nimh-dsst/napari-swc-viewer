@@ -8,6 +8,7 @@ import types
 import numpy as np
 
 from napari_swc_viewer.analysis.clustering import ClusterResult
+from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
 
 
 def _import_neuron_table_module():
@@ -114,12 +115,27 @@ class _DummyTable:
         self.sort_calls: list[tuple[int, object]] = []
         self.hidden_rows: dict[int, bool] = {}
         self._selected_rows: set[int] = set()
+        self._column_count = 7
+        self.headers: list[str] = []
+        self.resize_calls: list[tuple[int, object]] = []
 
     def rowCount(self) -> int:
         return len(self._file_ids)
 
     def columnCount(self) -> int:
-        return 7
+        return self._column_count
+
+    def setColumnCount(self, count: int) -> None:
+        self._column_count = int(count)
+
+    def setHorizontalHeaderLabels(self, headers: list[str]) -> None:
+        self.headers = list(headers)
+
+    def horizontalHeader(self):
+        return self
+
+    def setSectionResizeMode(self, column: int, mode) -> None:
+        self.resize_calls.append((int(column), mode))
 
     def model(self) -> _DummyModel:
         return _DummyModel()
@@ -278,9 +294,7 @@ def test_neuron_table_sort_by_cluster_delegates_to_cluster_column_sort() -> None
 
     widget.sort_by_cluster()
 
-    assert widget._table.sort_calls == [
-        (module.COL_CLUSTER, module.Qt.AscendingOrder)
-    ]
+    assert widget._table.sort_calls == [(module.COL_CLUSTER, module.Qt.AscendingOrder)]
 
 
 def test_update_cluster_assignments_clears_unassigned_rows() -> None:
@@ -294,8 +308,8 @@ def test_update_cluster_assignments_clears_unassigned_rows() -> None:
         },
     )
     cluster_cells: list[tuple[int, int | None]] = []
-    widget._set_cluster_cell = (
-        lambda row, cluster_id: cluster_cells.append((row, cluster_id))
+    widget._set_cluster_cell = lambda row, cluster_id: cluster_cells.append(
+        (row, cluster_id)
     )
     result = ClusterResult(
         correlation_matrix=np.eye(1, dtype=np.float32),
@@ -316,7 +330,9 @@ def test_update_cluster_assignments_clears_unassigned_rows() -> None:
     assert len(widget.state_changed.calls) == 1
 
 
-def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallback() -> None:
+def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallback() -> (
+    None
+):
     module = _import_neuron_table_module()
     widget = _make_widget(
         module,
@@ -326,8 +342,8 @@ def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallba
         },
     )
     heatmap_cells: list[tuple[int, tuple[str, ...]]] = []
-    widget._set_heatmap_cell = (
-        lambda row, layer_names: heatmap_cells.append((row, tuple(layer_names)))
+    widget._set_heatmap_cell = lambda row, layer_names: heatmap_cells.append(
+        (row, tuple(layer_names))
     )
 
     widget.set_heatmap_layers_by_file_id(
@@ -486,3 +502,61 @@ def test_neuron_table_select_file_ids_selects_multiple_visible_rows_once() -> No
 
     assert widget.get_selected_file_ids() == ["n1", "n3"]
     assert widget.selection_changed.calls == [(["n1", "n3"],)]
+
+
+def test_neuron_table_selected_file_ids_excludes_rows_hidden_after_selection() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+        },
+    )
+    widget._table._selected_rows = {0, 1}
+    widget._table.setRowHidden(0, True)
+
+    assert widget.get_selected_file_ids() == ["n2"]
+
+
+def test_neuron_table_named_assignment_columns_preserve_prior_run_and_active_map() -> (
+    None
+):
+    module = _import_neuron_table_module()
+    store = ClusterAssignmentStore()
+    first = store.add(
+        name="Soma Location 1",
+        assignments={"n1": 1, "n2": 2, "n3": 2},
+        input_file_ids=["n1", "n2", "n3"],
+    )
+    store.add(
+        name="Voxel Correlation 1",
+        assignments={"n2": 1, "n3": 2},
+        input_file_ids=["n2", "n3"],
+        parent_assignment_id=first.assignment_id,
+        parent_cluster_ids=[2],
+    )
+    widget = _make_widget(
+        module,
+        {
+            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
+            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+            "n3": module.NeuronEntry(file_id="n3", subject="s3"),
+        },
+    )
+    widget._assignment_store = store
+    widget._cluster_column_by_id = {}
+
+    widget.refresh_cluster_assignments()
+    widget.sort_by_cluster()
+
+    assert widget._table.headers[9:] == [
+        "Soma Location 1",
+        "Voxel Correlation 1 (active)",
+        "Color",
+    ]
+    assert widget.get_cluster_map() == {"n1": None, "n2": 1, "n3": 2}
+    assert widget._table.sort_calls[-1] == (10, module.Qt.AscendingOrder)
+    state = widget.export_state()
+    assert state["version"] == 2
+    assert len(state["cluster_assignments"]["sets"]) == 2

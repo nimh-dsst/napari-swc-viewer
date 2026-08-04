@@ -61,6 +61,7 @@ from ..auto_center import (
     compute_center_of_rendered_neurons,
     depth_axis_from_not_displayed,
 )
+from ..cluster_assignments import ClusterAssignmentStore
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
 from ..neuron_table_ops import ClusterFilterSelection
@@ -724,6 +725,7 @@ class NeuronViewerWidget(QWidget):
             self._point_parquet_has_origin_csv = False
             self._point_preview_counts: dict[tuple[str, str], int] = {}
             self._saved_table_state: dict[str, object] = {}
+            self._cluster_assignment_store = ClusterAssignmentStore()
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
             self._layer_name_event_connections: dict[
@@ -2563,8 +2565,14 @@ class NeuronViewerWidget(QWidget):
         with startup_timing(logger, "neuron_viewer_setup_tab", tab="Analysis"):
             self._analysis_tab = AnalysisTabWidget(self.viewer)
             self._analysis_tab.set_slice_projector(self._slice_projector)
+            self._analysis_tab.set_cluster_assignment_store(
+                self._cluster_assignment_store
+            )
             self._analysis_tab.set_current_table_file_ids_provider(
                 self._current_table_file_ids
+            )
+            self._analysis_tab.set_selected_table_file_ids_provider(
+                self._neuron_table.get_selected_file_ids
             )
             self._analysis_tab.set_flatmap_correlation_source_provider(
                 self._flatmap_tab.latest_flatmap_correlation_source
@@ -2849,7 +2857,9 @@ class NeuronViewerWidget(QWidget):
         neurons_section = CollapsibleSection("Selected Neurons")
         neurons_layout = neurons_section.content_layout()
 
-        self._neuron_table = NeuronTableWidget()
+        self._neuron_table = NeuronTableWidget(
+            assignment_store=self._cluster_assignment_store
+        )
         self._neuron_table.colors_changed.connect(self._apply_neuron_colors)
         self._neuron_table.visibility_changed.connect(self._apply_neuron_visibility)
         self._neuron_table.selection_changed.connect(self._highlight_selected_neurons)
@@ -2857,6 +2867,26 @@ class NeuronViewerWidget(QWidget):
         if state_changed is not None:
             state_changed.connect(self._refresh_neuron_table_summary)
         neurons_layout.addWidget(self._neuron_table)
+
+        assignment_row = QHBoxLayout()
+        assignment_row.addWidget(QLabel("Cluster assignment:"))
+        self._cluster_assignment_combo = QComboBox()
+        self._cluster_assignment_combo.currentIndexChanged.connect(
+            self._on_active_cluster_assignment_changed
+        )
+        assignment_row.addWidget(self._cluster_assignment_combo, 1)
+        self._rename_cluster_assignment_btn = QPushButton("Rename...")
+        self._rename_cluster_assignment_btn.clicked.connect(
+            self._rename_active_cluster_assignment
+        )
+        assignment_row.addWidget(self._rename_cluster_assignment_btn)
+        self._delete_cluster_assignment_btn = QPushButton("Delete")
+        self._delete_cluster_assignment_btn.clicked.connect(
+            self._delete_active_cluster_assignment
+        )
+        assignment_row.addWidget(self._delete_cluster_assignment_btn)
+        neurons_layout.addLayout(assignment_row)
+        self._refresh_cluster_assignment_controls()
 
         manual_heatmap_row = QHBoxLayout()
         manual_heatmap_row.addWidget(QLabel("Manual Heatmap:"))
@@ -3713,6 +3743,30 @@ class NeuronViewerWidget(QWidget):
     def _load_enhanced_table_state(self, filepath: str | Path) -> int:
         """Read enhanced parquet table metadata without making it mandatory."""
         self._saved_table_state = {}
+        self._cluster_assignment_store.load_state({})
+        refresh_assignments = getattr(
+            self,
+            "_refresh_cluster_assignment_controls",
+            None,
+        )
+        if callable(refresh_assignments):
+            refresh_assignments()
+        table = getattr(self, "_neuron_table", None)
+        refresh_table_assignments = getattr(
+            table,
+            "refresh_cluster_assignments",
+            None,
+        )
+        if callable(refresh_table_assignments):
+            refresh_table_assignments(preserve_selection=True)
+        analysis_tab = getattr(self, "_analysis_tab", None)
+        assignment_handler = getattr(
+            analysis_tab,
+            "on_active_cluster_assignment_changed",
+            None,
+        )
+        if callable(assignment_handler):
+            assignment_handler()
         try:
             payload = read_enhanced_parquet_metadata(filepath)
         except Exception:
@@ -3730,6 +3784,15 @@ class NeuronViewerWidget(QWidget):
         if not entries:
             return 0
         self._saved_table_state = table_state
+        assignment_state = table_state.get("cluster_assignments")
+        if isinstance(assignment_state, dict):
+            self._cluster_assignment_store.load_state(assignment_state)
+            if callable(refresh_assignments):
+                refresh_assignments()
+            if callable(refresh_table_assignments):
+                refresh_table_assignments(preserve_selection=True)
+            if callable(assignment_handler):
+                assignment_handler()
         return len(entries)
 
     def _current_table_state(self) -> dict[str, object]:
@@ -3918,6 +3981,8 @@ class NeuronViewerWidget(QWidget):
         if callable(importer):
             importer(bundle.table_state)
             self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+        self._refresh_cluster_assignment_controls()
+        self._apply_active_cluster_assignment()
 
         self._restore_project_layers(bundle)
         self._sync_neuron_table_heatmap_membership()
@@ -5561,6 +5626,9 @@ class NeuronViewerWidget(QWidget):
                     parts.append(f"Cluster {cluster_id}: {count:,}")
             clusters_line = "Clusters: " + ", ".join(parts)
 
+        active_assignment = self._cluster_assignment_store.active
+        if active_assignment is not None:
+            clusters_line = f"{active_assignment.name} — {clusters_line}"
         self._neuron_table_summary_label.setText(f"{counts_line}\n{clusters_line}")
 
     def _selected_neuron_heatmap_base_name(
@@ -7794,6 +7862,8 @@ class NeuronViewerWidget(QWidget):
         applier = getattr(self._neuron_table, "apply_state", None)
         if callable(applier):
             applier(table_state, preserve_membership=True)
+            self._refresh_cluster_assignment_controls()
+            self._apply_active_cluster_assignment()
 
     def _selected_cluster_filter(self) -> ClusterFilterSelection:
         """Return selected cluster groups from the Data tab dropdown."""
@@ -7811,6 +7881,123 @@ class NeuronViewerWidget(QWidget):
             return ClusterFilterSelection(frozenset({int(data)}))
         except (TypeError, ValueError):
             return ClusterFilterSelection()
+
+    def _refresh_cluster_assignment_controls(self) -> None:
+        """Refresh the named assignment selector and management buttons."""
+        combo = getattr(self, "_cluster_assignment_combo", None)
+        if combo is None:
+            return
+        store = self._cluster_assignment_store
+        active_id = store.active_assignment_id
+        blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            for assignment in store.sets():
+                combo.addItem(assignment.name, assignment.assignment_id)
+            if active_id is not None:
+                index = combo.findData(active_id)
+                combo.setCurrentIndex(index if index >= 0 else -1)
+            else:
+                combo.setCurrentIndex(-1)
+        finally:
+            combo.blockSignals(blocked)
+        enabled = len(store) > 0
+        self._rename_cluster_assignment_btn.setEnabled(enabled)
+        self._delete_cluster_assignment_btn.setEnabled(enabled)
+
+    def _active_assignment_color_map(self) -> dict[object, list[float]]:
+        """Return active-set colors for all table and rendered neurons."""
+        assignment = self._cluster_assignment_store.active
+        if assignment is None:
+            return {}
+        default = [0.5, 0.5, 0.5, 1.0]
+        file_ids = list(self._neuron_table.file_ids())
+        seen = {str(file_id) for file_id in file_ids}
+        for file_id in self._current_scene_file_ids():
+            if str(file_id) not in seen:
+                file_ids.append(file_id)
+                seen.add(str(file_id))
+        return {
+            file_id: list(
+                assignment.label_colors.get(
+                    assignment.label_for(file_id),
+                    default,
+                )
+            )
+            for file_id in file_ids
+        }
+
+    def _apply_active_cluster_assignment(self) -> None:
+        """Propagate the active assignment to all cluster-aware consumers."""
+        self._neuron_table.refresh_cluster_assignments(preserve_selection=True)
+        active_colors = self._active_assignment_color_map()
+        if active_colors:
+            self._neuron_table.update_colors(active_colors, emit_signal=False)
+            effective_colors = self._build_effective_color_map()
+            effective_colors.update(active_colors)
+            self._update_layer_colors(effective_colors)
+        self._refresh_cluster_filter_controls()
+        self._refresh_neuron_table_summary()
+        analysis_tab = getattr(self, "_analysis_tab", None)
+        handler = getattr(analysis_tab, "on_active_cluster_assignment_changed", None)
+        if callable(handler):
+            handler()
+
+    def _on_active_cluster_assignment_changed(self, index: int) -> None:
+        """Activate the assignment selected in the Data tab."""
+        combo = self._cluster_assignment_combo
+        assignment_id = combo.itemData(index) if index >= 0 else None
+        if assignment_id is None:
+            return
+        try:
+            self._cluster_assignment_store.set_active(str(assignment_id))
+        except KeyError:
+            self._refresh_cluster_assignment_controls()
+            return
+        self._apply_active_cluster_assignment()
+
+    def _rename_active_cluster_assignment(self) -> None:
+        """Prompt for a new display name for the active assignment."""
+        assignment = self._cluster_assignment_store.active
+        if assignment is None:
+            return
+        from qtpy.QtWidgets import QInputDialog
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Rename Cluster Assignment",
+            "Assignment name:",
+            text=assignment.name,
+        )
+        if not accepted or not str(name).strip():
+            return
+        self._cluster_assignment_store.rename(
+            assignment.assignment_id,
+            str(name),
+        )
+        self._refresh_cluster_assignment_controls()
+        self._neuron_table.refresh_cluster_assignments(preserve_selection=True)
+        self._refresh_neuron_table_summary()
+
+    def _delete_active_cluster_assignment(self) -> None:
+        """Confirm and delete the active assignment without removing neurons."""
+        assignment = self._cluster_assignment_store.active
+        if assignment is None:
+            return
+        from qtpy.QtWidgets import QMessageBox
+
+        response = QMessageBox.question(
+            self,
+            "Delete Cluster Assignment",
+            f"Delete cluster assignment '{assignment.name}'? Neurons will not be removed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if response != QMessageBox.Yes:
+            return
+        self._cluster_assignment_store.delete(assignment.assignment_id)
+        self._refresh_cluster_assignment_controls()
+        self._apply_active_cluster_assignment()
 
     def _selected_cluster_from_filter(self) -> int | None:
         """Return the single selected cluster, if the filter is single-cluster."""
@@ -8840,8 +9027,13 @@ class NeuronViewerWidget(QWidget):
 
     def _on_cluster_colors_updated(self, result, color_map: dict) -> None:
         """Handle cluster color updates from the analysis tab."""
+        self._refresh_cluster_assignment_controls()
         self._neuron_table.update_cluster_assignments(result)
-        self._neuron_table.update_colors(color_map, emit_signal=False)
+        active_colors = self._active_assignment_color_map()
+        self._neuron_table.update_colors(
+            active_colors or color_map,
+            emit_signal=False,
+        )
         self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
         self._refresh_apply_existing_clusters_button()

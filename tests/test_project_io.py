@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
 from napari_swc_viewer.project_io import (
     PROJECT_BUNDLE_FORMAT,
     ENHANCED_NEURON_COLUMNS,
@@ -71,9 +73,7 @@ def _add_flatmap_v3_schema_metadata(path: Path) -> dict[bytes, bytes]:
         b"custom.dataset_metadata": b"must-survive",
     }
     fields = [
-        field.with_metadata({b"units": b"micrometer"})
-        if field.name == "x"
-        else field
+        field.with_metadata({b"units": b"micrometer"}) if field.name == "x" else field
         for field in table.schema
     ]
     schema = pa.schema(fields, metadata=metadata)
@@ -126,6 +126,33 @@ def _subset_table_state() -> dict[str, object]:
     }
 
 
+def _multi_assignment_table_state() -> dict[str, object]:
+    store = ClusterAssignmentStore()
+    soma = store.add(
+        name="Soma Location 1",
+        assignments={"n1": 1, "n2": 1, "n3": 2},
+        input_file_ids=["n1", "n2", "n3"],
+        activate=True,
+    )
+    store.add(
+        name="Voxel Correlation 1",
+        assignments={"n1": 2, "n2": 1},
+        input_file_ids=["n1", "n2"],
+        parent_assignment_id=soma.assignment_id,
+        parent_cluster_ids=[1],
+        activate=True,
+    )
+    return {
+        "version": 2,
+        "entries": [
+            {"file_id": "n1", "subject": "s1", "cluster_id": 2},
+            {"file_id": "n2", "subject": "s2", "cluster_id": 1},
+            {"file_id": "n3", "subject": "s3", "cluster_id": None},
+        ],
+        "cluster_assignments": store.to_state(),
+    }
+
+
 @dataclass
 class _DummyLayer:
     name: str
@@ -152,7 +179,9 @@ class _DummyColormap:
         self.nan_color = [0.0, 0.0, 0.0, 0.0]
 
 
-def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path: Path) -> None:
+def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.parquet"
     output = tmp_path / "enhanced.parquet"
     _write_source_parquet(source)
@@ -164,7 +193,11 @@ def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path
         metadata={"atlas_name": "fake_atlas"},
     )
 
-    loaded = pd.read_parquet(output).sort_values(["file_id", "node_id"]).reset_index(drop=True)
+    loaded = (
+        pd.read_parquet(output)
+        .sort_values(["file_id", "node_id"])
+        .reset_index(drop=True)
+    )
     assert len(loaded) == 3
     assert all(column in loaded.columns for column in ENHANCED_NEURON_COLUMNS)
     assert loaded.loc[loaded["file_id"] == "n1", "neuron_label"].unique().tolist() == [
@@ -182,7 +215,98 @@ def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path
     payload = read_enhanced_parquet_metadata(output)
     assert payload["metadata"]["atlas_name"] == "fake_atlas"
     assert payload["table_state"]["entries"][0]["label"] == "projection"
-    assert payload["enhanced_columns"] == list(ENHANCED_NEURON_COLUMNS)
+    assert payload["enhanced_columns"] == [
+        *ENHANCED_NEURON_COLUMNS,
+        "cluster_imported_cluster_assignment",
+    ]
+
+
+def test_enhanced_parquet_writes_all_named_assignment_columns_and_active_mirror(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "enhanced.parquet"
+    _write_three_neuron_source_parquet(source)
+
+    export_enhanced_neuron_parquet(
+        source,
+        output,
+        table_state=_multi_assignment_table_state(),
+    )
+
+    loaded = pd.read_parquet(output)
+    assert set(loaded.loc[loaded["file_id"] == "n1", "cluster_soma_location_1"]) == {1}
+    assert set(loaded.loc[loaded["file_id"] == "n3", "cluster_soma_location_1"]) == {2}
+    assert set(
+        loaded.loc[loaded["file_id"] == "n1", "cluster_voxel_correlation_1"]
+    ) == {2}
+    assert (
+        loaded.loc[loaded["file_id"] == "n3", "cluster_voxel_correlation_1"]
+        .isna()
+        .all()
+    )
+    assert set(loaded.loc[loaded["file_id"] == "n2", "cluster_assignment"]) == {1}
+    assert loaded.loc[loaded["file_id"] == "n3", "cluster_assignment"].isna().all()
+
+    payload = read_enhanced_parquet_metadata(output)
+    registry = payload["table_state"]["cluster_assignments"]
+    assert registry["active_assignment_id"] == registry["sets"][1]["assignment_id"]
+    assert [item["name"] for item in registry["sets"]] == [
+        "Soma Location 1",
+        "Voxel Correlation 1",
+    ]
+
+
+def test_enhanced_parquet_uses_collision_safe_assignment_column(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "enhanced.parquet"
+    _write_three_neuron_source_parquet(source)
+    source_df = pd.read_parquet(source)
+    source_df["cluster_soma_location_1"] = 99
+    source_df.to_parquet(source, index=False)
+
+    export_enhanced_neuron_parquet(
+        source,
+        output,
+        table_state=_multi_assignment_table_state(),
+    )
+
+    loaded = pd.read_parquet(output)
+    assert set(loaded["cluster_soma_location_1"]) == {99}
+    assert "cluster_soma_location_1_2" in loaded.columns
+    payload = read_enhanced_parquet_metadata(output)
+    assert (
+        payload["table_state"]["cluster_assignments"]["sets"][0]["column_name"]
+        == "cluster_soma_location_1_2"
+    )
+
+
+def test_enhanced_parquet_assignment_column_cannot_replace_active_mirror(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "enhanced.parquet"
+    _write_source_parquet(source)
+    store = ClusterAssignmentStore()
+    store.add(
+        name="Assignment",
+        assignments={"n1": 7},
+        input_file_ids=["n1", "n2"],
+    )
+    state = {
+        "version": 2,
+        "entries": [{"file_id": "n1"}, {"file_id": "n2"}],
+        "cluster_assignments": store.to_state(),
+    }
+
+    export_enhanced_neuron_parquet(source, output, table_state=state)
+
+    loaded = pd.read_parquet(output)
+    assert "cluster_assignment" in loaded.columns
+    assert "cluster_assignment_2" in loaded.columns
+    assert set(loaded.loc[loaded["file_id"] == "n1", "cluster_assignment"]) == {7}
 
 
 def test_enhanced_and_filtered_exports_preserve_flatmap_v3_schema_metadata(
@@ -215,7 +339,9 @@ def test_enhanced_and_filtered_exports_preserve_flatmap_v3_schema_metadata(
     assert pd.read_parquet(filtered)["file_id"].tolist() == ["n3", "n3", "n1", "n1"]
 
 
-def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(tmp_path: Path) -> None:
+def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.parquet"
     _write_source_parquet(source)
 
@@ -224,6 +350,24 @@ def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(tmp_path: Path
     assert payload["has_project_metadata"] is False
     assert payload["enhanced_columns"] == []
     assert payload["table_state"]["entries"] == []
+
+
+def test_read_enhanced_parquet_metadata_imports_legacy_cluster_id(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-clusters.parquet"
+    _write_source_parquet(source)
+    frame = pd.read_parquet(source)
+    frame["cluster_id"] = [4, 4, 9]
+    frame.to_parquet(source, index=False)
+
+    payload = read_enhanced_parquet_metadata(source)
+
+    entries = {
+        entry["file_id"]: entry["cluster_id"]
+        for entry in payload["table_state"]["entries"]
+    }
+    assert entries == {"n1": 4, "n2": 9}
 
 
 def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -> None:
@@ -246,9 +390,94 @@ def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -
     assert saved.loc[saved["file_id"] == "n3", "neuron_label"].unique().tolist() == [
         "target"
     ]
-    assert saved.loc[saved["file_id"] == "n1", "cluster_assignment"].unique().tolist() == [
-        2
+    assert saved.loc[
+        saved["file_id"] == "n1", "cluster_assignment"
+    ].unique().tolist() == [2]
+
+
+def test_load_project_bundle_accepts_version_one_manifest_and_table_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "legacy.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+        layers=[],
+    )
+    manifest_path = bundle_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = "1"
+    manifest_path.write_text(json.dumps(manifest))
+
+    bundle = load_project_bundle(bundle_path)
+
+    assert bundle.manifest["version"] == "1"
+    assert bundle.table_state["version"] == "1"
+    assert bundle.table_state["entries"][0]["cluster_id"] == 3
+
+
+def test_project_bundle_filters_v2_assignments_to_current_membership(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_three_neuron_source_parquet(source)
+    state = _multi_assignment_table_state()
+    state["entries"] = state["entries"][:2]
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=state,
+        layers=[],
+    )
+
+    bundle = load_project_bundle(bundle_path)
+    registry = bundle.table_state["cluster_assignments"]
+    assert bundle.manifest["version"] == "2"
+    assert [item["name"] for item in registry["sets"]] == [
+        "Soma Location 1",
+        "Voxel Correlation 1",
     ]
+    for assignment in registry["sets"]:
+        assert set(assignment["assignments"]) <= {"n1", "n2"}
+        assert set(assignment["input_file_ids"]) <= {"n1", "n2"}
+
+
+def test_project_bundle_keeps_collision_resolved_assignment_column_stable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    reexported = tmp_path / "reexported.parquet"
+    _write_three_neuron_source_parquet(source)
+    frame = pd.read_parquet(source)
+    frame["cluster_soma_location_1"] = 99
+    frame.to_parquet(source, index=False)
+
+    state = _multi_assignment_table_state()
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=state,
+        layers=[],
+    )
+    bundle = load_project_bundle(bundle_path)
+    first_set = bundle.table_state["cluster_assignments"]["sets"][0]
+    assert first_set["column_name"] == "cluster_soma_location_1_2"
+
+    export_enhanced_neuron_parquet(
+        bundle.source_parquet_path,
+        reexported,
+        table_state=bundle.table_state,
+    )
+    loaded = pd.read_parquet(reexported)
+    assert set(loaded["cluster_soma_location_1"]) == {99}
+    assert "cluster_soma_location_1_2" in loaded.columns
+    assert "cluster_soma_location_1_2_2" not in loaded.columns
 
 
 def test_save_project_bundle_replaces_existing_enhanced_columns(tmp_path: Path) -> None:
@@ -352,7 +581,9 @@ def test_save_project_bundle_rejects_empty_table(tmp_path: Path) -> None:
     assert not (bundle_path / "data" / "source_neurons.parquet").exists()
 
 
-def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(tmp_path: Path) -> None:
+def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.parquet"
     bundle_path = tmp_path / "saved.swcv"
     _write_source_parquet(source)
@@ -406,8 +637,12 @@ def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(tmp_pa
 
     assert progress_events[0] == ("Preparing project bundle...", 0, 6)
     assert progress_events[-1] == ("Done", 6, 6)
-    assert any("Saving layer 1/2: alpha Heatmap" in event[0] for event in progress_events)
-    assert any("Saving layer 2/2: Mask: alpha Heatmap" in event[0] for event in progress_events)
+    assert any(
+        "Saving layer 1/2: alpha Heatmap" in event[0] for event in progress_events
+    )
+    assert any(
+        "Saving layer 2/2: Mask: alpha Heatmap" in event[0] for event in progress_events
+    )
 
     bundle = load_project_bundle(bundle_path)
     assert bundle.manifest["format"] == PROJECT_BUNDLE_FORMAT
