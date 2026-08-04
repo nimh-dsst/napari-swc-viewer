@@ -484,22 +484,29 @@ For Soma Location, algorithm options:
 Common controls:
 
 - Input neurons: `Whole Parquet`, `Current Table`, or `Selected Rows`
-- Target region acronym
+- Target region: required for CCFv3 `Whole Parquet`; optional for CCFv3
+  `Current Table` and `Selected Rows`
 - Dilation %
 - Clusters (for non-DBSCAN modes)
 - Linkage method (hierarchical modes)
 - DBSCAN `eps` and `min_samples` when DBSCAN is selected
 
 The three CCFv3 input scopes retain independent target-region selections.
-`Selected Rows` requires at least two visible selected table rows. Flat map +
-Depth clustering supports all three input scopes but does not expose region
-controls.
+When `Current Table` or `Selected Rows` shows `All regions (optional)`, the run
+uses all nodes in that table cohort. Selecting a target region restricts that
+cohort with the existing dilation setting. `Whole Parquet` does not run until
+at least one represented target region is selected. `Selected Rows` requires
+at least two visible selected table rows. Flat map + Depth clustering supports
+all three input scopes but does not expose region controls.
 
 Run:
 
 1. Click `Run Clustering`. Each completed run creates and activates a new named
    assignment column, such as `Soma Location 1` or `Voxel Correlation 1`, while
    retaining earlier columns.
+   Before clustering starts, the plugin counts the node rows that will actually
+   contribute. Runs over 10,000,000 nodes show the exact formatted count and ask
+   you to **Continue** or **Cancel**; cancellation creates no assignment.
 2. Optional: expand `Clustermap` and click `Build Dendrogram` to render the dendrogram and cluster map
 3. Click `Color Neurons by Cluster` to recolor rendered neuron layers
 

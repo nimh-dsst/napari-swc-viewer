@@ -7,6 +7,7 @@ import logging
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -1008,6 +1009,104 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
     assert metadata.dendrogram_leaf_order == [1, 0]
 
 
+def test_correlation_worker_allows_unfiltered_ccf_scope(monkeypatch):
+    workers = _import_workers_module()
+    CorrelationWorker = workers.CorrelationWorker
+    calls: dict[str, object] = {}
+
+    def fake_compute_pearson(
+        conn,
+        parquet_path,
+        voxel_id_map,
+        resolution,
+        file_ids=None,
+    ):
+        calls["voxel_id_map"] = voxel_id_map
+        calls["file_ids"] = file_ids
+        return pd.DataFrame(
+            {
+                "swc_id_1": ["n1", "n1", "n2", "n2"],
+                "swc_id_2": ["n1", "n2", "n1", "n2"],
+                "r": [1.0, 0.5, 0.5, 1.0],
+            }
+        )
+
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.correlation.compute_pearson_correlation_matrix",
+        fake_compute_pearson,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.compute_clustermap_data",
+        lambda mat, neuron_ids, method, n_clusters: _make_cluster_result(
+            list(neuron_ids), [1, 2]
+        ),
+    )
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection())
+
+    worker = CorrelationWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
+        region_selection=None,
+        file_ids=["n1", "n2"],
+        n_clusters=2,
+    )
+    finished: list[ClusterResult] = []
+    worker.finished.connect(finished.append)
+    worker.run()
+
+    assert calls == {"voxel_id_map": None, "file_ids": ["n1", "n2"]}
+    assert finished[0].metadata is not None
+    assert finished[0].metadata.selected_region_ids == []
+    assert finished[0].metadata.dilation_fraction == 0.0
+
+
+def test_clustering_preflight_counts_with_reusable_region_map(monkeypatch):
+    workers = _import_workers_module()
+    voxel_id_map = np.zeros((3, 3, 3), dtype=np.int32)
+    mask_builder = MagicMock(return_value=voxel_id_map)
+    count_helper = MagicMock(return_value=500_001)
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        mask_builder,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.correlation.count_correlation_input_nodes",
+        count_helper,
+    )
+    monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection())
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    worker = workers.ClusteringPreflightWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(resolution=(25.0, 25.0, 25.0)),
+        coordinate_space="ccf",
+        clustering_method="voxel",
+        region_selection=selection,
+        dilation_fraction=0.2,
+        file_ids=["n1", "n2"],
+    )
+    finished: list = []
+    worker.finished.connect(finished.append)
+
+    worker.run()
+
+    mask_builder.assert_called_once_with(
+        worker._atlas,
+        ["FRP"],
+        0.2,
+    )
+    assert count_helper.call_args.args[2] is voxel_id_map
+    assert count_helper.call_args.kwargs["file_ids"] == ["n1", "n2"]
+    assert finished[0].node_count == 500_001
+    assert finished[0].voxel_id_map is voxel_id_map
+
+
 def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
     monkeypatch,
 ) -> None:
@@ -1312,6 +1411,49 @@ def test_soma_cluster_worker_filters_to_current_table_file_ids(monkeypatch):
     assert observed["neuron_ids"] == ["n1", "n2"]
     assert observed["coords_shape"] == (2, 3)
     assert finished[0].neuron_ids == ["n1", "n2"]
+
+
+def test_soma_cluster_worker_allows_unfiltered_ccf_scope(monkeypatch):
+    workers = _import_workers_module()
+    SomaClusterWorker = workers.SomaClusterWorker
+    mask_builder = MagicMock()
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        mask_builder,
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.query_ccf_soma_coordinates",
+        lambda parquet_path, resolution, file_ids, voxel_id_map: (
+            ["n1", "n2"],
+            np.array([[0.0, 0.0, 0.0], [25.0, 25.0, 25.0]]),
+            2,
+        ),
+    )
+    monkeypatch.setattr(
+        "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
+        lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(
+            list(neuron_ids), [1, 2]
+        ),
+    )
+
+    worker = SomaClusterWorker(
+        parquet_path="neurons.parquet",
+        atlas=types.SimpleNamespace(
+            resolution=(25.0, 25.0, 25.0), atlas_name="fake_atlas"
+        ),
+        region_selection=None,
+        algorithm="hierarchical",
+        n_clusters=2,
+        file_ids=["n1", "n2"],
+    )
+    finished: list[ClusterResult] = []
+    worker.finished.connect(finished.append)
+    worker.run()
+
+    mask_builder.assert_not_called()
+    assert finished[0].metadata is not None
+    assert finished[0].metadata.selected_region_ids == []
+    assert finished[0].metadata.dilation_fraction == 0.0
 
 
 def test_soma_cluster_worker_kmeans_uses_synthesized_dendrogram_linkage(monkeypatch):

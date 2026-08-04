@@ -1198,8 +1198,60 @@ def test_run_clustering_pipeline_current_scope_requires_nonempty_table() -> None
     widget._run_correlation_clustering.assert_not_called()
 
 
+def test_current_table_clustering_allows_no_target_region() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: ["n1", "n2"])
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._dilation_spin.setValue(40)
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.file_ids == ("n1", "n2")
+    assert request.region_selection is None
+    assert request.dilation_fraction == 0.0
+    assert widget._cluster_region_summary_label.text() == "All regions (optional)"
+    assert widget._cluster_region_target_label.text() == "Target region (optional):"
+
+
+def test_selected_rows_clustering_allows_no_target_region() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3"])
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.file_ids == ("n2", "n3")
+    assert request.region_selection is None
+
+
+def test_whole_parquet_clustering_still_requires_target_region() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._selected_cluster_region_selection = lambda: None
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    assert widget._progress_label.text() == "Select at least one target region."
+    widget._start_clustering_preflight.assert_not_called()
+
+
 def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -> None:
-    """Current-table clustering scope should pass the table subset into the worker launch."""
+    """Current-table clustering should snapshot its table subset for preflight."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
     widget._db = object()
@@ -1215,15 +1267,14 @@ def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_soma_clustering = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     widget._run_clustering_pipeline()
 
-    widget._run_soma_clustering.assert_called_once_with(
-        selection,
-        0.35,
-        file_ids=["n1", "n2"],
-    )
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.region_selection == selection
+    assert request.dilation_fraction == 0.35
+    assert request.file_ids == ("n1", "n2")
 
 
 def test_run_clustering_pipeline_passes_selected_row_file_ids_to_clustering() -> None:
@@ -1243,15 +1294,13 @@ def test_run_clustering_pipeline_passes_selected_row_file_ids_to_clustering() ->
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_soma_clustering = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     widget._run_clustering_pipeline()
 
-    widget._run_soma_clustering.assert_called_once_with(
-        selection,
-        0.0,
-        file_ids=["n2", "n3"],
-    )
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.region_selection == selection
+    assert request.file_ids == ("n2", "n3")
     assert widget._pending_cluster_context["input_scope"] == "selected"
     assert widget._pending_cluster_context["input_file_ids"] == ["n2", "n3"]
 
@@ -1271,15 +1320,13 @@ def test_ccf_voxel_clustering_passes_selected_row_file_ids() -> None:
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_correlation_clustering = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     widget._run_clustering_pipeline()
 
-    widget._run_correlation_clustering.assert_called_once_with(
-        selection,
-        0.0,
-        file_ids=["n1", "n3"],
-    )
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.region_selection == selection
+    assert request.file_ids == ("n1", "n3")
 
 
 def test_selected_rows_clustering_requires_at_least_two_rows() -> None:
@@ -1295,6 +1342,87 @@ def test_selected_rows_clustering_requires_at_least_two_rows() -> None:
 
     assert "Only one table row is selected" in widget._progress_label.text()
     widget._run_correlation_clustering.assert_not_called()
+
+
+def _captured_unfiltered_request(widget):
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: ["n1", "n2"])
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._start_clustering_preflight = MagicMock()
+    widget._run_clustering_pipeline()
+    return widget._start_clustering_preflight.call_args.args[0]
+
+
+def test_large_clustering_warning_text_formats_node_count() -> None:
+    module = _import_analysis_tab_module()
+
+    assert module._large_clustering_warning_text(10_000_001) == (
+        "This clustering run will process 10,000,001 nodes, which exceeds the "
+        "10,000,000-node warning threshold. Continue?"
+    )
+
+
+def test_preflight_at_threshold_launches_without_warning() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    request = _captured_unfiltered_request(widget)
+    widget._pending_clustering_request = request
+    widget._pending_clustering_preflight = types.SimpleNamespace(
+        node_count=10_000_000,
+        voxel_id_map=None,
+    )
+    widget._confirm_large_clustering_run = MagicMock(return_value=False)
+    widget._launch_clustering_request = MagicMock()
+
+    widget._on_clustering_preflight_thread_finished()
+
+    widget._confirm_large_clustering_run.assert_not_called()
+    widget._launch_clustering_request.assert_called_once_with(request, None)
+
+
+def test_large_preflight_can_cancel_without_launching() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    request = _captured_unfiltered_request(widget)
+    widget._pending_clustering_request = request
+    widget._pending_clustering_preflight = types.SimpleNamespace(
+        node_count=10_000_001,
+        voxel_id_map=None,
+    )
+    widget._confirm_large_clustering_run = MagicMock(return_value=False)
+    widget._launch_clustering_request = MagicMock()
+
+    widget._on_clustering_preflight_thread_finished()
+
+    widget._confirm_large_clustering_run.assert_called_once_with(10_000_001)
+    widget._launch_clustering_request.assert_not_called()
+    assert widget._progress_label.text() == (
+        "Clustering cancelled; 10,000,001 nodes would have been processed."
+    )
+    assert widget._pending_cluster_context == {}
+
+
+def test_large_preflight_confirmation_launches_prepared_request() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    request = _captured_unfiltered_request(widget)
+    voxel_id_map = np.zeros((2, 2, 2), dtype=np.int32)
+    widget._pending_clustering_request = request
+    widget._pending_clustering_preflight = types.SimpleNamespace(
+        node_count=10_500_000,
+        voxel_id_map=voxel_id_map,
+    )
+    widget._confirm_large_clustering_run = MagicMock(return_value=True)
+    widget._launch_clustering_request = MagicMock()
+
+    widget._on_clustering_preflight_thread_finished()
+
+    widget._launch_clustering_request.assert_called_once_with(
+        request,
+        voxel_id_map,
+    )
 
 
 def _enable_flatmap_coords(widget, styles=("both_shaped", "both_square")):
@@ -1390,17 +1518,13 @@ def test_ccf_voxel_correlation_unaffected_by_flatmap_availability() -> None:
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_correlation_clustering = MagicMock()
-    widget._run_flatmap_correlation_clustering = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     widget._run_clustering_pipeline()
 
-    widget._run_correlation_clustering.assert_called_once_with(
-        selection,
-        0.0,
-        file_ids=None,
-    )
-    widget._run_flatmap_correlation_clustering.assert_not_called()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.coordinate_space == "CCFv3 Coordinates"
+    assert request.region_selection == selection
 
 
 def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
@@ -1419,6 +1543,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
     widget._flatmap_depth_bin_spin.setValue(50.0)
     widget._flatmap_include_depth_minus_one_cb.setChecked(False)
     widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     created_workers = []
 
@@ -1431,9 +1556,14 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
     workers_module.FlatmapParquetCorrelationWorker = (
         _FakeFlatmapParquetCorrelationWorker
     )
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapSomaClusterWorker = object
+    workers_module.SomaClusterWorker = object
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
 
     assert len(created_workers) == 1
     assert created_workers[0].kwargs == {
@@ -1445,6 +1575,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
         "include_depth_minus_one": False,
         "linkage_method": "complete",
         "n_clusters": 7,
+        "file_ids": None,
     }
     widget._start_background_worker.assert_called_once_with(
         created_workers[0],
@@ -1468,6 +1599,7 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
     widget._eps_spin.setValue(120.0)
     widget._min_samples_spin.setValue(6)
     widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     created_workers = []
 
@@ -1478,9 +1610,14 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
 
     workers_module = types.ModuleType("napari_swc_viewer.workers")
     workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapParquetCorrelationWorker = object
+    workers_module.SomaClusterWorker = object
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
 
     assert len(created_workers) == 1
     assert created_workers[0].kwargs == {
@@ -1492,6 +1629,7 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
         "n_clusters": 4,
         "eps": 120.0,
         "min_samples": 6,
+        "file_ids": None,
     }
     widget._start_background_worker.assert_called_once_with(
         created_workers[0],
@@ -1512,6 +1650,7 @@ def test_flatmap_selected_rows_scope_passes_file_ids_to_worker(monkeypatch) -> N
     widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
     widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3"])
     widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
     created_workers = []
 
     class _FakeFlatmapParquetCorrelationWorker:
@@ -1523,9 +1662,14 @@ def test_flatmap_selected_rows_scope_passes_file_ids_to_worker(monkeypatch) -> N
     workers_module.FlatmapParquetCorrelationWorker = (
         _FakeFlatmapParquetCorrelationWorker
     )
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapSomaClusterWorker = object
+    workers_module.SomaClusterWorker = object
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
 
     assert created_workers[0].kwargs["file_ids"] == ["n2", "n3"]
     assert widget._pending_cluster_context["coordinate_space"] == ("Flat map + Depth")
@@ -1545,6 +1689,7 @@ def test_flatmap_soma_selected_rows_scope_passes_file_ids_to_worker(
     widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
     widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3"])
     widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
     created_workers = []
 
     class _FakeFlatmapSomaClusterWorker:
@@ -1554,9 +1699,14 @@ def test_flatmap_soma_selected_rows_scope_passes_file_ids_to_worker(
 
     workers_module = types.ModuleType("napari_swc_viewer.workers")
     workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapParquetCorrelationWorker = object
+    workers_module.SomaClusterWorker = object
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
 
     assert created_workers[0].kwargs["file_ids"] == ["n2", "n3"]
 

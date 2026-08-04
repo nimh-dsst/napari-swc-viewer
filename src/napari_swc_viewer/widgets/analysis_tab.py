@@ -64,6 +64,7 @@ _COORD_SPACE_CCF = "CCFv3 Coordinates"
 _COORD_SPACE_FLATMAP = "Flat map + Depth"
 _CLUSTER_METHOD_VOXEL = "Voxel Correlation"
 _CLUSTER_METHOD_SOMA = "Soma Location"
+_LARGE_CLUSTER_NODE_THRESHOLD = 10_000_000
 _FLATMAP_STYLE_LABELS = {
     "both_shaped": "Bilateral shaped",
     "both_square": "Bilateral square",
@@ -90,6 +91,27 @@ class _HeatmapRequest:
 
 
 @dataclass(frozen=True)
+class _ClusteringRequest:
+    """Immutable snapshot of every setting used by one clustering run."""
+
+    coordinate_space: str
+    clustering_method: str
+    scope: str
+    file_ids: tuple[str, ...] | None
+    region_selection: ClusterRegionSelection | None
+    dilation_fraction: float
+    linkage_method: str
+    n_clusters: int
+    algorithm: str
+    eps: float
+    min_samples: int
+    flatmap_style: str | None
+    flatmap_xy_bins: int
+    flatmap_depth_bin_um: float
+    flatmap_include_depth_minus_one: bool
+
+
+@dataclass(frozen=True)
 class _ClusterColorApplicationSummary:
     """Summary of cached cluster application to the table and rendered layers."""
 
@@ -111,6 +133,14 @@ def _analysis_heatmap_contrast_limits(
     if not np.isfinite(upper) or upper <= 0.0:
         return (0.0, 1.0)
     return (0.0, upper)
+
+
+def _large_clustering_warning_text(node_count: int) -> str:
+    """Return the confirmation text for an oversized clustering input."""
+    return (
+        f"This clustering run will process {int(node_count):,} nodes, "
+        "which exceeds the 10,000,000-node warning threshold. Continue?"
+    )
 
 
 def _populate_embedded_clustermap_figure(
@@ -333,6 +363,8 @@ class AnalysisTabWidget(QWidget):
         self._selected_table_file_ids_provider = None
         self._cluster_assignment_store = None
         self._pending_cluster_context: dict[str, object] = {}
+        self._pending_clustering_request: _ClusteringRequest | None = None
+        self._pending_clustering_preflight = None
         self._flatmap_correlation_source_provider = None
         self._flatmap_coords_available = False
         self._flatmap_available_styles: tuple[str, ...] = ()
@@ -950,12 +982,25 @@ class AnalysisTabWidget(QWidget):
 
     def _update_region_summary_labels(self) -> None:
         """Refresh the visible region summary labels for Analysis workflows."""
+        cluster_scope = self._selected_cluster_region_scope()
+        cluster_empty_text = (
+            "None selected"
+            if cluster_scope == _ANALYSIS_SCOPE_WHOLE
+            else "All regions (optional)"
+        )
         self._cluster_region_summary_label.setText(
             self._format_selected_region_text(
                 self._active_cluster_region_selector(),
-                empty_text="None selected",
+                empty_text=cluster_empty_text,
             )
         )
+        target_label = getattr(self, "_cluster_region_target_label", None)
+        if target_label is not None:
+            target_label.setText(
+                "Target region:"
+                if cluster_scope == _ANALYSIS_SCOPE_WHOLE
+                else "Target region (optional):"
+            )
         self._heat_region_summary_label.setText(
             self._format_selected_region_text(
                 getattr(self, "_heat_region_selector", None),
@@ -1476,43 +1521,11 @@ class AnalysisTabWidget(QWidget):
         self._min_samples_spin.setVisible(is_dbscan)
 
     def _run_clustering_pipeline(self) -> None:
-        """Start the appropriate clustering pipeline in a background thread."""
+        """Validate and start an exact asynchronous clustering preflight."""
         if self._db is None or self._atlas is None:
             return
 
         if self._worker_thread is not None and self._worker_thread.isRunning():
-            return
-
-        clustering_method = self._clustering_method_combo.currentText()
-
-        if self._current_coordinate_space() == _COORD_SPACE_FLATMAP:
-            self._run_flatmap_clustering(clustering_method)
-            return
-
-        if clustering_method == _CLUSTER_METHOD_SOMA:
-            proceed, base_file_ids, _scope_label, _input_count = (
-                self._resolve_cluster_query_file_scope()
-            )
-            if not proceed:
-                return
-            region_selection = self._selected_cluster_region_selection()
-            if region_selection is None:
-                self._progress_label.setText("Select at least one target region.")
-                return
-            if not region_selection.represented_region_ids:
-                self._progress_label.setText(
-                    "Selected region(s) have no represented dataset regions."
-                )
-                return
-            self._capture_cluster_run_context(
-                clustering_method,
-                base_file_ids,
-            )
-            self._run_soma_clustering(
-                region_selection,
-                self._dilation_spin.value() / 100.0,
-                file_ids=base_file_ids,
-            )
             return
 
         proceed, base_file_ids, _scope_label, _input_count = (
@@ -1521,49 +1534,227 @@ class AnalysisTabWidget(QWidget):
         if not proceed:
             return
 
-        region_selection = self._selected_cluster_region_selection()
-        if region_selection is None:
-            self._progress_label.setText("Select at least one target region.")
-            return
-        if not region_selection.represented_region_ids:
-            self._progress_label.setText(
-                "Selected region(s) have no represented dataset regions."
-            )
-            return
+        coordinate_space = self._current_coordinate_space()
+        clustering_method = self._clustering_method_combo.currentText()
+        scope = self._selected_cluster_region_scope()
+        region_selection = None
+        if coordinate_space == _COORD_SPACE_CCF:
+            region_selection = self._selected_cluster_region_selection()
+            if region_selection is None and scope == _ANALYSIS_SCOPE_WHOLE:
+                self._progress_label.setText("Select at least one target region.")
+                return
+            if (
+                region_selection is not None
+                and not region_selection.represented_region_ids
+            ):
+                self._progress_label.setText(
+                    "Selected region(s) have no represented dataset regions."
+                )
+                return
 
+        flatmap_style = None
+        if coordinate_space == _COORD_SPACE_FLATMAP:
+            flatmap_style = self._selected_flatmap_style()
+            if flatmap_style is None:
+                self._progress_label.setText(
+                    "No flatmap style available in the loaded Parquet."
+                )
+                return
+
+        algorithm = {
+            "Hierarchical": "hierarchical",
+            "K-Means": "kmeans",
+            "DBSCAN": "dbscan",
+        }[self._algorithm_combo.currentText()]
+        request = _ClusteringRequest(
+            coordinate_space=coordinate_space,
+            clustering_method=clustering_method,
+            scope=scope,
+            file_ids=(
+                None
+                if base_file_ids is None
+                else tuple(str(file_id) for file_id in base_file_ids)
+            ),
+            region_selection=region_selection,
+            dilation_fraction=(
+                self._dilation_spin.value() / 100.0
+                if region_selection is not None
+                else 0.0
+            ),
+            linkage_method=self._method_combo.currentText(),
+            n_clusters=int(self._n_clusters_spin.value()),
+            algorithm=algorithm,
+            eps=float(self._eps_spin.value()),
+            min_samples=int(self._min_samples_spin.value()),
+            flatmap_style=flatmap_style,
+            flatmap_xy_bins=int(self._flatmap_xy_bins_spin.value()),
+            flatmap_depth_bin_um=float(self._flatmap_depth_bin_spin.value()),
+            flatmap_include_depth_minus_one=(
+                self._flatmap_include_depth_minus_one_cb.isChecked()
+            ),
+        )
         self._capture_cluster_run_context(
             clustering_method,
             base_file_ids,
         )
-        self._run_correlation_clustering(
-            region_selection,
-            self._dilation_spin.value() / 100.0,
-            file_ids=base_file_ids,
-        )
+        self._start_clustering_preflight(request)
 
-    def _run_correlation_clustering(
-        self,
-        region_selection: ClusterRegionSelection,
-        dilation: float,
-        *,
-        file_ids: list[str] | None = None,
-    ) -> None:
-        """Start the voxel correlation + clustering pipeline."""
-        from ..workers import CorrelationWorker
+    def _start_clustering_preflight(self, request: _ClusteringRequest) -> None:
+        """Count one immutable clustering request on a background thread."""
+        from ..workers import ClusteringPreflightWorker
 
-        method = self._method_combo.currentText()
-        n_clusters = self._n_clusters_spin.value()
-
-        worker = CorrelationWorker(
+        worker = ClusteringPreflightWorker(
             parquet_path=self._parquet_path,
             atlas=self._atlas,
-            region_selection=region_selection,
-            dilation_fraction=dilation,
-            linkage_method=method,
-            n_clusters=n_clusters,
-            file_ids=file_ids,
+            coordinate_space=(
+                "flatmap" if request.coordinate_space == _COORD_SPACE_FLATMAP else "ccf"
+            ),
+            clustering_method=(
+                "soma" if request.clustering_method == _CLUSTER_METHOD_SOMA else "voxel"
+            ),
+            region_selection=request.region_selection,
+            dilation_fraction=request.dilation_fraction,
+            file_ids=(None if request.file_ids is None else list(request.file_ids)),
+            flatmap_style=request.flatmap_style,
+            flatmap_xy_bins=request.flatmap_xy_bins,
+            flatmap_depth_bin_um=request.flatmap_depth_bin_um,
+            flatmap_include_depth_minus_one=(request.flatmap_include_depth_minus_one),
+        )
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_clustering_preflight_finished)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(self._on_clustering_preflight_error)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(self._on_clustering_preflight_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+
+        self._pending_clustering_request = request
+        self._pending_clustering_preflight = None
+        self._worker_thread = thread
+        self._current_worker = worker
+        self._progress_label.setText("Counting clustering nodes...")
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, 0)
+        self._update_button_states()
+        thread.start()
+
+    def _on_clustering_preflight_finished(self, result) -> None:
+        """Store a preflight result until its worker thread has stopped."""
+        self._pending_clustering_preflight = result
+
+    def _on_clustering_preflight_error(self, message: str) -> None:
+        """Stop a clustering request when exact preflight counting fails."""
+        self._pending_clustering_request = None
+        self._pending_clustering_preflight = None
+        self._pending_cluster_context = {}
+        self._on_error(message)
+
+    def _on_clustering_preflight_thread_finished(self) -> None:
+        """Prompt when needed, then launch the snapshotted clustering run."""
+        self._on_thread_finished()
+        request = self._pending_clustering_request
+        result = self._pending_clustering_preflight
+        self._pending_clustering_request = None
+        self._pending_clustering_preflight = None
+        if request is None or result is None:
+            self._update_button_states()
+            return
+
+        node_count = int(result.node_count)
+        if (
+            node_count > _LARGE_CLUSTER_NODE_THRESHOLD
+            and not self._confirm_large_clustering_run(node_count)
+        ):
+            self._pending_cluster_context = {}
+            self._progress_bar.setVisible(False)
+            self._progress_label.setText(
+                f"Clustering cancelled; {node_count:,} nodes would have been processed."
+            )
+            self._update_button_states()
+            return
+        self._launch_clustering_request(request, result.voxel_id_map)
+
+    def _confirm_large_clustering_run(self, node_count: int) -> bool:
+        """Ask whether a clustering input above the warning threshold may run."""
+        from qtpy.QtWidgets import QMessageBox
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Large Clustering Run")
+        message.setText(_large_clustering_warning_text(node_count))
+        continue_button = message.addButton("Continue", QMessageBox.AcceptRole)
+        cancel_button = message.addButton("Cancel", QMessageBox.RejectRole)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is continue_button
+
+    def _launch_clustering_request(
+        self,
+        request: _ClusteringRequest,
+        voxel_id_map: np.ndarray | None,
+    ) -> None:
+        """Launch a previously counted immutable clustering request."""
+        from ..workers import (
+            CorrelationWorker,
+            FlatmapParquetCorrelationWorker,
+            FlatmapSomaClusterWorker,
+            SomaClusterWorker,
         )
 
+        file_ids = None if request.file_ids is None else list(request.file_ids)
+        common = {
+            "parquet_path": self._parquet_path,
+            "atlas": self._atlas,
+        }
+        if request.coordinate_space == _COORD_SPACE_FLATMAP:
+            if request.clustering_method == _CLUSTER_METHOD_SOMA:
+                worker = FlatmapSomaClusterWorker(
+                    **common,
+                    style=request.flatmap_style,
+                    algorithm=request.algorithm,
+                    linkage_method=request.linkage_method,
+                    n_clusters=request.n_clusters,
+                    eps=request.eps,
+                    min_samples=request.min_samples,
+                    file_ids=file_ids,
+                )
+            else:
+                worker = FlatmapParquetCorrelationWorker(
+                    **common,
+                    style=request.flatmap_style,
+                    xy_bins=request.flatmap_xy_bins,
+                    depth_bin_um=request.flatmap_depth_bin_um,
+                    include_depth_minus_one=(request.flatmap_include_depth_minus_one),
+                    linkage_method=request.linkage_method,
+                    n_clusters=request.n_clusters,
+                    file_ids=file_ids,
+                )
+        elif request.clustering_method == _CLUSTER_METHOD_SOMA:
+            worker = SomaClusterWorker(
+                **common,
+                region_selection=request.region_selection,
+                dilation_fraction=request.dilation_fraction,
+                algorithm=request.algorithm,
+                linkage_method=request.linkage_method,
+                n_clusters=request.n_clusters,
+                eps=request.eps,
+                min_samples=request.min_samples,
+                file_ids=file_ids,
+                voxel_id_map=voxel_id_map,
+            )
+        else:
+            worker = CorrelationWorker(
+                **common,
+                region_selection=request.region_selection,
+                dilation_fraction=request.dilation_fraction,
+                linkage_method=request.linkage_method,
+                n_clusters=request.n_clusters,
+                file_ids=file_ids,
+                voxel_id_map=voxel_id_map,
+            )
         self._start_background_worker(worker, self._on_correlation_finished)
 
     def _capture_cluster_run_context(
@@ -1594,131 +1785,6 @@ class AnalysisTabWidget(QWidget):
             "parent_assignment_id": parent_assignment_id,
             "parent_cluster_ids": parent_cluster_ids,
         }
-
-    def _run_flatmap_clustering(self, clustering_method: str) -> None:
-        """Dispatch a Flat map + Depth clustering run from Parquet columns.
-
-        Region filtering in flat map space is not yet available, so clustering
-        runs over every neuron with valid flatmap/depth coordinates.
-        """
-        proceed, file_ids, _scope_label, _input_count = (
-            self._resolve_cluster_query_file_scope()
-        )
-        if not proceed:
-            return
-
-        style = self._selected_flatmap_style()
-        if style is None:
-            self._progress_label.setText(
-                "No flatmap style available in the loaded Parquet."
-            )
-            return
-
-        self._capture_cluster_run_context(clustering_method, file_ids)
-
-        if clustering_method == _CLUSTER_METHOD_SOMA:
-            if file_ids is None:
-                self._run_flatmap_soma_clustering(style)
-            else:
-                self._run_flatmap_soma_clustering(style, file_ids=file_ids)
-        else:
-            if file_ids is None:
-                self._run_flatmap_correlation_clustering(style)
-            else:
-                self._run_flatmap_correlation_clustering(
-                    style,
-                    file_ids=file_ids,
-                )
-
-    def _run_flatmap_correlation_clustering(
-        self,
-        style: str,
-        *,
-        file_ids: list[str] | None = None,
-    ) -> None:
-        """Start flatmap-space voxel correlation clustering from Parquet."""
-        from ..workers import FlatmapParquetCorrelationWorker
-
-        worker_kwargs = dict(
-            parquet_path=self._parquet_path,
-            atlas=self._atlas,
-            style=style,
-            xy_bins=self._flatmap_xy_bins_spin.value(),
-            depth_bin_um=self._flatmap_depth_bin_spin.value(),
-            include_depth_minus_one=(
-                self._flatmap_include_depth_minus_one_cb.isChecked()
-            ),
-            linkage_method=self._method_combo.currentText(),
-            n_clusters=self._n_clusters_spin.value(),
-        )
-        if file_ids is not None:
-            worker_kwargs["file_ids"] = file_ids
-        worker = FlatmapParquetCorrelationWorker(**worker_kwargs)
-        self._start_background_worker(worker, self._on_correlation_finished)
-
-    def _run_flatmap_soma_clustering(
-        self,
-        style: str,
-        *,
-        file_ids: list[str] | None = None,
-    ) -> None:
-        """Start flatmap-space soma-location clustering from Parquet."""
-        from ..workers import FlatmapSomaClusterWorker
-
-        algorithm_map = {
-            "Hierarchical": "hierarchical",
-            "K-Means": "kmeans",
-            "DBSCAN": "dbscan",
-        }
-        algorithm = algorithm_map[self._algorithm_combo.currentText()]
-
-        worker_kwargs = dict(
-            parquet_path=self._parquet_path,
-            atlas=self._atlas,
-            style=style,
-            algorithm=algorithm,
-            linkage_method=self._method_combo.currentText(),
-            n_clusters=self._n_clusters_spin.value(),
-            eps=self._eps_spin.value(),
-            min_samples=self._min_samples_spin.value(),
-        )
-        if file_ids is not None:
-            worker_kwargs["file_ids"] = file_ids
-        worker = FlatmapSomaClusterWorker(**worker_kwargs)
-        self._start_background_worker(worker, self._on_correlation_finished)
-
-    def _run_soma_clustering(
-        self,
-        region_selection: ClusterRegionSelection,
-        dilation: float,
-        *,
-        file_ids: list[str] | None = None,
-    ) -> None:
-        """Start the soma-location clustering pipeline."""
-        from ..workers import SomaClusterWorker
-
-        algorithm_text = self._algorithm_combo.currentText()
-        algorithm_map = {
-            "Hierarchical": "hierarchical",
-            "K-Means": "kmeans",
-            "DBSCAN": "dbscan",
-        }
-        algorithm = algorithm_map[algorithm_text]
-
-        worker = SomaClusterWorker(
-            parquet_path=self._parquet_path,
-            atlas=self._atlas,
-            region_selection=region_selection,
-            dilation_fraction=dilation,
-            algorithm=algorithm,
-            linkage_method=self._method_combo.currentText(),
-            n_clusters=self._n_clusters_spin.value(),
-            eps=self._eps_spin.value(),
-            min_samples=self._min_samples_spin.value(),
-            file_ids=file_ids,
-        )
-
-        self._start_background_worker(worker, self._on_correlation_finished)
 
     def _start_background_worker(self, worker, finished_slot) -> None:
         """Wire up and start a background worker in a QThread."""

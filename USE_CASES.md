@@ -691,6 +691,9 @@ Enhanced Parquet exports preserve every assignment and its run provenance.
   version-3 Parquet with bilateral flatmap/depth columns.
 - Populate **Selected Neurons** with the full test population and leave at
   least two neurons in each intended soma cluster.
+- To verify the large-run guard, prepare cohorts whose post-filter clustering
+  inputs contain exactly 10,000,000 and at least 10,000,001 contributing node
+  rows.
 - Start with no prior cluster assignments or record their names so the new
   columns can be distinguished.
 
@@ -698,25 +701,30 @@ Enhanced Parquet exports preserve every assignment and its run provenance.
 
 1. **Action:** Open **Analysis** > **Clustering**, choose **CCFv3
    Coordinates**, **Soma Location**, and the desired soma algorithm. Set
-   **Input neurons** to **Current Table**, select a represented target region,
-   choose at least two clusters, and click **Run Clustering**.
+   **Input neurons** to **Current Table**, click **Clear Selection** under
+   **Select Target Region**, choose at least two clusters, and click **Run
+   Clustering**.
    **Expected:** The run completes and creates a **Soma Location 1** column in
    the Data-tab table. **Cluster assignment** selects **Soma Location 1**, and
-   every clustered neuron has an integer label. The cluster filter, summary,
-   rendered colors, flatmap cluster mode, and Analysis heatmap cluster choices
-   use these labels.
+   every clustered neuron has an integer label. **Target region (optional)**
+   reports **All regions (optional)**, and all eligible somas in the Current
+   Table cohort contribute. The cluster filter, summary, rendered colors,
+   flatmap cluster mode, and Analysis heatmap cluster choices use these labels.
 2. **Action:** In **Data** > **Selected Neurons**, use **Cluster** to show one
    soma cluster and select all of its visible rows with Ctrl+A or Cmd+A.
    **Expected:** Only rows from that soma cluster are selected. Other neurons
    remain in the table and retain their soma labels.
 3. **Action:** Return to **Analysis** > **Clustering**, choose **Voxel
    Correlation**, set **Input neurons** to **Selected Rows**, select the target
-   region for this scope, and click **Run Clustering**.
+   region for this scope, and click **Run Clustering**. Repeat after clicking
+   **Clear Selection** for this scope.
    **Expected:** Only the explicitly selected neuron IDs enter the run. A new
    **Voxel Correlation 1** column appears and becomes active. Its selected
    neurons receive local integer labels; every neuron outside the run is blank.
    **Soma Location 1** remains unchanged. The saved provenance records the
-   selected cohort and its parent Soma Location assignment and cluster.
+   selected cohort and its parent Soma Location assignment and cluster. The
+   first run uses the selected region and dilation; the repeated run reports
+   **All regions (optional)** and uses all finite CCFv3 nodes for those rows.
 4. **Action:** Switch **Cluster assignment** between **Soma Location 1** and
    **Voxel Correlation 1**.
    **Expected:** The active header, cluster filter, summary, sort target,
@@ -750,13 +758,24 @@ Enhanced Parquet exports preserve every assignment and its run provenance.
    most recently created remaining assignment becomes active.
 9. **Action:** Set **Input neurons** to **Selected Rows** with no selected
    rows, then with exactly one selected row, and click **Run Clustering** after
-   each change. Repeat a valid selected-row run in **Flat map + Depth** for
-   both **Soma Location** and **Voxel Correlation** when flatmap columns are
-   available.
+   each change. Set **Input neurons** to **Whole Parquet**, clear its target
+   region selection, and try again. Repeat a valid selected-row run in **Flat
+   map + Depth** for both **Soma Location** and **Voxel Correlation** when
+   flatmap columns are available.
    **Expected:** Empty and one-row inputs produce actionable messages and do
-   not launch a worker or create a column. Valid flatmap runs use exactly the
-   selected neuron IDs and create new sparse assignments like their CCFv3
+   not launch a worker or create a column. Whole Parquet reports **Select at
+   least one target region** and does not run. Valid flatmap runs use exactly
+   the selected neuron IDs and create new sparse assignments like their CCFv3
    counterparts.
+10. **Action:** Run clustering on the cohort with exactly 10,000,000 contributing
+    node rows. Then run it on the cohort with at least 10,000,001 contributing
+    rows; click **Cancel** in **Large Clustering Run**, repeat, and click
+    **Continue**.
+    **Expected:** The 10,000,000-node run starts without a warning. The larger
+    run displays its exact comma-formatted node count and defaults to **Cancel**.
+    Cancelling starts no clustering worker and creates no assignment; the
+    repeated confirmation starts the snapshotted run without changing its
+    cohort or region filter.
 
 **Manual verification**
 
