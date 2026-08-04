@@ -5791,6 +5791,7 @@ def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> N
     assert layer.metadata["heatmap_source"] is True
     assert layer.metadata["heatmap_native_grid"] is True
     assert layer.metadata["heatmap_creation_mode"] == "single"
+    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
     assert layer.colormap == "hot"
 
 
@@ -5834,9 +5835,12 @@ def test_add_individual_heatmap_layer_uses_neuron_color_and_metadata(
         "name": "manual_heatmap_alpha",
     }
     assert layer.opacity == 0.6
+    assert layer.contrast_limits == (0.0, 1.0)
     assert layer.metadata["file_ids"] == ["n1"]
     assert layer.metadata["selection_count"] == 1
     assert layer.metadata["heatmap_creation_mode"] == "individual"
+    assert layer.metadata["heatmap_contrast_limits"] == (0.0, 1.0)
+    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_20_percent_max"
     assert layer.metadata["color"] == list(color)
 
 

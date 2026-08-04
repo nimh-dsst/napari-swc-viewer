@@ -428,7 +428,10 @@ Buttons:
   - `Individual Heatmaps`: create one Greek-named heatmap per selected neuron,
     colored to match that neuron. If two or more selected neurons initially
     have the same RGB color, they are first assigned distinct Turbo colors;
-    other table neurons are not recolored.
+    other table neurons are not recolored. Each individual layer initially
+    displays a contrast range from zero to 20% of its maximum node count so
+    lower-density structure remains visible; this can still be adjusted in
+    napari's layer controls.
   - Individual heatmaps are built sequentially. If their estimated float32
     image data exceeds 1 GiB, a confirmation defaults to `Cancel` before any
     colors or layers change.

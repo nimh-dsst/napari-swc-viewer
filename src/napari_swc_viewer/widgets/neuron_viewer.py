@@ -317,6 +317,7 @@ _MANUAL_HEATMAP_ALL_LABEL = "All Manual Heatmaps"
 _SELECTED_HEATMAP_MODE_SINGLE = "single"
 _SELECTED_HEATMAP_MODE_INDIVIDUAL = "individual"
 _INDIVIDUAL_HEATMAP_MEMORY_WARNING_BYTES = 1024**3
+_INDIVIDUAL_HEATMAP_CONTRAST_FRACTION = 0.2
 _GREEK_HEATMAP_IDENTIFIERS = (
     "alpha",
     "beta",
@@ -8501,6 +8502,11 @@ class NeuronViewerWidget(QWidget):
         layer_name = self._selected_neuron_heatmap_layer_name(file_ids)
         manual_heatmap_id = layer_name.removesuffix(" Heatmap")
         contrast_limits = _heatmap_contrast_limits(volume)
+        if creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL:
+            contrast_limits = (
+                contrast_limits[0],
+                contrast_limits[1] * _INDIVIDUAL_HEATMAP_CONTRAST_FRACTION,
+            )
         colormap = "hot"
         if creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL and color is not None:
             from napari.utils.colormaps import Colormap
@@ -8525,7 +8531,11 @@ class NeuronViewerWidget(QWidget):
             "selection_count": len(file_ids),
             "heatmap_creation_mode": creation_mode,
             "heatmap_contrast_limits": contrast_limits,
-            "heatmap_autocontrast_policy": "stable_full_volume",
+            "heatmap_autocontrast_policy": (
+                "stable_20_percent_max"
+                if creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL
+                else "stable_full_volume"
+            ),
         }
         if color is not None:
             metadata["color"] = [float(channel) for channel in color]

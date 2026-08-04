@@ -835,8 +835,11 @@ swatches, and heatmaps remain visually associated.
    Greek-named layers are added in deterministic order, one for each originally
    selected neuron, regardless of the later selection change. Each layer uses
    a transparent-to-neuron-color colormap, contains only that neuron's counts,
+   initially sets its upper contrast limit to 20% of its maximum node count,
    and appears only on that neuron's **Heatmap** cell and **Manual Heatmap**
-   filter result. The existing neuron colors do not change.
+   filter result. Lower-density structures are more visible than with the full
+   contrast range, and the limit remains editable in napari. The existing
+   neuron colors do not change.
 5. **Action:** Select the same three cohort rows, set all three color swatches
    to the same RGB color, record the fourth neuron's color, and choose **Add
    Heatmap** > **Individual Heatmaps** again.
