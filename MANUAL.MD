@@ -422,7 +422,16 @@ Buttons:
 - `Add Soma Only`: add currently selected neurons to the scene as soma-only, reusing the shared soma layers without full trace geometry.
 - `Remove Selected`: remove only currently selected neurons from the scene.
 - `Clear All`: remove all neuron layers.
-- `Add Heatmap`: create a heatmap from the currently selected table neurons.
+- `Add Heatmap`: open a menu for creating native-grid node-count heatmaps from
+  the currently selected table neurons.
+  - `Single Heatmap`: create one `hot` heatmap containing all selected neurons.
+  - `Individual Heatmaps`: create one Greek-named heatmap per selected neuron,
+    colored to match that neuron. If two or more selected neurons initially
+    have the same RGB color, they are first assigned distinct Turbo colors;
+    other table neurons are not recolored.
+  - Individual heatmaps are built sequentially. If their estimated float32
+    image data exceeds 1 GiB, a confirmation defaults to `Cancel` before any
+    colors or layers change.
 - `Remove Selected From Table`: remove currently selected neuron rows from the table while keeping rendered scene layers.
 - `Remove Unselected from Table`: keep selected table rows and remove all other table rows, including rows hidden by active filters.
 - `Clear Table`: clear the table while keeping rendered scene layers.

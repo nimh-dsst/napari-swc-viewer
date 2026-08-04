@@ -114,8 +114,12 @@ def summarize_neuron_table(
 
     return NeuronTableSummary(
         table_count=len(file_ids),
-        added_count=sum(bool(added_by_file.get(file_id, False)) for file_id in file_ids),
-        visible_count=sum(bool(visible_by_file.get(file_id, False)) for file_id in file_ids),
+        added_count=sum(
+            bool(added_by_file.get(file_id, False)) for file_id in file_ids
+        ),
+        visible_count=sum(
+            bool(visible_by_file.get(file_id, False)) for file_id in file_ids
+        ),
         cluster_counts=tuple(cluster_counts),
     )
 
@@ -145,6 +149,22 @@ def visibility_for_selected_cluster(
     return cluster_filter_matches(cluster_by_file, selection)
 
 
+def turbo_colors_for_file_ids(
+    file_ids: Iterable[object],
+) -> dict[object, list[float]]:
+    """Return deterministic Turbo colors for the supplied neuron IDs."""
+    ordered_file_ids = sorted(set(file_ids), key=str)
+    if not ordered_file_ids:
+        return {}
+
+    cmap = colormaps["turbo"]
+    samples = np.linspace(0.0, 1.0, len(ordered_file_ids))
+    return {
+        file_id: [float(channel) for channel in cmap(float(sample))]
+        for file_id, sample in zip(ordered_file_ids, samples)
+    }
+
+
 def recolor_cluster_turbo(
     cluster_by_file: Mapping[str, int | None],
     selection: ClusterFilterSelection | int | None,
@@ -156,19 +176,11 @@ def recolor_cluster_turbo(
         return {}
 
     matches = cluster_filter_matches(cluster_by_file, selected)
-    member_ids = sorted(
-        (file_id for file_id, is_match in matches.items() if is_match),
-        key=str,
-    )
+    member_ids = [file_id for file_id, is_match in matches.items() if is_match]
     if not member_ids and not gray_others:
         return {}
 
-    cmap = colormaps["turbo"]
-    samples = np.linspace(0.0, 1.0, max(len(member_ids), 1))
-
-    updates: dict[str, list[float]] = {}
-    for file_id, t in zip(member_ids, samples):
-        updates[file_id] = [float(c) for c in cmap(float(t))]
+    updates = turbo_colors_for_file_ids(member_ids)
 
     if gray_others:
         for file_id in cluster_by_file:

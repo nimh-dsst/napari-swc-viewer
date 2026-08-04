@@ -33,6 +33,7 @@ Unless a use case says otherwise:
 | [UC-005](#uc-005-view-an-allen-isocortex-layer-flatmap-stack) | View flatmap node counts as six Allen Isocortex layer images | Not run |
 | [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
 | [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
+| [UC-008](#uc-008-create-combined-and-individual-neuron-heatmaps) | Create one combined heatmap or color-matched heatmaps for individual neurons | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -776,6 +777,90 @@ Enhanced Parquet exports preserve every assignment and its run provenance.
     Cancelling starts no clustering worker and creates no assignment; the
     repeated confirmation starts the snapshotted run without changing its
     cohort or region filter.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
+
+### UC-008: Create Combined and Individual Neuron Heatmaps
+
+**Capability**
+
+The user can turn selected rows in the Data-tab neuron table into either one
+combined node-count heatmap or one color-matched heatmap per neuron. Individual
+layers preserve the selected cohort captured when the run starts and make it
+possible to compare neuron occupancy independently. A monochrome cohort is
+automatically assigned distinct Turbo colors so its rendered neurons, table
+swatches, and heatmaps remain visually associated.
+
+**Prerequisites**
+
+- Have an Allen mouse atlas available locally and a neuron Parquet containing
+  at least four neurons with morphology nodes inside the atlas bounds.
+- Know three neurons to use as the heatmap cohort and retain a fourth neuron as
+  a non-selected color control.
+- To exercise the memory warning, use an atlas resolution and selected-neuron
+  count whose displayed estimate exceeds 1 GiB.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** Open **Data** > **Selected Neurons**, click **Add Heatmap**, and
+   inspect its menu before loading a neuron Parquet.
+   **Expected:** The menu contains exactly **Single Heatmap** and **Individual
+   Heatmaps**. Choosing either option reports **Load a neuron Parquet before
+   creating a heatmap** and creates no layer.
+2. **Action:** Load the test neuron Parquet, add its four neurons to **Selected
+   Neurons**, leave the atlas unloaded, select three rows, and choose **Add
+   Heatmap** > **Single Heatmap**. Then clear the table selection and try the
+   action again after loading the atlas.
+   **Expected:** Without an atlas, the first attempt reports **Load an atlas
+   before creating a neuron heatmap**. With no selected rows, the second attempt
+   reports **Select at least one neuron row to create a heatmap**. Neither
+   attempt creates a layer.
+3. **Action:** Give the three cohort neurons visibly different colors with
+   their color swatches, select their rows, and choose **Add Heatmap** >
+   **Single Heatmap**.
+   **Expected:** One Greek-named image layer such as **alpha Heatmap** is added
+   with the `hot` colormap. Its node counts combine all three selected neurons.
+   Each cohort row lists that layer in the **Heatmap** column, the fourth row
+   does not, and choosing the layer under **Manual Heatmap** shows only its
+   three source rows.
+4. **Action:** Keep the same distinctly colored rows selected and choose **Add
+   Heatmap** > **Individual Heatmaps**. Change the table selection while the
+   sequential progress messages are visible.
+   **Expected:** **Add Heatmap** is disabled for the full queue. Three new
+   Greek-named layers are added in deterministic order, one for each originally
+   selected neuron, regardless of the later selection change. Each layer uses
+   a transparent-to-neuron-color colormap, contains only that neuron's counts,
+   and appears only on that neuron's **Heatmap** cell and **Manual Heatmap**
+   filter result. The existing neuron colors do not change.
+5. **Action:** Select the same three cohort rows, set all three color swatches
+   to the same RGB color, record the fourth neuron's color, and choose **Add
+   Heatmap** > **Individual Heatmaps** again.
+   **Expected:** The three selected neurons receive distinct Turbo colors in
+   stable neuron-ID order, and rendered versions of those neurons update to the
+   same colors. The fourth neuron's color is unchanged. Each newly created
+   heatmap matches its source neuron's new color.
+6. **Action:** Set one cohort neuron back to the same color as another while
+   leaving the third different, then create individual heatmaps for all three.
+   Repeat with only one selected neuron.
+   **Expected:** A partially duplicated but non-monochrome cohort keeps its
+   existing colors, including the duplicate. A one-neuron request creates one
+   individual layer without recoloring that neuron.
+7. **Action:** Select enough neurons for the projected individual heatmap data
+   to exceed 1 GiB and choose **Add Heatmap** > **Individual Heatmaps**. Leave
+   **Cancel** selected in **Large Individual Heatmap Request** and confirm.
+   **Expected:** The warning shows the selected layer count and estimated GiB
+   before rendering overhead. Cancelling starts no worker, adds no layers, and
+   changes no neuron colors.
+8. **Action:** Delete or rename one of the individual heatmap layers, then use
+   the table's **Heatmap** column and **Manual Heatmap** selector.
+   **Expected:** Layer membership and names stay synchronized. Deleting a layer
+   removes its membership; renaming it updates the affected row and selector
+   without changing the recorded source neuron.
 
 **Manual verification**
 
