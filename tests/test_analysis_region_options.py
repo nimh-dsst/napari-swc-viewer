@@ -95,12 +95,16 @@ class _DummyLabel(_DummyWidget):
     def __init__(self, text: str = "", *_args, **_kwargs) -> None:
         super().__init__()
         self._text = text
+        self._word_wrap = False
 
     def setText(self, text: str) -> None:
         self._text = text
 
     def text(self) -> str:
         return self._text
+
+    def setWordWrap(self, wrap: bool) -> None:
+        self._word_wrap = bool(wrap)
 
 
 class _DummyButton(_DummyWidget):

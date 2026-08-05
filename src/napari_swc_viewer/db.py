@@ -15,6 +15,7 @@ import pandas as pd
 
 from .atlas_utils import mask_to_swc_xyz_bounds, swc_coords_xyz_to_atlas_voxels
 from .swc import NodeType, normalize_node_types
+from .terminals import TERMINUS_NODE_TYPES, TerminusCoverage, query_termini
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -361,6 +362,43 @@ class NeuronDatabase:
             ORDER BY file_id, node_id
         """
         return self.conn.execute(query, file_ids).fetchdf()
+
+    def get_termini(
+        self,
+        file_ids: list[str] | None = None,
+        node_types: list[int] | tuple[int, ...] | None = TERMINUS_NODE_TYPES,
+    ) -> tuple[pd.DataFrame, TerminusCoverage]:
+        """Get childless nodes of the selected types, with a coverage report.
+
+        Childless nodes of an axon-typed compartment are that axon's termini.
+        The node-type restriction narrows only which termini are reported; the
+        child lookup always spans every node of each selected cell, so a node
+        whose only child carries another type is never reported as a terminus.
+
+        Apply any region restriction to the returned frame rather than to
+        ``file_ids``: filtering nodes out of the source would make their parents
+        look childless.
+
+        Parameters
+        ----------
+        file_ids : list[str], optional
+            Restrict to these neurons. ``None`` uses every neuron in the source.
+        node_types : list[int] or tuple[int, ...], optional
+            SWC types to report. Defaults to axon only. ``None`` reports every
+            childless node; an empty sequence reports none.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, TerminusCoverage]
+            Terminus nodes, and a report of which neurons were skipped because
+            they contain no nodes of the selected types.
+        """
+        return query_termini(
+            self.conn,
+            "neurons",
+            node_types=node_types,
+            file_ids=file_ids,
+        )
 
     def get_neurons_for_rendering(
         self,
