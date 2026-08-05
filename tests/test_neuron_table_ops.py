@@ -14,6 +14,7 @@ from napari_swc_viewer.neuron_table_ops import (
     has_unclustered_entries,
     recolor_cluster_turbo,
     summarize_neuron_table,
+    turbo_colors_for_file_ids,
     visibility_for_selected_cluster,
 )
 
@@ -134,6 +135,33 @@ def test_recolor_cluster_turbo_handles_multi_selection_and_unclustered() -> None
     for file_id, expected_color in zip(selected_ids, expected_colors):
         assert colors[file_id] == expected_color
     assert colors["n4"] == list(GRAY_RGBA)
+
+
+def test_turbo_colors_for_file_ids_is_stable_and_deduplicates() -> None:
+    colors = turbo_colors_for_file_ids(["n2", "n10", "n2", "n1"])
+
+    expected_ids = ["n1", "n10", "n2"]
+    expected_samples = np.linspace(0.0, 1.0, 3)
+    assert list(colors) == expected_ids
+    for file_id, sample in zip(expected_ids, expected_samples):
+        assert colors[file_id] == [
+            float(channel) for channel in colormaps["turbo"](float(sample))
+        ]
+
+
+def test_turbo_colors_for_file_ids_handles_empty_and_singleton_inputs() -> None:
+    assert turbo_colors_for_file_ids([]) == {}
+    assert turbo_colors_for_file_ids(["only"]) == {
+        "only": [float(channel) for channel in colormaps["turbo"](0.0)]
+    }
+
+
+def test_recolor_cluster_turbo_uses_shared_turbo_palette() -> None:
+    cluster_by_file = {"n3": 2, "n2": 1, "n1": 1}
+
+    colors = recolor_cluster_turbo(cluster_by_file, 1, gray_others=False)
+
+    assert colors == turbo_colors_for_file_ids(["n1", "n2"])
 
 
 def test_available_cluster_ids_sorted_unique() -> None:

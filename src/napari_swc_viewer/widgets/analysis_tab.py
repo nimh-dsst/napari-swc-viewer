@@ -59,17 +59,19 @@ logger = logging.getLogger(__name__)
 
 _ANALYSIS_SCOPE_WHOLE = "whole"
 _ANALYSIS_SCOPE_CURRENT = "current"
+_ANALYSIS_SCOPE_SELECTED = "selected"
 _COORD_SPACE_CCF = "CCFv3 Coordinates"
 _COORD_SPACE_FLATMAP = "Flat map + Depth"
 _CLUSTER_METHOD_VOXEL = "Voxel Correlation"
 _CLUSTER_METHOD_SOMA = "Soma Location"
+_LARGE_CLUSTER_NODE_THRESHOLD = 10_000_000
 _FLATMAP_STYLE_LABELS = {
     "both_shaped": "Bilateral shaped",
     "both_square": "Bilateral square",
 }
 _FLATMAP_COORDS_INFO_TEXT = (
-    "Clustering runs over all neurons with flatmap/depth coordinates in the "
-    "loaded Parquet. Region filtering in flat map space is not yet available."
+    "Clustering uses flatmap/depth coordinates in the loaded Parquet. "
+    "Target-region filtering in flat map space is not yet available."
 )
 
 
@@ -86,6 +88,27 @@ class _HeatmapRequest:
     soma_radius_um: float | None
     depth_bin_factor: int
     depth_axis: int
+
+
+@dataclass(frozen=True)
+class _ClusteringRequest:
+    """Immutable snapshot of every setting used by one clustering run."""
+
+    coordinate_space: str
+    clustering_method: str
+    scope: str
+    file_ids: tuple[str, ...] | None
+    region_selection: ClusterRegionSelection | None
+    dilation_fraction: float
+    linkage_method: str
+    n_clusters: int
+    algorithm: str
+    eps: float
+    min_samples: int
+    flatmap_style: str | None
+    flatmap_xy_bins: int
+    flatmap_depth_bin_um: float
+    flatmap_include_depth_minus_one: bool
 
 
 @dataclass(frozen=True)
@@ -110,6 +133,14 @@ def _analysis_heatmap_contrast_limits(
     if not np.isfinite(upper) or upper <= 0.0:
         return (0.0, 1.0)
     return (0.0, upper)
+
+
+def _large_clustering_warning_text(node_count: int) -> str:
+    """Return the confirmation text for an oversized clustering input."""
+    return (
+        f"This clustering run will process {int(node_count):,} nodes, "
+        "which exceeds the 10,000,000-node warning threshold. Continue?"
+    )
 
 
 def _populate_embedded_clustermap_figure(
@@ -176,14 +207,10 @@ def _apply_analysis_heatmap_contrast_limits(
 
 def _is_thumbnail_rank_mismatch_error(error: RuntimeError) -> bool:
     """Return whether napari thumbnail generation hit the known rank bug."""
-    return "sequence argument must have length equal to input rank" in str(
-        error
-    )
+    return "sequence argument must have length equal to input rank" in str(error)
 
 
-def _analysis_heatmap_ndisplay(
-    layer: Any, response: Any | None = None
-) -> int | None:
+def _analysis_heatmap_ndisplay(layer: Any, response: Any | None = None) -> int | None:
     """Return the current display dimensionality for a heatmap layer."""
     slice_input = getattr(response, "slice_input", None)
     ndisplay = getattr(slice_input, "ndisplay", None)
@@ -236,9 +263,7 @@ def _install_analysis_heatmap_layer_workarounds(layer: Any) -> None:
 
         layer._update_thumbnail = MethodType(_safe_update_thumbnail, layer)
 
-    original_reset_contrast_limits = getattr(
-        layer, "reset_contrast_limits", None
-    )
+    original_reset_contrast_limits = getattr(layer, "reset_contrast_limits", None)
     if callable(original_reset_contrast_limits):
 
         def _stable_reset_contrast_limits(self, mode=None) -> None:
@@ -251,9 +276,7 @@ def _install_analysis_heatmap_layer_workarounds(layer: Any) -> None:
                 return
             _apply_analysis_heatmap_contrast_limits(self, limits)
 
-        layer.reset_contrast_limits = MethodType(
-            _stable_reset_contrast_limits, layer
-        )
+        layer.reset_contrast_limits = MethodType(_stable_reset_contrast_limits, layer)
 
     original_reset_contrast_limits_range = getattr(
         layer, "reset_contrast_limits_range", None
@@ -274,9 +297,7 @@ def _install_analysis_heatmap_layer_workarounds(layer: Any) -> None:
             _stable_reset_contrast_limits_range, layer
         )
 
-    original_update_slice_response = getattr(
-        layer, "_update_slice_response", None
-    )
+    original_update_slice_response = getattr(layer, "_update_slice_response", None)
     if callable(original_update_slice_response):
 
         def _stable_update_slice_response(self, response) -> Any:
@@ -297,9 +318,7 @@ def _install_analysis_heatmap_layer_workarounds(layer: Any) -> None:
                 _apply_analysis_heatmap_contrast_limits(self, limits)
             return result
 
-        layer._update_slice_response = MethodType(
-            _stable_update_slice_response, layer
-        )
+        layer._update_slice_response = MethodType(_stable_update_slice_response, layer)
 
     layer._analysis_heatmap_workarounds_installed = True
 
@@ -341,6 +360,11 @@ class AnalysisTabWidget(QWidget):
         self._clustermap_rendered = False
         self._cluster_region_query_scope = _ANALYSIS_SCOPE_WHOLE
         self._current_table_file_ids_provider = None
+        self._selected_table_file_ids_provider = None
+        self._cluster_assignment_store = None
+        self._pending_cluster_context: dict[str, object] = {}
+        self._pending_clustering_request: _ClusteringRequest | None = None
+        self._pending_clustering_preflight = None
         self._flatmap_correlation_source_provider = None
         self._flatmap_coords_available = False
         self._flatmap_available_styles: tuple[str, ...] = ()
@@ -366,15 +390,11 @@ class AnalysisTabWidget(QWidget):
 
         regions_df = self._db.get_unique_regions()
         normalized_ids: set[int] = set()
-        region_values = (
-            regions_df["region_id"] if "region_id" in regions_df else []
-        )
+        region_values = regions_df["region_id"] if "region_id" in regions_df else []
         for region_id in list(region_values):
             if region_id is None:
                 continue
-            if isinstance(region_id, (float, np.floating)) and np.isnan(
-                region_id
-            ):
+            if isinstance(region_id, (float, np.floating)) and np.isnan(region_id):
                 continue
 
             try:
@@ -402,6 +422,15 @@ class AnalysisTabWidget(QWidget):
         """Set a callback returning the current neuron-table file IDs."""
         self._current_table_file_ids_provider = provider
 
+    def set_selected_table_file_ids_provider(self, provider) -> None:
+        """Set a callback returning explicitly selected table-row file IDs."""
+        self._selected_table_file_ids_provider = provider
+
+    def set_cluster_assignment_store(self, store) -> None:
+        """Set the shared named cluster-assignment store."""
+        self._cluster_assignment_store = store
+        self.on_active_cluster_assignment_changed()
+
     def set_flatmap_correlation_source_provider(self, provider) -> None:
         """Retained for backward compatibility (no longer gates availability).
 
@@ -426,6 +455,15 @@ class AnalysisTabWidget(QWidget):
 
     def _matched_current_table_file_ids(self) -> list[object]:
         """Return current table file IDs that exist in the cached cluster result."""
+        store = self.__dict__.get("_cluster_assignment_store")
+        assignment = getattr(store, "active", None)
+        if assignment is not None:
+            current_file_ids = self._raw_current_table_file_ids()
+            return [
+                file_id
+                for file_id in current_file_ids
+                if assignment.label_for(file_id) is not None
+            ]
         result = getattr(self, "_last_cluster_result", None)
         if result is None:
             return []
@@ -456,22 +494,17 @@ class AnalysisTabWidget(QWidget):
         """Enable/disable buttons based on loaded data."""
         self.refresh_flatmap_coordinate_availability()
         ready = self._db is not None and self._atlas is not None
-        busy = (
-            self._worker_thread is not None and self._worker_thread.isRunning()
-        )
+        busy = self._worker_thread is not None and self._worker_thread.isRunning()
         self._run_corr_btn.setEnabled(ready and not busy)
         self._run_heat_btn.setEnabled(ready and not busy)
         has_cluster_heatmap_options = (
             ready
             and not busy
-            and self._last_cluster_result is not None
             and getattr(self, "_heat_cluster_combo", None) is not None
             and self._heat_cluster_combo.count() > 1
         )
         if hasattr(self, "_add_all_cluster_heatmaps_btn"):
-            self._add_all_cluster_heatmaps_btn.setEnabled(
-                has_cluster_heatmap_options
-            )
+            self._add_all_cluster_heatmaps_btn.setEnabled(has_cluster_heatmap_options)
         analysis_ready = self._last_cluster_result is not None and not busy
         if hasattr(self, "_render_clustermap_btn"):
             self._render_clustermap_btn.setEnabled(analysis_ready)
@@ -552,15 +585,13 @@ class AnalysisTabWidget(QWidget):
         self._algorithm_row.addWidget(self._algorithm_label)
         self._algorithm_combo = QComboBox()
         self._algorithm_combo.addItems(["Hierarchical", "K-Means", "DBSCAN"])
-        self._algorithm_combo.currentTextChanged.connect(
-            self._on_algorithm_changed
-        )
+        self._algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
         self._algorithm_row.addWidget(self._algorithm_combo)
         corr_layout.addLayout(self._algorithm_row)
 
-        # Search scope
+        # Input neuron scope
         scope_row = QHBoxLayout()
-        self._cluster_region_scope_label = QLabel("Search scope:")
+        self._cluster_region_scope_label = QLabel("Input neurons:")
         scope_row.addWidget(self._cluster_region_scope_label)
         self._cluster_region_scope_combo = QComboBox()
         self._cluster_region_scope_combo.addItem(
@@ -570,6 +601,10 @@ class AnalysisTabWidget(QWidget):
         self._cluster_region_scope_combo.addItem(
             "Current Table",
             _ANALYSIS_SCOPE_CURRENT,
+        )
+        self._cluster_region_scope_combo.addItem(
+            "Selected Rows",
+            _ANALYSIS_SCOPE_SELECTED,
         )
         self._cluster_region_scope_combo.currentTextChanged.connect(
             self._on_cluster_region_scope_changed
@@ -620,6 +655,20 @@ class AnalysisTabWidget(QWidget):
         )
         current_layout.addWidget(self._current_table_cluster_region_selector)
         self._cluster_region_scope_stack.addWidget(current_page)
+
+        selected_page = QWidget()
+        selected_layout = QVBoxLayout(selected_page)
+        selected_layout.setContentsMargins(0, 0, 0, 0)
+        self._selected_rows_cluster_region_selector = RegionSelectorWidget(
+            single_select=False,
+            show_include_children=False,
+            force_include_children=True,
+        )
+        self._selected_rows_cluster_region_selector.selection_changed.connect(
+            self._on_cluster_region_selection_changed
+        )
+        selected_layout.addWidget(self._selected_rows_cluster_region_selector)
+        self._cluster_region_scope_stack.addWidget(selected_page)
 
         cluster_region_layout.addWidget(self._cluster_region_scope_stack)
         corr_layout.addWidget(self._cluster_region_section)
@@ -705,9 +754,7 @@ class AnalysisTabWidget(QWidget):
         self._flatmap_depth_bin_row.addWidget(self._flatmap_depth_bin_spin)
         corr_layout.addLayout(self._flatmap_depth_bin_row)
 
-        self._flatmap_include_depth_minus_one_cb = QCheckBox(
-            "Include depth -1 plane"
-        )
+        self._flatmap_include_depth_minus_one_cb = QCheckBox("Include depth -1 plane")
         self._flatmap_include_depth_minus_one_cb.setChecked(True)
         corr_layout.addWidget(self._flatmap_include_depth_minus_one_cb)
 
@@ -720,9 +767,7 @@ class AnalysisTabWidget(QWidget):
         layout.addWidget(self._clustering_section)
 
         # Set initial visibility
-        self._on_clustering_method_changed(
-            self._clustering_method_combo.currentText()
-        )
+        self._on_clustering_method_changed(self._clustering_method_combo.currentText())
 
         # --- Node Count Heatmap group ---
         self._heatmap_section = CollapsibleSection(
@@ -741,9 +786,7 @@ class AnalysisTabWidget(QWidget):
             "Select Heatmap Region",
             expanded=False,
         )
-        heat_region_selector_layout = (
-            self._heat_region_section.content_layout()
-        )
+        heat_region_selector_layout = self._heat_region_section.content_layout()
         self._heat_region_selector = RegionSelectorWidget(
             single_select=True,
             show_include_children=False,
@@ -771,9 +814,7 @@ class AnalysisTabWidget(QWidget):
         heat_layout.addLayout(node_type_row)
 
         soma_radius_row = QHBoxLayout()
-        self._heat_soma_radius_enabled_cb = QCheckBox(
-            "Filter by soma distance"
-        )
+        self._heat_soma_radius_enabled_cb = QCheckBox("Filter by soma distance")
         self._heat_soma_radius_enabled_cb.setChecked(False)
         self._heat_soma_radius_enabled_cb.setToolTip(
             "Restrict heatmap nodes to a radius around each neuron's soma"
@@ -804,9 +845,7 @@ class AnalysisTabWidget(QWidget):
         self._depth_bin_spin.setToolTip(
             "Merge N depth-planes into one voxel along the slicing axis"
         )
-        self._depth_bin_spin.valueChanged.connect(
-            self._update_voxel_depth_label
-        )
+        self._depth_bin_spin.valueChanged.connect(self._update_voxel_depth_label)
         depth_bin_row.addWidget(self._depth_bin_spin)
         heat_layout.addLayout(depth_bin_row)
 
@@ -819,9 +858,7 @@ class AnalysisTabWidget(QWidget):
         self._run_heat_btn.clicked.connect(self._run_heatmap_pipeline)
         heat_action_row.addWidget(self._run_heat_btn)
 
-        self._add_all_cluster_heatmaps_btn = QPushButton(
-            "Add All Cluster Heatmaps"
-        )
+        self._add_all_cluster_heatmaps_btn = QPushButton("Add All Cluster Heatmaps")
         self._add_all_cluster_heatmaps_btn.setEnabled(False)
         self._add_all_cluster_heatmaps_btn.clicked.connect(
             self._run_all_cluster_heatmaps
@@ -855,9 +892,7 @@ class AnalysisTabWidget(QWidget):
         )
         clustermap_layout.addWidget(self._clustermap_status_label)
         self._build_clustermap_btn = QPushButton("Build Dendrogram")
-        self._build_clustermap_btn.clicked.connect(
-            self._render_clustermap_requested
-        )
+        self._build_clustermap_btn.clicked.connect(self._render_clustermap_requested)
         clustermap_layout.addWidget(self._build_clustermap_btn)
         self._render_clustermap_btn = self._build_clustermap_btn
         self._figure = Figure(figsize=(6, 6))
@@ -898,23 +933,15 @@ class AnalysisTabWidget(QWidget):
         export_layout.addLayout(export_dpi_row)
 
         self._save_cluster_workbook_btn = QPushButton("Save Cluster Workbook")
-        self._save_cluster_workbook_btn.clicked.connect(
-            self._save_cluster_workbook
-        )
+        self._save_cluster_workbook_btn.clicked.connect(self._save_cluster_workbook)
         export_layout.addWidget(self._save_cluster_workbook_btn)
 
-        self._save_distance_workbook_btn = QPushButton(
-            "Save Distance Workbook"
-        )
-        self._save_distance_workbook_btn.clicked.connect(
-            self._save_distance_workbook
-        )
+        self._save_distance_workbook_btn = QPushButton("Save Distance Workbook")
+        self._save_distance_workbook_btn.clicked.connect(self._save_distance_workbook)
         export_layout.addWidget(self._save_distance_workbook_btn)
 
         self._save_extended_parquet_btn = QPushButton("Save Extended Parquet")
-        self._save_extended_parquet_btn.clicked.connect(
-            self._save_extended_parquet
-        )
+        self._save_extended_parquet_btn.clicked.connect(self._save_extended_parquet)
         export_layout.addWidget(self._save_extended_parquet_btn)
 
         self._save_dendrogram_btn = QPushButton("Save Dendrogram")
@@ -924,9 +951,7 @@ class AnalysisTabWidget(QWidget):
         layout.addWidget(self._export_section)
 
         layout.addStretch()
-        self._show_clustermap_message(
-            "Run clustering, then click Render Dendrogram."
-        )
+        self._show_clustermap_message("Run clustering, then click Render Dendrogram.")
         self._sync_cluster_region_scope_selector()
         self._refresh_analysis_region_selectors()
         self._update_button_states()
@@ -957,12 +982,25 @@ class AnalysisTabWidget(QWidget):
 
     def _update_region_summary_labels(self) -> None:
         """Refresh the visible region summary labels for Analysis workflows."""
+        cluster_scope = self._selected_cluster_region_scope()
+        cluster_empty_text = (
+            "None selected"
+            if cluster_scope == _ANALYSIS_SCOPE_WHOLE
+            else "All regions (optional)"
+        )
         self._cluster_region_summary_label.setText(
             self._format_selected_region_text(
                 self._active_cluster_region_selector(),
-                empty_text="None selected",
+                empty_text=cluster_empty_text,
             )
         )
+        target_label = getattr(self, "_cluster_region_target_label", None)
+        if target_label is not None:
+            target_label.setText(
+                "Target region:"
+                if cluster_scope == _ANALYSIS_SCOPE_WHOLE
+                else "Target region (optional):"
+            )
         self._heat_region_summary_label.setText(
             self._format_selected_region_text(
                 getattr(self, "_heat_region_selector", None),
@@ -996,9 +1034,7 @@ class AnalysisTabWidget(QWidget):
             return
 
         selectors = (*cluster_selectors, heat_selector)
-        previous_regions = [
-            self._selected_regions(selector) for selector in selectors
-        ]
+        previous_regions = [self._selected_regions(selector) for selector in selectors]
 
         if self._atlas is None or not self._dataset_region_ids:
             for selector in selectors:
@@ -1016,9 +1052,7 @@ class AnalysisTabWidget(QWidget):
                 if region_id in allowed_ids
             ]
             if len(retained) > 1 and hasattr(selector, "select_regions"):
-                selector.select_regions(
-                    [acronym for _region_id, acronym in retained]
-                )
+                selector.select_regions([acronym for _region_id, acronym in retained])
             else:
                 previous_id = retained[0][0] if retained else None
                 selector.select_region_by_id(previous_id)
@@ -1034,20 +1068,30 @@ class AnalysisTabWidget(QWidget):
                 "_cluster_region_query_scope",
                 _ANALYSIS_SCOPE_WHOLE,
             )
-            if scope in {_ANALYSIS_SCOPE_WHOLE, _ANALYSIS_SCOPE_CURRENT}:
+            if scope in {
+                _ANALYSIS_SCOPE_WHOLE,
+                _ANALYSIS_SCOPE_CURRENT,
+                _ANALYSIS_SCOPE_SELECTED,
+            }:
                 return scope
             return _ANALYSIS_SCOPE_WHOLE
 
         current_data = getattr(combo, "currentData", None)
         if callable(current_data):
             data = current_data()
-            if data in {_ANALYSIS_SCOPE_WHOLE, _ANALYSIS_SCOPE_CURRENT}:
+            if data in {
+                _ANALYSIS_SCOPE_WHOLE,
+                _ANALYSIS_SCOPE_CURRENT,
+                _ANALYSIS_SCOPE_SELECTED,
+            }:
                 return str(data)
 
         current_text = getattr(combo, "currentText", None)
         text = current_text() if callable(current_text) else ""
         if text == "Current Table":
             return _ANALYSIS_SCOPE_CURRENT
+        if text == "Selected Rows":
+            return _ANALYSIS_SCOPE_SELECTED
         return _ANALYSIS_SCOPE_WHOLE
 
     def _cluster_region_selectors(self) -> tuple[RegionSelectorWidget, ...]:
@@ -1056,6 +1100,7 @@ class AnalysisTabWidget(QWidget):
         for attr_name in (
             "_whole_parquet_cluster_region_selector",
             "_current_table_cluster_region_selector",
+            "_selected_rows_cluster_region_selector",
             "_cluster_region_selector",
         ):
             selector = getattr(self, attr_name, None)
@@ -1073,10 +1118,19 @@ class AnalysisTabWidget(QWidget):
         if selected_scope not in {
             _ANALYSIS_SCOPE_WHOLE,
             _ANALYSIS_SCOPE_CURRENT,
+            _ANALYSIS_SCOPE_SELECTED,
         }:
             selected_scope = self._selected_cluster_region_scope()
 
-        if selected_scope == _ANALYSIS_SCOPE_CURRENT:
+        if selected_scope == _ANALYSIS_SCOPE_SELECTED:
+            selector = getattr(
+                self,
+                "_selected_rows_cluster_region_selector",
+                None,
+            )
+            if selector is not None:
+                return selector
+        elif selected_scope == _ANALYSIS_SCOPE_CURRENT:
             selector = getattr(self, "_current_table_cluster_region_selector", None)
             if selector is not None:
                 return selector
@@ -1097,22 +1151,53 @@ class AnalysisTabWidget(QWidget):
         if stack is None:
             return
 
-        index = (
-            1
-            if self._selected_cluster_region_scope() == _ANALYSIS_SCOPE_CURRENT
-            else 0
-        )
+        scope = self._selected_cluster_region_scope()
+        index = {
+            _ANALYSIS_SCOPE_WHOLE: 0,
+            _ANALYSIS_SCOPE_CURRENT: 1,
+            _ANALYSIS_SCOPE_SELECTED: 2,
+        }.get(scope, 0)
         stack.setCurrentIndex(index)
 
     def _current_table_file_ids(self) -> list[str]:
         """Return file IDs currently present in the main neuron table."""
         return [str(file_id) for file_id in self._raw_current_table_file_ids()]
 
+    def _selected_table_file_ids(self) -> list[str]:
+        """Return de-duplicated explicitly selected table-row file IDs."""
+        provider = self.__dict__.get("_selected_table_file_ids_provider")
+        if not callable(provider):
+            return []
+        try:
+            values = provider()
+        except Exception:
+            return []
+        if values is None:
+            return []
+        return list(dict.fromkeys(str(file_id) for file_id in values))
+
     def _resolve_cluster_query_file_scope(
         self,
     ) -> tuple[bool, list[str] | None, str, int | None]:
         """Resolve the optional current-table restriction for clustering."""
         scope = self._selected_cluster_region_scope()
+        if scope == _ANALYSIS_SCOPE_SELECTED:
+            file_ids = self._selected_table_file_ids()
+            if len(file_ids) >= 2:
+                return True, file_ids, "selected rows", len(file_ids)
+            if not file_ids:
+                message = (
+                    "No table rows are selected; select at least two neurons "
+                    "before clustering Selected Rows."
+                )
+            else:
+                message = (
+                    "Only one table row is selected; select at least two "
+                    "neurons before clustering Selected Rows."
+                )
+            self._progress_label.setText(message)
+            return False, None, "selected rows", len(file_ids)
+
         if scope != _ANALYSIS_SCOPE_CURRENT:
             return True, None, "whole parquet", None
 
@@ -1195,9 +1280,7 @@ class AnalysisTabWidget(QWidget):
             for style in styles:
                 combo.addItem(_FLATMAP_STYLE_LABELS.get(style, style), style)
             if previous in styles:
-                combo.setCurrentText(
-                    _FLATMAP_STYLE_LABELS.get(previous, str(previous))
-                )
+                combo.setCurrentText(_FLATMAP_STYLE_LABELS.get(previous, str(previous)))
         finally:
             if callable(blocker):
                 blocker(False)
@@ -1270,13 +1353,9 @@ class AnalysisTabWidget(QWidget):
 
     def _selected_heat_region(self) -> tuple[int, str] | None:
         """Return the currently selected heatmap region."""
-        return self._selected_region(
-            getattr(self, "_heat_region_selector", None)
-        )
+        return self._selected_region(getattr(self, "_heat_region_selector", None))
 
-    def _represented_region_ids_for_selection(
-        self, region_id: int
-    ) -> list[int]:
+    def _represented_region_ids_for_selection(self, region_id: int) -> list[int]:
         """Return represented dataset region IDs inside a selected atlas region."""
         if self._atlas is None or not self._dataset_region_ids:
             return []
@@ -1309,9 +1388,7 @@ class AnalysisTabWidget(QWidget):
             return represented
 
         for region_id in region_ids:
-            for represented_id in self._represented_region_ids_for_selection(
-                region_id
-            ):
+            for represented_id in self._represented_region_ids_for_selection(region_id):
                 if represented_id in seen_ids:
                     continue
                 struct = self._atlas.structures.get(int(represented_id), {})
@@ -1336,9 +1413,7 @@ class AnalysisTabWidget(QWidget):
             [region_id for region_id, _acronym in selected_regions]
         )
         return ClusterRegionSelection(
-            selected_region_ids=[
-                region_id for region_id, _acronym in selected_regions
-            ],
+            selected_region_ids=[region_id for region_id, _acronym in selected_regions],
             selected_region_acronyms=[
                 acronym for _region_id, acronym in selected_regions
             ],
@@ -1350,9 +1425,7 @@ class AnalysisTabWidget(QWidget):
             ],
         )
 
-    def _on_cluster_region_selection_changed(
-        self, _acronyms: list[str]
-    ) -> None:
+    def _on_cluster_region_selection_changed(self, _acronyms: list[str]) -> None:
         """Keep the clustering region summary in sync with tree selection."""
         self._update_region_summary_labels()
 
@@ -1387,8 +1460,6 @@ class AnalysisTabWidget(QWidget):
         # CCFv3-only region + dilation controls (region filtering in flat map
         # space is handled separately and not yet available).
         for widget in (
-            getattr(self, "_cluster_region_scope_label", None),
-            getattr(self, "_cluster_region_scope_combo", None),
             getattr(self, "_cluster_region_target_label", None),
             getattr(self, "_cluster_region_summary_label", None),
             getattr(self, "_cluster_region_section", None),
@@ -1450,39 +1521,11 @@ class AnalysisTabWidget(QWidget):
         self._min_samples_spin.setVisible(is_dbscan)
 
     def _run_clustering_pipeline(self) -> None:
-        """Start the appropriate clustering pipeline in a background thread."""
+        """Validate and start an exact asynchronous clustering preflight."""
         if self._db is None or self._atlas is None:
             return
 
         if self._worker_thread is not None and self._worker_thread.isRunning():
-            return
-
-        clustering_method = self._clustering_method_combo.currentText()
-
-        if self._current_coordinate_space() == _COORD_SPACE_FLATMAP:
-            self._run_flatmap_clustering(clustering_method)
-            return
-
-        if clustering_method == _CLUSTER_METHOD_SOMA:
-            proceed, base_file_ids, _scope_label, _input_count = (
-                self._resolve_cluster_query_file_scope()
-            )
-            if not proceed:
-                return
-            region_selection = self._selected_cluster_region_selection()
-            if region_selection is None:
-                self._progress_label.setText("Select at least one target region.")
-                return
-            if not region_selection.represented_region_ids:
-                self._progress_label.setText(
-                    "Selected region(s) have no represented dataset regions."
-                )
-                return
-            self._run_soma_clustering(
-                region_selection,
-                self._dilation_spin.value() / 100.0,
-                file_ids=base_file_ids,
-            )
             return
 
         proceed, base_file_ids, _scope_label, _input_count = (
@@ -1491,138 +1534,257 @@ class AnalysisTabWidget(QWidget):
         if not proceed:
             return
 
-        region_selection = self._selected_cluster_region_selection()
-        if region_selection is None:
-            self._progress_label.setText("Select at least one target region.")
-            return
-        if not region_selection.represented_region_ids:
-            self._progress_label.setText(
-                "Selected region(s) have no represented dataset regions."
-            )
-            return
+        coordinate_space = self._current_coordinate_space()
+        clustering_method = self._clustering_method_combo.currentText()
+        scope = self._selected_cluster_region_scope()
+        region_selection = None
+        if coordinate_space == _COORD_SPACE_CCF:
+            region_selection = self._selected_cluster_region_selection()
+            if region_selection is None and scope == _ANALYSIS_SCOPE_WHOLE:
+                self._progress_label.setText("Select at least one target region.")
+                return
+            if (
+                region_selection is not None
+                and not region_selection.represented_region_ids
+            ):
+                self._progress_label.setText(
+                    "Selected region(s) have no represented dataset regions."
+                )
+                return
 
-        self._run_correlation_clustering(
-            region_selection,
-            self._dilation_spin.value() / 100.0,
-            file_ids=base_file_ids,
-        )
+        flatmap_style = None
+        if coordinate_space == _COORD_SPACE_FLATMAP:
+            flatmap_style = self._selected_flatmap_style()
+            if flatmap_style is None:
+                self._progress_label.setText(
+                    "No flatmap style available in the loaded Parquet."
+                )
+                return
 
-    def _run_correlation_clustering(
-        self,
-        region_selection: ClusterRegionSelection,
-        dilation: float,
-        *,
-        file_ids: list[str] | None = None,
-    ) -> None:
-        """Start the voxel correlation + clustering pipeline."""
-        from ..workers import CorrelationWorker
-
-        method = self._method_combo.currentText()
-        n_clusters = self._n_clusters_spin.value()
-
-        worker = CorrelationWorker(
-            parquet_path=self._parquet_path,
-            atlas=self._atlas,
+        algorithm = {
+            "Hierarchical": "hierarchical",
+            "K-Means": "kmeans",
+            "DBSCAN": "dbscan",
+        }[self._algorithm_combo.currentText()]
+        request = _ClusteringRequest(
+            coordinate_space=coordinate_space,
+            clustering_method=clustering_method,
+            scope=scope,
+            file_ids=(
+                None
+                if base_file_ids is None
+                else tuple(str(file_id) for file_id in base_file_ids)
+            ),
             region_selection=region_selection,
-            dilation_fraction=dilation,
-            linkage_method=method,
-            n_clusters=n_clusters,
-            file_ids=file_ids,
-        )
-
-        self._start_background_worker(worker, self._on_correlation_finished)
-
-    def _run_flatmap_clustering(self, clustering_method: str) -> None:
-        """Dispatch a Flat map + Depth clustering run from Parquet columns.
-
-        Region filtering in flat map space is not yet available, so clustering
-        runs over every neuron with valid flatmap/depth coordinates.
-        """
-        style = self._selected_flatmap_style()
-        if style is None:
-            self._progress_label.setText(
-                "No flatmap style available in the loaded Parquet."
-            )
-            return
-
-        if clustering_method == _CLUSTER_METHOD_SOMA:
-            self._run_flatmap_soma_clustering(style)
-        else:
-            self._run_flatmap_correlation_clustering(style)
-
-    def _run_flatmap_correlation_clustering(self, style: str) -> None:
-        """Start flatmap-space voxel correlation clustering from Parquet."""
-        from ..workers import FlatmapParquetCorrelationWorker
-
-        worker = FlatmapParquetCorrelationWorker(
-            parquet_path=self._parquet_path,
-            atlas=self._atlas,
-            style=style,
-            xy_bins=self._flatmap_xy_bins_spin.value(),
-            depth_bin_um=self._flatmap_depth_bin_spin.value(),
-            include_depth_minus_one=(
-                self._flatmap_include_depth_minus_one_cb.isChecked()
+            dilation_fraction=(
+                self._dilation_spin.value() / 100.0
+                if region_selection is not None
+                else 0.0
             ),
             linkage_method=self._method_combo.currentText(),
-            n_clusters=self._n_clusters_spin.value(),
+            n_clusters=int(self._n_clusters_spin.value()),
+            algorithm=algorithm,
+            eps=float(self._eps_spin.value()),
+            min_samples=int(self._min_samples_spin.value()),
+            flatmap_style=flatmap_style,
+            flatmap_xy_bins=int(self._flatmap_xy_bins_spin.value()),
+            flatmap_depth_bin_um=float(self._flatmap_depth_bin_spin.value()),
+            flatmap_include_depth_minus_one=(
+                self._flatmap_include_depth_minus_one_cb.isChecked()
+            ),
         )
-        self._start_background_worker(worker, self._on_correlation_finished)
+        self._capture_cluster_run_context(
+            clustering_method,
+            base_file_ids,
+        )
+        self._start_clustering_preflight(request)
 
-    def _run_flatmap_soma_clustering(self, style: str) -> None:
-        """Start flatmap-space soma-location clustering from Parquet."""
-        from ..workers import FlatmapSomaClusterWorker
+    def _start_clustering_preflight(self, request: _ClusteringRequest) -> None:
+        """Count one immutable clustering request on a background thread."""
+        from ..workers import ClusteringPreflightWorker
 
-        algorithm_map = {
-            "Hierarchical": "hierarchical",
-            "K-Means": "kmeans",
-            "DBSCAN": "dbscan",
-        }
-        algorithm = algorithm_map[self._algorithm_combo.currentText()]
-
-        worker = FlatmapSomaClusterWorker(
+        worker = ClusteringPreflightWorker(
             parquet_path=self._parquet_path,
             atlas=self._atlas,
-            style=style,
-            algorithm=algorithm,
-            linkage_method=self._method_combo.currentText(),
-            n_clusters=self._n_clusters_spin.value(),
-            eps=self._eps_spin.value(),
-            min_samples=self._min_samples_spin.value(),
+            coordinate_space=(
+                "flatmap" if request.coordinate_space == _COORD_SPACE_FLATMAP else "ccf"
+            ),
+            clustering_method=(
+                "soma" if request.clustering_method == _CLUSTER_METHOD_SOMA else "voxel"
+            ),
+            region_selection=request.region_selection,
+            dilation_fraction=request.dilation_fraction,
+            file_ids=(None if request.file_ids is None else list(request.file_ids)),
+            flatmap_style=request.flatmap_style,
+            flatmap_xy_bins=request.flatmap_xy_bins,
+            flatmap_depth_bin_um=request.flatmap_depth_bin_um,
+            flatmap_include_depth_minus_one=(request.flatmap_include_depth_minus_one),
         )
-        self._start_background_worker(worker, self._on_correlation_finished)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_clustering_preflight_finished)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(self._on_clustering_preflight_error)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(self._on_clustering_preflight_thread_finished)
+        thread.finished.connect(thread.deleteLater)
 
-    def _run_soma_clustering(
+        self._pending_clustering_request = request
+        self._pending_clustering_preflight = None
+        self._worker_thread = thread
+        self._current_worker = worker
+        self._progress_label.setText("Counting clustering nodes...")
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, 0)
+        self._update_button_states()
+        thread.start()
+
+    def _on_clustering_preflight_finished(self, result) -> None:
+        """Store a preflight result until its worker thread has stopped."""
+        self._pending_clustering_preflight = result
+
+    def _on_clustering_preflight_error(self, message: str) -> None:
+        """Stop a clustering request when exact preflight counting fails."""
+        self._pending_clustering_request = None
+        self._pending_clustering_preflight = None
+        self._pending_cluster_context = {}
+        self._on_error(message)
+
+    def _on_clustering_preflight_thread_finished(self) -> None:
+        """Prompt when needed, then launch the snapshotted clustering run."""
+        self._on_thread_finished()
+        request = self._pending_clustering_request
+        result = self._pending_clustering_preflight
+        self._pending_clustering_request = None
+        self._pending_clustering_preflight = None
+        if request is None or result is None:
+            self._update_button_states()
+            return
+
+        node_count = int(result.node_count)
+        if (
+            node_count > _LARGE_CLUSTER_NODE_THRESHOLD
+            and not self._confirm_large_clustering_run(node_count)
+        ):
+            self._pending_cluster_context = {}
+            self._progress_bar.setVisible(False)
+            self._progress_label.setText(
+                f"Clustering cancelled; {node_count:,} nodes would have been processed."
+            )
+            self._update_button_states()
+            return
+        self._launch_clustering_request(request, result.voxel_id_map)
+
+    def _confirm_large_clustering_run(self, node_count: int) -> bool:
+        """Ask whether a clustering input above the warning threshold may run."""
+        from qtpy.QtWidgets import QMessageBox
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Large Clustering Run")
+        message.setText(_large_clustering_warning_text(node_count))
+        continue_button = message.addButton("Continue", QMessageBox.AcceptRole)
+        cancel_button = message.addButton("Cancel", QMessageBox.RejectRole)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is continue_button
+
+    def _launch_clustering_request(
         self,
-        region_selection: ClusterRegionSelection,
-        dilation: float,
-        *,
-        file_ids: list[str] | None = None,
+        request: _ClusteringRequest,
+        voxel_id_map: np.ndarray | None,
     ) -> None:
-        """Start the soma-location clustering pipeline."""
-        from ..workers import SomaClusterWorker
-
-        algorithm_text = self._algorithm_combo.currentText()
-        algorithm_map = {
-            "Hierarchical": "hierarchical",
-            "K-Means": "kmeans",
-            "DBSCAN": "dbscan",
-        }
-        algorithm = algorithm_map[algorithm_text]
-
-        worker = SomaClusterWorker(
-            parquet_path=self._parquet_path,
-            atlas=self._atlas,
-            region_selection=region_selection,
-            dilation_fraction=dilation,
-            algorithm=algorithm,
-            linkage_method=self._method_combo.currentText(),
-            n_clusters=self._n_clusters_spin.value(),
-            eps=self._eps_spin.value(),
-            min_samples=self._min_samples_spin.value(),
-            file_ids=file_ids,
+        """Launch a previously counted immutable clustering request."""
+        from ..workers import (
+            CorrelationWorker,
+            FlatmapParquetCorrelationWorker,
+            FlatmapSomaClusterWorker,
+            SomaClusterWorker,
         )
 
+        file_ids = None if request.file_ids is None else list(request.file_ids)
+        common = {
+            "parquet_path": self._parquet_path,
+            "atlas": self._atlas,
+        }
+        if request.coordinate_space == _COORD_SPACE_FLATMAP:
+            if request.clustering_method == _CLUSTER_METHOD_SOMA:
+                worker = FlatmapSomaClusterWorker(
+                    **common,
+                    style=request.flatmap_style,
+                    algorithm=request.algorithm,
+                    linkage_method=request.linkage_method,
+                    n_clusters=request.n_clusters,
+                    eps=request.eps,
+                    min_samples=request.min_samples,
+                    file_ids=file_ids,
+                )
+            else:
+                worker = FlatmapParquetCorrelationWorker(
+                    **common,
+                    style=request.flatmap_style,
+                    xy_bins=request.flatmap_xy_bins,
+                    depth_bin_um=request.flatmap_depth_bin_um,
+                    include_depth_minus_one=(request.flatmap_include_depth_minus_one),
+                    linkage_method=request.linkage_method,
+                    n_clusters=request.n_clusters,
+                    file_ids=file_ids,
+                )
+        elif request.clustering_method == _CLUSTER_METHOD_SOMA:
+            worker = SomaClusterWorker(
+                **common,
+                region_selection=request.region_selection,
+                dilation_fraction=request.dilation_fraction,
+                algorithm=request.algorithm,
+                linkage_method=request.linkage_method,
+                n_clusters=request.n_clusters,
+                eps=request.eps,
+                min_samples=request.min_samples,
+                file_ids=file_ids,
+                voxel_id_map=voxel_id_map,
+            )
+        else:
+            worker = CorrelationWorker(
+                **common,
+                region_selection=request.region_selection,
+                dilation_fraction=request.dilation_fraction,
+                linkage_method=request.linkage_method,
+                n_clusters=request.n_clusters,
+                file_ids=file_ids,
+                voxel_id_map=voxel_id_map,
+            )
         self._start_background_worker(worker, self._on_correlation_finished)
+
+    def _capture_cluster_run_context(
+        self,
+        clustering_method: str,
+        file_ids: list[str] | None,
+    ) -> None:
+        """Capture UI-only cohort and lineage provenance for a worker run."""
+        scope = self._selected_cluster_region_scope()
+        parent_assignment_id = None
+        parent_cluster_ids: list[int] = []
+        store = self.__dict__.get("_cluster_assignment_store")
+        active = getattr(store, "active", None)
+        if scope == _ANALYSIS_SCOPE_SELECTED and active is not None:
+            parent_assignment_id = active.assignment_id
+            parent_cluster_ids = sorted(
+                {
+                    int(label)
+                    for file_id in file_ids or []
+                    if (label := active.label_for(file_id)) is not None
+                }
+            )
+        self._pending_cluster_context = {
+            "method_name": str(clustering_method),
+            "input_scope": scope,
+            "input_file_ids": None if file_ids is None else list(file_ids),
+            "coordinate_space": self._current_coordinate_space(),
+            "parent_assignment_id": parent_assignment_id,
+            "parent_cluster_ids": parent_cluster_ids,
+        }
 
     def _start_background_worker(self, worker, finished_slot) -> None:
         """Wire up and start a background worker in a QThread."""
@@ -1689,9 +1851,7 @@ class AnalysisTabWidget(QWidget):
             return (None, None, None)
 
         region_id, acronym = selected_region
-        represented_ids = tuple(
-            self._represented_region_ids_for_selection(region_id)
-        )
+        represented_ids = tuple(self._represented_region_ids_for_selection(region_id))
         if not represented_ids:
             self._progress_label.setText(
                 "Selected region has no represented dataset regions."
@@ -1701,6 +1861,10 @@ class AnalysisTabWidget(QWidget):
 
     def _cluster_file_ids(self, cluster_label: int) -> tuple[str, ...]:
         """Return neuron IDs assigned to one cluster label."""
+        store = self.__dict__.get("_cluster_assignment_store")
+        assignment = getattr(store, "active", None)
+        if assignment is not None:
+            return assignment.file_ids_for_label(cluster_label)
         result = self._last_cluster_result
         if result is None:
             return ()
@@ -1749,9 +1913,7 @@ class AnalysisTabWidget(QWidget):
             return None
 
         selected_region_id, selected_region_acronym, region_ids = region_filter
-        request_cluster = (
-            None if cluster_label is None else int(cluster_label)
-        )
+        request_cluster = None if cluster_label is None else int(cluster_label)
         file_ids = None
         if request_cluster is not None:
             file_ids = self._cluster_file_ids(request_cluster)
@@ -1762,9 +1924,7 @@ class AnalysisTabWidget(QWidget):
                 return None
 
         resolved_depth_axis = (
-            self._current_depth_axis()
-            if depth_axis is None
-            else int(depth_axis)
+            self._current_depth_axis() if depth_axis is None else int(depth_axis)
         )
         resolved_depth_bin = (
             self._depth_bin_spin.value()
@@ -1814,6 +1974,50 @@ class AnalysisTabWidget(QWidget):
         if result is None:
             return []
         return [int(label) for label in sorted(np.unique(result.labels).tolist())]
+
+    def on_active_cluster_assignment_changed(self) -> None:
+        """Synchronize Analysis controls with the shared active assignment."""
+        store = self.__dict__.get("_cluster_assignment_store")
+        assignment = getattr(store, "active", None)
+        if assignment is None:
+            self._last_cluster_result = None
+            self._cluster_label_colors = {}
+            self._cluster_color_map = None
+            self._actual_n_clusters = 0
+            combo = getattr(self, "_heat_cluster_combo", None)
+            if combo is not None:
+                self._update_cluster_filter_combo()
+            self._update_button_states()
+            return
+        self._last_cluster_result = assignment.runtime_result
+        self._cluster_label_colors = {
+            int(label): list(color) for label, color in assignment.label_colors.items()
+        }
+        self._cluster_color_map = {
+            file_id: list(
+                assignment.label_colors.get(
+                    int(label),
+                    [0.5, 0.5, 0.5, 1.0],
+                )
+            )
+            for file_id, label in assignment.assignments.items()
+        }
+        self._actual_n_clusters = len(set(assignment.assignments.values()))
+        combo = getattr(self, "_heat_cluster_combo", None)
+        if combo is not None:
+            self._update_cluster_filter_combo()
+        self._update_button_states()
+        if assignment.runtime_result is None:
+            message = (
+                f"{assignment.name} assignments restored. Rerun required for "
+                "dendrogram and distance exports."
+            )
+            progress = getattr(self, "_progress_label", None)
+            if progress is not None:
+                progress.setText(message)
+            clustermap_status = getattr(self, "_clustermap_status_label", None)
+            if clustermap_status is not None:
+                clustermap_status.setText(message)
 
     def _all_cluster_heatmap_requests(self) -> list[_HeatmapRequest]:
         """Return heatmap requests for every cluster-specific option."""
@@ -1866,17 +2070,11 @@ class AnalysisTabWidget(QWidget):
             parquet_path=self._parquet_path,
             atlas=self._atlas,
             region_ids=(
-                list(request.region_ids)
-                if request.region_ids is not None
-                else None
+                list(request.region_ids) if request.region_ids is not None else None
             ),
-            file_ids=(
-                list(request.file_ids) if request.file_ids is not None else None
-            ),
+            file_ids=(list(request.file_ids) if request.file_ids is not None else None),
             node_types=(
-                list(request.node_types)
-                if request.node_types is not None
-                else None
+                list(request.node_types) if request.node_types is not None else None
             ),
             soma_radius_um=request.soma_radius_um,
             depth_bin_factor=request.depth_bin_factor,
@@ -1931,9 +2129,7 @@ class AnalysisTabWidget(QWidget):
             return
 
         overall_total = max(int(total) * self._active_heatmap_total, 1)
-        overall_current = (
-            (self._active_heatmap_index - 1) * int(total)
-        ) + int(current)
+        overall_current = ((self._active_heatmap_index - 1) * int(total)) + int(current)
         self._progress_label.setText(
             f"Heatmap {self._active_heatmap_index}/"
             f"{self._active_heatmap_total}: "
@@ -1956,6 +2152,7 @@ class AnalysisTabWidget(QWidget):
         self._last_cluster_result = result
         color_map_start = perf_counter()
         self._build_cluster_color_map()
+        self._save_cluster_assignment(result)
         color_summary = self._color_neurons_by_cluster()
         logger.debug(
             "_on_correlation_finished color map built: elapsed=%.3fs actual_clusters=%d",
@@ -1967,9 +2164,7 @@ class AnalysisTabWidget(QWidget):
         requested_k = self._n_clusters_spin.value()
         actual_k = self._actual_n_clusters
         if actual_k < requested_k:
-            cluster_msg = (
-                f"{actual_k} of {requested_k} requested clusters found"
-            )
+            cluster_msg = f"{actual_k} of {requested_k} requested clusters found"
         else:
             cluster_msg = f"{actual_k} clusters"
         progress_message = (
@@ -1978,18 +2173,14 @@ class AnalysisTabWidget(QWidget):
             "Table updated and sorted by cluster."
         )
         if color_summary.colored_count > 0 and color_summary.rendered_count > 0:
-            neuron_word = (
-                "neuron" if color_summary.rendered_count == 1 else "neurons"
-            )
+            neuron_word = "neuron" if color_summary.rendered_count == 1 else "neurons"
             progress_message += (
                 f" Auto-colored {color_summary.colored_count}/"
                 f"{color_summary.rendered_count} rendered {neuron_word} "
                 "by cluster."
             )
             if color_summary.gray_count > 0:
-                progress_message += (
-                    f" {color_summary.gray_count} shown in gray."
-                )
+                progress_message += f" {color_summary.gray_count} shown in gray."
         self._progress_label.setText(progress_message)
         clustermap_message = (
             "Clustering complete. Click 'Build Dendrogram' to render the cluster map."
@@ -2018,6 +2209,43 @@ class AnalysisTabWidget(QWidget):
             "_on_correlation_finished complete: total_elapsed=%.3fs",
             perf_counter() - finish_start,
         )
+
+    def _save_cluster_assignment(self, result: ClusterResult) -> None:
+        """Persist labels and provenance for one completed clustering run."""
+        store = self.__dict__.get("_cluster_assignment_store")
+        if store is None:
+            return
+        context = dict(self.__dict__.get("_pending_cluster_context", {}))
+        method_name = str(
+            context.get("method_name")
+            or getattr(self._clustering_method_combo, "currentText", lambda: "")()
+            or "Cluster Assignment"
+        )
+        metadata = getattr(result, "metadata", None)
+        if metadata is not None and hasattr(metadata, "to_dict"):
+            run_metadata = metadata.to_dict()
+        else:
+            run_metadata = {}
+        run_metadata.update(
+            {
+                "input_scope": str(context.get("input_scope") or "whole"),
+                "coordinate_space": str(
+                    context.get("coordinate_space") or _COORD_SPACE_CCF
+                ),
+            }
+        )
+        store.add_result(
+            result,
+            method_name=method_name,
+            input_file_ids=context.get("input_file_ids"),
+            label_colors=getattr(self, "_cluster_label_colors", {}),
+            run_metadata=run_metadata,
+            input_scope=str(context.get("input_scope") or "whole"),
+            coordinate_space=str(context.get("coordinate_space") or _COORD_SPACE_CCF),
+            parent_assignment_id=context.get("parent_assignment_id"),
+            parent_cluster_ids=context.get("parent_cluster_ids", ()),
+        )
+        self._pending_cluster_context = {}
 
     def _on_heatmap_finished(self, volume: np.ndarray) -> None:
         """Handle completed heatmap pipeline."""
@@ -2100,14 +2328,10 @@ class AnalysisTabWidget(QWidget):
             "heatmap_selected_region_id": request.selected_region_id,
             "heatmap_selected_region_acronym": request.selected_region_acronym,
             "heatmap_region_ids": (
-                list(request.region_ids)
-                if request.region_ids is not None
-                else None
+                list(request.region_ids) if request.region_ids is not None else None
             ),
             "heatmap_node_types": (
-                list(request.node_types)
-                if request.node_types is not None
-                else None
+                list(request.node_types) if request.node_types is not None else None
             ),
             "heatmap_node_type_labels": (
                 NodeTypeSelectorComboBox.metadata_labels(request.node_types)
@@ -2146,9 +2370,7 @@ class AnalysisTabWidget(QWidget):
             return
 
         if self._completed_heatmap_requests:
-            self._last_heatmap_requests = list(
-                self._completed_heatmap_requests
-            )
+            self._last_heatmap_requests = list(self._completed_heatmap_requests)
 
         completed_count = len(self._completed_heatmap_requests)
         batch_mode = self._heatmap_batch_mode
@@ -2168,9 +2390,7 @@ class AnalysisTabWidget(QWidget):
     def _on_heatmap_error(self, message: str) -> None:
         """Handle a heatmap worker failure and stop any remaining queue."""
         if self._completed_heatmap_requests:
-            self._last_heatmap_requests = list(
-                self._completed_heatmap_requests
-            )
+            self._last_heatmap_requests = list(self._completed_heatmap_requests)
         self._pending_heatmap_requests = []
         self._current_heatmap_request = None
         self._completed_heatmap_requests = []
@@ -2318,16 +2538,12 @@ class AnalysisTabWidget(QWidget):
             return None
         return (physical_width, physical_height)
 
-    def _clustermap_preview_figsize(
-        self, dpi: float
-    ) -> tuple[float, float] | None:
+    def _clustermap_preview_figsize(self, dpi: float) -> tuple[float, float] | None:
         """Return the preview figure size using backend-owned geometry."""
         get_size_inches = getattr(self._figure, "get_size_inches", None)
         if callable(get_size_inches):
             try:
-                size_values = np.asarray(get_size_inches(), dtype=float).reshape(
-                    -1
-                )
+                size_values = np.asarray(get_size_inches(), dtype=float).reshape(-1)
             except (TypeError, ValueError):
                 size_values = np.array([], dtype=float)
             if size_values.size >= 2:
@@ -2357,8 +2573,10 @@ class AnalysisTabWidget(QWidget):
 
         try:
             dpi_getter = getattr(self._figure, "get_dpi", None)
-            dpi = float(dpi_getter()) if callable(dpi_getter) else float(
-                getattr(self._figure, "dpi", 100.0) or 100.0
+            dpi = (
+                float(dpi_getter())
+                if callable(dpi_getter)
+                else float(getattr(self._figure, "dpi", 100.0) or 100.0)
             )
             figsize = self._clustermap_preview_figsize(dpi)
             physical_size = self._clustermap_canvas_physical_pixel_size()
@@ -2506,8 +2724,7 @@ class AnalysisTabWidget(QWidget):
             if lab not in self._cluster_label_colors:
                 self._cluster_label_colors[lab] = color_map[neuron_id]
         logger.info(
-            f"Built cluster color map: {len(color_map)} neurons, "
-            f"{n_clusters} clusters"
+            f"Built cluster color map: {len(color_map)} neurons, {n_clusters} clusters"
         )
         logger.debug(
             "_build_cluster_color_map complete: elapsed=%.3fs",
@@ -2523,15 +2740,28 @@ class AnalysisTabWidget(QWidget):
         self._heat_cluster_combo.clear()
         self._heat_cluster_combo.addItem("All neurons")
 
+        store = self.__dict__.get("_cluster_assignment_store")
+        assignment = getattr(store, "active", None)
         result = self._last_cluster_result
-        if result is None or not hasattr(self, "_cluster_label_colors"):
+        if assignment is not None:
+            unique_labels = sorted(set(assignment.assignments.values()))
+            counts = {
+                label: sum(value == label for value in assignment.assignments.values())
+                for label in unique_labels
+            }
+        elif result is not None:
+            unique_labels = sorted(np.unique(result.labels).tolist())
+            counts = {
+                int(label): int(np.sum(result.labels == label))
+                for label in unique_labels
+            }
+        else:
             self._heat_cluster_combo.setEnabled(False)
             return
 
-        unique_labels = sorted(np.unique(result.labels).tolist())
         for label in unique_labels:
             rgba = self._cluster_label_colors.get(label, [0.5, 0.5, 0.5, 1.0])
-            count = int(np.sum(result.labels == label))
+            count = int(counts[int(label)])
 
             # Create a small color swatch icon
             pixmap = QPixmap(16, 16)
@@ -2585,9 +2815,7 @@ class AnalysisTabWidget(QWidget):
         )
         return output_path or None
 
-    def _start_analysis_export(
-        self, export_kind: str, output_path: str
-    ) -> None:
+    def _start_analysis_export(self, export_kind: str, output_path: str) -> None:
         """Start one workbook/parquet export in a background thread."""
         from ..workers import AnalysisExportWorker
 
@@ -2746,10 +2974,7 @@ class AnalysisTabWidget(QWidget):
         individual segments/points. Returns a small summary for status
         text composed by the caller.
         """
-        if (
-            self._cluster_color_map is None
-            or self._last_cluster_result is None
-        ):
+        if self._cluster_color_map is None or self._last_cluster_result is None:
             return _ClusterColorApplicationSummary(
                 matched_table_count=0,
                 updated_layer_count=0,
@@ -2789,9 +3014,7 @@ class AnalysisTabWidget(QWidget):
                     unique_fids = set(fids)
                     if n_rendered == 0:
                         n_rendered = len(unique_fids)
-                        n_colored = sum(
-                            1 for fid in unique_fids if fid in color_map
-                        )
+                        n_colored = sum(1 for fid in unique_fids if fid in color_map)
                     colors = np.array(
                         [color_map.get(fid, default_color)[:4] for fid in fids]
                     )

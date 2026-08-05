@@ -15,7 +15,9 @@ import pytest
 
 from napari_swc_viewer.analysis.flatmap_correlation import (
     compute_flatmap_voxel_correlation_from_parquet,
+    count_flatmap_voxel_correlation_nodes,
     query_flatmap_soma_coordinates,
+    query_flatmap_soma_coordinates_and_count,
 )
 from napari_swc_viewer.flatmap_parquet import read_flatmap_parquet_transform_info
 
@@ -28,31 +30,34 @@ def _v3_augmented_frame(
 ) -> pd.DataFrame:
     """Build a version-3-style neuron frame with the full augmented columns."""
     rng = np.random.default_rng(seed)
-    rows: dict[str, list] = {name: [] for name in (
-        "file_id",
-        "node_id",
-        "parent_id",
-        "type",
-        "x",
-        "y",
-        "z",
-        "x_flat_shaped",
-        "y_flat_shaped",
-        "flatmap_shaped_valid",
-        "flatmap_shaped_projection_valid",
-        "flatmap_shaped_invalid_code",
-        "flatmap_shaped_lookup_mode",
-        "x_flat_square",
-        "y_flat_square",
-        "flatmap_square_valid",
-        "flatmap_square_projection_valid",
-        "flatmap_square_invalid_code",
-        "flatmap_square_lookup_mode",
-        "depth_um",
-        "depth_valid",
-        "depth_invalid_code",
-        "depth_lookup_mode",
-    )}
+    rows: dict[str, list] = {
+        name: []
+        for name in (
+            "file_id",
+            "node_id",
+            "parent_id",
+            "type",
+            "x",
+            "y",
+            "z",
+            "x_flat_shaped",
+            "y_flat_shaped",
+            "flatmap_shaped_valid",
+            "flatmap_shaped_projection_valid",
+            "flatmap_shaped_invalid_code",
+            "flatmap_shaped_lookup_mode",
+            "x_flat_square",
+            "y_flat_square",
+            "flatmap_square_valid",
+            "flatmap_square_projection_valid",
+            "flatmap_square_invalid_code",
+            "flatmap_square_lookup_mode",
+            "depth_um",
+            "depth_valid",
+            "depth_invalid_code",
+            "depth_lookup_mode",
+        )
+    }
     node_id = 0
     for neuron in range(n_neurons):
         # Cluster each neuron's nodes around a distinct flatmap centroid so
@@ -94,9 +99,13 @@ def _v3_augmented_frame(
     frame["parent_id"] = frame["parent_id"].astype(np.int32)
     frame["type"] = frame["type"].astype(np.int32)
     for name in (
-        "x", "y", "z",
-        "x_flat_shaped", "y_flat_shaped",
-        "x_flat_square", "y_flat_square",
+        "x",
+        "y",
+        "z",
+        "x_flat_shaped",
+        "y_flat_shaped",
+        "x_flat_square",
+        "y_flat_square",
         "depth_um",
     ):
         frame[name] = frame[name].astype(np.float32)
@@ -127,14 +136,12 @@ def test_transform_info_detects_v3_styles(flatmap_parquet) -> None:
 
 def test_compute_flatmap_voxel_correlation_from_parquet(flatmap_parquet) -> None:
     _frame, path = flatmap_parquet
-    result, count_data, provenance = (
-        compute_flatmap_voxel_correlation_from_parquet(
-            path,
-            style="both_shaped",
-            xy_bins=32,
-            depth_bin_um=50.0,
-            n_clusters=2,
-        )
+    result, count_data, provenance = compute_flatmap_voxel_correlation_from_parquet(
+        path,
+        style="both_shaped",
+        xy_bins=32,
+        depth_bin_um=50.0,
+        n_clusters=2,
     )
     assert len(result.neuron_ids) == 4
     assert len(result.labels) == 4
@@ -170,6 +177,33 @@ def test_query_flatmap_soma_coordinates(flatmap_parquet) -> None:
     # Soma centroids should be ordered and well separated along each axis.
     assert np.all(np.diff(coords[:, 0]) > 0)
     assert np.all(np.diff(coords[:, 2]) > 0)
+
+
+def test_flatmap_preflight_counts_exact_contributing_nodes(flatmap_parquet) -> None:
+    frame, path = flatmap_parquet
+
+    assert (
+        count_flatmap_voxel_correlation_nodes(
+            path,
+            style="both_shaped",
+            xy_bins=32,
+            depth_bin_um=50.0,
+            file_ids=["neuron_0", "neuron_1"],
+        )
+        == 2 * 25
+    )
+    ids, coords, soma_node_count = query_flatmap_soma_coordinates_and_count(
+        path,
+        style="both_shaped",
+        file_ids=["neuron_0", "neuron_1"],
+    )
+    assert ids == ["neuron_0", "neuron_1"]
+    assert coords.shape == (2, 3)
+    assert soma_node_count == int(
+        frame[
+            frame["file_id"].isin(["neuron_0", "neuron_1"]) & (frame["type"] == 1)
+        ].shape[0]
+    )
 
 
 def test_flatmap_parquet_correlation_worker(flatmap_parquet) -> None:

@@ -3,14 +3,13 @@
 Ported from swc-mapper/pearson_cross_correlation_matrix_egpe_counts.py and
 swc-mapper/corr_full_to_matrix.py.
 
-Computes pairwise Pearson correlations between neurons based on their
-node counts per voxel within a target brain region.
+Computes pairwise Pearson correlations between neurons based on their node
+counts per voxel, optionally restricted to a target brain region.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -24,19 +23,160 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _prepare_region_nodes_view(
+    conn: duckdb.DuckDBPyConnection,
+    parquet_path: str,
+    voxel_id_map: NDArray[np.int32] | None,
+    resolution: float,
+    file_ids: list[str] | tuple[str, ...] | None,
+) -> tuple[bool, bool]:
+    """Create the scoped node-to-voxel view used by counting and correlation."""
+    parquet_path_escaped = str(parquet_path).replace("\\", "/")
+    scoped_file_ids = None
+    if file_ids is not None:
+        scoped_file_ids = list(dict.fromkeys(str(file_id) for file_id in file_ids))
+        if not scoped_file_ids:
+            conn.execute(
+                "CREATE OR REPLACE TEMP VIEW region_nodes AS "
+                "SELECT CAST(NULL AS VARCHAR) AS swc_id, "
+                "CAST(NULL AS BIGINT) AS voxel_id WHERE FALSE"
+            )
+            return False, False
+
+    scope_registered = scoped_file_ids is not None
+    if scope_registered:
+        conn.register(
+            "scope_ids",
+            pa.table({"swc_id": np.asarray(scoped_file_ids, dtype=object)}),
+        )
+    scope_join = (
+        "JOIN scope_ids s ON CAST(p.file_id AS VARCHAR) = s.swc_id"
+        if scope_registered
+        else ""
+    )
+
+    conn.execute(f"""
+        CREATE OR REPLACE TEMP VIEW base_nodes AS
+        SELECT
+            CAST(p.file_id AS VARCHAR) AS swc_id,
+            CAST(FLOOR(z / {float(resolution)}) AS BIGINT) AS xi,
+            CAST(FLOOR(y / {float(resolution)}) AS BIGINT) AS yi,
+            CAST(FLOOR(x / {float(resolution)}) AS BIGINT) AS zi
+        FROM read_parquet('{parquet_path_escaped}') p
+        {scope_join}
+        WHERE x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL
+          AND isfinite(x) AND isfinite(y) AND isfinite(z)
+    """)
+
+    if voxel_id_map is None:
+        conn.execute("""
+            CREATE OR REPLACE TEMP TABLE occupied_voxels AS
+            SELECT
+                zi,
+                yi,
+                xi,
+                ROW_NUMBER() OVER (ORDER BY zi, yi, xi) - 1 AS voxel_id
+            FROM (SELECT DISTINCT zi, yi, xi FROM base_nodes)
+        """)
+        conn.execute("""
+            CREATE OR REPLACE TEMP VIEW region_nodes AS
+            SELECT b.swc_id, v.voxel_id
+            FROM base_nodes b
+            JOIN occupied_voxels v USING (zi, yi, xi)
+        """)
+        return False, scope_registered
+
+    Z, Y, X = voxel_id_map.shape
+    conn.register(
+        "lut",
+        pa.table(
+            {
+                "idx": np.arange(voxel_id_map.size, dtype=np.int64),
+                "val": voxel_id_map.ravel(),
+            }
+        ),
+    )
+    conn.execute(f"""
+        CREATE OR REPLACE TEMP VIEW region_nodes AS
+        WITH mapped AS (
+            SELECT b.swc_id, l.val AS voxel_id
+            FROM base_nodes b
+            JOIN lut l
+                ON l.idx = (b.zi * ({Y} * {X})::BIGINT + b.yi * {X}::BIGINT + b.xi)
+            WHERE b.xi >= 0 AND b.xi < {X}
+              AND b.yi >= 0 AND b.yi < {Y}
+              AND b.zi >= 0 AND b.zi < {Z}
+        )
+        SELECT swc_id, CAST(voxel_id AS BIGINT) AS voxel_id
+        FROM mapped
+        WHERE voxel_id >= 0
+    """)
+    return True, scope_registered
+
+
+def _cleanup_region_nodes_view(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    lut_registered: bool,
+    scope_registered: bool,
+) -> None:
+    """Remove temporary relations and Arrow registrations."""
+    for relation in ("region_nodes", "base_nodes", "occupied_voxels"):
+        try:
+            conn.execute(f"DROP VIEW IF EXISTS {relation}")
+            conn.execute(f"DROP TABLE IF EXISTS {relation}")
+        except Exception:
+            pass
+    if lut_registered:
+        try:
+            conn.unregister("lut")
+        except Exception:
+            pass
+    if scope_registered:
+        try:
+            conn.unregister("scope_ids")
+        except Exception:
+            pass
+
+
+def count_correlation_input_nodes(
+    conn: duckdb.DuckDBPyConnection,
+    parquet_path: str,
+    voxel_id_map: NDArray[np.int32] | None,
+    resolution: float,
+    file_ids: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    """Return the exact node-row count used by CCF voxel correlation."""
+    lut_registered, scope_registered = _prepare_region_nodes_view(
+        conn,
+        parquet_path,
+        voxel_id_map,
+        resolution,
+        file_ids,
+    )
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM region_nodes").fetchone()
+        return int(row[0] or 0) if row is not None else 0
+    finally:
+        _cleanup_region_nodes_view(
+            conn,
+            lut_registered=lut_registered,
+            scope_registered=scope_registered,
+        )
+
+
 def compute_pearson_correlation_matrix(
     conn: duckdb.DuckDBPyConnection,
     parquet_path: str,
-    voxel_id_map: NDArray[np.int32],
+    voxel_id_map: NDArray[np.int32] | None,
     resolution: float,
     file_ids: list[str] | tuple[str, ...] | None = None,
     progress_callback: callable | None = None,
 ) -> pd.DataFrame:
     """Compute pairwise Pearson correlation of neuron node counts per voxel.
 
-    For each neuron, counts the number of nodes in each voxel of the target
-    region (defined by voxel_id_map), then computes Pearson r between all
-    neuron pairs.
+    For each neuron, counts nodes in each occupied voxel, optionally restricted
+    by ``voxel_id_map``, then computes Pearson r between all neuron pairs.
 
     Parameters
     ----------
@@ -44,9 +184,9 @@ def compute_pearson_correlation_matrix(
         An open DuckDB connection.
     parquet_path : str
         Path to the neuron parquet file.
-    voxel_id_map : NDArray[np.int32]
-        3D voxel ID map from get_expanded_region_voxel_ids(). Voxels inside
-        the target region have sequential IDs >= 0, outside = -1.
+    voxel_id_map : NDArray[np.int32] or None
+        Optional 3D target-region voxel ID map. When omitted, all finite CCF
+        coordinates in the selected file scope contribute.
     resolution : float
         Voxel resolution in microns (e.g., 25.0).
     file_ids : list[str] or tuple[str, ...], optional
@@ -60,73 +200,22 @@ def compute_pearson_correlation_matrix(
         Long-form correlation table with columns: swc_id_1, swc_id_2, r.
         Includes both triangles plus the diagonal (r=1).
     """
-    parquet_path_escaped = str(parquet_path).replace("\\", "/")
-    Z, Y, X = voxel_id_map.shape
-    scoped_file_ids = None
-    if file_ids is not None:
-        scoped_file_ids = list(
-            dict.fromkeys(str(file_id) for file_id in file_ids)
-        )
-        if not scoped_file_ids:
-            return pd.DataFrame(columns=["swc_id_1", "swc_id_2", "r"])
 
     def _progress(name: str, step: int, total: int = 7) -> None:
         logger.info(f"Correlation step {step}/{total}: {name}")
         if progress_callback is not None:
             progress_callback(name, step, total)
 
-    # Register the voxel ID map as a PyArrow lookup table
-    _progress("Registering voxel ID lookup table", 1)
-    arrow_lut = pa.table(
-        {
-            "idx": np.arange(voxel_id_map.size, dtype=np.int64),
-            "val": voxel_id_map.ravel(),
-        }
+    _progress("Preparing voxel lookup", 1)
+    lut_registered, scope_registered = _prepare_region_nodes_view(
+        conn,
+        parquet_path,
+        voxel_id_map,
+        resolution,
+        file_ids,
     )
-    conn.register("lut", arrow_lut)
-    if scoped_file_ids is not None:
-        conn.register(
-            "scope_ids",
-            pa.table({"swc_id": np.asarray(scoped_file_ids, dtype=object)}),
-        )
 
-    # Create a view that maps node coordinates to voxel IDs.
-    # Axis convention from swc-mapper: parquet has (x, y, z) in microns,
-    # atlas is in PIR order (dim0, dim1, dim2).
-    # z -> xi (atlas dim 2), y -> yi (atlas dim 1), x -> zi (atlas dim 0)
-    # linear index = zi * (Y * X) + yi * X + xi
     _progress("Mapping nodes to voxel IDs", 2)
-    scope_join = ""
-    if scoped_file_ids is not None:
-        scope_join = (
-            "JOIN scope_ids s ON CAST(p.file_id AS VARCHAR) = s.swc_id"
-        )
-    conn.execute(f"""
-        CREATE OR REPLACE TEMP VIEW region_nodes AS
-        WITH base AS (
-            SELECT
-                CAST(p.file_id AS VARCHAR) AS swc_id,
-                CAST(FLOOR(z / {float(resolution)}) AS BIGINT) AS xi,
-                CAST(FLOOR(y / {float(resolution)}) AS BIGINT) AS yi,
-                CAST(FLOOR(x / {float(resolution)}) AS BIGINT) AS zi
-            FROM read_parquet('{parquet_path_escaped}') p
-            {scope_join}
-        ),
-        mapped AS (
-            SELECT
-                b.swc_id,
-                l.val AS voxel_id
-            FROM base b
-            JOIN lut l
-                ON l.idx = (b.zi * ({Y} * {X})::BIGINT + b.yi * {X}::BIGINT + b.xi)
-            WHERE b.xi >= 0 AND b.xi < {X}
-              AND b.yi >= 0 AND b.yi < {Y}
-              AND b.zi >= 0 AND b.zi < {Z}
-        )
-        SELECT swc_id, CAST(voxel_id AS INTEGER) AS voxel_id
-        FROM mapped
-        WHERE voxel_id >= 0
-    """)
 
     # Count nodes per neuron per voxel
     _progress("Counting nodes per voxel", 3)
@@ -219,8 +308,12 @@ def compute_pearson_correlation_matrix(
 
     # Clean up temp tables
     for table in [
-        "region_nodes", "counts_by_voxel", "voxel_universe",
-        "per_neuron", "swc_numeric", "pairwise_xy", "corr_pairs",
+        "counts_by_voxel",
+        "voxel_universe",
+        "per_neuron",
+        "swc_numeric",
+        "pairwise_xy",
+        "corr_pairs",
     ]:
         try:
             conn.execute(f"DROP VIEW IF EXISTS {table}")
@@ -228,17 +321,15 @@ def compute_pearson_correlation_matrix(
         except Exception:
             pass
 
-    conn.unregister("lut")
-    if scoped_file_ids is not None:
-        try:
-            conn.unregister("scope_ids")
-        except Exception:
-            pass
+    _cleanup_region_nodes_view(
+        conn,
+        lut_registered=lut_registered,
+        scope_registered=scope_registered,
+    )
 
     n_neurons = result_df["swc_id_1"].nunique()
     logger.info(
-        f"Correlation matrix computed: {n_neurons} neurons, "
-        f"{len(result_df)} entries"
+        f"Correlation matrix computed: {n_neurons} neurons, {len(result_df)} entries"
     )
     return result_df
 
@@ -263,9 +354,9 @@ def correlation_long_to_matrix(
         pd.unique(pd.concat([corr_df["swc_id_1"], corr_df["swc_id_2"]]))
     ).sort_values()
 
-    mat_df = corr_df.pivot(
-        index="swc_id_1", columns="swc_id_2", values="r"
-    ).reindex(index=ids, columns=ids)
+    mat_df = corr_df.pivot(index="swc_id_1", columns="swc_id_2", values="r").reindex(
+        index=ids, columns=ids
+    )
 
     # Fill any missing pairs with -1 (uncorrelated/missing)
     mat_df.fillna(-1.0, inplace=True)
@@ -274,7 +365,9 @@ def correlation_long_to_matrix(
 
     # Sanity checks
     if not np.allclose(mat, mat.T, equal_nan=True):
-        logger.warning("Correlation matrix is not perfectly symmetric; forcing symmetry")
+        logger.warning(
+            "Correlation matrix is not perfectly symmetric; forcing symmetry"
+        )
         mat = (mat + mat.T) / 2.0
 
     if not np.allclose(np.diag(mat), 1.0):

@@ -10,6 +10,7 @@ This widget provides a unified interface for:
 from __future__ import annotations
 
 import colorsys
+from dataclasses import dataclass
 from importlib.metadata import version as package_version
 import logging
 from pathlib import Path
@@ -35,6 +36,7 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -61,9 +63,10 @@ from ..auto_center import (
     compute_center_of_rendered_neurons,
     depth_axis_from_not_displayed,
 )
+from ..cluster_assignments import ClusterAssignmentStore
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
-from ..neuron_table_ops import ClusterFilterSelection
+from ..neuron_table_ops import ClusterFilterSelection, turbo_colors_for_file_ids
 from ..flatmap_parquet import read_flatmap_parquet_transform_info
 from ..isocortex_layers import (
     CustomRegionSelectionGroup,
@@ -82,6 +85,7 @@ from ..point_import import (
 from ..project_io import (
     ProjectBundle,
     export_enhanced_neuron_parquet,
+    is_recognized_project_bundle,
     load_project_bundle,
     read_enhanced_parquet_metadata,
     save_project_bundle,
@@ -311,6 +315,10 @@ _CLUSTER_FILTER_ALL = "all"
 _CLUSTER_FILTER_UNCLUSTERED = "unclustered"
 _CLUSTER_FILTER_CLUSTER = "cluster"
 _MANUAL_HEATMAP_ALL_LABEL = "All Manual Heatmaps"
+_SELECTED_HEATMAP_MODE_SINGLE = "single"
+_SELECTED_HEATMAP_MODE_INDIVIDUAL = "individual"
+_INDIVIDUAL_HEATMAP_MEMORY_WARNING_BYTES = 1024**3
+_INDIVIDUAL_HEATMAP_CONTRAST_FRACTION = 0.2
 _GREEK_HEATMAP_IDENTIFIERS = (
     "alpha",
     "beta",
@@ -337,6 +345,15 @@ _GREEK_HEATMAP_IDENTIFIERS = (
     "psi",
     "omega",
 )
+
+
+@dataclass(frozen=True)
+class _SelectedNeuronHeatmapRequest:
+    """Immutable specification for one Data-tab heatmap build."""
+
+    file_ids: tuple[str, ...]
+    creation_mode: str
+    color: tuple[float, float, float, float] | None = None
 
 
 def _point_heatmap_color(index: int) -> tuple[float, float, float, float]:
@@ -724,6 +741,8 @@ class NeuronViewerWidget(QWidget):
             self._point_parquet_has_origin_csv = False
             self._point_preview_counts: dict[tuple[str, str], int] = {}
             self._saved_table_state: dict[str, object] = {}
+            self._current_project_path: Path | None = None
+            self._cluster_assignment_store = ClusterAssignmentStore()
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
             self._layer_name_event_connections: dict[
@@ -782,6 +801,18 @@ class NeuronViewerWidget(QWidget):
             self._selected_heatmap_thread: QThread | None = None
             self._selected_heatmap_worker = None
             self._selected_heatmap_request_file_ids: tuple[str, ...] = ()
+            self._selected_heatmap_pending_requests: list[
+                _SelectedNeuronHeatmapRequest
+            ] = []
+            self._selected_heatmap_completed_requests: list[
+                _SelectedNeuronHeatmapRequest
+            ] = []
+            self._selected_heatmap_current_request: (
+                _SelectedNeuronHeatmapRequest | None
+            ) = None
+            self._selected_heatmap_total = 0
+            self._selected_heatmap_index = 0
+            self._selected_heatmap_failed = False
             self._cached_atlas_thread: QThread | None = None
             self._cached_atlas_worker = None
             self._atlas_load_thread: QThread | None = None
@@ -2563,8 +2594,14 @@ class NeuronViewerWidget(QWidget):
         with startup_timing(logger, "neuron_viewer_setup_tab", tab="Analysis"):
             self._analysis_tab = AnalysisTabWidget(self.viewer)
             self._analysis_tab.set_slice_projector(self._slice_projector)
+            self._analysis_tab.set_cluster_assignment_store(
+                self._cluster_assignment_store
+            )
             self._analysis_tab.set_current_table_file_ids_provider(
                 self._current_table_file_ids
+            )
+            self._analysis_tab.set_selected_table_file_ids_provider(
+                self._neuron_table.get_selected_file_ids
             )
             self._analysis_tab.set_flatmap_correlation_source_provider(
                 self._flatmap_tab.latest_flatmap_correlation_source
@@ -2687,9 +2724,17 @@ class NeuronViewerWidget(QWidget):
         file_layout.addLayout(file_row)
 
         project_io_row = QHBoxLayout()
-        self._save_project_btn = QPushButton("Save Project...")
-        self._save_project_btn.clicked.connect(self._save_project_bundle_dialog)
+        self._save_project_btn = QPushButton("Save Project")
+        self._save_project_btn.setEnabled(False)
+        self._save_project_btn.setToolTip(
+            "Load or create an SWC Viewer project before saving in place."
+        )
+        self._save_project_btn.clicked.connect(self._save_current_project)
         project_io_row.addWidget(self._save_project_btn)
+
+        self._save_project_as_btn = QPushButton("Save Project As...")
+        self._save_project_as_btn.clicked.connect(self._save_project_as_dialog)
+        project_io_row.addWidget(self._save_project_as_btn)
 
         self._load_project_btn = QPushButton("Load Project...")
         self._load_project_btn.clicked.connect(self._load_project_bundle_dialog)
@@ -2849,7 +2894,9 @@ class NeuronViewerWidget(QWidget):
         neurons_section = CollapsibleSection("Selected Neurons")
         neurons_layout = neurons_section.content_layout()
 
-        self._neuron_table = NeuronTableWidget()
+        self._neuron_table = NeuronTableWidget(
+            assignment_store=self._cluster_assignment_store
+        )
         self._neuron_table.colors_changed.connect(self._apply_neuron_colors)
         self._neuron_table.visibility_changed.connect(self._apply_neuron_visibility)
         self._neuron_table.selection_changed.connect(self._highlight_selected_neurons)
@@ -2857,6 +2904,26 @@ class NeuronViewerWidget(QWidget):
         if state_changed is not None:
             state_changed.connect(self._refresh_neuron_table_summary)
         neurons_layout.addWidget(self._neuron_table)
+
+        assignment_row = QHBoxLayout()
+        assignment_row.addWidget(QLabel("Cluster assignment:"))
+        self._cluster_assignment_combo = QComboBox()
+        self._cluster_assignment_combo.currentIndexChanged.connect(
+            self._on_active_cluster_assignment_changed
+        )
+        assignment_row.addWidget(self._cluster_assignment_combo, 1)
+        self._rename_cluster_assignment_btn = QPushButton("Rename...")
+        self._rename_cluster_assignment_btn.clicked.connect(
+            self._rename_active_cluster_assignment
+        )
+        assignment_row.addWidget(self._rename_cluster_assignment_btn)
+        self._delete_cluster_assignment_btn = QPushButton("Delete")
+        self._delete_cluster_assignment_btn.clicked.connect(
+            self._delete_active_cluster_assignment
+        )
+        assignment_row.addWidget(self._delete_cluster_assignment_btn)
+        neurons_layout.addLayout(assignment_row)
+        self._refresh_cluster_assignment_controls()
 
         manual_heatmap_row = QHBoxLayout()
         manual_heatmap_row.addWidget(QLabel("Manual Heatmap:"))
@@ -2938,9 +3005,7 @@ class NeuronViewerWidget(QWidget):
 
         heatmap_btn_row = QHBoxLayout()
         self._add_selected_heatmap_btn = QPushButton("Add Heatmap")
-        self._add_selected_heatmap_btn.clicked.connect(
-            self._add_selected_neurons_heatmap
-        )
+        self._configure_selected_heatmap_menu()
         heatmap_btn_row.addWidget(self._add_selected_heatmap_btn)
 
         self._remove_selected_from_table_btn = QPushButton("Remove Selected From Table")
@@ -2989,6 +3054,23 @@ class NeuronViewerWidget(QWidget):
 
         layout.addWidget(neurons_section)
         layout.addStretch()
+
+    def _configure_selected_heatmap_menu(self) -> None:
+        """Attach the combined and individual actions to Add Heatmap."""
+        self._add_selected_heatmap_menu = QMenu(self._add_selected_heatmap_btn)
+        self._add_single_heatmap_action = self._add_selected_heatmap_menu.addAction(
+            "Single Heatmap"
+        )
+        self._add_single_heatmap_action.triggered.connect(
+            self._add_selected_neurons_heatmap
+        )
+        self._add_individual_heatmaps_action = (
+            self._add_selected_heatmap_menu.addAction("Individual Heatmaps")
+        )
+        self._add_individual_heatmaps_action.triggered.connect(
+            self._add_selected_neurons_individual_heatmaps
+        )
+        self._add_selected_heatmap_btn.setMenu(self._add_selected_heatmap_menu)
 
     def _setup_regions_tab(self, parent: QWidget) -> None:
         """Set up the region selection tab."""
@@ -3619,6 +3701,7 @@ class NeuronViewerWidget(QWidget):
                 old_db.close()
             except Exception:
                 logger.debug("Failed to close previous neuron database", exc_info=True)
+        self._set_current_project_path(None)
 
         self._file_label.setText(Path(filepath).name)
 
@@ -3713,6 +3796,30 @@ class NeuronViewerWidget(QWidget):
     def _load_enhanced_table_state(self, filepath: str | Path) -> int:
         """Read enhanced parquet table metadata without making it mandatory."""
         self._saved_table_state = {}
+        self._cluster_assignment_store.load_state({})
+        refresh_assignments = getattr(
+            self,
+            "_refresh_cluster_assignment_controls",
+            None,
+        )
+        if callable(refresh_assignments):
+            refresh_assignments()
+        table = getattr(self, "_neuron_table", None)
+        refresh_table_assignments = getattr(
+            table,
+            "refresh_cluster_assignments",
+            None,
+        )
+        if callable(refresh_table_assignments):
+            refresh_table_assignments(preserve_selection=True)
+        analysis_tab = getattr(self, "_analysis_tab", None)
+        assignment_handler = getattr(
+            analysis_tab,
+            "on_active_cluster_assignment_changed",
+            None,
+        )
+        if callable(assignment_handler):
+            assignment_handler()
         try:
             payload = read_enhanced_parquet_metadata(filepath)
         except Exception:
@@ -3730,6 +3837,15 @@ class NeuronViewerWidget(QWidget):
         if not entries:
             return 0
         self._saved_table_state = table_state
+        assignment_state = table_state.get("cluster_assignments")
+        if isinstance(assignment_state, dict):
+            self._cluster_assignment_store.load_state(assignment_state)
+            if callable(refresh_assignments):
+                refresh_assignments()
+            if callable(refresh_table_assignments):
+                refresh_table_assignments(preserve_selection=True)
+            if callable(assignment_handler):
+                assignment_handler()
         return len(entries)
 
     def _current_table_state(self) -> dict[str, object]:
@@ -3766,28 +3882,121 @@ class NeuronViewerWidget(QWidget):
             ]
         return payload
 
-    def _save_project_bundle_dialog(self) -> None:
-        """Prompt for and save a lossless project bundle directory."""
+    def _set_current_project_path(self, path: str | Path | None) -> None:
+        """Set the current project target and refresh its save control."""
+        self._current_project_path = (
+            Path(path).expanduser().resolve() if path is not None else None
+        )
+        button = getattr(self, "_save_project_btn", None)
+        if button is None:
+            return
+        button.setEnabled(self._current_project_path is not None)
+        if self._current_project_path is None:
+            button.setToolTip(
+                "Load or create an SWC Viewer project before saving in place."
+            )
+        else:
+            button.setToolTip(f"Save changes to {self._current_project_path}")
+
+    def _set_project_save_in_progress(self, saving: bool) -> None:
+        """Disable save actions during synchronous project serialization."""
+        self._save_project_as_btn.setEnabled(not saving)
+        self._save_project_btn.setEnabled(
+            not saving and self._current_project_path is not None
+        )
+
+    def _save_project_as_dialog(self) -> None:
+        """Prompt for and create a new lossless project bundle directory."""
         if self._db is None:
             message = "Load a neuron Parquet before saving a project."
             self._regions_status_label.setText(message)
             show_warning(message)
             return
 
-        default_name = f"{Path(self._db.parquet_path).stem}.swcv"
+        if self._current_project_path is None:
+            default_name = f"{Path(self._db.parquet_path).stem}.swcv"
+        else:
+            default_name = str(
+                self._current_project_path.with_name(
+                    f"{self._current_project_path.stem}_copy.swcv"
+                )
+            )
         output_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save SWC Viewer Project",
+            "Save SWC Viewer Project As",
             default_name,
             "SWC Viewer Project (*.swcv);;All Files (*)",
         )
         if not output_path:
             return
         bundle_path = Path(output_path)
-        if bundle_path.suffix != ".swcv":
+        if bundle_path.suffix.lower() != ".swcv":
             bundle_path = bundle_path.with_suffix(".swcv")
+        if bundle_path.exists() or bundle_path.is_symlink():
+            message = (
+                f"Project destination already exists: {bundle_path}. "
+                "Choose a new destination. Save Project can only overwrite the "
+                "current project."
+            )
+            self._project_status_label.setText(message)
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
 
-        self._save_project_btn.setEnabled(False)
+        self._save_project_to_path(bundle_path, overwrite=False)
+
+    @staticmethod
+    def _project_overwrite_confirmation_text(bundle_path: Path) -> str:
+        """Return the destructive-save confirmation text for a project path."""
+        return (
+            "Replace the current SWC Viewer project?\n\n"
+            f"{bundle_path}\n\n"
+            "All existing contents in this project folder will be replaced. "
+            "This cannot be undone."
+        )
+
+    def _confirm_project_overwrite(self, bundle_path: Path) -> bool:
+        """Ask whether the current recognized project may be overwritten."""
+        from qtpy.QtWidgets import QMessageBox
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Overwrite SWC Viewer Project?")
+        message.setText(self._project_overwrite_confirmation_text(bundle_path))
+        overwrite_button = message.addButton("Overwrite", QMessageBox.DestructiveRole)
+        cancel_button = message.addButton("Cancel", QMessageBox.RejectRole)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is overwrite_button
+
+    def _save_current_project(self) -> None:
+        """Confirm and overwrite the project associated with this session."""
+        bundle_path = self._current_project_path
+        if bundle_path is None:
+            return
+        if not is_recognized_project_bundle(bundle_path):
+            message = (
+                "The current project is no longer available or is not a recognized "
+                f"SWC Viewer project: {bundle_path}"
+            )
+            self._set_current_project_path(None)
+            self._project_status_label.setText(message)
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+        if not self._confirm_project_overwrite(bundle_path):
+            return
+        self._save_project_to_path(bundle_path, overwrite=True)
+
+    def _save_project_to_path(self, bundle_path: Path, *, overwrite: bool) -> None:
+        """Save current session state to one new or replaceable project path."""
+        if self._db is None:
+            message = "Load a neuron Parquet before saving a project."
+            self._regions_status_label.setText(message)
+            show_warning(message)
+            return
+
+        self._set_project_save_in_progress(True)
         self._project_progress.setVisible(True)
         self._project_progress.setRange(0, 0)
         self._project_progress.setValue(0)
@@ -3814,10 +4023,13 @@ class NeuronViewerWidget(QWidget):
                 analysis_metadata=self._analysis_project_metadata(),
                 flatmap_cache_reference=(self._flatmap_tab.active_cache_reference()),
                 progress_callback=_on_save_progress,
+                overwrite=overwrite,
             )
         except Exception as exc:
             logger.error("Failed to save project bundle: %s", exc)
-            self._save_project_btn.setEnabled(True)
+            if overwrite and not is_recognized_project_bundle(bundle_path):
+                self._set_current_project_path(None)
+            self._set_project_save_in_progress(False)
             self._project_progress.setVisible(False)
             self._project_progress.setRange(0, 1)
             self._project_progress.setValue(0)
@@ -3826,7 +4038,8 @@ class NeuronViewerWidget(QWidget):
             show_warning(f"Failed to save project: {exc}")
             return
 
-        self._save_project_btn.setEnabled(True)
+        self._set_current_project_path(saved)
+        self._set_project_save_in_progress(False)
         self._project_progress.setVisible(False)
         self._project_progress.setRange(0, 1)
         self._project_progress.setValue(0)
@@ -3918,6 +4131,8 @@ class NeuronViewerWidget(QWidget):
         if callable(importer):
             importer(bundle.table_state)
             self._neuron_table.set_added_file_ids(self._current_scene_file_ids())
+        self._refresh_cluster_assignment_controls()
+        self._apply_active_cluster_assignment()
 
         self._restore_project_layers(bundle)
         self._sync_neuron_table_heatmap_membership()
@@ -3926,6 +4141,7 @@ class NeuronViewerWidget(QWidget):
         self._refresh_histogram_layer_list()
         self._refresh_mask_layer_options()
         self._sync_after_neuron_table_membership_change()
+        self._set_current_project_path(bundle.path)
 
     def _restore_project_layers(self, bundle: ProjectBundle) -> None:
         """Recreate saved app-created image and label layers from bundle arrays."""
@@ -5527,7 +5743,11 @@ class NeuronViewerWidget(QWidget):
     def _selected_heatmap_running(self) -> bool:
         """Return whether a selected-neuron heatmap worker is active."""
         thread = getattr(self, "_selected_heatmap_thread", None)
-        return bool(thread is not None and thread.isRunning())
+        if thread is not None and thread.isRunning():
+            return True
+        if getattr(self, "_selected_heatmap_current_request", None) is not None:
+            return True
+        return bool(getattr(self, "_selected_heatmap_pending_requests", []))
 
     def _update_selected_neuron_heatmap_controls(self) -> None:
         """Enable or disable the selected-neuron heatmap action."""
@@ -5561,6 +5781,9 @@ class NeuronViewerWidget(QWidget):
                     parts.append(f"Cluster {cluster_id}: {count:,}")
             clusters_line = "Clusters: " + ", ".join(parts)
 
+        active_assignment = self._cluster_assignment_store.active
+        if active_assignment is not None:
+            clusters_line = f"{active_assignment.name} — {clusters_line}"
         self._neuron_table_summary_label.setText(f"{counts_line}\n{clusters_line}")
 
     def _selected_neuron_heatmap_base_name(
@@ -7794,6 +8017,8 @@ class NeuronViewerWidget(QWidget):
         applier = getattr(self._neuron_table, "apply_state", None)
         if callable(applier):
             applier(table_state, preserve_membership=True)
+            self._refresh_cluster_assignment_controls()
+            self._apply_active_cluster_assignment()
 
     def _selected_cluster_filter(self) -> ClusterFilterSelection:
         """Return selected cluster groups from the Data tab dropdown."""
@@ -7811,6 +8036,123 @@ class NeuronViewerWidget(QWidget):
             return ClusterFilterSelection(frozenset({int(data)}))
         except (TypeError, ValueError):
             return ClusterFilterSelection()
+
+    def _refresh_cluster_assignment_controls(self) -> None:
+        """Refresh the named assignment selector and management buttons."""
+        combo = getattr(self, "_cluster_assignment_combo", None)
+        if combo is None:
+            return
+        store = self._cluster_assignment_store
+        active_id = store.active_assignment_id
+        blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            for assignment in store.sets():
+                combo.addItem(assignment.name, assignment.assignment_id)
+            if active_id is not None:
+                index = combo.findData(active_id)
+                combo.setCurrentIndex(index if index >= 0 else -1)
+            else:
+                combo.setCurrentIndex(-1)
+        finally:
+            combo.blockSignals(blocked)
+        enabled = len(store) > 0
+        self._rename_cluster_assignment_btn.setEnabled(enabled)
+        self._delete_cluster_assignment_btn.setEnabled(enabled)
+
+    def _active_assignment_color_map(self) -> dict[object, list[float]]:
+        """Return active-set colors for all table and rendered neurons."""
+        assignment = self._cluster_assignment_store.active
+        if assignment is None:
+            return {}
+        default = [0.5, 0.5, 0.5, 1.0]
+        file_ids = list(self._neuron_table.file_ids())
+        seen = {str(file_id) for file_id in file_ids}
+        for file_id in self._current_scene_file_ids():
+            if str(file_id) not in seen:
+                file_ids.append(file_id)
+                seen.add(str(file_id))
+        return {
+            file_id: list(
+                assignment.label_colors.get(
+                    assignment.label_for(file_id),
+                    default,
+                )
+            )
+            for file_id in file_ids
+        }
+
+    def _apply_active_cluster_assignment(self) -> None:
+        """Propagate the active assignment to all cluster-aware consumers."""
+        self._neuron_table.refresh_cluster_assignments(preserve_selection=True)
+        active_colors = self._active_assignment_color_map()
+        if active_colors:
+            self._neuron_table.update_colors(active_colors, emit_signal=False)
+            effective_colors = self._build_effective_color_map()
+            effective_colors.update(active_colors)
+            self._update_layer_colors(effective_colors)
+        self._refresh_cluster_filter_controls()
+        self._refresh_neuron_table_summary()
+        analysis_tab = getattr(self, "_analysis_tab", None)
+        handler = getattr(analysis_tab, "on_active_cluster_assignment_changed", None)
+        if callable(handler):
+            handler()
+
+    def _on_active_cluster_assignment_changed(self, index: int) -> None:
+        """Activate the assignment selected in the Data tab."""
+        combo = self._cluster_assignment_combo
+        assignment_id = combo.itemData(index) if index >= 0 else None
+        if assignment_id is None:
+            return
+        try:
+            self._cluster_assignment_store.set_active(str(assignment_id))
+        except KeyError:
+            self._refresh_cluster_assignment_controls()
+            return
+        self._apply_active_cluster_assignment()
+
+    def _rename_active_cluster_assignment(self) -> None:
+        """Prompt for a new display name for the active assignment."""
+        assignment = self._cluster_assignment_store.active
+        if assignment is None:
+            return
+        from qtpy.QtWidgets import QInputDialog
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Rename Cluster Assignment",
+            "Assignment name:",
+            text=assignment.name,
+        )
+        if not accepted or not str(name).strip():
+            return
+        self._cluster_assignment_store.rename(
+            assignment.assignment_id,
+            str(name),
+        )
+        self._refresh_cluster_assignment_controls()
+        self._neuron_table.refresh_cluster_assignments(preserve_selection=True)
+        self._refresh_neuron_table_summary()
+
+    def _delete_active_cluster_assignment(self) -> None:
+        """Confirm and delete the active assignment without removing neurons."""
+        assignment = self._cluster_assignment_store.active
+        if assignment is None:
+            return
+        from qtpy.QtWidgets import QMessageBox
+
+        response = QMessageBox.question(
+            self,
+            "Delete Cluster Assignment",
+            f"Delete cluster assignment '{assignment.name}'? Neurons will not be removed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if response != QMessageBox.Yes:
+            return
+        self._cluster_assignment_store.delete(assignment.assignment_id)
+        self._refresh_cluster_assignment_controls()
+        self._apply_active_cluster_assignment()
 
     def _selected_cluster_from_filter(self) -> int | None:
         """Return the single selected cluster, if the filter is single-cluster."""
@@ -8017,51 +8359,204 @@ class NeuronViewerWidget(QWidget):
         if hasattr(self, "_regions_status_label"):
             self._regions_status_label.setText("Cleared neuron table.")
 
-    def _add_selected_neurons_heatmap(self) -> None:
-        """Build a node-count heatmap for the currently selected neurons."""
+    def _selected_neuron_heatmap_selection(self) -> tuple[object, ...]:
+        """Validate and return a stable snapshot of selected table neuron IDs."""
         if self._selected_heatmap_running():
-            return
+            return ()
         if self._db is None:
             self._render_status_label.setText(
                 "Load a neuron Parquet before creating a heatmap."
             )
-            return
+            return ()
         if self._atlas is None:
             self._render_status_label.setText(
                 "Load an atlas before creating a neuron heatmap."
             )
-            return
+            return ()
 
-        selected_file_ids = [
-            str(file_id) for file_id in self._neuron_table.get_selected_file_ids()
-        ]
+        selected_file_ids = tuple(
+            sorted(self._neuron_table.get_selected_file_ids(), key=str)
+        )
         if not selected_file_ids:
             self._render_status_label.setText(
                 "Select at least one neuron row to create a heatmap."
             )
+        return selected_file_ids
+
+    def _add_selected_neurons_heatmap(self, _checked: bool = False) -> None:
+        """Build one node-count heatmap for all currently selected neurons."""
+        selected_file_ids = self._selected_neuron_heatmap_selection()
+        if not selected_file_ids:
             return
 
-        self._start_selected_neuron_heatmap(selected_file_ids)
+        request = _SelectedNeuronHeatmapRequest(
+            file_ids=tuple(str(file_id) for file_id in selected_file_ids),
+            creation_mode=_SELECTED_HEATMAP_MODE_SINGLE,
+        )
+        self._start_selected_neuron_heatmap_requests([request])
 
-    def _start_selected_neuron_heatmap(self, file_ids: list[str]) -> None:
+    @staticmethod
+    def _individual_heatmap_estimated_bytes(
+        atlas: BrainGlobeAtlas,
+        neuron_count: int,
+    ) -> int:
+        """Estimate retained float32 image bytes for individual heatmap layers."""
+        shape = getattr(getattr(atlas, "annotation", None), "shape", ())
+        if not shape:
+            return 0
+        voxel_count = int(np.prod(shape, dtype=np.int64))
+        return voxel_count * np.dtype(np.float32).itemsize * max(0, int(neuron_count))
+
+    @staticmethod
+    def _individual_heatmap_memory_warning_text(
+        neuron_count: int,
+        estimated_bytes: int,
+    ) -> str:
+        """Return the confirmation text for a memory-heavy individual batch."""
+        estimated_gib = float(estimated_bytes) / float(1024**3)
+        return (
+            f"Creating {int(neuron_count):,} individual heatmaps is estimated "
+            f"to retain {estimated_gib:.2f} GiB of image data before rendering "
+            "overhead. Continue?"
+        )
+
+    def _confirm_large_individual_heatmap_request(
+        self,
+        neuron_count: int,
+        estimated_bytes: int,
+    ) -> bool:
+        """Ask whether an individual heatmap request above 1 GiB may run."""
+        from qtpy.QtWidgets import QMessageBox
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Large Individual Heatmap Request")
+        message.setText(
+            self._individual_heatmap_memory_warning_text(
+                neuron_count,
+                estimated_bytes,
+            )
+        )
+        continue_button = message.addButton("Continue", QMessageBox.AcceptRole)
+        cancel_button = message.addButton("Cancel", QMessageBox.RejectRole)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is continue_button
+
+    @staticmethod
+    def _selected_neuron_colors_are_monochrome(
+        colors: list[list[float]],
+    ) -> bool:
+        """Return whether at least two colors have matching RGB channels."""
+        if len(colors) < 2:
+            return False
+        first_rgb = np.asarray(colors[0][:3], dtype=float)
+        return all(
+            np.allclose(first_rgb, np.asarray(color[:3], dtype=float))
+            for color in colors[1:]
+        )
+
+    def _add_selected_neurons_individual_heatmaps(
+        self,
+        _checked: bool = False,
+    ) -> None:
+        """Build one color-matched node-count heatmap per selected neuron."""
+        selected_file_ids = self._selected_neuron_heatmap_selection()
+        if not selected_file_ids:
+            return
+
+        estimated_bytes = self._individual_heatmap_estimated_bytes(
+            self._atlas,
+            len(selected_file_ids),
+        )
+        if (
+            estimated_bytes > _INDIVIDUAL_HEATMAP_MEMORY_WARNING_BYTES
+            and not self._confirm_large_individual_heatmap_request(
+                len(selected_file_ids),
+                estimated_bytes,
+            )
+        ):
+            self._render_status_label.setText(
+                "Individual heatmap creation cancelled; no colors or layers changed."
+            )
+            return
+
+        colors_by_file_id = {
+            file_id: list(self._neuron_table.get_color(file_id))
+            for file_id in selected_file_ids
+        }
+        if self._selected_neuron_colors_are_monochrome(
+            list(colors_by_file_id.values())
+        ):
+            colors_by_file_id = turbo_colors_for_file_ids(selected_file_ids)
+            self._neuron_table.update_colors(colors_by_file_id)
+
+        requests = [
+            _SelectedNeuronHeatmapRequest(
+                file_ids=(str(file_id),),
+                creation_mode=_SELECTED_HEATMAP_MODE_INDIVIDUAL,
+                color=tuple(float(channel) for channel in colors_by_file_id[file_id]),
+            )
+            for file_id in selected_file_ids
+        ]
+        self._start_selected_neuron_heatmap_requests(requests)
+
+    def _start_selected_neuron_heatmap_requests(
+        self,
+        requests: list[_SelectedNeuronHeatmapRequest],
+    ) -> None:
+        """Start one or more Data-tab heatmap requests in sequence."""
+        if not requests:
+            return
+
+        self._selected_heatmap_pending_requests = list(requests)
+        self._selected_heatmap_completed_requests = []
+        self._selected_heatmap_current_request = None
+        self._selected_heatmap_total = len(requests)
+        self._selected_heatmap_index = 0
+        self._selected_heatmap_failed = False
+        self._render_progress.setVisible(True)
+        self._render_progress.setRange(0, 0)
+        self._update_selected_neuron_heatmap_controls()
+        self._start_next_selected_neuron_heatmap_request()
+
+    def _start_next_selected_neuron_heatmap_request(self) -> None:
+        """Start the next queued selected-neuron heatmap request."""
+        if not self._selected_heatmap_pending_requests:
+            return
+
+        request = self._selected_heatmap_pending_requests.pop(0)
+        self._selected_heatmap_current_request = request
+        self._selected_heatmap_request_file_ids = request.file_ids
+        self._selected_heatmap_index = (
+            len(self._selected_heatmap_completed_requests) + 1
+        )
+        self._start_selected_neuron_heatmap(request)
+
+    def _start_selected_neuron_heatmap(
+        self,
+        request: _SelectedNeuronHeatmapRequest,
+    ) -> None:
         """Start the background worker that builds a selected-neuron heatmap."""
         from ..workers import HeatmapWorker
 
-        self._selected_heatmap_request_file_ids = tuple(
-            str(file_id) for file_id in file_ids
-        )
-
         self._render_progress.setVisible(True)
         self._render_progress.setRange(0, 0)
-        self._render_status_label.setText(
-            f"Building heatmap for {len(self._selected_heatmap_request_file_ids)} selected neuron(s)..."
-        )
+        if request.creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL:
+            self._render_status_label.setText(
+                f"Building individual heatmap {self._selected_heatmap_index}/"
+                f"{self._selected_heatmap_total} for {request.file_ids[0]}..."
+            )
+        else:
+            self._render_status_label.setText(
+                f"Building heatmap for {len(request.file_ids)} selected neuron(s)..."
+            )
 
         thread = QThread()
         worker = HeatmapWorker(
             parquet_path=str(self._db.parquet_path),
             atlas=self._atlas,
-            file_ids=list(self._selected_heatmap_request_file_ids),
+            file_ids=list(request.file_ids),
         )
         self._selected_heatmap_thread = thread
         self._selected_heatmap_worker = worker
@@ -8074,10 +8569,10 @@ class NeuronViewerWidget(QWidget):
         worker.finished.connect(thread.quit)
         worker.error.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(
             lambda: self._cleanup_selected_heatmap_thread(thread, worker)
         )
+        thread.finished.connect(thread.deleteLater)
 
         self._update_selected_neuron_heatmap_controls()
         thread.start()
@@ -8092,17 +8587,46 @@ class NeuronViewerWidget(QWidget):
         self._render_progress.setVisible(True)
         self._render_progress.setRange(0, max(1, total))
         self._render_progress.setValue(current)
-        self._render_status_label.setText(message)
+        request = getattr(self, "_selected_heatmap_current_request", None)
+        if (
+            request is not None
+            and request.creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL
+        ):
+            self._render_status_label.setText(
+                f"Individual heatmap {self._selected_heatmap_index}/"
+                f"{self._selected_heatmap_total} for {request.file_ids[0]}: {message}"
+            )
+        else:
+            self._render_status_label.setText(message)
 
     def _add_selected_neuron_heatmap_layer(
         self,
         volume: np.ndarray,
         file_ids: list[str] | tuple[str, ...],
+        *,
+        creation_mode: str = _SELECTED_HEATMAP_MODE_SINGLE,
+        color: tuple[float, float, float, float] | None = None,
     ):
         """Add one selected-neuron heatmap layer to the viewer."""
         layer_name = self._selected_neuron_heatmap_layer_name(file_ids)
         manual_heatmap_id = layer_name.removesuffix(" Heatmap")
         contrast_limits = _heatmap_contrast_limits(volume)
+        if creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL:
+            contrast_limits = (
+                contrast_limits[0],
+                contrast_limits[1] * _INDIVIDUAL_HEATMAP_CONTRAST_FRACTION,
+            )
+        colormap = "hot"
+        if creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL and color is not None:
+            from napari.utils.colormaps import Colormap
+
+            colormap = Colormap(
+                colors=[
+                    [0.0, 0.0, 0.0, 0.0],
+                    [float(color[0]), float(color[1]), float(color[2]), 1.0],
+                ],
+                name=f"manual_heatmap_{manual_heatmap_id}",
+            )
         metadata = {
             "heatmap_source": True,
             "heatmap_native_grid": True,
@@ -8114,13 +8638,20 @@ class NeuronViewerWidget(QWidget):
             ),
             "file_ids": [str(file_id) for file_id in file_ids],
             "selection_count": len(file_ids),
+            "heatmap_creation_mode": creation_mode,
             "heatmap_contrast_limits": contrast_limits,
-            "heatmap_autocontrast_policy": "stable_full_volume",
+            "heatmap_autocontrast_policy": (
+                "stable_20_percent_max"
+                if creation_mode == _SELECTED_HEATMAP_MODE_INDIVIDUAL
+                else "stable_full_volume"
+            ),
         }
+        if color is not None:
+            metadata["color"] = [float(channel) for channel in color]
         return self.viewer.add_image(
             volume,
             name=layer_name,
-            colormap="hot",
+            colormap=colormap,
             blending="additive",
             rendering="mip",
             opacity=self._opacity_slider.value() / 100.0,
@@ -8130,22 +8661,54 @@ class NeuronViewerWidget(QWidget):
 
     def _on_selected_neuron_heatmap_finished(self, volume: np.ndarray) -> None:
         """Handle successful selected-neuron heatmap creation."""
-        file_ids = self._selected_heatmap_request_file_ids
+        request = getattr(self, "_selected_heatmap_current_request", None)
+        if request is None:
+            file_ids = self._selected_heatmap_request_file_ids
+            request = _SelectedNeuronHeatmapRequest(
+                file_ids=tuple(file_ids),
+                creation_mode=_SELECTED_HEATMAP_MODE_SINGLE,
+            )
+        else:
+            file_ids = request.file_ids
         if not file_ids:
             return
 
-        layer = self._add_selected_neuron_heatmap_layer(volume, file_ids)
-        self._render_progress.setVisible(False)
-        self._render_progress.setRange(0, 1)
-        self._render_progress.setValue(0)
-        self._render_status_label.setText(
-            f"Added {layer.name} with {(volume > 0).sum():,} non-zero voxels."
+        layer = self._add_selected_neuron_heatmap_layer(
+            volume,
+            file_ids,
+            creation_mode=request.creation_mode,
+            color=request.color,
         )
+        completed = getattr(self, "_selected_heatmap_completed_requests", None)
+        if completed is not None:
+            completed.append(request)
+        if getattr(self, "_selected_heatmap_total", 0) > 1:
+            self._render_status_label.setText(
+                f"Added {layer.name} ({self._selected_heatmap_index}/"
+                f"{self._selected_heatmap_total})."
+            )
+        else:
+            self._render_status_label.setText(
+                f"Added {layer.name} with {(volume > 0).sum():,} non-zero voxels."
+            )
         logger.info(
-            "Created selected-neuron heatmap %s for %d neuron(s)",
+            "Created %s selected-neuron heatmap %s for %d neuron(s)",
+            request.creation_mode,
             layer.name,
             len(file_ids),
         )
+        refresher = getattr(
+            self,
+            "_refresh_selected_neuron_heatmap_dependents",
+            None,
+        )
+        if callable(refresher):
+            refresher()
+        else:
+            NeuronViewerWidget._refresh_selected_neuron_heatmap_dependents(self)
+
+    def _refresh_selected_neuron_heatmap_dependents(self) -> None:
+        """Refresh UI whose contents depend on Data-tab heatmap layers."""
         sync_heatmaps = getattr(self, "_sync_neuron_table_heatmap_membership", None)
         if callable(sync_heatmaps):
             sync_heatmaps()
@@ -8157,11 +8720,21 @@ class NeuronViewerWidget(QWidget):
         self._refresh_mask_layer_options()
 
     def _on_selected_neuron_heatmap_error(self, error_msg: str) -> None:
-        """Handle a selected-neuron heatmap worker failure."""
+        """Handle a worker failure and stop the remaining heatmap queue."""
+        self._selected_heatmap_failed = True
+        self._selected_heatmap_pending_requests = []
         self._render_progress.setVisible(False)
         self._render_progress.setRange(0, 1)
         self._render_progress.setValue(0)
-        self._render_status_label.setText(f"Error: {error_msg}")
+        completed_count = len(getattr(self, "_selected_heatmap_completed_requests", []))
+        total = int(getattr(self, "_selected_heatmap_total", 0))
+        if total > 1:
+            self._render_status_label.setText(
+                f"Error after {completed_count}/{total} individual heatmaps: "
+                f"{error_msg}"
+            )
+        else:
+            self._render_status_label.setText(f"Error: {error_msg}")
         logger.error("Selected-neuron heatmap failed: %s", error_msg)
 
     def _cleanup_selected_heatmap_thread(
@@ -8175,6 +8748,29 @@ class NeuronViewerWidget(QWidget):
         if self._selected_heatmap_worker is worker:
             self._selected_heatmap_worker = None
         self._selected_heatmap_request_file_ids = ()
+        self._selected_heatmap_current_request = None
+
+        if not getattr(self, "_selected_heatmap_failed", False) and getattr(
+            self, "_selected_heatmap_pending_requests", []
+        ):
+            self._start_next_selected_neuron_heatmap_request()
+            return
+
+        completed_count = len(getattr(self, "_selected_heatmap_completed_requests", []))
+        total = int(getattr(self, "_selected_heatmap_total", 0))
+        failed = bool(getattr(self, "_selected_heatmap_failed", False))
+        self._selected_heatmap_pending_requests = []
+        self._selected_heatmap_completed_requests = []
+        self._selected_heatmap_total = 0
+        self._selected_heatmap_index = 0
+        self._selected_heatmap_failed = False
+        self._render_progress.setVisible(False)
+        self._render_progress.setRange(0, 1)
+        self._render_progress.setValue(0)
+        if not failed and total > 1:
+            self._render_status_label.setText(
+                f"Added {completed_count} individual heatmaps to the scene."
+            )
         self._update_selected_neuron_heatmap_controls()
 
     def _render_selected_neurons(self) -> None:
@@ -8840,8 +9436,13 @@ class NeuronViewerWidget(QWidget):
 
     def _on_cluster_colors_updated(self, result, color_map: dict) -> None:
         """Handle cluster color updates from the analysis tab."""
+        self._refresh_cluster_assignment_controls()
         self._neuron_table.update_cluster_assignments(result)
-        self._neuron_table.update_colors(color_map, emit_signal=False)
+        active_colors = self._active_assignment_color_map()
+        self._neuron_table.update_colors(
+            active_colors or color_map,
+            emit_signal=False,
+        )
         self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
         self._refresh_apply_existing_clusters_button()

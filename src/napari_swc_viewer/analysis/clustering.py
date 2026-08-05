@@ -49,9 +49,7 @@ class ClusterRegionSelection:
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe mapping for export metadata."""
         return {
-            "selected_region_ids": [
-                int(value) for value in self.selected_region_ids
-            ],
+            "selected_region_ids": [int(value) for value in self.selected_region_ids],
             "selected_region_acronyms": [
                 str(value) for value in self.selected_region_acronyms
             ],
@@ -117,12 +115,8 @@ class ClusterRunMetadata:
             clustering_linkage=clustering_linkage,
             dendrogram_linkage=dendrogram_linkage,
             selected_region_ids=list(region_selection.selected_region_ids),
-            selected_region_acronyms=list(
-                region_selection.selected_region_acronyms
-            ),
-            represented_region_ids=list(
-                region_selection.represented_region_ids
-            ),
+            selected_region_acronyms=list(region_selection.selected_region_acronyms),
+            represented_region_ids=list(region_selection.represented_region_ids),
             represented_region_acronyms=list(
                 region_selection.represented_region_acronyms
             ),
@@ -132,13 +126,9 @@ class ClusterRunMetadata:
             dbscan_eps=dbscan_eps,
             dbscan_min_samples=dbscan_min_samples,
             atlas_name=atlas_name,
-            atlas_resolution_um=tuple(
-                float(value) for value in atlas_resolution_um
-            ),
+            atlas_resolution_um=tuple(float(value) for value in atlas_resolution_um),
             source_parquet_path=source_parquet_path,
-            dendrogram_leaf_order=[
-                int(value) for value in dendrogram_leaf_order
-            ],
+            dendrogram_leaf_order=[int(value) for value in dendrogram_leaf_order],
             extra_metadata=dict(extra_metadata or {}),
         )
 
@@ -150,9 +140,7 @@ class ClusterRunMetadata:
             "distance_metric": self.distance_metric,
             "clustering_linkage": self.clustering_linkage,
             "dendrogram_linkage": self.dendrogram_linkage,
-            "selected_region_ids": [
-                int(value) for value in self.selected_region_ids
-            ],
+            "selected_region_ids": [int(value) for value in self.selected_region_ids],
             "selected_region_acronyms": [
                 str(value) for value in self.selected_region_acronyms
             ],
@@ -168,9 +156,7 @@ class ClusterRunMetadata:
             "dbscan_eps": self.dbscan_eps,
             "dbscan_min_samples": self.dbscan_min_samples,
             "atlas_name": self.atlas_name,
-            "atlas_resolution_um": [
-                float(value) for value in self.atlas_resolution_um
-            ],
+            "atlas_resolution_um": [float(value) for value in self.atlas_resolution_um],
             "source_parquet_path": self.source_parquet_path,
             "dendrogram_leaf_order": [
                 int(value) for value in self.dendrogram_leaf_order
@@ -196,17 +182,11 @@ class ClusterResult:
 
     def neuron_ids_in_leaf_order(self) -> list[str]:
         """Return neuron IDs in dendrogram leaf order."""
-        return [
-            self.neuron_ids[int(index)]
-            for index in self.reorder_indices.tolist()
-        ]
+        return [self.neuron_ids[int(index)] for index in self.reorder_indices.tolist()]
 
     def labels_in_leaf_order(self) -> list[int]:
         """Return cluster labels in dendrogram leaf order."""
-        return [
-            int(self.labels[int(index)])
-            for index in self.reorder_indices.tolist()
-        ]
+        return [int(self.labels[int(index)]) for index in self.reorder_indices.tolist()]
 
 
 def compute_linkage(
@@ -245,9 +225,7 @@ def compute_linkage(
         squareform_elapsed,
     )
     linkage_start = perf_counter()
-    logger.debug(
-        "compute_linkage calling scipy.linkage with method=%s", method
-    )
+    logger.debug("compute_linkage calling scipy.linkage with method=%s", method)
     result = linkage(condensed, method=method)
     linkage_elapsed = perf_counter() - linkage_start
     logger.debug(
@@ -351,9 +329,7 @@ def extract_clusters(
     NDArray[np.int32]
         Cluster label for each sample (1-indexed).
     """
-    return fcluster(linkage_matrix, t=n_clusters, criterion="maxclust").astype(
-        np.int32
-    )
+    return fcluster(linkage_matrix, t=n_clusters, criterion="maxclust").astype(np.int32)
 
 
 def cophenetic_spearman(
@@ -405,9 +381,7 @@ def compare_partitions(
             normalized_mutual_info_score,
         )
     except ImportError:
-        logger.warning(
-            "scikit-learn not installed; skipping partition comparison"
-        )
+        logger.warning("scikit-learn not installed; skipping partition comparison")
         return []
 
     results = []
@@ -424,6 +398,96 @@ def compare_partitions(
 # ---------------------------------------------------------------------------
 # Soma-location clustering
 # ---------------------------------------------------------------------------
+
+
+def query_ccf_soma_coordinates(
+    parquet_path: str,
+    *,
+    resolution: float,
+    file_ids: list[str] | tuple[str, ...] | None = None,
+    voxel_id_map: NDArray[np.int32] | None = None,
+) -> tuple[list[str], NDArray[np.float64], int]:
+    """Return scoped per-neuron CCF soma coordinates and contributing rows.
+
+    Soma coordinates are averaged per ``file_id`` exactly as the clustering
+    worker expects.  If a region lookup is supplied, the averaged coordinate
+    must fall inside that lookup.  The returned count is the number of source
+    soma-node rows that contributed to the retained averages.
+    """
+    import duckdb
+
+    parquet_escaped = str(parquet_path).replace("\\", "/")
+    conn = duckdb.connect()
+    try:
+        soma_df = conn.execute(f"""
+            SELECT
+                file_id,
+                AVG(x) AS x,
+                AVG(y) AS y,
+                AVG(z) AS z,
+                COUNT(*)::BIGINT AS soma_node_count
+            FROM read_parquet('{parquet_escaped}')
+            WHERE type = 1
+            GROUP BY file_id
+            ORDER BY file_id
+        """).fetchdf()
+    finally:
+        conn.close()
+
+    if soma_df.empty:
+        return [], np.empty((0, 3), dtype=np.float64), 0
+
+    if file_ids is not None:
+        scope_ids = {str(file_id) for file_id in file_ids}
+        soma_df = soma_df[soma_df["file_id"].astype(str).isin(scope_ids)].reset_index(
+            drop=True
+        )
+    if soma_df.empty:
+        return [], np.empty((0, 3), dtype=np.float64), 0
+
+    coords = soma_df[["x", "y", "z"]].to_numpy(dtype=np.float64)
+    retained = np.all(np.isfinite(coords), axis=1)
+    if voxel_id_map is not None and retained.any():
+        Z, Y, X = voxel_id_map.shape
+        zi = np.zeros(len(coords), dtype=np.int64)
+        yi = np.zeros(len(coords), dtype=np.int64)
+        xi = np.zeros(len(coords), dtype=np.int64)
+        finite_indices = np.flatnonzero(retained)
+        zi[finite_indices] = np.floor(
+            coords[finite_indices, 0] / float(resolution)
+        ).astype(np.int64)
+        yi[finite_indices] = np.floor(
+            coords[finite_indices, 1] / float(resolution)
+        ).astype(np.int64)
+        xi[finite_indices] = np.floor(
+            coords[finite_indices, 2] / float(resolution)
+        ).astype(np.int64)
+        in_bounds = (
+            retained
+            & (xi >= 0)
+            & (xi < X)
+            & (yi >= 0)
+            & (yi < Y)
+            & (zi >= 0)
+            & (zi < Z)
+        )
+        in_region = np.zeros(len(coords), dtype=bool)
+        in_region[in_bounds] = (
+            voxel_id_map[zi[in_bounds], yi[in_bounds], xi[in_bounds]] >= 0
+        )
+        retained &= in_region
+
+    filtered = soma_df.loc[retained]
+    filtered_coords = coords[retained]
+    if "soma_node_count" in filtered:
+        node_count = int(filtered["soma_node_count"].sum())
+    else:  # Compatibility with lightweight test doubles.
+        node_count = int(len(filtered))
+    return (
+        filtered["file_id"].astype(str).tolist(),
+        filtered_coords,
+        node_count,
+    )
 
 
 def _euclidean_distance_matrix(
@@ -583,14 +647,11 @@ def cluster_somas_kmeans(
     dist = squareform(condensed, checks=False).astype(np.float32, copy=False)
 
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = (
-        km.fit_predict(coords).astype(np.int32) + 1
-    )  # 1-indexed like fcluster
+    labels = km.fit_predict(coords).astype(np.int32) + 1  # 1-indexed like fcluster
 
     actual_k = int(len(np.unique(labels)))
     logger.info(
-        f"Soma k-means clustering: {len(neuron_ids)} neurons, "
-        f"{actual_k} clusters"
+        f"Soma k-means clustering: {len(neuron_ids)} neurons, {actual_k} clusters"
     )
 
     return ClusterResult(

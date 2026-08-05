@@ -184,8 +184,8 @@ The **Selected Neurons** table is a holding area for neurons that can be
 visualized, analyzed, colored, filtered, or exported. Rows in this table are not
 automatically rendered in the napari scene. The table lets you select rows,
 toggle `Vis`, inspect `Added`, `Heatmap`, `Neuron ID`, `Subject`, editable
-`Label`/`Group`/`Tags`/`Notes`, `Cluster`, and `Color`, and then decide which
-rows to render or use for heatmaps.
+`Label`/`Group`/`Tags`/`Notes`, saved cluster-assignment columns, and `Color`,
+and then decide which rows to render or use for heatmaps.
 
 ## Add soma markers for all 77 neurons
 
@@ -221,7 +221,7 @@ then build one `GPe`-limited heatmap per cluster.
 
    - `Method`: `Soma Location`
    - `Algorithm`: `K-Means`
-   - `Search scope`: `Current Table`
+   - `Input neurons`: `Current Table`
    - `Clusters`: `10`
    - `Dilation %`: `0%`
 

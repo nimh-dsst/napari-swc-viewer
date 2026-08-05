@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import shutil
 from dataclasses import dataclass
@@ -17,8 +18,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .cluster_assignments import ClusterAssignmentStore
+
 PROJECT_BUNDLE_FORMAT = "napari_swc_viewer.project_bundle"
-PROJECT_FORMAT_VERSION = "1"
+PROJECT_FORMAT_VERSION = "2"
 PROJECT_METADATA_PREFIX = "napari_swc_viewer.project."
 
 ENHANCED_NEURON_COLUMNS = (
@@ -36,6 +39,8 @@ _TEXT_ENHANCED_COLUMNS = (
 )
 _SOURCE_FILE_ID_INLINE_LIMIT = 10_000
 _ProgressCallback = Callable[[str, int, int], None]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -181,11 +186,143 @@ def _cluster_from_entry(entry: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _cluster_store_from_table_state(
+    table_state: Mapping[str, Any] | Sequence[Any] | None,
+) -> ClusterAssignmentStore:
+    """Return named assignments, migrating legacy row values when needed."""
+    normalized = _normalise_table_state(table_state)
+    store = ClusterAssignmentStore()
+    raw_state = normalized.get("cluster_assignments")
+    if isinstance(raw_state, Mapping):
+        store.load_state(raw_state)
+    if len(store) == 0:
+        legacy = {
+            file_id: _cluster_from_entry(entry)
+            for file_id, entry in _table_state_by_file_id(normalized).items()
+        }
+        store.import_legacy(legacy)
+    return store
+
+
+def _app_owned_cluster_columns(schema: pa.Schema) -> set[str]:
+    """Return dynamic assignment columns declared by existing app metadata."""
+    metadata = dict(schema.metadata or {})
+    key = f"{PROJECT_METADATA_PREFIX}metadata_json".encode("utf-8")
+    raw_payload = metadata.get(key)
+    if raw_payload is None:
+        return set()
+    try:
+        payload = json.loads(raw_payload.decode("utf-8"))
+        assignment_state = payload.get("table_state", {}).get(
+            "cluster_assignments",
+            {},
+        )
+        raw_sets = assignment_state.get("sets", [])
+    except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
+        return set()
+    return {
+        str(raw_set.get("column_name"))
+        for raw_set in raw_sets
+        if isinstance(raw_set, Mapping) and raw_set.get("column_name")
+    }
+
+
+def _resolved_assignment_columns(
+    store: ClusterAssignmentStore,
+    source_columns: Iterable[str],
+    *,
+    replaceable_columns: Iterable[str] = (),
+) -> dict[str, str]:
+    """Return collision-safe output columns for all assignment sets."""
+    replaceable = set(replaceable_columns)
+    # Dynamic assignment columns must not collide with either source data or
+    # the fixed enhanced fields written by this app, especially the active-set
+    # compatibility mirror named ``cluster_assignment``.
+    used = (set(source_columns) - replaceable) | set(ENHANCED_NEURON_COLUMNS)
+    resolved: dict[str, str] = {}
+    for assignment in store.sets():
+        base = assignment.column_name
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        resolved[assignment.assignment_id] = candidate
+        used.add(candidate)
+    return resolved
+
+
+def _table_state_with_resolved_columns(
+    table_state: Mapping[str, Any] | Sequence[Any] | None,
+    resolved_columns: Mapping[str, str],
+) -> dict[str, Any]:
+    """Return a metadata payload whose registry matches physical columns."""
+    normalized = _normalise_table_state(table_state)
+    raw_state = normalized.get("cluster_assignments")
+    if not isinstance(raw_state, Mapping):
+        return normalized
+    assignment_state = dict(raw_state)
+    updated_sets: list[object] = []
+    for raw_set in raw_state.get("sets", []):
+        if not isinstance(raw_set, Mapping):
+            updated_sets.append(raw_set)
+            continue
+        updated = dict(raw_set)
+        assignment_id = str(updated.get("assignment_id") or "")
+        if assignment_id in resolved_columns:
+            updated["column_name"] = resolved_columns[assignment_id]
+        updated_sets.append(updated)
+    assignment_state["sets"] = updated_sets
+    normalized["cluster_assignments"] = assignment_state
+    return normalized
+
+
+def _filter_table_state_assignments(
+    table_state: Mapping[str, Any] | Sequence[Any] | None,
+    file_ids: Iterable[object],
+) -> dict[str, Any]:
+    """Restrict durable assignment cohorts to project-table membership."""
+    normalized = _normalise_table_state(table_state)
+    keep = {str(file_id) for file_id in file_ids}
+    raw_state = normalized.get("cluster_assignments")
+    if not isinstance(raw_state, Mapping):
+        return normalized
+    assignment_state = dict(raw_state)
+    filtered_sets: list[object] = []
+    for raw_set in raw_state.get("sets", []):
+        if not isinstance(raw_set, Mapping):
+            continue
+        filtered = dict(raw_set)
+        assignments = raw_set.get("assignments", {})
+        if isinstance(assignments, Mapping):
+            filtered["assignments"] = {
+                str(file_id): label
+                for file_id, label in assignments.items()
+                if str(file_id) in keep
+            }
+        filtered["input_file_ids"] = [
+            str(file_id)
+            for file_id in raw_set.get("input_file_ids", [])
+            if str(file_id) in keep
+        ]
+        filtered["unassigned_neuron_ids"] = [
+            str(file_id)
+            for file_id in raw_set.get("unassigned_neuron_ids", [])
+            if str(file_id) in keep
+        ]
+        filtered_sets.append(filtered)
+    assignment_state["sets"] = filtered_sets
+    normalized["cluster_assignments"] = assignment_state
+    return normalized
+
+
 def _enhanced_column_values(
     file_ids: Iterable[Any],
     table_state: Mapping[str, Any] | Sequence[Any] | None,
 ) -> dict[str, list[Any]]:
     by_file_id = _table_state_by_file_id(table_state)
+    store = _cluster_store_from_table_state(table_state)
+    active = store.active
     values: dict[str, list[Any]] = {column: [] for column in ENHANCED_NEURON_COLUMNS}
     for file_id in file_ids:
         entry = by_file_id.get(str(file_id), {})
@@ -193,7 +330,11 @@ def _enhanced_column_values(
         values["neuron_group"].append(entry.get("group", entry.get("neuron_group")))
         values["neuron_tags_json"].append(_tags_json_from_entry(entry))
         values["neuron_notes"].append(entry.get("notes", entry.get("neuron_notes")))
-        values["cluster_assignment"].append(_cluster_from_entry(entry))
+        values["cluster_assignment"].append(
+            active.label_for(file_id)
+            if active is not None
+            else _cluster_from_entry(entry)
+        )
     return values
 
 
@@ -232,7 +373,31 @@ def export_enhanced_neuron_parquet(
     if "file_id" not in table.column_names:
         raise ValueError("Enhanced neuron Parquet requires a file_id column.")
 
-    values = _enhanced_column_values(table.column("file_id").to_pylist(), table_state)
+    source_schema = table.schema
+    owned_columns = _app_owned_cluster_columns(source_schema)
+    removable_owned = [
+        column for column in owned_columns if column in table.column_names
+    ]
+    if removable_owned:
+        table = table.drop_columns(removable_owned)
+
+    store = _cluster_store_from_table_state(table_state)
+    base_table_state = _normalise_table_state(table_state)
+    if len(store) > 0 and not isinstance(
+        base_table_state.get("cluster_assignments"),
+        Mapping,
+    ):
+        base_table_state["cluster_assignments"] = store.to_state()
+    resolved_columns = _resolved_assignment_columns(
+        store,
+        table.column_names,
+    )
+    export_table_state = _table_state_with_resolved_columns(
+        base_table_state,
+        resolved_columns,
+    )
+    file_ids = table.column("file_id").to_pylist()
+    values = _enhanced_column_values(file_ids, export_table_state)
     for column in _TEXT_ENHANCED_COLUMNS:
         table = _append_or_replace_column(
             table,
@@ -244,6 +409,16 @@ def export_enhanced_neuron_parquet(
         "cluster_assignment",
         pa.array(values["cluster_assignment"], type=pa.int32()),
     )
+    for assignment in store.sets():
+        column_name = resolved_columns[assignment.assignment_id]
+        table = _append_or_replace_column(
+            table,
+            column_name,
+            pa.array(
+                [assignment.label_for(file_id) for file_id in file_ids],
+                type=pa.int32(),
+            ),
+        )
 
     schema_metadata = dict(table.schema.metadata or {})
     schema_metadata[f"{PROJECT_METADATA_PREFIX}version".encode("utf-8")] = (
@@ -254,7 +429,7 @@ def export_enhanced_neuron_parquet(
             _json_safe(
                 _enhanced_parquet_payload(
                     source_parquet_path=source_path,
-                    table_state=table_state,
+                    table_state=export_table_state,
                     metadata=metadata,
                 )
             ),
@@ -283,8 +458,15 @@ def _text_or_none(value: Any) -> str | None:
     return str(value)
 
 
-def _selected_table_rows(table_state: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _selected_table_rows(
+    table_state: Mapping[str, Any],
+    *,
+    resolved_columns: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Return current-table rows for filtered project parquet export."""
+    store = _cluster_store_from_table_state(table_state)
+    active = store.active
+    assignment_columns = dict(resolved_columns or {})
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw_entry in table_state.get("entries", []):
@@ -294,50 +476,64 @@ def _selected_table_rows(table_state: Mapping[str, Any]) -> list[dict[str, Any]]
         if file_id is None or file_id in seen:
             continue
         seen.add(file_id)
-        rows.append(
-            {
-                "file_id": file_id,
-                "row_order": len(rows),
-                "neuron_label": _text_or_none(
-                    raw_entry.get("label", raw_entry.get("neuron_label"))
-                ),
-                "neuron_group": _text_or_none(
-                    raw_entry.get("group", raw_entry.get("neuron_group"))
-                ),
-                "neuron_tags_json": _tags_json_from_entry(raw_entry),
-                "neuron_notes": _text_or_none(
-                    raw_entry.get("notes", raw_entry.get("neuron_notes"))
-                ),
-                "cluster_assignment": _cluster_from_entry(raw_entry),
-            }
-        )
+        row = {
+            "file_id": file_id,
+            "row_order": len(rows),
+            "neuron_label": _text_or_none(
+                raw_entry.get("label", raw_entry.get("neuron_label"))
+            ),
+            "neuron_group": _text_or_none(
+                raw_entry.get("group", raw_entry.get("neuron_group"))
+            ),
+            "neuron_tags_json": _tags_json_from_entry(raw_entry),
+            "neuron_notes": _text_or_none(
+                raw_entry.get("notes", raw_entry.get("neuron_notes"))
+            ),
+            "cluster_assignment": (
+                active.label_for(file_id)
+                if active is not None
+                else _cluster_from_entry(raw_entry)
+            ),
+        }
+        for assignment in store.sets():
+            column_name = assignment_columns.get(
+                assignment.assignment_id,
+                assignment.column_name,
+            )
+            row[column_name] = assignment.label_for(file_id)
+        rows.append(row)
     return rows
 
 
-def _selected_rows_arrow_table(rows: Sequence[Mapping[str, Any]]) -> pa.Table:
+def _selected_rows_arrow_table(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    assignment_columns: Iterable[str] = (),
+) -> pa.Table:
     """Build the small selected-neuron table registered with DuckDB."""
-    return pa.Table.from_pydict(
-        {
-            "file_id": [str(row["file_id"]) for row in rows],
-            "row_order": [int(row["row_order"]) for row in rows],
-            "neuron_label": [row.get("neuron_label") for row in rows],
-            "neuron_group": [row.get("neuron_group") for row in rows],
-            "neuron_tags_json": [row.get("neuron_tags_json") for row in rows],
-            "neuron_notes": [row.get("neuron_notes") for row in rows],
-            "cluster_assignment": [row.get("cluster_assignment") for row in rows],
-        },
-        schema=pa.schema(
-            [
-                ("file_id", pa.string()),
-                ("row_order", pa.int32()),
-                ("neuron_label", pa.string()),
-                ("neuron_group", pa.string()),
-                ("neuron_tags_json", pa.string()),
-                ("neuron_notes", pa.string()),
-                ("cluster_assignment", pa.int32()),
-            ]
-        ),
-    )
+    columns = list(assignment_columns)
+    data = {
+        "file_id": [str(row["file_id"]) for row in rows],
+        "row_order": [int(row["row_order"]) for row in rows],
+        "neuron_label": [row.get("neuron_label") for row in rows],
+        "neuron_group": [row.get("neuron_group") for row in rows],
+        "neuron_tags_json": [row.get("neuron_tags_json") for row in rows],
+        "neuron_notes": [row.get("neuron_notes") for row in rows],
+        "cluster_assignment": [row.get("cluster_assignment") for row in rows],
+    }
+    for column in columns:
+        data[column] = [row.get(column) for row in rows]
+    schema_fields = [
+        ("file_id", pa.string()),
+        ("row_order", pa.int32()),
+        ("neuron_label", pa.string()),
+        ("neuron_group", pa.string()),
+        ("neuron_tags_json", pa.string()),
+        ("neuron_notes", pa.string()),
+        ("cluster_assignment", pa.int32()),
+    ]
+    schema_fields.extend((column, pa.int32()) for column in columns)
+    return pa.Table.from_pydict(data, schema=pa.schema(schema_fields))
 
 
 def _source_parquet_provenance(path: Path) -> dict[str, Any]:
@@ -357,6 +553,8 @@ def _source_parquet_provenance(path: Path) -> dict[str, Any]:
 def _preserve_source_parquet_schema_metadata(
     parquet_path: Path,
     source_schema: pa.Schema,
+    *,
+    metadata_updates: Mapping[bytes, bytes] | None = None,
 ) -> None:
     """Reattach source Arrow metadata after DuckDB writes a filtered file.
 
@@ -380,7 +578,9 @@ def _preserve_source_parquet_schema_metadata(
                 metadata=field_metadata,
             )
         )
-    preserved_schema = pa.schema(fields, metadata=source_schema.metadata)
+    schema_metadata = dict(source_schema.metadata or {})
+    schema_metadata.update(metadata_updates or {})
+    preserved_schema = pa.schema(fields, metadata=schema_metadata)
     if preserved_schema.equals(written_schema, check_metadata=True):
         parquet_file.close()
         return
@@ -389,7 +589,9 @@ def _preserve_source_parquet_schema_metadata(
         f".{parquet_path.name}.{uuid4().hex}.metadata.tmp"
     )
     try:
-        with pq.ParquetWriter(temp_path, preserved_schema, compression="snappy") as writer:
+        with pq.ParquetWriter(
+            temp_path, preserved_schema, compression="snappy"
+        ) as writer:
             for batch in parquet_file.iter_batches(batch_size=65_536):
                 writer.write_batch(
                     pa.RecordBatch.from_arrays(batch.columns, schema=preserved_schema)
@@ -412,16 +614,31 @@ def export_filtered_project_neuron_parquet(
     source_path = Path(source_parquet_path)
     output = Path(output_path)
     table_state_payload = _normalise_table_state(table_state)
-    selected_rows = _selected_table_rows(table_state_payload)
-    if not selected_rows:
-        raise ValueError("Save Project requires at least one neuron in the data table.")
-
     schema = pq.read_schema(source_path)
     if "file_id" not in schema.names:
         raise ValueError("Project neuron Parquet requires a file_id column.")
 
+    store = _cluster_store_from_table_state(table_state_payload)
+    owned_columns = _app_owned_cluster_columns(schema)
+    resolved_columns = _resolved_assignment_columns(
+        store,
+        schema.names,
+        replaceable_columns=owned_columns,
+    )
+    assignment_columns = [
+        resolved_columns[assignment.assignment_id] for assignment in store.sets()
+    ]
+    selected_rows = _selected_table_rows(
+        table_state_payload,
+        resolved_columns=resolved_columns,
+    )
+    if not selected_rows:
+        raise ValueError("Save Project requires at least one neuron in the data table.")
+
     source_columns = [
-        name for name in schema.names if name not in ENHANCED_NEURON_COLUMNS
+        name
+        for name in schema.names
+        if name not in ENHANCED_NEURON_COLUMNS and name not in owned_columns
     ]
     select_parts = [
         f"src.{_quote_identifier(name)} AS {_quote_identifier(name)}"
@@ -429,7 +646,7 @@ def export_filtered_project_neuron_parquet(
     ]
     select_parts.extend(
         f"sel.{_quote_identifier(column)} AS {_quote_identifier(column)}"
-        for column in ENHANCED_NEURON_COLUMNS
+        for column in (*ENHANCED_NEURON_COLUMNS, *assignment_columns)
     )
 
     order_parts = ["sel.row_order", 'CAST(src."file_id" AS VARCHAR)']
@@ -447,7 +664,13 @@ def export_filtered_project_neuron_parquet(
 
     conn = duckdb.connect()
     try:
-        conn.register("selected_neurons", _selected_rows_arrow_table(selected_rows))
+        conn.register(
+            "selected_neurons",
+            _selected_rows_arrow_table(
+                selected_rows,
+                assignment_columns=assignment_columns,
+            ),
+        )
         conn.execute(
             f"""
             COPY (
@@ -464,14 +687,47 @@ def export_filtered_project_neuron_parquet(
     finally:
         conn.close()
 
-    _preserve_source_parquet_schema_metadata(write_target, schema)
+    export_table_state = _table_state_with_resolved_columns(
+        table_state_payload,
+        resolved_columns,
+    )
+    metadata_payload = _enhanced_parquet_payload(
+        source_parquet_path=source_path,
+        table_state=export_table_state,
+        metadata={"project_subset": True},
+    )
+    _preserve_source_parquet_schema_metadata(
+        write_target,
+        schema,
+        metadata_updates={
+            f"{PROJECT_METADATA_PREFIX}version".encode("utf-8"): (
+                PROJECT_FORMAT_VERSION.encode("utf-8")
+            ),
+            f"{PROJECT_METADATA_PREFIX}metadata_json".encode("utf-8"): (
+                json.dumps(_json_safe(metadata_payload), sort_keys=True).encode("utf-8")
+            ),
+        },
+    )
     if replace_output:
         write_target.replace(output)
     return output
 
 
-def _table_state_from_enhanced_columns(parquet_path: Path, schema: pa.Schema) -> dict[str, Any]:
+def _table_state_from_enhanced_columns(
+    parquet_path: Path,
+    schema: pa.Schema,
+) -> dict[str, Any]:
+    legacy_cluster_column = next(
+        (
+            column
+            for column in ("cluster_assignment", "cluster_id")
+            if column in schema.names
+        ),
+        None,
+    )
     available = [column for column in ENHANCED_NEURON_COLUMNS if column in schema.names]
+    if legacy_cluster_column == "cluster_id":
+        available.append("cluster_id")
     if not available or "file_id" not in schema.names:
         return {"version": PROJECT_FORMAT_VERSION, "entries": []}
 
@@ -485,8 +741,11 @@ def _table_state_from_enhanced_columns(parquet_path: Path, schema: pa.Schema) ->
             select_parts.append(f"MAX(CAST({column} AS VARCHAR)) AS {column}")
         else:
             select_parts.append(f"NULL AS {column}")
-    if "cluster_assignment" in schema.names:
-        select_parts.append("MAX(CAST(cluster_assignment AS INTEGER)) AS cluster_assignment")
+    if legacy_cluster_column is not None:
+        select_parts.append(
+            f"MAX(CAST({_quote_identifier(legacy_cluster_column)} AS INTEGER)) "
+            "AS cluster_assignment"
+        )
     else:
         select_parts.append("NULL AS cluster_assignment")
 
@@ -545,9 +804,23 @@ def read_enhanced_parquet_metadata(parquet_path: str | Path) -> dict[str, Any]:
     if "table_state" not in payload:
         payload["table_state"] = _table_state_from_enhanced_columns(path, schema)
     payload["has_project_metadata"] = json_key in metadata
-    payload["enhanced_columns"] = [
+    enhanced_columns = [
         column for column in ENHANCED_NEURON_COLUMNS if column in schema.names
     ]
+    table_state = payload.get("table_state", {})
+    assignment_state = (
+        table_state.get("cluster_assignments", {})
+        if isinstance(table_state, Mapping)
+        else {}
+    )
+    if isinstance(assignment_state, Mapping):
+        for raw_set in assignment_state.get("sets", []):
+            if not isinstance(raw_set, Mapping):
+                continue
+            column_name = raw_set.get("column_name")
+            if column_name in schema.names and column_name not in enhanced_columns:
+                enhanced_columns.append(str(column_name))
+    payload["enhanced_columns"] = enhanced_columns
     return payload
 
 
@@ -657,9 +930,7 @@ def _source_neuron_sets(
         "source_heatmap_kind": metadata.get("heatmap_kind"),
         "count": len(file_ids),
         "derivation": {
-            key: metadata.get(key)
-            for key in derivation_keys
-            if key in metadata
+            key: metadata.get(key) for key in derivation_keys if key in metadata
         },
     }
     payload.update(_write_source_file_ids(layer_dir, layer_id, file_ids))
@@ -713,7 +984,10 @@ def _serialize_colormap(colormap: Any) -> dict[str, Any] | None:
 
     colors = getattr(colormap, "colors", None)
     if colors is None:
-        return {"type": "named_colormap", "name": getattr(colormap, "name", str(colormap))}
+        return {
+            "type": "named_colormap",
+            "name": getattr(colormap, "name", str(colormap)),
+        }
 
     interpolation = getattr(colormap, "interpolation", None)
     return {
@@ -777,21 +1051,101 @@ def _layer_metadata_payload(
     }
 
 
-def save_project_bundle(
-    bundle_path: str | Path,
+def _recognized_project_bundle_error(bundle: Path) -> str | None:
+    """Return why *bundle* is unsafe to overwrite, or ``None`` if recognized."""
+    if bundle.is_symlink():
+        return f"Project overwrite target must not be a symlink: {bundle}"
+    if not bundle.exists():
+        return f"Project overwrite target does not exist: {bundle}"
+    if not bundle.is_dir():
+        return f"Project overwrite target is not a directory: {bundle}"
+    if bundle.suffix.lower() != ".swcv":
+        return f"Project overwrite target must end in .swcv: {bundle}"
+
+    manifest_path = bundle / "manifest.json"
+    try:
+        manifest = _read_json(manifest_path)
+    except (OSError, ValueError) as exc:
+        return f"Project overwrite target has no readable manifest: {bundle} ({exc})"
+    if manifest.get("format") != PROJECT_BUNDLE_FORMAT:
+        return f"Directory is not an SWC Viewer project: {bundle}"
+    return None
+
+
+def is_recognized_project_bundle(bundle_path: str | Path) -> bool:
+    """Return whether a directory is safe for project overwrite operations."""
+    return _recognized_project_bundle_error(Path(bundle_path)) is None
+
+
+def _temporary_bundle_sibling(bundle: Path, purpose: str) -> Path:
+    """Return a unique hidden sibling path used during project publication."""
+    return bundle.with_name(f".{bundle.name}.{uuid4().hex}.{purpose}")
+
+
+def _remove_temporary_bundle(path: Path, *, purpose: str) -> None:
+    """Best-effort cleanup for a temporary project directory."""
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError:
+        logger.warning("Could not remove %s at %s", purpose, path, exc_info=True)
+
+
+def _publish_project_bundle(
+    staged_bundle: Path,
+    bundle: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Publish a complete staged bundle, restoring the old bundle on failure."""
+    if not overwrite:
+        staged_bundle.rename(bundle)
+        return
+
+    rollback_bundle = _temporary_bundle_sibling(bundle, "rollback")
+    bundle.rename(rollback_bundle)
+    try:
+        staged_bundle.rename(bundle)
+    except Exception as publish_error:
+        try:
+            rollback_bundle.rename(bundle)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "Failed to publish the replacement project and could not restore "
+                f"the original. The original project remains at {rollback_bundle}: "
+                f"{rollback_error}"
+            ) from publish_error
+        raise
+
+    if rollback_bundle.exists():
+        try:
+            shutil.rmtree(rollback_bundle)
+        except OSError:
+            logger.warning(
+                "Saved replacement project, but could not remove the previous "
+                "project bundle at %s",
+                rollback_bundle,
+                exc_info=True,
+            )
+
+
+def _write_project_bundle_contents(
+    bundle: Path,
     *,
     source_parquet_path: str | Path,
-    table_state: Mapping[str, Any] | Sequence[Any] | None = None,
-    layers: Iterable[Any] = (),
-    atlas_name: str | None = None,
-    analysis_metadata: Mapping[str, Any] | None = None,
-    flatmap_cache_reference: Mapping[str, Any] | None = None,
-    progress_callback: _ProgressCallback | None = None,
-) -> Path:
-    """Save layer state and an optional external flatmap-cache reference."""
-    bundle = Path(bundle_path)
-    app_layers = [layer for layer in layers if _is_app_created_layer(layer)]
-    total_steps = 4 + len(app_layers)
+    table_state: Mapping[str, Any] | Sequence[Any] | None,
+    app_layers: Sequence[Any],
+    atlas_name: str | None,
+    analysis_metadata: Mapping[str, Any] | None,
+    flatmap_cache_reference: Mapping[str, Any] | None,
+    progress_callback: _ProgressCallback | None,
+    total_steps: int,
+) -> None:
+    """Write a complete project bundle into an unpublished directory."""
     _emit_progress(progress_callback, "Preparing project bundle...", 0, total_steps)
 
     source_path = Path(source_parquet_path)
@@ -799,6 +1153,21 @@ def save_project_bundle(
     selected_rows = _selected_table_rows(table_state_payload)
     if not selected_rows:
         raise ValueError("Save Project requires at least one neuron in the data table.")
+    table_state_payload = _filter_table_state_assignments(
+        table_state_payload,
+        [row["file_id"] for row in selected_rows],
+    )
+    source_schema = pq.read_schema(source_path)
+    store = _cluster_store_from_table_state(table_state_payload)
+    resolved_columns = _resolved_assignment_columns(
+        store,
+        source_schema.names,
+        replaceable_columns=_app_owned_cluster_columns(source_schema),
+    )
+    table_state_payload = _table_state_with_resolved_columns(
+        table_state_payload,
+        resolved_columns,
+    )
 
     data_dir = bundle / "data"
     layers_dir = bundle / "layers"
@@ -857,7 +1226,9 @@ def save_project_bundle(
             }
         )
 
-    _emit_progress(progress_callback, "Writing project manifest...", total_steps - 1, total_steps)
+    _emit_progress(
+        progress_callback, "Writing project manifest...", total_steps - 1, total_steps
+    )
     manifest = {
         "format": PROJECT_BUNDLE_FORMAT,
         "version": PROJECT_FORMAT_VERSION,
@@ -882,6 +1253,55 @@ def save_project_bundle(
         # The reference is informational and may be relocated by the user.
         manifest["flatmap_cache"] = dict(flatmap_cache_reference)
     _write_json(bundle / "manifest.json", manifest)
+
+
+def save_project_bundle(
+    bundle_path: str | Path,
+    *,
+    source_parquet_path: str | Path,
+    table_state: Mapping[str, Any] | Sequence[Any] | None = None,
+    layers: Iterable[Any] = (),
+    atlas_name: str | None = None,
+    analysis_metadata: Mapping[str, Any] | None = None,
+    flatmap_cache_reference: Mapping[str, Any] | None = None,
+    progress_callback: _ProgressCallback | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Save a complete project bundle, optionally replacing a recognized bundle."""
+    bundle = Path(bundle_path)
+    if overwrite:
+        error = _recognized_project_bundle_error(bundle)
+        if error is not None:
+            if not bundle.exists() and not bundle.is_symlink():
+                raise FileNotFoundError(error)
+            raise ValueError(error)
+    elif bundle.exists() or bundle.is_symlink():
+        raise FileExistsError(
+            f"Project destination already exists: {bundle}. "
+            "Choose a new destination or overwrite the current project."
+        )
+
+    app_layers = [layer for layer in layers if _is_app_created_layer(layer)]
+    total_steps = 4 + len(app_layers)
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    staged_bundle = _temporary_bundle_sibling(bundle, "staging")
+    try:
+        _write_project_bundle_contents(
+            staged_bundle,
+            source_parquet_path=source_parquet_path,
+            table_state=table_state,
+            app_layers=app_layers,
+            atlas_name=atlas_name,
+            analysis_metadata=analysis_metadata,
+            flatmap_cache_reference=flatmap_cache_reference,
+            progress_callback=progress_callback,
+            total_steps=total_steps,
+        )
+        _publish_project_bundle(staged_bundle, bundle, overwrite=overwrite)
+    except Exception:
+        _remove_temporary_bundle(staged_bundle, purpose="staged project bundle")
+        raise
+
     _emit_progress(progress_callback, "Done", total_steps, total_steps)
     return bundle
 
@@ -911,7 +1331,9 @@ def load_project_bundle(bundle_path: str | Path) -> ProjectBundle:
         data_path = bundle / str(layer_ref.get("data_path", ""))
         metadata_path = bundle / str(layer_ref.get("metadata_path", ""))
         if not data_path.exists() or not metadata_path.exists():
-            raise FileNotFoundError(f"Project layer files are incomplete for {layer_id}.")
+            raise FileNotFoundError(
+                f"Project layer files are incomplete for {layer_id}."
+            )
         loaded_layers.append(
             ProjectLayer(
                 layer_id=layer_id,

@@ -93,7 +93,9 @@ def _rendered_binned_nodes(
     table = projected_nodes.copy()
 
     render_valid = table["render_valid"].fillna(False).astype(bool).to_numpy()
-    depth_bins = pd.to_numeric(table["depth_bin"], errors="coerce").to_numpy(dtype=float)
+    depth_bins = pd.to_numeric(table["depth_bin"], errors="coerce").to_numpy(
+        dtype=float
+    )
     y_bins = pd.to_numeric(table["y_flat_bin"], errors="coerce").to_numpy(dtype=float)
     x_bins = pd.to_numeric(table["x_flat_bin"], errors="coerce").to_numpy(dtype=float)
     finite_bins = np.isfinite(depth_bins) & np.isfinite(y_bins) & np.isfinite(x_bins)
@@ -161,7 +163,9 @@ def build_flatmap_count_matrix(
     rendered_ids = set(rendered["_flatmap_file_id"].tolist())
     neuron_ids = [file_id for file_id in input_file_ids if file_id in rendered_ids]
     if not neuron_ids:
-        neuron_ids = list(_unique_strings_in_order(rendered["_flatmap_file_id"].tolist()))
+        neuron_ids = list(
+            _unique_strings_in_order(rendered["_flatmap_file_id"].tolist())
+        )
 
     unassigned = [file_id for file_id in input_file_ids if file_id not in rendered_ids]
     counts = (
@@ -207,13 +211,13 @@ def pearson_correlation_from_counts(count_matrix: np.ndarray) -> np.ndarray:
     return np.clip(corr, -1.0, 1.0).astype(np.float32)
 
 
-def query_flatmap_soma_coordinates(
+def query_flatmap_soma_coordinates_and_count(
     parquet_path: str,
     *,
     style: str,
     file_ids: list[str] | None = None,
-) -> tuple[list[str], np.ndarray]:
-    """Return per-neuron soma coordinates in flatmap + depth space.
+) -> tuple[list[str], np.ndarray, int]:
+    """Return per-neuron flatmap soma coordinates and contributing row count.
 
     Averages the flatmap ``x``/``y`` and ``depth_um`` of each neuron's soma
     nodes (``type == 1``) that have valid flatmap and depth projections, using
@@ -236,7 +240,7 @@ def query_flatmap_soma_coordinates(
     suffix = _style_suffix(style)
     file_filter = _file_id_filter(file_ids)
     if file_filter is None:
-        return [], np.empty((0, 3), dtype=float)
+        return [], np.empty((0, 3), dtype=float), 0
     file_filter_sql, params = file_filter
 
     conn = duckdb.connect()
@@ -272,7 +276,8 @@ def query_flatmap_soma_coordinates(
                 file_id,
                 AVG({x_ref}) AS x_flat,
                 AVG({y_ref}) AS y_flat,
-                AVG(depth_um) AS depth_um
+                AVG(depth_um) AS depth_um,
+                COUNT(*)::BIGINT AS soma_node_count
             FROM {source_sql}
             WHERE {where_sql}
             GROUP BY file_id
@@ -287,12 +292,28 @@ def query_flatmap_soma_coordinates(
         conn.close()
 
     if soma_df.empty:
-        return [], np.empty((0, 3), dtype=float)
+        return [], np.empty((0, 3), dtype=float), 0
 
     coords = soma_df[["x_flat", "y_flat", "depth_um"]].to_numpy(dtype=float)
     finite = np.all(np.isfinite(coords), axis=1)
     coords = coords[finite]
     ids = soma_df["file_id"].astype(str).to_numpy()[finite].tolist()
+    node_count = int(soma_df.loc[finite, "soma_node_count"].sum())
+    return ids, coords, node_count
+
+
+def query_flatmap_soma_coordinates(
+    parquet_path: str,
+    *,
+    style: str,
+    file_ids: list[str] | None = None,
+) -> tuple[list[str], np.ndarray]:
+    """Return per-neuron soma coordinates in flatmap + depth space."""
+    ids, coords, _node_count = query_flatmap_soma_coordinates_and_count(
+        parquet_path,
+        style=style,
+        file_ids=file_ids,
+    )
     return ids, coords
 
 
@@ -417,6 +438,83 @@ def build_flatmap_count_matrix_from_bin_counts(
         rendered_node_count=int(node_counts.sum()),
         unassigned_neuron_ids=unassigned,
     )
+
+
+def count_flatmap_voxel_correlation_nodes(
+    parquet_path: str,
+    *,
+    style: str,
+    xy_bins: int,
+    depth_bin_um: float,
+    include_depth_minus_one: bool = True,
+    file_ids: list[str] | None = None,
+) -> int:
+    """Return the exact rendered-node count for flatmap voxel correlation."""
+    import duckdb
+
+    from ..flatmap_heatmap import (
+        MAX_FLATMAP_HEATMAP_VOXELS,
+        _combine_where,
+        _depth_bin_count,
+        _duckdb_column_names,
+        _duckdb_source_path,
+        _file_id_filter,
+        _flatmap_sql_expressions,
+        _nondegenerate_bounds,
+        _style_suffix,
+        _validate_resolution,
+    )
+
+    suffix = _style_suffix(style)
+    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
+    x_bounds, y_bounds, depth_range = _resolve_flatmap_render_bounds(
+        parquet_path, style, suffix
+    )
+    x_lower, x_upper = _nondegenerate_bounds(*x_bounds)
+    y_lower, y_upper = _nondegenerate_bounds(*y_bounds)
+    depth_lower, depth_upper = _nondegenerate_bounds(*depth_range)
+    valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
+    sentinel_offset = 1 if include_depth_minus_one else 0
+    total_depth_bins = valid_depth_bins + sentinel_offset
+    if total_depth_bins * xy_bins * xy_bins > MAX_FLATMAP_HEATMAP_VOXELS:
+        raise ValueError(
+            "Flatmap voxel grid is too large: "
+            f"{total_depth_bins}x{xy_bins}x{xy_bins} voxels. "
+            "Use fewer XY bins or a larger depth bin."
+        )
+
+    file_filter = _file_id_filter(file_ids)
+    if file_filter is None:
+        return 0
+    file_filter_sql, params = file_filter
+
+    conn = duckdb.connect()
+    try:
+        source_sql = f"read_parquet('{_duckdb_source_path(parquet_path)}')"
+        expressions = _flatmap_sql_expressions(
+            _duckdb_column_names(conn, source_sql),
+            suffix=suffix,
+            x_lower=x_lower,
+            x_upper=x_upper,
+            y_lower=y_lower,
+            y_upper=y_upper,
+            depth_lower=depth_lower,
+            depth_bin_um=depth_bin_um,
+            xy_bins=xy_bins,
+            valid_depth_bins=valid_depth_bins,
+            sentinel_offset=sentinel_offset,
+            include_depth_minus_one=include_depth_minus_one,
+        )
+        where_sql = _combine_where(expressions["render_where"], file_filter_sql)
+        query = f"SELECT COUNT(*) FROM {source_sql} WHERE {where_sql}"
+        row = (
+            conn.execute(query, params).fetchone()
+            if params
+            else conn.execute(query).fetchone()
+        )
+    finally:
+        conn.close()
+    return int(row[0] or 0) if row is not None else 0
 
 
 def compute_flatmap_voxel_correlation_from_parquet(

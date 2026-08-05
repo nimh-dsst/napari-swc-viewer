@@ -15,7 +15,10 @@ import pandas as pd
 import pytest
 
 from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
-from napari_swc_viewer.neuron_table_ops import ClusterFilterSelection
+from napari_swc_viewer.neuron_table_ops import (
+    ClusterFilterSelection,
+    turbo_colors_for_file_ids,
+)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -153,6 +156,7 @@ for _name, _value in {
     "QHBoxLayout": _FakeWidget,
     "QLabel": _FakeWidget,
     "QListWidget": _FakeWidget,
+    "QMenu": _FakeWidget,
     "QProgressBar": _FakeWidget,
     "QPushButton": _FakeWidget,
     "QScrollArea": _FakeWidget,
@@ -567,6 +571,32 @@ class _DummyButton:
 
     def setText(self, value: str) -> None:
         self.text = value
+
+
+class _DummyMenuAction:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.triggered = _DummySignal()
+
+
+class _DummyMenu:
+    def __init__(self, parent=None) -> None:
+        self.parent = parent
+        self.actions: list[_DummyMenuAction] = []
+
+    def addAction(self, text: str) -> _DummyMenuAction:
+        action = _DummyMenuAction(text)
+        self.actions.append(action)
+        return action
+
+
+class _DummyMenuButton(_DummyButton):
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.menu = None
+
+    def setMenu(self, menu) -> None:
+        self.menu = menu
 
 
 class _DummyClusterFilterCombo:
@@ -4866,6 +4896,7 @@ def test_refresh_neuron_table_summary_formats_counts_and_clusters() -> None:
     widget = types.SimpleNamespace(
         _neuron_table=types.SimpleNamespace(summary=lambda: summary),
         _neuron_table_summary_label=_DummyLabel(),
+        _cluster_assignment_store=types.SimpleNamespace(active=None),
     )
 
     NeuronViewerWidget._refresh_neuron_table_summary(widget)
@@ -4884,6 +4915,8 @@ def test_on_cluster_colors_updated_sorts_and_refreshes_filters() -> None:
     )
     widget = types.SimpleNamespace(
         _neuron_table=neuron_table,
+        _refresh_cluster_assignment_controls=MagicMock(),
+        _active_assignment_color_map=MagicMock(return_value={}),
         _refresh_cluster_filter_controls=MagicMock(),
         _refresh_apply_existing_clusters_button=MagicMock(),
     )
@@ -4896,6 +4929,7 @@ def test_on_cluster_colors_updated_sorts_and_refreshes_filters() -> None:
         color_map,
     )
 
+    widget._refresh_cluster_assignment_controls.assert_called_once_with()
     neuron_table.update_cluster_assignments.assert_called_once_with(result)
     neuron_table.update_colors.assert_called_once_with(
         color_map,
@@ -5346,6 +5380,329 @@ def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_remov
     widget._update_layer_colors.assert_called_once_with({"n1": [0.2, 0.3, 0.4, 1.0]})
 
 
+def test_add_heatmap_menu_exposes_single_and_individual_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        NeuronViewerWidget._configure_selected_heatmap_menu.__globals__,
+        "QMenu",
+        _DummyMenu,
+    )
+    single = MagicMock()
+    individual = MagicMock()
+    widget = types.SimpleNamespace(
+        _add_selected_heatmap_btn=_DummyMenuButton("Add Heatmap"),
+        _add_selected_neurons_heatmap=single,
+        _add_selected_neurons_individual_heatmaps=individual,
+    )
+
+    NeuronViewerWidget._configure_selected_heatmap_menu(widget)
+
+    assert widget._add_selected_heatmap_btn.text == "Add Heatmap"
+    assert [action.text for action in widget._add_selected_heatmap_menu.actions] == [
+        "Single Heatmap",
+        "Individual Heatmaps",
+    ]
+    widget._add_single_heatmap_action.triggered.emit(False)
+    widget._add_individual_heatmaps_action.triggered.emit(False)
+    single.assert_called_once_with(False)
+    individual.assert_called_once_with(False)
+
+
+def _selected_heatmap_action_widget(table, atlas=None):
+    widget = types.SimpleNamespace(
+        _db=types.SimpleNamespace(parquet_path=Path("/tmp/neurons.parquet")),
+        _atlas=atlas
+        or types.SimpleNamespace(
+            annotation=np.zeros((2, 2, 2), dtype=np.uint8),
+            atlas_name="fake_atlas",
+        ),
+        _neuron_table=table,
+        _render_status_label=_DummyLabel(),
+        _selected_heatmap_running=lambda: False,
+        _start_selected_neuron_heatmap_requests=MagicMock(),
+    )
+    widget._selected_neuron_heatmap_selection = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_selection,
+        widget,
+    )
+    widget._individual_heatmap_estimated_bytes = (
+        NeuronViewerWidget._individual_heatmap_estimated_bytes
+    )
+    widget._selected_neuron_colors_are_monochrome = (
+        NeuronViewerWidget._selected_neuron_colors_are_monochrome
+    )
+    widget._confirm_large_individual_heatmap_request = MagicMock(return_value=True)
+    return widget
+
+
+def test_single_heatmap_action_snapshots_sorted_selection_in_one_request() -> None:
+    table = types.SimpleNamespace(get_selected_file_ids=lambda: ["n2", "n1"])
+    widget = _selected_heatmap_action_widget(table)
+
+    NeuronViewerWidget._add_selected_neurons_heatmap(widget)
+
+    requests = widget._start_selected_neuron_heatmap_requests.call_args.args[0]
+    assert len(requests) == 1
+    assert requests[0].file_ids == ("n1", "n2")
+    assert requests[0].creation_mode == "single"
+    assert requests[0].color is None
+
+
+def test_individual_heatmaps_recolor_only_monochrome_selected_neurons() -> None:
+    initial_colors = {
+        "n1": [0.5, 0.5, 0.5, 1.0],
+        "n2": [0.5, 0.5, 0.5, 0.4],
+        "n3": [0.2, 0.3, 0.4, 1.0],
+    }
+    table = types.SimpleNamespace(
+        get_selected_file_ids=lambda: ["n2", "n1"],
+        get_color=lambda file_id: initial_colors[file_id],
+        update_colors=MagicMock(),
+    )
+    widget = _selected_heatmap_action_widget(table)
+
+    NeuronViewerWidget._add_selected_neurons_individual_heatmaps(widget)
+
+    expected_colors = turbo_colors_for_file_ids(["n1", "n2"])
+    table.update_colors.assert_called_once_with(expected_colors)
+    assert "n3" not in table.update_colors.call_args.args[0]
+    requests = widget._start_selected_neuron_heatmap_requests.call_args.args[0]
+    assert [request.file_ids for request in requests] == [("n1",), ("n2",)]
+    assert [request.creation_mode for request in requests] == [
+        "individual",
+        "individual",
+    ]
+    assert [request.color for request in requests] == [
+        tuple(expected_colors["n1"]),
+        tuple(expected_colors["n2"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "selected_file_ids, colors",
+    [
+        (["n1"], {"n1": [0.5, 0.5, 0.5, 1.0]}),
+        (
+            ["n1", "n2"],
+            {
+                "n1": [1.0, 0.0, 0.0, 1.0],
+                "n2": [0.0, 1.0, 0.0, 1.0],
+            },
+        ),
+    ],
+)
+def test_individual_heatmaps_preserve_singleton_or_distinct_colors(
+    selected_file_ids: list[str],
+    colors: dict[str, list[float]],
+) -> None:
+    table = types.SimpleNamespace(
+        get_selected_file_ids=lambda: list(selected_file_ids),
+        get_color=lambda file_id: colors[file_id],
+        update_colors=MagicMock(),
+    )
+    widget = _selected_heatmap_action_widget(table)
+
+    NeuronViewerWidget._add_selected_neurons_individual_heatmaps(widget)
+
+    table.update_colors.assert_not_called()
+    requests = widget._start_selected_neuron_heatmap_requests.call_args.args[0]
+    assert [request.color for request in requests] == [
+        tuple(colors[file_id]) for file_id in sorted(selected_file_ids)
+    ]
+
+
+def test_large_individual_heatmap_cancellation_changes_nothing() -> None:
+    table = types.SimpleNamespace(
+        get_selected_file_ids=lambda: ["n1", "n2"],
+        get_color=MagicMock(),
+        update_colors=MagicMock(),
+    )
+    atlas = types.SimpleNamespace(
+        annotation=types.SimpleNamespace(shape=(1024, 1024, 129)),
+        atlas_name="fake_atlas",
+    )
+    widget = _selected_heatmap_action_widget(table, atlas=atlas)
+    widget._confirm_large_individual_heatmap_request.return_value = False
+
+    NeuronViewerWidget._add_selected_neurons_individual_heatmaps(widget)
+
+    widget._confirm_large_individual_heatmap_request.assert_called_once()
+    table.get_color.assert_not_called()
+    table.update_colors.assert_not_called()
+    widget._start_selected_neuron_heatmap_requests.assert_not_called()
+    assert "cancelled" in widget._render_status_label.text
+
+
+def test_individual_heatmap_memory_estimate_uses_float32_atlas_volumes() -> None:
+    atlas = types.SimpleNamespace(annotation=np.zeros((2, 3, 4), dtype=np.uint8))
+
+    estimated = NeuronViewerWidget._individual_heatmap_estimated_bytes(atlas, 5)
+
+    assert estimated == 2 * 3 * 4 * 4 * 5
+    warning = NeuronViewerWidget._individual_heatmap_memory_warning_text(
+        5,
+        2 * 1024**3,
+    )
+    assert "5 individual heatmaps" in warning
+    assert "2.00 GiB" in warning
+
+
+def _selected_heatmap_request(
+    file_id: str,
+    *,
+    creation_mode: str = "individual",
+):
+    request_type = (
+        NeuronViewerWidget._start_selected_neuron_heatmap_requests.__globals__[
+            "_SelectedNeuronHeatmapRequest"
+        ]
+    )
+    return request_type(
+        file_ids=(file_id,),
+        creation_mode=creation_mode,
+        color=(0.1, 0.2, 0.3, 1.0) if creation_mode == "individual" else None,
+    )
+
+
+def test_selected_heatmap_request_queue_initializes_and_starts_first() -> None:
+    requests = [_selected_heatmap_request("n1"), _selected_heatmap_request("n2")]
+    widget = types.SimpleNamespace(
+        _render_progress=_DummyProgressBar(),
+        _update_selected_neuron_heatmap_controls=MagicMock(),
+        _start_next_selected_neuron_heatmap_request=MagicMock(),
+    )
+
+    NeuronViewerWidget._start_selected_neuron_heatmap_requests(widget, requests)
+
+    assert widget._selected_heatmap_pending_requests == requests
+    assert widget._selected_heatmap_completed_requests == []
+    assert widget._selected_heatmap_total == 2
+    assert widget._selected_heatmap_index == 0
+    assert widget._selected_heatmap_failed is False
+    assert widget._render_progress.visible is True
+    widget._update_selected_neuron_heatmap_controls.assert_called_once_with()
+    widget._start_next_selected_neuron_heatmap_request.assert_called_once_with()
+
+
+def test_selected_heatmap_button_stays_disabled_while_queue_is_pending() -> None:
+    widget = types.SimpleNamespace(
+        _selected_heatmap_thread=None,
+        _selected_heatmap_current_request=None,
+        _selected_heatmap_pending_requests=[_selected_heatmap_request("n1")],
+        _add_selected_heatmap_btn=_DummyButton(),
+    )
+    widget._selected_heatmap_running = types.MethodType(
+        NeuronViewerWidget._selected_heatmap_running,
+        widget,
+    )
+
+    NeuronViewerWidget._update_selected_neuron_heatmap_controls(widget)
+    assert widget._add_selected_heatmap_btn.enabled is False
+
+    widget._selected_heatmap_pending_requests = []
+    NeuronViewerWidget._update_selected_neuron_heatmap_controls(widget)
+    assert widget._add_selected_heatmap_btn.enabled is True
+
+
+def test_selected_heatmap_queue_starts_singleton_requests_in_order() -> None:
+    first = _selected_heatmap_request("n1")
+    second = _selected_heatmap_request("n2")
+    widget = types.SimpleNamespace(
+        _selected_heatmap_pending_requests=[first, second],
+        _selected_heatmap_completed_requests=[],
+        _start_selected_neuron_heatmap=MagicMock(),
+    )
+
+    NeuronViewerWidget._start_next_selected_neuron_heatmap_request(widget)
+
+    assert widget._selected_heatmap_current_request is first
+    assert widget._selected_heatmap_request_file_ids == ("n1",)
+    assert widget._selected_heatmap_pending_requests == [second]
+    assert widget._selected_heatmap_index == 1
+    widget._start_selected_neuron_heatmap.assert_called_once_with(first)
+
+
+def test_selected_heatmap_cleanup_advances_queue_before_enabling_button() -> None:
+    thread = object()
+    worker = object()
+    pending = _selected_heatmap_request("n2")
+    widget = types.SimpleNamespace(
+        _selected_heatmap_thread=thread,
+        _selected_heatmap_worker=worker,
+        _selected_heatmap_request_file_ids=("n1",),
+        _selected_heatmap_current_request=_selected_heatmap_request("n1"),
+        _selected_heatmap_pending_requests=[pending],
+        _selected_heatmap_completed_requests=[_selected_heatmap_request("n1")],
+        _selected_heatmap_failed=False,
+        _selected_heatmap_total=2,
+        _selected_heatmap_index=1,
+        _render_progress=_DummyProgressBar(),
+        _render_status_label=_DummyLabel(),
+        _start_next_selected_neuron_heatmap_request=MagicMock(),
+        _update_selected_neuron_heatmap_controls=MagicMock(),
+    )
+
+    NeuronViewerWidget._cleanup_selected_heatmap_thread(widget, thread, worker)
+
+    assert widget._selected_heatmap_thread is None
+    assert widget._selected_heatmap_worker is None
+    assert widget._selected_heatmap_current_request is None
+    widget._start_next_selected_neuron_heatmap_request.assert_called_once_with()
+    widget._update_selected_neuron_heatmap_controls.assert_not_called()
+
+
+def test_selected_heatmap_error_stops_pending_queue_and_reports_partial_result() -> (
+    None
+):
+    widget = types.SimpleNamespace(
+        _selected_heatmap_pending_requests=[_selected_heatmap_request("n3")],
+        _selected_heatmap_completed_requests=[_selected_heatmap_request("n1")],
+        _selected_heatmap_total=3,
+        _render_progress=_DummyProgressBar(),
+        _render_status_label=_DummyLabel(),
+    )
+
+    NeuronViewerWidget._on_selected_neuron_heatmap_error(widget, "query failed")
+
+    assert widget._selected_heatmap_failed is True
+    assert widget._selected_heatmap_pending_requests == []
+    assert widget._render_progress.visible is False
+    assert widget._render_status_label.text == (
+        "Error after 1/3 individual heatmaps: query failed"
+    )
+
+
+def test_selected_heatmap_cleanup_finishes_successful_batch() -> None:
+    thread = object()
+    worker = object()
+    completed = [_selected_heatmap_request("n1"), _selected_heatmap_request("n2")]
+    widget = types.SimpleNamespace(
+        _selected_heatmap_thread=thread,
+        _selected_heatmap_worker=worker,
+        _selected_heatmap_request_file_ids=("n2",),
+        _selected_heatmap_current_request=completed[-1],
+        _selected_heatmap_pending_requests=[],
+        _selected_heatmap_completed_requests=completed,
+        _selected_heatmap_failed=False,
+        _selected_heatmap_total=2,
+        _selected_heatmap_index=2,
+        _render_progress=_DummyProgressBar(),
+        _render_status_label=_DummyLabel(),
+        _update_selected_neuron_heatmap_controls=MagicMock(),
+    )
+
+    NeuronViewerWidget._cleanup_selected_heatmap_thread(widget, thread, worker)
+
+    assert widget._selected_heatmap_completed_requests == []
+    assert widget._selected_heatmap_total == 0
+    assert widget._render_progress.visible is False
+    assert (
+        widget._render_status_label.text == "Added 2 individual heatmaps to the scene."
+    )
+    widget._update_selected_neuron_heatmap_controls.assert_called_once_with()
+
+
 def test_selected_neuron_heatmap_layer_name_uses_greek_identifiers() -> None:
     viewer = _DummyViewer(ndisplay=3)
     viewer.layers.extend(
@@ -5433,6 +5790,58 @@ def test_add_selected_neuron_heatmap_layer_sets_single_selection_metadata() -> N
     assert layer.metadata["selection_count"] == 1
     assert layer.metadata["heatmap_source"] is True
     assert layer.metadata["heatmap_native_grid"] is True
+    assert layer.metadata["heatmap_creation_mode"] == "single"
+    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
+    assert layer.colormap == "hot"
+
+
+def test_add_individual_heatmap_layer_uses_neuron_color_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_colormaps(monkeypatch)
+    viewer = _DummyViewer(ndisplay=3)
+    widget = types.SimpleNamespace(
+        viewer=viewer,
+        _db=types.SimpleNamespace(parquet_path=Path("/tmp/neurons.parquet")),
+        _atlas=types.SimpleNamespace(atlas_name="fake_atlas"),
+        _opacity_slider=_DummyValueControl(60),
+    )
+    _bind_manual_heatmap_helpers(widget)
+    widget._next_manual_heatmap_identifier = types.MethodType(
+        NeuronViewerWidget._next_manual_heatmap_identifier,
+        widget,
+    )
+    widget._selected_neuron_heatmap_layer_name = types.MethodType(
+        NeuronViewerWidget._selected_neuron_heatmap_layer_name,
+        widget,
+    )
+    widget._current_atlas_name = types.MethodType(
+        NeuronViewerWidget._current_atlas_name,
+        widget,
+    )
+    color = (0.1, 0.2, 0.3, 0.4)
+
+    layer = NeuronViewerWidget._add_selected_neuron_heatmap_layer(
+        widget,
+        np.array([[[0.0, 5.0]]], dtype=np.float32),
+        ["n1"],
+        creation_mode="individual",
+        color=color,
+    )
+
+    assert layer.name == "alpha Heatmap"
+    assert layer.colormap.kwargs == {
+        "colors": [[0.0, 0.0, 0.0, 0.0], [0.1, 0.2, 0.3, 1.0]],
+        "name": "manual_heatmap_alpha",
+    }
+    assert layer.opacity == 0.6
+    assert layer.contrast_limits == (0.0, 1.0)
+    assert layer.metadata["file_ids"] == ["n1"]
+    assert layer.metadata["selection_count"] == 1
+    assert layer.metadata["heatmap_creation_mode"] == "individual"
+    assert layer.metadata["heatmap_contrast_limits"] == (0.0, 1.0)
+    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_20_percent_max"
+    assert layer.metadata["color"] == list(color)
 
 
 def test_current_selected_neuron_heatmap_layers_ignores_analysis_heatmaps() -> None:

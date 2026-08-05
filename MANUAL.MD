@@ -401,7 +401,20 @@ In the table you can:
 - Select rows to choose which neurons to render
 - Toggle per-neuron visibility (`Vis`)
 - Edit per-neuron color (color swatch)
-- Inspect subject and cluster columns
+- Inspect subject and every saved cluster-assignment column; blank assignment
+  cells mean that neuron was outside the run or was not assigned
+
+Cluster assignment controls:
+
+- `Cluster assignment` chooses the active saved run used by the cluster filter,
+  summary, rendered-neuron colors, flatmap grouping, and Analysis heatmaps
+- `Rename...` changes the display name without changing its portable Parquet
+  column name
+- `Delete` removes only the saved assignment after confirmation; it never
+  removes neuron rows, and the newest remaining assignment becomes active
+- `Export Enhanced Parquet...` writes every assignment as a nullable integer
+  column and keeps the active assignment in `cluster_assignment` for older
+  readers
 
 Buttons:
 
@@ -409,7 +422,19 @@ Buttons:
 - `Add Soma Only`: add currently selected neurons to the scene as soma-only, reusing the shared soma layers without full trace geometry.
 - `Remove Selected`: remove only currently selected neurons from the scene.
 - `Clear All`: remove all neuron layers.
-- `Add Heatmap`: create a heatmap from the currently selected table neurons.
+- `Add Heatmap`: open a menu for creating native-grid node-count heatmaps from
+  the currently selected table neurons.
+  - `Single Heatmap`: create one `hot` heatmap containing all selected neurons.
+  - `Individual Heatmaps`: create one Greek-named heatmap per selected neuron,
+    colored to match that neuron. If two or more selected neurons initially
+    have the same RGB color, they are first assigned distinct Turbo colors;
+    other table neurons are not recolored. Each individual layer initially
+    displays a contrast range from zero to 20% of its maximum node count so
+    lower-density structure remains visible; this can still be adjusted in
+    napari's layer controls.
+  - Individual heatmaps are built sequentially. If their estimated float32
+    image data exceeds 1 GiB, a confirmation defaults to `Cancel` before any
+    colors or layers change.
 - `Remove Selected From Table`: remove currently selected neuron rows from the table while keeping rendered scene layers.
 - `Remove Unselected from Table`: keep selected table rows and remove all other table rows, including rows hidden by active filters.
 - `Clear Table`: clear the table while keeping rendered scene layers.
@@ -470,17 +495,37 @@ For Soma Location, algorithm options:
 
 Common controls:
 
-- Target region acronym
+- Input neurons: `Whole Parquet`, `Current Table`, or `Selected Rows`
+- Target region: required for CCFv3 `Whole Parquet`; optional for CCFv3
+  `Current Table` and `Selected Rows`
 - Dilation %
 - Clusters (for non-DBSCAN modes)
 - Linkage method (hierarchical modes)
 - DBSCAN `eps` and `min_samples` when DBSCAN is selected
 
+The three CCFv3 input scopes retain independent target-region selections.
+When `Current Table` or `Selected Rows` shows `All regions (optional)`, the run
+uses all nodes in that table cohort. Selecting a target region restricts that
+cohort with the existing dilation setting. `Whole Parquet` does not run until
+at least one represented target region is selected. `Selected Rows` requires
+at least two visible selected table rows. Flat map + Depth clustering supports
+all three input scopes but does not expose region controls.
+
 Run:
 
-1. Click `Run Clustering`
+1. Click `Run Clustering`. Each completed run creates and activates a new named
+   assignment column, such as `Soma Location 1` or `Voxel Correlation 1`, while
+   retaining earlier columns.
+   Before clustering starts, the plugin counts the node rows that will actually
+   contribute. Runs over 10,000,000 nodes show the exact formatted count and ask
+   you to **Continue** or **Cancel**; cancellation creates no assignment.
 2. Optional: expand `Clustermap` and click `Build Dendrogram` to render the dendrogram and cluster map
 3. Click `Color Neurons by Cluster` to recolor rendered neuron layers
+
+Projects and Enhanced Parquet preserve assignment labels, palettes, cohorts,
+lineage, and run provenance. Projects do not store large clustering matrices,
+so dendrogram and distance exports show `Rerun required` after reload; filters,
+colors, grouping, and cluster heatmaps remain available.
 
 ### Node Count Heatmap
 

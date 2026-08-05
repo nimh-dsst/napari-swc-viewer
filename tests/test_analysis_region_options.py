@@ -10,12 +10,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
-import pandas as pd
 
 from napari_swc_viewer.analysis.clustering import (
     ClusterRegionSelection,
     ClusterResult,
 )
+from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
 
 
 class _BoundSignal:
@@ -387,9 +387,7 @@ class _DummyCollapsibleSection(_DummyWidget):
 
     instances: list["_DummyCollapsibleSection"] = []
 
-    def __init__(
-        self, title: str, *, expanded: bool = True, parent=None
-    ) -> None:
+    def __init__(self, title: str, *, expanded: bool = True, parent=None) -> None:
         super().__init__(parent)
         self.title = title
         self.expanded = expanded
@@ -436,12 +434,8 @@ class _DummyRegionSelector(_DummyWidget):
             return [int(self.selected[0])]
         return []
 
-    def set_allowed_structure_ids(
-        self, structure_ids: set[int] | None
-    ) -> None:
-        self.allowed_ids = (
-            None if structure_ids is None else set(structure_ids)
-        )
+    def set_allowed_structure_ids(self, structure_ids: set[int] | None) -> None:
+        self.allowed_ids = None if structure_ids is None else set(structure_ids)
 
     def set_atlas(self, atlas) -> None:
         self.atlas = atlas
@@ -770,9 +764,7 @@ def test_analysis_region_sections_are_collapsed_by_default():
     _widget = AnalysisTabWidget(_DummyViewer())
 
     titles = [section.title for section in _DummyCollapsibleSection.instances]
-    expanded = [
-        section.expanded for section in _DummyCollapsibleSection.instances
-    ]
+    expanded = [section.expanded for section in _DummyCollapsibleSection.instances]
 
     assert titles == [
         "Clustering",
@@ -805,8 +797,8 @@ def test_analysis_tab_defaults_to_ward_linkage_and_no_dilation():
     assert widget._dilation_spin.value() == 0
 
 
-def test_analysis_tab_search_scope_precedes_target_region_summary():
-    """Search scope should appear before the target region summary display."""
+def test_analysis_tab_input_scope_precedes_target_region_summary():
+    """Input-neuron scope should appear before the target region summary."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
 
@@ -818,7 +810,7 @@ def test_analysis_tab_search_scope_precedes_target_region_summary():
         and isinstance(child.children[0], _DummyLabel)
     ]
 
-    assert clustering_labels.index("Search scope:") < clustering_labels.index(
+    assert clustering_labels.index("Input neurons:") < clustering_labels.index(
         "Target region:"
     )
 
@@ -837,9 +829,7 @@ def test_analysis_tab_defaults_soma_distance_filter_off():
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
 
-    assert widget._heat_soma_radius_enabled_cb._text == (
-        "Filter by soma distance"
-    )
+    assert widget._heat_soma_radius_enabled_cb._text == ("Filter by soma distance")
     assert widget._heat_soma_radius_enabled_cb.isChecked() is False
     assert not widget._heat_soma_radius_spin.isEnabled()
 
@@ -1063,7 +1053,7 @@ def test_refresh_analysis_region_selectors_preserves_multiple_cluster_selections
 
 
 def test_active_cluster_selector_switches_with_scope() -> None:
-    """Clustering scope changes should swap between whole/current selectors."""
+    """Each clustering input scope should retain its own target selector."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
     structures = {
@@ -1072,8 +1062,10 @@ def test_active_cluster_selector_switches_with_scope() -> None:
     }
     widget._whole_parquet_cluster_region_selector._structure_map = structures
     widget._current_table_cluster_region_selector._structure_map = structures
+    widget._selected_rows_cluster_region_selector._structure_map = structures
     widget._whole_parquet_cluster_region_selector.select_region_by_id(184)
     widget._current_table_cluster_region_selector.select_region_by_id(500)
+    widget._selected_rows_cluster_region_selector.select_region_by_id(184)
 
     widget._cluster_region_scope_combo.setCurrentText("Whole Parquet")
 
@@ -1086,6 +1078,12 @@ def test_active_cluster_selector_switches_with_scope() -> None:
     assert widget._selected_cluster_region() == (500, "CP")
     assert widget._cluster_region_scope_stack.index == 1
     assert widget._cluster_region_summary_label.text() == "CP (Caudoputamen)"
+
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+
+    assert widget._selected_cluster_region() == (184, "FRP")
+    assert widget._cluster_region_scope_stack.index == 2
+    assert widget._cluster_region_summary_label.text() == "FRP (Frontal pole)"
 
 
 def test_represented_region_ids_for_selection_expands_parent_to_dataset_descendants():
@@ -1200,8 +1198,60 @@ def test_run_clustering_pipeline_current_scope_requires_nonempty_table() -> None
     widget._run_correlation_clustering.assert_not_called()
 
 
+def test_current_table_clustering_allows_no_target_region() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: ["n1", "n2"])
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._dilation_spin.setValue(40)
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.file_ids == ("n1", "n2")
+    assert request.region_selection is None
+    assert request.dilation_fraction == 0.0
+    assert widget._cluster_region_summary_label.text() == "All regions (optional)"
+    assert widget._cluster_region_target_label.text() == "Target region (optional):"
+
+
+def test_selected_rows_clustering_allows_no_target_region() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3"])
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.file_ids == ("n2", "n3")
+    assert request.region_selection is None
+
+
+def test_whole_parquet_clustering_still_requires_target_region() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._selected_cluster_region_selection = lambda: None
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    assert widget._progress_label.text() == "Select at least one target region."
+    widget._start_clustering_preflight.assert_not_called()
+
+
 def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -> None:
-    """Current-table clustering scope should pass the table subset into the worker launch."""
+    """Current-table clustering should snapshot its table subset for preflight."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
     widget = AnalysisTabWidget(_DummyViewer())
     widget._db = object()
@@ -1217,14 +1267,161 @@ def test_run_clustering_pipeline_passes_current_table_file_ids_to_clustering() -
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_soma_clustering = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     widget._run_clustering_pipeline()
 
-    widget._run_soma_clustering.assert_called_once_with(
-        selection,
-        0.35,
-        file_ids=["n1", "n2"],
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.region_selection == selection
+    assert request.dilation_fraction == 0.35
+    assert request.file_ids == ("n1", "n2")
+
+
+def test_run_clustering_pipeline_passes_selected_row_file_ids_to_clustering() -> None:
+    """Selected Rows should pass only explicit row selections into workers."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: ["n1", "n2", "n3"])
+    widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3", "n2"])
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.region_selection == selection
+    assert request.file_ids == ("n2", "n3")
+    assert widget._pending_cluster_context["input_scope"] == "selected"
+    assert widget._pending_cluster_context["input_file_ids"] == ["n2", "n3"]
+
+
+def test_ccf_voxel_clustering_passes_selected_row_file_ids() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_selected_table_file_ids_provider(lambda: ["n1", "n3"])
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    selection = ClusterRegionSelection(
+        selected_region_ids=[184],
+        selected_region_acronyms=["FRP"],
+        represented_region_ids=[68],
+        represented_region_acronyms=["FRP1"],
+    )
+    widget._selected_cluster_region_selection = lambda: selection
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.region_selection == selection
+    assert request.file_ids == ("n1", "n3")
+
+
+def test_selected_rows_clustering_requires_at_least_two_rows() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_selected_table_file_ids_provider(lambda: ["n1"])
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget._run_correlation_clustering = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    assert "Only one table row is selected" in widget._progress_label.text()
+    widget._run_correlation_clustering.assert_not_called()
+
+
+def _captured_unfiltered_request(widget):
+    widget._db = object()
+    widget._atlas = object()
+    widget.set_current_table_file_ids_provider(lambda: ["n1", "n2"])
+    widget._cluster_region_scope_combo.setCurrentText("Current Table")
+    widget._selected_cluster_region_selection = lambda: None
+    widget._start_clustering_preflight = MagicMock()
+    widget._run_clustering_pipeline()
+    return widget._start_clustering_preflight.call_args.args[0]
+
+
+def test_large_clustering_warning_text_formats_node_count() -> None:
+    module = _import_analysis_tab_module()
+
+    assert module._large_clustering_warning_text(10_000_001) == (
+        "This clustering run will process 10,000,001 nodes, which exceeds the "
+        "10,000,000-node warning threshold. Continue?"
+    )
+
+
+def test_preflight_at_threshold_launches_without_warning() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    request = _captured_unfiltered_request(widget)
+    widget._pending_clustering_request = request
+    widget._pending_clustering_preflight = types.SimpleNamespace(
+        node_count=10_000_000,
+        voxel_id_map=None,
+    )
+    widget._confirm_large_clustering_run = MagicMock(return_value=False)
+    widget._launch_clustering_request = MagicMock()
+
+    widget._on_clustering_preflight_thread_finished()
+
+    widget._confirm_large_clustering_run.assert_not_called()
+    widget._launch_clustering_request.assert_called_once_with(request, None)
+
+
+def test_large_preflight_can_cancel_without_launching() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    request = _captured_unfiltered_request(widget)
+    widget._pending_clustering_request = request
+    widget._pending_clustering_preflight = types.SimpleNamespace(
+        node_count=10_000_001,
+        voxel_id_map=None,
+    )
+    widget._confirm_large_clustering_run = MagicMock(return_value=False)
+    widget._launch_clustering_request = MagicMock()
+
+    widget._on_clustering_preflight_thread_finished()
+
+    widget._confirm_large_clustering_run.assert_called_once_with(10_000_001)
+    widget._launch_clustering_request.assert_not_called()
+    assert widget._progress_label.text() == (
+        "Clustering cancelled; 10,000,001 nodes would have been processed."
+    )
+    assert widget._pending_cluster_context == {}
+
+
+def test_large_preflight_confirmation_launches_prepared_request() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    request = _captured_unfiltered_request(widget)
+    voxel_id_map = np.zeros((2, 2, 2), dtype=np.int32)
+    widget._pending_clustering_request = request
+    widget._pending_clustering_preflight = types.SimpleNamespace(
+        node_count=10_500_000,
+        voxel_id_map=voxel_id_map,
+    )
+    widget._confirm_large_clustering_run = MagicMock(return_value=True)
+    widget._launch_clustering_request = MagicMock()
+
+    widget._on_clustering_preflight_thread_finished()
+
+    widget._launch_clustering_request.assert_called_once_with(
+        request,
+        voxel_id_map,
     )
 
 
@@ -1281,8 +1478,8 @@ def test_flatmap_voxel_hides_region_controls_and_shows_binning() -> None:
     widget._clustering_method_combo.setCurrentText("Voxel Correlation")
     widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
 
-    assert widget._cluster_region_scope_label._visible is False
-    assert widget._cluster_region_scope_combo._visible is False
+    assert widget._cluster_region_scope_label._visible is True
+    assert widget._cluster_region_scope_combo._visible is True
     assert widget._dilation_label._visible is False
     assert widget._dilation_spin._visible is False
     assert widget._flatmap_style_combo._visible is True
@@ -1321,17 +1518,13 @@ def test_ccf_voxel_correlation_unaffected_by_flatmap_availability() -> None:
         represented_region_acronyms=["FRP1"],
     )
     widget._selected_cluster_region_selection = lambda: selection
-    widget._run_correlation_clustering = MagicMock()
-    widget._run_flatmap_correlation_clustering = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     widget._run_clustering_pipeline()
 
-    widget._run_correlation_clustering.assert_called_once_with(
-        selection,
-        0.0,
-        file_ids=None,
-    )
-    widget._run_flatmap_correlation_clustering.assert_not_called()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.coordinate_space == "CCFv3 Coordinates"
+    assert request.region_selection == selection
 
 
 def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
@@ -1350,6 +1543,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
     widget._flatmap_depth_bin_spin.setValue(50.0)
     widget._flatmap_include_depth_minus_one_cb.setChecked(False)
     widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     created_workers = []
 
@@ -1362,9 +1556,14 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
     workers_module.FlatmapParquetCorrelationWorker = (
         _FakeFlatmapParquetCorrelationWorker
     )
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapSomaClusterWorker = object
+    workers_module.SomaClusterWorker = object
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
 
     assert len(created_workers) == 1
     assert created_workers[0].kwargs == {
@@ -1376,6 +1575,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
         "include_depth_minus_one": False,
         "linkage_method": "complete",
         "n_clusters": 7,
+        "file_ids": None,
     }
     widget._start_background_worker.assert_called_once_with(
         created_workers[0],
@@ -1399,6 +1599,7 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
     widget._eps_spin.setValue(120.0)
     widget._min_samples_spin.setValue(6)
     widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
 
     created_workers = []
 
@@ -1409,9 +1610,14 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
 
     workers_module = types.ModuleType("napari_swc_viewer.workers")
     workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapParquetCorrelationWorker = object
+    workers_module.SomaClusterWorker = object
     monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
 
     widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
 
     assert len(created_workers) == 1
     assert created_workers[0].kwargs == {
@@ -1423,11 +1629,86 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
         "n_clusters": 4,
         "eps": 120.0,
         "min_samples": 6,
+        "file_ids": None,
     }
     widget._start_background_worker.assert_called_once_with(
         created_workers[0],
         widget._on_correlation_finished,
     )
+
+
+def test_flatmap_selected_rows_scope_passes_file_ids_to_worker(monkeypatch) -> None:
+    """Flatmap clustering should honor the same Selected Rows scope."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3"])
+    widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
+    created_workers = []
+
+    class _FakeFlatmapParquetCorrelationWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapParquetCorrelationWorker = (
+        _FakeFlatmapParquetCorrelationWorker
+    )
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapSomaClusterWorker = object
+    workers_module.SomaClusterWorker = object
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+    widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
+
+    assert created_workers[0].kwargs["file_ids"] == ["n2", "n3"]
+    assert widget._pending_cluster_context["coordinate_space"] == ("Flat map + Depth")
+
+
+def test_flatmap_soma_selected_rows_scope_passes_file_ids_to_worker(
+    monkeypatch,
+) -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    widget._cluster_region_scope_combo.setCurrentText("Selected Rows")
+    widget.set_selected_table_file_ids_provider(lambda: ["n2", "n3"])
+    widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
+    created_workers = []
+
+    class _FakeFlatmapSomaClusterWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapParquetCorrelationWorker = object
+    workers_module.SomaClusterWorker = object
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+    widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    widget._launch_clustering_request(request, None)
+
+    assert created_workers[0].kwargs["file_ids"] == ["n2", "n3"]
 
 
 def test_update_button_states_enables_export_controls_after_clustering():
@@ -1493,8 +1774,8 @@ def test_on_correlation_finished_leaves_clustermap_unrendered():
     widget._update_button_states = lambda: None
     widget._update_cluster_filter_combo = lambda: None
     placeholder_messages: list[str] = []
-    widget._show_clustermap_message = lambda message: (
-        placeholder_messages.append(message)
+    widget._show_clustermap_message = lambda message: placeholder_messages.append(
+        message
     )
     draw_calls: list[object] = []
     widget._draw_clustermap = lambda result: draw_calls.append(result)
@@ -1527,9 +1808,7 @@ def test_render_clustermap_requires_button_press():
     result = types.SimpleNamespace()
     widget._last_cluster_result = result
     draw_calls: list[object] = []
-    widget._draw_clustermap = lambda cluster_result: draw_calls.append(
-        cluster_result
-    )
+    widget._draw_clustermap = lambda cluster_result: draw_calls.append(cluster_result)
 
     widget._render_clustermap_requested()
 
@@ -1570,7 +1849,96 @@ def test_on_correlation_finished_auto_colors_rendered_layers_and_emits_updates()
     assert color_array.shape == (8, 4)
     assert emitted == [(result, widget._cluster_color_map)]
     assert "Table updated and sorted by cluster." in widget._progress_label.text()
-    assert "Auto-colored 2/2 rendered neurons by cluster." in widget._progress_label.text()
+    assert (
+        "Auto-colored 2/2 rendered neurons by cluster." in widget._progress_label.text()
+    )
+
+
+def test_completed_selected_run_saves_sparse_assignment_and_lineage() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    store = ClusterAssignmentStore()
+    parent = store.add(
+        name="Soma Location 1",
+        assignments={"n1": 1, "n2": 1, "n3": 2},
+        input_file_ids=["n1", "n2", "n3"],
+    )
+    widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
+    widget._cluster_assignment_store = store
+    widget._pending_cluster_context = {
+        "method_name": "Voxel Correlation",
+        "input_scope": "selected",
+        "input_file_ids": ["n1", "n2"],
+        "coordinate_space": "CCFv3 Coordinates",
+        "parent_assignment_id": parent.assignment_id,
+        "parent_cluster_ids": [1],
+    }
+    widget._cluster_label_colors = {
+        1: [0.1, 0.2, 0.3, 1.0],
+        2: [0.8, 0.7, 0.6, 1.0],
+    }
+    result = ClusterResult(
+        correlation_matrix=np.eye(2, dtype=np.float32),
+        distance_matrix=np.zeros((2, 2), dtype=np.float32),
+        linkage_matrix=np.zeros((1, 4), dtype=np.float64),
+        neuron_ids=["n1", "n2"],
+        reorder_indices=np.array([0, 1], dtype=np.intp),
+        labels=np.array([2, 1], dtype=np.int32),
+    )
+
+    widget._save_cluster_assignment(result)
+
+    saved = store.active
+    assert saved is not None
+    assert saved.name == "Voxel Correlation 1"
+    assert saved.assignments == {"n1": 2, "n2": 1}
+    assert saved.label_for("n3") is None
+    assert saved.parent_assignment_id == parent.assignment_id
+    assert saved.parent_cluster_ids == (1,)
+    assert saved.runtime_result is result
+
+
+def test_restored_assignment_drives_heatmap_groups_without_runtime_matrices() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    store = ClusterAssignmentStore()
+    store.add(
+        name="Restored Groups",
+        assignments={"n1": 1, "n2": 2, "n3": 1},
+        input_file_ids=["n1", "n2", "n3"],
+        label_colors={
+            1: [0.1, 0.2, 0.3, 1.0],
+            2: [0.8, 0.7, 0.6, 1.0],
+        },
+    )
+
+    widget.set_cluster_assignment_store(store)
+
+    assert widget._last_cluster_result is None
+    assert widget._cluster_file_ids(1) == ("n1", "n3")
+    assert widget._heat_cluster_combo.count() == 3
+    assert "Rerun required" in widget._progress_label.text()
+
+
+def test_deleting_last_assignment_clears_live_analysis_result() -> None:
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    store = ClusterAssignmentStore()
+    assignment = store.add(
+        name="Soma Location 1",
+        assignments={"n1": 1, "n2": 2},
+        input_file_ids=["n1", "n2"],
+        runtime_result=object(),
+    )
+    widget.set_cluster_assignment_store(store)
+
+    store.delete(assignment.assignment_id)
+    widget.on_active_cluster_assignment_changed()
+
+    assert widget._last_cluster_result is None
+    assert widget._cluster_color_map is None
+    assert widget._heat_cluster_combo.count() == 1
+    assert not widget._save_distance_workbook_btn.isEnabled()
+    assert not widget._save_distance_workbook_btn.isEnabled()
 
 
 def test_has_cached_clusters_for_current_table_false_without_cache_or_provider():
@@ -1658,8 +2026,7 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
 
     layer = widget._heatmap_layer
     assert layer.name == (
-        "Cluster 1 CH (Basal dendrite + Apical dendrite, "
-        "100 μm soma radius) Heatmap"
+        "Cluster 1 CH (Basal dendrite + Apical dendrite, 100 μm soma radius) Heatmap"
     )
     assert layer.contrast_limits == (0.0, 7.0)
     assert layer.contrast_limits_range == (0.0, 7.0)
@@ -1677,9 +2044,7 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.metadata["heatmap_soma_radius_um"] == 100.0
     assert layer.metadata["file_ids"] == ["n1", "n2"]
     assert layer.metadata["source_file_ids"] == ["n1", "n2"]
-    assert (
-        layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
-    )
+    assert layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
 
 
 def test_all_cluster_heatmap_requests_excludes_all_neurons_entry():
@@ -1820,8 +2185,8 @@ def test_dims_order_rebuilds_tracked_heatmap_request_set():
         ),
     ]
     calls: list[tuple[list[object], bool]] = []
-    widget._start_heatmap_requests = (
-        lambda requests, batch_mode: calls.append((requests, batch_mode))
+    widget._start_heatmap_requests = lambda requests, batch_mode: calls.append(
+        (requests, batch_mode)
     )
 
     widget._on_dims_order_changed()
@@ -1842,9 +2207,7 @@ def test_analysis_heatmap_workaround_swallows_thumbnail_rank_mismatch():
 
     class _CrashLayer(_DummyImageLayer):
         def _update_thumbnail(self) -> None:
-            raise RuntimeError(
-                "sequence argument must have length equal to input rank"
-            )
+            raise RuntimeError("sequence argument must have length equal to input rank")
 
     layer = _CrashLayer(
         np.zeros((2, 2, 2), dtype=np.float32),
@@ -1969,9 +2332,7 @@ def test_draw_clustermap_emits_debug_logs(caplog):
     AnalysisTabWidget = module.AnalysisTabWidget
     widget = AnalysisTabWidget.__new__(AnalysisTabWidget)
     widget._clustermap_rendered = False
-    widget._clustermap_section = _DummyCollapsibleSection(
-        "Clustermap", expanded=True
-    )
+    widget._clustermap_section = _DummyCollapsibleSection("Clustermap", expanded=True)
     widget._figure = _DummyFigure()
     widget._figure.size_inches = (5.0, 3.0)
     widget._canvas = _DummyCanvas(widget._figure)
@@ -1983,9 +2344,7 @@ def test_draw_clustermap_emits_debug_logs(caplog):
     }
     populate_calls: list[tuple[object, object, object, tuple[float, float], int]] = []
 
-    def _fake_populate(
-        figure, result, cluster_color_map, *, figsize, dpi
-    ):
+    def _fake_populate(figure, result, cluster_color_map, *, figsize, dpi):
         populate_calls.append(
             (figure, result, cluster_color_map, tuple(figsize), int(dpi))
         )
@@ -2008,13 +2367,9 @@ def test_draw_clustermap_emits_debug_logs(caplog):
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("_draw_clustermap start" in message for message in messages)
+    assert any("populate_clustermap_figure complete" in message for message in messages)
     assert any(
-        "populate_clustermap_figure complete" in message
-        for message in messages
-    )
-    assert any(
-        "_draw_clustermap canvas draw complete" in message
-        for message in messages
+        "_draw_clustermap canvas draw complete" in message for message in messages
     )
     assert populate_calls == [
         (
@@ -2049,9 +2404,7 @@ def test_draw_clustermap_uses_physical_canvas_size_when_figure_size_unavailable(
     widget._cluster_color_map = None
     populate_calls: list[tuple[object, object, object, tuple[float, float], int]] = []
 
-    def _fake_populate(
-        figure, result, cluster_color_map, *, figsize, dpi
-    ):
+    def _fake_populate(figure, result, cluster_color_map, *, figsize, dpi):
         populate_calls.append(
             (figure, result, cluster_color_map, tuple(figsize), int(dpi))
         )
@@ -2107,19 +2460,13 @@ def test_build_clustermap_on_demand_draws_cached_result_and_logs(caplog):
         widget._build_clustermap_on_demand()
 
     messages = [record.getMessage() for record in caplog.records]
+    assert any("_build_clustermap_on_demand start" in message for message in messages)
     assert any(
-        "_build_clustermap_on_demand start" in message for message in messages
-    )
-    assert any(
-        "_build_clustermap_on_demand complete" in message
-        for message in messages
+        "_build_clustermap_on_demand complete" in message for message in messages
     )
     widget._draw_clustermap.assert_called_once_with(result)
     widget._update_button_states.assert_called_once_with()
-    assert (
-        widget._clustermap_status_label.text()
-        == "Dendrogram ready for 2 neurons."
-    )
+    assert widget._clustermap_status_label.text() == "Dendrogram ready for 2 neurons."
 
 
 def test_on_correlation_finished_emits_debug_logs(caplog):
@@ -2160,9 +2507,7 @@ def test_on_correlation_finished_emits_debug_logs(caplog):
         widget._on_correlation_finished(result)
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any(
-        "_on_correlation_finished start" in message for message in messages
-    )
+    assert any("_on_correlation_finished start" in message for message in messages)
     assert any("color map built" in message for message in messages)
     assert any(
         "clustermap render deferred until button click" in message

@@ -32,6 +32,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ..cluster_assignments import ClusterAssignmentStore
 from ..neuron_table_ops import (
     ClusterFilterSelection,
     GRAY_RGBA,
@@ -63,6 +64,17 @@ COL_TAGS = 7
 COL_NOTES = 8
 COL_CLUSTER = 9
 COL_COLOR = 10
+_BASE_HEADERS = [
+    "Vis",
+    "Added",
+    "Heatmap",
+    "Neuron ID",
+    "Subject",
+    "Label",
+    "Group",
+    "Tags",
+    "Notes",
+]
 _EDITABLE_METADATA_COLUMNS = {
     COL_LABEL: "label",
     COL_GROUP: "group",
@@ -190,9 +202,23 @@ class NeuronTableWidget(QWidget):
     selection_changed = Signal(list)
     state_changed = Signal()
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        assignment_store: ClusterAssignmentStore | None = None,
+    ):
         super().__init__(parent)
         self._entries: dict[object, NeuronEntry] = {}
+        # ``ClusterAssignmentStore`` is falsey while empty because it defines
+        # ``__len__``.  Test explicitly so the initially empty shared store is
+        # retained rather than silently replaced with a private one.
+        self._assignment_store = (
+            assignment_store
+            if assignment_store is not None
+            else ClusterAssignmentStore()
+        )
+        self._cluster_column_by_id: dict[str, int] = {}
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -200,21 +226,7 @@ class NeuronTableWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._table = QTableWidget(0, 11)
-        self._table.setHorizontalHeaderLabels(
-            [
-                "Vis",
-                "Added",
-                "Heatmap",
-                "Neuron ID",
-                "Subject",
-                "Label",
-                "Group",
-                "Tags",
-                "Notes",
-                "Cluster",
-                "Color",
-            ]
-        )
+        self._configure_cluster_columns()
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
@@ -229,8 +241,7 @@ class NeuronTableWidget(QWidget):
         header.setSectionResizeMode(COL_GROUP, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_TAGS, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_NOTES, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_CLUSTER, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_COLOR, QHeaderView.ResizeToContents)
+        self._configure_header_resize_modes()
 
         self._table.verticalHeader().setVisible(False)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
@@ -238,6 +249,70 @@ class NeuronTableWidget(QWidget):
         self._table.setSortingEnabled(True)
 
         layout.addWidget(self._table)
+
+    def _assignment_sets(self):
+        """Return saved assignment sets, tolerating legacy test widgets."""
+        store = self.__dict__.get("_assignment_store")
+        return () if store is None else store.sets()
+
+    def _active_assignment_id(self) -> str | None:
+        store = self.__dict__.get("_assignment_store")
+        return None if store is None else store.active_assignment_id
+
+    def _color_column(self) -> int:
+        """Return the current Color column index."""
+        return COL_CLUSTER + max(len(self._assignment_sets()), 1)
+
+    def _cluster_column(self, assignment_id: str | None = None) -> int:
+        """Return the requested or active cluster column index."""
+        columns = self.__dict__.get("_cluster_column_by_id", {})
+        resolved_id = assignment_id or self._active_assignment_id()
+        return columns.get(resolved_id, COL_CLUSTER)
+
+    def _configure_cluster_columns(self) -> None:
+        """Configure headers for all saved assignment sets."""
+        assignment_sets = self._assignment_sets()
+        self._cluster_column_by_id = {
+            assignment.assignment_id: COL_CLUSTER + index
+            for index, assignment in enumerate(assignment_sets)
+        }
+        active_id = self._active_assignment_id()
+        cluster_headers = [
+            (
+                f"{assignment.name} (active)"
+                if assignment.assignment_id == active_id
+                else assignment.name
+            )
+            for assignment in assignment_sets
+        ]
+        if not cluster_headers:
+            cluster_headers = ["Cluster"]
+        headers = [*_BASE_HEADERS, *cluster_headers, "Color"]
+        set_column_count = getattr(self._table, "setColumnCount", None)
+        set_headers = getattr(self._table, "setHorizontalHeaderLabels", None)
+        if not callable(set_column_count) or not callable(set_headers):
+            return
+        set_column_count(len(headers))
+        set_headers(headers)
+
+    def _configure_header_resize_modes(self) -> None:
+        """Apply resize policies after dynamic column changes."""
+        header_getter = getattr(self._table, "horizontalHeader", None)
+        if not callable(header_getter):
+            return
+        header = header_getter()
+        header.setSectionResizeMode(COL_VISIBLE, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ADDED, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_HEATMAP, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_NEURON_ID, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_SUBJECT, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_LABEL, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_GROUP, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_TAGS, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_NOTES, QHeaderView.Stretch)
+        for column in range(COL_CLUSTER, self._color_column()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self._color_column(), QHeaderView.ResizeToContents)
 
     def populate(self, neurons: list[tuple[str, str]]) -> None:
         """Fill the table with neurons from a query result.
@@ -252,6 +327,11 @@ class NeuronTableWidget(QWidget):
 
         self._table.setRowCount(0)
         self._entries.clear()
+        # A newly loaded Parquet may replace the assignment registry before
+        # the table membership is populated.  Rebuild the dynamic columns here
+        # so stale assignment columns from the previous dataset cannot linger.
+        self._configure_cluster_columns()
+        self._configure_header_resize_modes()
 
         n = len(neurons)
         cmap = plt.get_cmap("turbo")
@@ -300,18 +380,30 @@ class NeuronTableWidget(QWidget):
 
         self._set_text_cell(row, COL_LABEL, entry.label, editable=True)
         self._set_text_cell(row, COL_GROUP, entry.group, editable=True)
-        self._set_text_cell(row, COL_TAGS, self._tags_display(entry.tags), editable=True)
+        self._set_text_cell(
+            row, COL_TAGS, self._tags_display(entry.tags), editable=True
+        )
         self._set_text_cell(row, COL_NOTES, entry.notes, editable=True)
 
-        # Cluster
-        self._set_cluster_cell(row, entry.cluster_id)
+        # Saved cluster assignments. Legacy widgets without a store retain the
+        # original single Cluster column.
+        assignment_sets = self._assignment_sets()
+        if assignment_sets:
+            for assignment in assignment_sets:
+                self._set_cluster_cell(
+                    row,
+                    assignment.label_for(entry.file_id),
+                    assignment_id=assignment.assignment_id,
+                )
+        else:
+            self._set_cluster_cell(row, entry.cluster_id)
 
         # Color swatch button
         btn = QPushButton()
         btn.setFixedSize(24, 24)
         self._apply_color_style(btn, entry.color)
         btn.clicked.connect(partial(self._on_color_clicked, entry.file_id))
-        self._table.setCellWidget(row, COL_COLOR, btn)
+        self._table.setCellWidget(row, self._color_column(), btn)
 
     def _set_added_cell(self, row: int, added: bool) -> None:
         """Set the Added column cell text and sort key."""
@@ -340,13 +432,20 @@ class NeuronTableWidget(QWidget):
         item.setText(display)
         item.setData(Qt.UserRole, display.casefold())
 
-    def _set_cluster_cell(self, row: int, cluster_id: int | None) -> None:
+    def _set_cluster_cell(
+        self,
+        row: int,
+        cluster_id: int | None,
+        *,
+        assignment_id: str | None = None,
+    ) -> None:
         """Set cluster cell text and numeric sort key."""
-        item = self._table.item(row, COL_CLUSTER)
+        column = self._cluster_column(assignment_id)
+        item = self._table.item(row, column)
         if item is None or not isinstance(item, _NumericSortItem):
             item = _NumericSortItem()
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(row, COL_CLUSTER, item)
+            self._table.setItem(row, column, item)
 
         item.setText("" if cluster_id is None else str(cluster_id))
         item.setData(Qt.UserRole, cluster_sort_value(cluster_id))
@@ -431,7 +530,9 @@ class NeuronTableWidget(QWidget):
             return
 
         entry.visible = bool(state)
-        self.visibility_changed.emit({fid: e.visible for fid, e in self._entries.items()})
+        self.visibility_changed.emit(
+            {fid: e.visible for fid, e in self._entries.items()}
+        )
         self.state_changed.emit()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
@@ -518,7 +619,7 @@ class NeuronTableWidget(QWidget):
 
     def _update_color_swatch_for_row(self, row: int, color: list[float]) -> None:
         """Update the color swatch button for one known table row."""
-        btn = self._table.cellWidget(row, COL_COLOR)
+        btn = self._table.cellWidget(row, self._color_column())
         if btn is not None:
             self._apply_color_style(btn, color)
 
@@ -539,6 +640,8 @@ class NeuronTableWidget(QWidget):
         try:
             self._table.clearSelection()
             self._table.clearContents()
+            self._configure_cluster_columns()
+            self._configure_header_resize_modes()
             self._table.setRowCount(0)
             self._entries = {entry.file_id: entry for entry in entries}
             self._table.setRowCount(len(entries))
@@ -551,6 +654,17 @@ class NeuronTableWidget(QWidget):
         self.selection_changed.emit([])
         self.state_changed.emit()
 
+    def refresh_cluster_assignments(self, *, preserve_selection: bool = True) -> None:
+        """Rebuild dynamic assignment columns from the shared store."""
+        selected = self.get_selected_file_ids() if preserve_selection else []
+        entries = self._entries_in_table_order()
+        active_map = self.get_cluster_map()
+        for entry in entries:
+            entry.cluster_id = active_map.get(entry.file_id)
+        self._replace_entries(entries)
+        if selected:
+            self.select_file_ids(selected)
+
     # --- Public API ---
 
     def get_selected_file_ids(self) -> list[object]:
@@ -558,6 +672,11 @@ class NeuronTableWidget(QWidget):
         rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
         selected: list[object] = []
         for row in rows:
+            # A Qt ``Select All`` can leave indexes selected after a cluster
+            # filter hides their rows.  "Selected Rows" clustering should use
+            # only the rows the user can currently see and act on.
+            if self._table.isRowHidden(row):
+                continue
             file_id = self._file_id_from_row(row)
             if file_id is not None:
                 selected.append(file_id)
@@ -574,6 +693,9 @@ class NeuronTableWidget(QWidget):
 
     def get_cluster_map(self) -> dict[object, int | None]:
         """Return a mapping of all file_ids to their current cluster assignment."""
+        store = self.__dict__.get("_assignment_store")
+        if store is not None and store.active is not None:
+            return store.active_map(self._entries.keys())
         return {fid: e.cluster_id for fid, e in self._entries.items()}
 
     def get_visibility_map(self) -> dict[str, bool]:
@@ -586,14 +708,24 @@ class NeuronTableWidget(QWidget):
 
     def export_state(self) -> dict[str, object]:
         """Return all table rows and per-neuron UI state as JSON-safe data."""
-        return {
-            "version": 1,
-            "entries": [
-                entry.to_state()
-                for entry in self._entries_in_table_order()
-            ],
+        cluster_map = self.get_cluster_map()
+        for file_id, entry in self._entries.items():
+            entry.cluster_id = cluster_map.get(file_id)
+        state = {
+            "version": 2 if "_assignment_store" in self.__dict__ else 1,
+            "entries": [entry.to_state() for entry in self._entries_in_table_order()],
             "selected_file_ids": self.get_selected_file_ids(),
         }
+        if "_assignment_store" in self.__dict__:
+            state["cluster_assignments"] = self.assignment_state()
+        return state
+
+    def assignment_state(self) -> dict[str, object]:
+        """Return the complete named-assignment registry."""
+        store = self.__dict__.get("_assignment_store")
+        if store is None:
+            return ClusterAssignmentStore().to_state()
+        return store.to_state()
 
     def import_state(self, state: Mapping[str, object]) -> None:
         """Replace table contents from a previously exported state payload."""
@@ -610,6 +742,7 @@ class NeuronTableWidget(QWidget):
             for entry in iterable
             if isinstance(entry, Mapping)
         ]
+        self._load_assignment_state(state, entries)
         self._replace_entries(entries)
         selected = state.get("selected_file_ids", [])
         if isinstance(selected, (str, bytes)):
@@ -620,6 +753,27 @@ class NeuronTableWidget(QWidget):
             except TypeError:
                 selected_file_ids = []
         self.select_file_ids(selected_file_ids)
+
+    def _load_assignment_state(
+        self,
+        state: Mapping[str, object],
+        entries: Iterable[NeuronEntry],
+    ) -> None:
+        """Load v2 assignments or migrate legacy row cluster values."""
+        if "_assignment_store" not in self.__dict__:
+            return
+        store = self.__dict__.get("_assignment_store")
+        if store is None:
+            store = ClusterAssignmentStore()
+            self._assignment_store = store
+        raw_assignments = state.get("cluster_assignments")
+        if isinstance(raw_assignments, Mapping):
+            store.load_state(raw_assignments)
+            return
+        if len(store) > 0:
+            return
+        legacy = {entry.file_id: entry.cluster_id for entry in entries}
+        store.import_legacy(legacy)
 
     def apply_state(
         self,
@@ -637,12 +791,16 @@ class NeuronTableWidget(QWidget):
             except TypeError:
                 iterable = []
 
+        parsed_entries: list[NeuronEntry] = []
         by_string_file_id = {}
         for raw_entry in iterable:
             if not isinstance(raw_entry, Mapping):
                 continue
             entry = NeuronEntry.from_state(raw_entry)
+            parsed_entries.append(entry)
             by_string_file_id[str(entry.file_id)] = entry
+
+        self._load_assignment_state(state, parsed_entries)
 
         if not by_string_file_id:
             return
@@ -656,7 +814,12 @@ class NeuronTableWidget(QWidget):
                 if saved is None:
                     continue
                 entry.color = list(saved.color)
-                entry.cluster_id = saved.cluster_id
+                store = self.__dict__.get("_assignment_store")
+                entry.cluster_id = (
+                    store.active.label_for(file_id)
+                    if store is not None and store.active is not None
+                    else saved.cluster_id
+                )
                 entry.visible = saved.visible
                 entry.label = saved.label
                 entry.group = saved.group
@@ -671,7 +834,14 @@ class NeuronTableWidget(QWidget):
                     continue
                 self._update_visibility_checkbox(row, entry.visible)
                 self._update_color_swatch_for_row(row, entry.color)
-                self._set_cluster_cell(row, entry.cluster_id)
+                for assignment in self._assignment_sets():
+                    self._set_cluster_cell(
+                        row,
+                        assignment.label_for(file_id),
+                        assignment_id=assignment.assignment_id,
+                    )
+                if not self._assignment_sets():
+                    self._set_cluster_cell(row, entry.cluster_id)
                 self._set_text_cell(row, COL_LABEL, entry.label, editable=True)
                 self._set_text_cell(row, COL_GROUP, entry.group, editable=True)
                 self._set_text_cell(
@@ -689,12 +859,14 @@ class NeuronTableWidget(QWidget):
 
         self.visibility_changed.emit(self.get_visibility_map())
         self.colors_changed.emit(self.get_full_color_map())
+        if self._assignment_sets():
+            self.refresh_cluster_assignments(preserve_selection=True)
         self.state_changed.emit()
 
     def summary(self) -> NeuronTableSummary:
         """Return summary counts for the current table contents."""
         return summarize_neuron_table(
-            {fid: entry.cluster_id for fid, entry in self._entries.items()},
+            self.get_cluster_map(),
             {fid: entry.added_to_scene for fid, entry in self._entries.items()},
             {fid: entry.visible for fid, entry in self._entries.items()},
         )
@@ -721,7 +893,8 @@ class NeuronTableWidget(QWidget):
         """Keep only the supplied neuron IDs while preserving survivor state."""
         keep_ids = set(file_ids)
         survivors = [
-            entry for entry in self._entries_in_table_order()
+            entry
+            for entry in self._entries_in_table_order()
             if entry.file_id in keep_ids
         ]
         self._replace_entries(survivors)
@@ -733,7 +906,8 @@ class NeuronTableWidget(QWidget):
         """Remove the supplied neuron IDs while preserving survivor state."""
         remove_ids = set(file_ids)
         survivors = [
-            entry for entry in self._entries_in_table_order()
+            entry
+            for entry in self._entries_in_table_order()
             if entry.file_id not in remove_ids
         ]
         self._replace_entries(survivors)
@@ -791,7 +965,9 @@ class NeuronTableWidget(QWidget):
             file_id: self._normalized_heatmap_layer_names(layer_names)
             for file_id, layer_names in heatmap_layers_by_file_id.items()
         }
-        by_string = {str(file_id): layer_names for file_id, layer_names in exact.items()}
+        by_string = {
+            str(file_id): layer_names for file_id, layer_names in exact.items()
+        }
         row_map = self._file_id_to_row_map()
 
         sorting_enabled = self._table.isSortingEnabled()
@@ -813,13 +989,11 @@ class NeuronTableWidget(QWidget):
 
     def available_cluster_ids(self) -> list[int]:
         """Return sorted unique cluster IDs in the table."""
-        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
-        return cluster_ids_available(cluster_map)
+        return cluster_ids_available(self.get_cluster_map())
 
     def has_unclustered_entries(self) -> bool:
         """Return whether any table row has no cluster assignment."""
-        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
-        return has_unclustered_entries(cluster_map)
+        return has_unclustered_entries(self.get_cluster_map())
 
     def apply_cluster_filter(
         self,
@@ -834,7 +1008,7 @@ class NeuronTableWidget(QWidget):
         heatmap_file_ids: set[object] | list[object] | tuple[object, ...] | None = None,
     ) -> None:
         """Hide rows outside the combined cluster and manual heatmap filters."""
-        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        cluster_map = self.get_cluster_map()
         cluster_matches = cluster_filter_matches(cluster_map, selection)
         if heatmap_file_ids is None:
             heatmap_matches = {file_id: True for file_id in self._entries}
@@ -853,7 +1027,7 @@ class NeuronTableWidget(QWidget):
         selection: ClusterFilterSelection | int | None,
     ) -> None:
         """Set visibility off for neurons outside the selected cluster groups."""
-        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        cluster_map = self.get_cluster_map()
         visibility = visibility_for_selected_cluster(cluster_map, selection)
 
         row_map = self._file_id_to_row_map()
@@ -895,7 +1069,7 @@ class NeuronTableWidget(QWidget):
         gray_others: bool = True,
     ) -> None:
         """Recolor selected groups with turbo; optionally gray non-selected neurons."""
-        cluster_map = {fid: entry.cluster_id for fid, entry in self._entries.items()}
+        cluster_map = self.get_cluster_map()
         updates = recolor_cluster_turbo(cluster_map, selection, gray_others=gray_others)
         if not updates:
             return
@@ -919,7 +1093,7 @@ class NeuronTableWidget(QWidget):
 
     def sort_by_cluster(self) -> None:
         """Sort rows by ascending numeric cluster assignment."""
-        self._table.sortByColumn(COL_CLUSTER, Qt.AscendingOrder)
+        self._table.sortByColumn(self._cluster_column(), Qt.AscendingOrder)
 
     def update_cluster_assignments(self, result: ClusterResult) -> None:
         """Update the Cluster column from a ClusterResult.
@@ -929,6 +1103,13 @@ class NeuronTableWidget(QWidget):
         result : ClusterResult
             Clustering result containing neuron_ids and labels.
         """
+        store = self.__dict__.get("_assignment_store")
+        if store is not None and store.active is not None:
+            if store.active.runtime_result is not result:
+                store.add_result(result, method_name="Cluster Assignment")
+            self.refresh_cluster_assignments()
+            return
+
         row_map = self._file_id_to_row_map()
         row_map_by_string = {str(file_id): row for file_id, row in row_map.items()}
         entries_by_string = {

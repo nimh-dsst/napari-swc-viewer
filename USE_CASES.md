@@ -32,6 +32,9 @@ Unless a use case says otherwise:
 | [UC-004](#uc-004-build-and-reuse-a-flatmap-region-cache) | Build, reopen, parse, and switch shaped/square region-cache data | Passed |
 | [UC-005](#uc-005-view-an-allen-isocortex-layer-flatmap-stack) | View flatmap node counts as six Allen Isocortex layer images | Not run |
 | [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
+| [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
+| [UC-008](#uc-008-create-combined-and-individual-neuron-heatmaps) | Create one combined heatmap or color-matched heatmaps for individual neurons | Not run |
+| [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -670,6 +673,266 @@ surfaces, and outlines.
 - Status: Not run
 - Last verified: Never
 - Notes: None
+
+### UC-007: Refine and Save Multiple Cluster Assignments
+
+**Capability**
+
+The user can retain several named clustering results for the same neurons. A
+first run can group neurons by soma location; one soma cluster can then be
+selected and clustered by voxel correlation without removing other neurons or
+overwriting the soma assignments. One assignment is active at a time for
+filtering, colors, flatmap grouping, and Analysis heatmaps. Projects and
+Enhanced Parquet exports preserve every assignment and its run provenance.
+
+**Prerequisites**
+
+- Load an Allen mouse atlas and a neuron Parquet containing at least six
+  neurons with soma nodes and morphology nodes in one represented atlas region.
+- To test Flat map + Depth selected-row clustering and flatmap grouping, use a
+  version-3 Parquet with bilateral flatmap/depth columns.
+- Populate **Selected Neurons** with the full test population and leave at
+  least two neurons in each intended soma cluster.
+- To verify the large-run guard, prepare cohorts whose post-filter clustering
+  inputs contain exactly 10,000,000 and at least 10,000,001 contributing node
+  rows.
+- Start with no prior cluster assignments or record their names so the new
+  columns can be distinguished.
+
+**Steps and expected results**
+
+1. **Action:** Open **Analysis** > **Clustering**, choose **CCFv3
+   Coordinates**, **Soma Location**, and the desired soma algorithm. Set
+   **Input neurons** to **Current Table**, click **Clear Selection** under
+   **Select Target Region**, choose at least two clusters, and click **Run
+   Clustering**.
+   **Expected:** The run completes and creates a **Soma Location 1** column in
+   the Data-tab table. **Cluster assignment** selects **Soma Location 1**, and
+   every clustered neuron has an integer label. **Target region (optional)**
+   reports **All regions (optional)**, and all eligible somas in the Current
+   Table cohort contribute. The cluster filter, summary, rendered colors,
+   flatmap cluster mode, and Analysis heatmap cluster choices use these labels.
+2. **Action:** In **Data** > **Selected Neurons**, use **Cluster** to show one
+   soma cluster and select all of its visible rows with Ctrl+A or Cmd+A.
+   **Expected:** Only rows from that soma cluster are selected. Other neurons
+   remain in the table and retain their soma labels.
+3. **Action:** Return to **Analysis** > **Clustering**, choose **Voxel
+   Correlation**, set **Input neurons** to **Selected Rows**, select the target
+   region for this scope, and click **Run Clustering**. Repeat after clicking
+   **Clear Selection** for this scope.
+   **Expected:** Only the explicitly selected neuron IDs enter the run. A new
+   **Voxel Correlation 1** column appears and becomes active. Its selected
+   neurons receive local integer labels; every neuron outside the run is blank.
+   **Soma Location 1** remains unchanged. The saved provenance records the
+   selected cohort and its parent Soma Location assignment and cluster. The
+   first run uses the selected region and dilation; the repeated run reports
+   **All regions (optional)** and uses all finite CCFv3 nodes for those rows.
+4. **Action:** Switch **Cluster assignment** between **Soma Location 1** and
+   **Voxel Correlation 1**.
+   **Expected:** The active header, cluster filter, summary, sort target,
+   rendered colors, flatmap cluster grouping, and Analysis heatmap cluster
+   choices all follow the selected assignment. Switching does not modify any
+   saved labels. The voxel assignment's blank rows appear under
+   **Unclustered**.
+5. **Action:** Click **Rename...**, give the voxel assignment a descriptive
+   name, and confirm. Then create another selected-row run.
+   **Expected:** The table header and selector use the new display name while
+   the next run creates another independent column. Existing Enhanced Parquet
+   column identifiers remain stable.
+6. **Action:** Select an assignment with live run data and build its
+   dendrogram or save a single-run Analysis export.
+   **Expected:** The output uses the active run. Other assignment columns are
+   unaffected.
+7. **Action:** In **Data** > **SWC Parquet Data**, click **Save Project As...**
+   and **Export Enhanced Parquet...**. Close the session, load the saved
+   project, and then load the Enhanced Parquet separately.
+   **Expected:** Both reload paths restore every assignment name, sparse label
+   map, active assignment, palette, cohort, parent context, and run parameters.
+   Enhanced Parquet contains one nullable integer column per assignment and a
+   backward-compatible `cluster_assignment` column matching the active set.
+   After project reload, assignment-based filters, colors, flatmap grouping,
+   and heatmaps work immediately; dendrogram and distance actions report
+   **Rerun required** because matrices are not stored.
+8. **Action:** With an assignment active, click **Delete**, cancel once, then
+   confirm deletion.
+   **Expected:** Cancelling changes nothing. Confirming removes only that
+   assignment column and its saved result; no neuron rows are removed. The
+   most recently created remaining assignment becomes active.
+9. **Action:** Set **Input neurons** to **Selected Rows** with no selected
+   rows, then with exactly one selected row, and click **Run Clustering** after
+   each change. Set **Input neurons** to **Whole Parquet**, clear its target
+   region selection, and try again. Repeat a valid selected-row run in **Flat
+   map + Depth** for both **Soma Location** and **Voxel Correlation** when
+   flatmap columns are available.
+   **Expected:** Empty and one-row inputs produce actionable messages and do
+   not launch a worker or create a column. Whole Parquet reports **Select at
+   least one target region** and does not run. Valid flatmap runs use exactly
+   the selected neuron IDs and create new sparse assignments like their CCFv3
+   counterparts.
+10. **Action:** Run clustering on the cohort with exactly 10,000,000 contributing
+    node rows. Then run it on the cohort with at least 10,000,001 contributing
+    rows; click **Cancel** in **Large Clustering Run**, repeat, and click
+    **Continue**.
+    **Expected:** The 10,000,000-node run starts without a warning. The larger
+    run displays its exact comma-formatted node count and defaults to **Cancel**.
+    Cancelling starts no clustering worker and creates no assignment; the
+    repeated confirmation starts the snapshotted run without changing its
+    cohort or region filter.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
+
+### UC-008: Create Combined and Individual Neuron Heatmaps
+
+**Capability**
+
+The user can turn selected rows in the Data-tab neuron table into either one
+combined node-count heatmap or one color-matched heatmap per neuron. Individual
+layers preserve the selected cohort captured when the run starts and make it
+possible to compare neuron occupancy independently. A monochrome cohort is
+automatically assigned distinct Turbo colors so its rendered neurons, table
+swatches, and heatmaps remain visually associated.
+
+**Prerequisites**
+
+- Have an Allen mouse atlas available locally and a neuron Parquet containing
+  at least four neurons with morphology nodes inside the atlas bounds.
+- Know three neurons to use as the heatmap cohort and retain a fourth neuron as
+  a non-selected color control.
+- To exercise the memory warning, use an atlas resolution and selected-neuron
+  count whose displayed estimate exceeds 1 GiB.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** Open **Data** > **Selected Neurons**, click **Add Heatmap**, and
+   inspect its menu before loading a neuron Parquet.
+   **Expected:** The menu contains exactly **Single Heatmap** and **Individual
+   Heatmaps**. Choosing either option reports **Load a neuron Parquet before
+   creating a heatmap** and creates no layer.
+2. **Action:** Load the test neuron Parquet, add its four neurons to **Selected
+   Neurons**, leave the atlas unloaded, select three rows, and choose **Add
+   Heatmap** > **Single Heatmap**. Then clear the table selection and try the
+   action again after loading the atlas.
+   **Expected:** Without an atlas, the first attempt reports **Load an atlas
+   before creating a neuron heatmap**. With no selected rows, the second attempt
+   reports **Select at least one neuron row to create a heatmap**. Neither
+   attempt creates a layer.
+3. **Action:** Give the three cohort neurons visibly different colors with
+   their color swatches, select their rows, and choose **Add Heatmap** >
+   **Single Heatmap**.
+   **Expected:** One Greek-named image layer such as **alpha Heatmap** is added
+   with the `hot` colormap. Its node counts combine all three selected neurons.
+   Each cohort row lists that layer in the **Heatmap** column, the fourth row
+   does not, and choosing the layer under **Manual Heatmap** shows only its
+   three source rows.
+4. **Action:** Keep the same distinctly colored rows selected and choose **Add
+   Heatmap** > **Individual Heatmaps**. Change the table selection while the
+   sequential progress messages are visible.
+   **Expected:** **Add Heatmap** is disabled for the full queue. Three new
+   Greek-named layers are added in deterministic order, one for each originally
+   selected neuron, regardless of the later selection change. Each layer uses
+   a transparent-to-neuron-color colormap, contains only that neuron's counts,
+   initially sets its upper contrast limit to 20% of its maximum node count,
+   and appears only on that neuron's **Heatmap** cell and **Manual Heatmap**
+   filter result. Lower-density structures are more visible than with the full
+   contrast range, and the limit remains editable in napari. The existing
+   neuron colors do not change.
+5. **Action:** Select the same three cohort rows, set all three color swatches
+   to the same RGB color, record the fourth neuron's color, and choose **Add
+   Heatmap** > **Individual Heatmaps** again.
+   **Expected:** The three selected neurons receive distinct Turbo colors in
+   stable neuron-ID order, and rendered versions of those neurons update to the
+   same colors. The fourth neuron's color is unchanged. Each newly created
+   heatmap matches its source neuron's new color.
+6. **Action:** Set one cohort neuron back to the same color as another while
+   leaving the third different, then create individual heatmaps for all three.
+   Repeat with only one selected neuron.
+   **Expected:** A partially duplicated but non-monochrome cohort keeps its
+   existing colors, including the duplicate. A one-neuron request creates one
+   individual layer without recoloring that neuron.
+7. **Action:** Select enough neurons for the projected individual heatmap data
+   to exceed 1 GiB and choose **Add Heatmap** > **Individual Heatmaps**. Leave
+   **Cancel** selected in **Large Individual Heatmap Request** and confirm.
+   **Expected:** The warning shows the selected layer count and estimated GiB
+   before rendering overhead. Cancelling starts no worker, adds no layers, and
+   changes no neuron colors.
+8. **Action:** Delete or rename one of the individual heatmap layers, then use
+   the table's **Heatmap** column and **Manual Heatmap** selector.
+   **Expected:** Layer membership and names stay synchronized. Deleting a layer
+   removes its membership; renaming it updates the affected row and selector
+   without changing the recorded source neuron.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: None
+
+### UC-009: Save and Overwrite the Current Project
+
+**Capability**
+
+The user can create an SWC Viewer project and then save later table, analysis,
+and app-created layer changes back to that same project folder. Replacement is
+confirmed explicitly and publishes a complete new bundle without retaining
+stale files from the previous version.
+
+**Prerequisites**
+
+- Load a neuron Parquet containing at least two neurons into **Data** > **SWC
+  Parquet Data**.
+- Add both neurons to **Selected Neurons** and create one app-generated heatmap
+  or mask layer that will be recognizable after a project reload.
+- Choose a writable directory where a new `.swcv` project folder can be
+  created.
+
+**Steps and expected results**
+
+1. **Action:** With only the neuron Parquet loaded, inspect the project controls
+   under **Data** > **SWC Parquet Data**.
+   **Expected:** **Save Project** is disabled. **Save Project As...**, **Load
+   Project...**, and **Export Enhanced Parquet...** remain available.
+2. **Action:** Click **Save Project As...**, choose a new path named
+   `overwrite_test.swcv`, and complete the save.
+   **Expected:** The project is created and the status reports **Saved project
+   bundle: overwrite_test.swcv**. **Save Project** becomes enabled and its
+   tooltip identifies the new project's absolute path.
+3. **Action:** Change a table label or note, remove the saved heatmap or mask
+   layer, create a different app-generated layer, and click **Save Project**.
+   In **Overwrite SWC Viewer Project?**, click **Cancel**.
+   **Expected:** The dialog shows the exact current project path, warns that all
+   existing project-folder contents will be replaced, and defaults to
+   **Cancel**. Cancelling starts no save and leaves the on-disk project
+   unchanged.
+4. **Action:** Click **Save Project** again and click **Overwrite**.
+   **Expected:** Progress is shown while saving, both save actions are disabled
+   during serialization, and completion reports **Saved project bundle:
+   overwrite_test.swcv**. No save-location picker is shown.
+5. **Action:** Close the session, click **Load Project...**, select
+   `overwrite_test.swcv`, and inspect its table state and app-generated layers.
+   **Expected:** The changed table metadata and replacement layer are restored.
+   The layer removed before overwrite does not return, and no stale project
+   files affect the loaded session.
+6. **Action:** Load a standalone neuron Parquet through **Load...**.
+   **Expected:** **Save Project** becomes disabled because the session is no
+   longer associated with a current project. **Save Project As...** can create
+   another project, and doing so enables **Save Project** for that new folder.
+7. **Action:** Load `overwrite_test.swcv`, then rename or move that folder
+   outside napari and click **Save Project**.
+   **Expected:** The plugin reports that the current project is unavailable or
+   unrecognized, disables **Save Project**, and does not create or replace any
+   folder. The user can still choose a new destination with **Save Project
+   As...**.
+
+**Manual verification**
+
+- Status: Passed
+- Last verified: 2026-08-05
+- Notes: Verified by removing Heatmap layers. Two clusterings were retained.
 
 ## Use-Case Template
 

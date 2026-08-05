@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pandas as pd
@@ -10,11 +12,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import napari_swc_viewer.project_io as project_io_module
+from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
 from napari_swc_viewer.project_io import (
     PROJECT_BUNDLE_FORMAT,
     ENHANCED_NEURON_COLUMNS,
     export_enhanced_neuron_parquet,
     export_filtered_project_neuron_parquet,
+    is_recognized_project_bundle,
     load_project_bundle,
     read_enhanced_parquet_metadata,
     save_project_bundle,
@@ -71,9 +76,7 @@ def _add_flatmap_v3_schema_metadata(path: Path) -> dict[bytes, bytes]:
         b"custom.dataset_metadata": b"must-survive",
     }
     fields = [
-        field.with_metadata({b"units": b"micrometer"})
-        if field.name == "x"
-        else field
+        field.with_metadata({b"units": b"micrometer"}) if field.name == "x" else field
         for field in table.schema
     ]
     schema = pa.schema(fields, metadata=metadata)
@@ -126,6 +129,33 @@ def _subset_table_state() -> dict[str, object]:
     }
 
 
+def _multi_assignment_table_state() -> dict[str, object]:
+    store = ClusterAssignmentStore()
+    soma = store.add(
+        name="Soma Location 1",
+        assignments={"n1": 1, "n2": 1, "n3": 2},
+        input_file_ids=["n1", "n2", "n3"],
+        activate=True,
+    )
+    store.add(
+        name="Voxel Correlation 1",
+        assignments={"n1": 2, "n2": 1},
+        input_file_ids=["n1", "n2"],
+        parent_assignment_id=soma.assignment_id,
+        parent_cluster_ids=[1],
+        activate=True,
+    )
+    return {
+        "version": 2,
+        "entries": [
+            {"file_id": "n1", "subject": "s1", "cluster_id": 2},
+            {"file_id": "n2", "subject": "s2", "cluster_id": 1},
+            {"file_id": "n3", "subject": "s3", "cluster_id": None},
+        ],
+        "cluster_assignments": store.to_state(),
+    }
+
+
 @dataclass
 class _DummyLayer:
     name: str
@@ -152,7 +182,9 @@ class _DummyColormap:
         self.nan_color = [0.0, 0.0, 0.0, 0.0]
 
 
-def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path: Path) -> None:
+def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.parquet"
     output = tmp_path / "enhanced.parquet"
     _write_source_parquet(source)
@@ -164,7 +196,11 @@ def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path
         metadata={"atlas_name": "fake_atlas"},
     )
 
-    loaded = pd.read_parquet(output).sort_values(["file_id", "node_id"]).reset_index(drop=True)
+    loaded = (
+        pd.read_parquet(output)
+        .sort_values(["file_id", "node_id"])
+        .reset_index(drop=True)
+    )
     assert len(loaded) == 3
     assert all(column in loaded.columns for column in ENHANCED_NEURON_COLUMNS)
     assert loaded.loc[loaded["file_id"] == "n1", "neuron_label"].unique().tolist() == [
@@ -182,7 +218,98 @@ def test_export_enhanced_neuron_parquet_round_trips_labels_and_metadata(tmp_path
     payload = read_enhanced_parquet_metadata(output)
     assert payload["metadata"]["atlas_name"] == "fake_atlas"
     assert payload["table_state"]["entries"][0]["label"] == "projection"
-    assert payload["enhanced_columns"] == list(ENHANCED_NEURON_COLUMNS)
+    assert payload["enhanced_columns"] == [
+        *ENHANCED_NEURON_COLUMNS,
+        "cluster_imported_cluster_assignment",
+    ]
+
+
+def test_enhanced_parquet_writes_all_named_assignment_columns_and_active_mirror(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "enhanced.parquet"
+    _write_three_neuron_source_parquet(source)
+
+    export_enhanced_neuron_parquet(
+        source,
+        output,
+        table_state=_multi_assignment_table_state(),
+    )
+
+    loaded = pd.read_parquet(output)
+    assert set(loaded.loc[loaded["file_id"] == "n1", "cluster_soma_location_1"]) == {1}
+    assert set(loaded.loc[loaded["file_id"] == "n3", "cluster_soma_location_1"]) == {2}
+    assert set(
+        loaded.loc[loaded["file_id"] == "n1", "cluster_voxel_correlation_1"]
+    ) == {2}
+    assert (
+        loaded.loc[loaded["file_id"] == "n3", "cluster_voxel_correlation_1"]
+        .isna()
+        .all()
+    )
+    assert set(loaded.loc[loaded["file_id"] == "n2", "cluster_assignment"]) == {1}
+    assert loaded.loc[loaded["file_id"] == "n3", "cluster_assignment"].isna().all()
+
+    payload = read_enhanced_parquet_metadata(output)
+    registry = payload["table_state"]["cluster_assignments"]
+    assert registry["active_assignment_id"] == registry["sets"][1]["assignment_id"]
+    assert [item["name"] for item in registry["sets"]] == [
+        "Soma Location 1",
+        "Voxel Correlation 1",
+    ]
+
+
+def test_enhanced_parquet_uses_collision_safe_assignment_column(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "enhanced.parquet"
+    _write_three_neuron_source_parquet(source)
+    source_df = pd.read_parquet(source)
+    source_df["cluster_soma_location_1"] = 99
+    source_df.to_parquet(source, index=False)
+
+    export_enhanced_neuron_parquet(
+        source,
+        output,
+        table_state=_multi_assignment_table_state(),
+    )
+
+    loaded = pd.read_parquet(output)
+    assert set(loaded["cluster_soma_location_1"]) == {99}
+    assert "cluster_soma_location_1_2" in loaded.columns
+    payload = read_enhanced_parquet_metadata(output)
+    assert (
+        payload["table_state"]["cluster_assignments"]["sets"][0]["column_name"]
+        == "cluster_soma_location_1_2"
+    )
+
+
+def test_enhanced_parquet_assignment_column_cannot_replace_active_mirror(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "enhanced.parquet"
+    _write_source_parquet(source)
+    store = ClusterAssignmentStore()
+    store.add(
+        name="Assignment",
+        assignments={"n1": 7},
+        input_file_ids=["n1", "n2"],
+    )
+    state = {
+        "version": 2,
+        "entries": [{"file_id": "n1"}, {"file_id": "n2"}],
+        "cluster_assignments": store.to_state(),
+    }
+
+    export_enhanced_neuron_parquet(source, output, table_state=state)
+
+    loaded = pd.read_parquet(output)
+    assert "cluster_assignment" in loaded.columns
+    assert "cluster_assignment_2" in loaded.columns
+    assert set(loaded.loc[loaded["file_id"] == "n1", "cluster_assignment"]) == {7}
 
 
 def test_enhanced_and_filtered_exports_preserve_flatmap_v3_schema_metadata(
@@ -215,7 +342,9 @@ def test_enhanced_and_filtered_exports_preserve_flatmap_v3_schema_metadata(
     assert pd.read_parquet(filtered)["file_id"].tolist() == ["n3", "n3", "n1", "n1"]
 
 
-def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(tmp_path: Path) -> None:
+def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.parquet"
     _write_source_parquet(source)
 
@@ -224,6 +353,24 @@ def test_read_enhanced_parquet_metadata_accepts_canonical_parquet(tmp_path: Path
     assert payload["has_project_metadata"] is False
     assert payload["enhanced_columns"] == []
     assert payload["table_state"]["entries"] == []
+
+
+def test_read_enhanced_parquet_metadata_imports_legacy_cluster_id(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-clusters.parquet"
+    _write_source_parquet(source)
+    frame = pd.read_parquet(source)
+    frame["cluster_id"] = [4, 4, 9]
+    frame.to_parquet(source, index=False)
+
+    payload = read_enhanced_parquet_metadata(source)
+
+    entries = {
+        entry["file_id"]: entry["cluster_id"]
+        for entry in payload["table_state"]["entries"]
+    }
+    assert entries == {"n1": 4, "n2": 9}
 
 
 def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -> None:
@@ -246,9 +393,316 @@ def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -
     assert saved.loc[saved["file_id"] == "n3", "neuron_label"].unique().tolist() == [
         "target"
     ]
-    assert saved.loc[saved["file_id"] == "n1", "cluster_assignment"].unique().tolist() == [
-        2
+    assert saved.loc[
+        saved["file_id"] == "n1", "cluster_assignment"
+    ].unique().tolist() == [2]
+    assert not list(tmp_path.glob(".saved.swcv.*.staging"))
+
+
+def test_save_project_bundle_rejects_existing_destination_without_changes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+    )
+    sentinel = bundle_path / "keep.txt"
+    sentinel.write_text("original")
+    original_manifest = (bundle_path / "manifest.json").read_bytes()
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        save_project_bundle(
+            bundle_path,
+            source_parquet_path=source,
+            table_state=_table_state(),
+        )
+
+    assert sentinel.read_text() == "original"
+    assert (bundle_path / "manifest.json").read_bytes() == original_manifest
+
+
+def test_save_project_bundle_overwrite_replaces_entire_bundle(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_source_parquet(source)
+    stale_layer = _DummyLayer(
+        name="Stale Heatmap",
+        data=np.ones((2, 2, 2), dtype=np.float32),
+        metadata={"heatmap_source": True, "file_ids": ["n1"]},
+    )
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+        layers=[stale_layer],
+    )
+    (bundle_path / "stale.txt").write_text("remove me")
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+        layers=[],
+        overwrite=True,
+    )
+
+    loaded = load_project_bundle(bundle_path)
+    assert loaded.layers == ()
+    assert not (bundle_path / "stale.txt").exists()
+    assert not any((bundle_path / "layers").iterdir())
+    assert not list(tmp_path.glob(".saved.swcv.*.rollback"))
+
+
+def test_save_project_bundle_overwrites_project_using_its_bundled_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+    )
+
+    bundled_source = bundle_path / "data" / "source_neurons.parquet"
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=bundled_source,
+        table_state=_table_state(),
+        overwrite=True,
+    )
+
+    loaded = load_project_bundle(bundle_path)
+    assert loaded.source_parquet_path == bundled_source
+    assert pd.read_parquet(bundled_source)["file_id"].unique().tolist() == ["n1"]
+
+
+def test_project_overwrite_rejects_unrecognized_file_and_directory_targets(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    _write_source_parquet(source)
+    missing = tmp_path / "missing.swcv"
+    file_target = tmp_path / "file.swcv"
+    file_target.write_text("not a project")
+    directory_target = tmp_path / "directory.swcv"
+    directory_target.mkdir()
+    (directory_target / "keep.txt").write_text("unrelated")
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        save_project_bundle(
+            missing,
+            source_parquet_path=source,
+            table_state=_table_state(),
+            overwrite=True,
+        )
+    with pytest.raises(ValueError, match="not a directory"):
+        save_project_bundle(
+            file_target,
+            source_parquet_path=source,
+            table_state=_table_state(),
+            overwrite=True,
+        )
+    with pytest.raises(ValueError, match="no readable manifest"):
+        save_project_bundle(
+            directory_target,
+            source_parquet_path=source,
+            table_state=_table_state(),
+            overwrite=True,
+        )
+
+    assert file_target.read_text() == "not a project"
+    assert (directory_target / "keep.txt").read_text() == "unrelated"
+    assert not is_recognized_project_bundle(directory_target)
+
+
+def test_project_overwrite_rejects_symlink_target(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    symlink_path = tmp_path / "linked.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+    )
+    try:
+        symlink_path.symlink_to(bundle_path, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        save_project_bundle(
+            symlink_path,
+            source_parquet_path=source,
+            table_state=_table_state(),
+            overwrite=True,
+        )
+
+    assert is_recognized_project_bundle(bundle_path)
+    assert not is_recognized_project_bundle(symlink_path)
+
+
+def test_project_overwrite_staging_failure_keeps_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+    )
+    sentinel = bundle_path / "keep.txt"
+    sentinel.write_text("original")
+
+    def fail_export(*_args, **_kwargs):
+        raise RuntimeError("injected staging failure")
+
+    monkeypatch.setattr(
+        project_io_module,
+        "export_filtered_project_neuron_parquet",
+        fail_export,
+    )
+    with pytest.raises(RuntimeError, match="injected staging failure"):
+        save_project_bundle(
+            bundle_path,
+            source_parquet_path=source,
+            table_state=_table_state(),
+            overwrite=True,
+        )
+
+    assert sentinel.read_text() == "original"
+    assert is_recognized_project_bundle(bundle_path)
+    assert not list(tmp_path.glob(".saved.swcv.*.staging"))
+
+
+def test_project_overwrite_publication_failure_restores_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+    )
+    sentinel = bundle_path / "keep.txt"
+    sentinel.write_text("original")
+    real_rename = Path.rename
+
+    def fail_staged_publication(path: Path, target: str | Path) -> Path:
+        if path.name.endswith(".staging") and Path(target) == bundle_path:
+            raise OSError("injected publication failure")
+        return real_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_staged_publication)
+    with pytest.raises(OSError, match="injected publication failure"):
+        save_project_bundle(
+            bundle_path,
+            source_parquet_path=source,
+            table_state=_table_state(),
+            overwrite=True,
+        )
+
+    assert sentinel.read_text() == "original"
+    assert is_recognized_project_bundle(bundle_path)
+    assert not list(tmp_path.glob(".saved.swcv.*.staging"))
+    assert not list(tmp_path.glob(".saved.swcv.*.rollback"))
+
+
+def test_load_project_bundle_accepts_version_one_manifest_and_table_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "legacy.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+        layers=[],
+    )
+    manifest_path = bundle_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = "1"
+    manifest_path.write_text(json.dumps(manifest))
+
+    bundle = load_project_bundle(bundle_path)
+
+    assert bundle.manifest["version"] == "1"
+    assert bundle.table_state["version"] == "1"
+    assert bundle.table_state["entries"][0]["cluster_id"] == 3
+
+
+def test_project_bundle_filters_v2_assignments_to_current_membership(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_three_neuron_source_parquet(source)
+    state = _multi_assignment_table_state()
+    state["entries"] = state["entries"][:2]
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=state,
+        layers=[],
+    )
+
+    bundle = load_project_bundle(bundle_path)
+    registry = bundle.table_state["cluster_assignments"]
+    assert bundle.manifest["version"] == "2"
+    assert [item["name"] for item in registry["sets"]] == [
+        "Soma Location 1",
+        "Voxel Correlation 1",
     ]
+    for assignment in registry["sets"]:
+        assert set(assignment["assignments"]) <= {"n1", "n2"}
+        assert set(assignment["input_file_ids"]) <= {"n1", "n2"}
+
+
+def test_project_bundle_keeps_collision_resolved_assignment_column_stable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    reexported = tmp_path / "reexported.parquet"
+    _write_three_neuron_source_parquet(source)
+    frame = pd.read_parquet(source)
+    frame["cluster_soma_location_1"] = 99
+    frame.to_parquet(source, index=False)
+
+    state = _multi_assignment_table_state()
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=state,
+        layers=[],
+    )
+    bundle = load_project_bundle(bundle_path)
+    first_set = bundle.table_state["cluster_assignments"]["sets"][0]
+    assert first_set["column_name"] == "cluster_soma_location_1_2"
+
+    export_enhanced_neuron_parquet(
+        bundle.source_parquet_path,
+        reexported,
+        table_state=bundle.table_state,
+    )
+    loaded = pd.read_parquet(reexported)
+    assert set(loaded["cluster_soma_location_1"]) == {99}
+    assert "cluster_soma_location_1_2" in loaded.columns
+    assert "cluster_soma_location_1_2_2" not in loaded.columns
 
 
 def test_save_project_bundle_replaces_existing_enhanced_columns(tmp_path: Path) -> None:
@@ -352,7 +806,9 @@ def test_save_project_bundle_rejects_empty_table(tmp_path: Path) -> None:
     assert not (bundle_path / "data" / "source_neurons.parquet").exists()
 
 
-def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(tmp_path: Path) -> None:
+def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.parquet"
     bundle_path = tmp_path / "saved.swcv"
     _write_source_parquet(source)
@@ -406,8 +862,12 @@ def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(tmp_pa
 
     assert progress_events[0] == ("Preparing project bundle...", 0, 6)
     assert progress_events[-1] == ("Done", 6, 6)
-    assert any("Saving layer 1/2: alpha Heatmap" in event[0] for event in progress_events)
-    assert any("Saving layer 2/2: Mask: alpha Heatmap" in event[0] for event in progress_events)
+    assert any(
+        "Saving layer 1/2: alpha Heatmap" in event[0] for event in progress_events
+    )
+    assert any(
+        "Saving layer 2/2: Mask: alpha Heatmap" in event[0] for event in progress_events
+    )
 
     bundle = load_project_bundle(bundle_path)
     assert bundle.manifest["format"] == PROJECT_BUNDLE_FORMAT
@@ -489,3 +949,214 @@ def test_project_colormap_payload_restores_labels_colormap_kwargs() -> None:
         kwargs["colormap"].color_dict[1],
         [0.2, 0.4, 0.6, 1.0],
     )
+
+
+def test_current_project_path_updates_save_control(tmp_path: Path) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    save_button = MagicMock()
+    widget = SimpleNamespace(_save_project_btn=save_button)
+    project_path = tmp_path / "saved.swcv"
+
+    NeuronViewerWidget._set_current_project_path(widget, project_path)
+
+    assert widget._current_project_path == project_path.resolve()
+    save_button.setEnabled.assert_called_with(True)
+    assert str(project_path.resolve()) in save_button.setToolTip.call_args.args[0]
+
+    NeuronViewerWidget._set_current_project_path(widget, None)
+
+    assert widget._current_project_path is None
+    save_button.setEnabled.assert_called_with(False)
+
+
+def test_loading_plain_parquet_clears_current_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    source = tmp_path / "source.parquet"
+    new_db = MagicMock()
+    new_db.get_statistics.return_value = {
+        "n_nodes": 3,
+        "n_files": 2,
+        "n_subjects": 2,
+        "n_regions": 2,
+    }
+    old_db = MagicMock()
+    flatmap_tab = SimpleNamespace(
+        invalidate_loaded_parquet_projection=MagicMock(),
+        refresh_cache_profiles=MagicMock(),
+    )
+    widget = SimpleNamespace(
+        _db=old_db,
+        _file_label=MagicMock(),
+        _stats_label=MagicMock(),
+        _regions_status_label=MagicMock(),
+        _analysis_tab=SimpleNamespace(set_database=MagicMock()),
+        _flatmap_tab=flatmap_tab,
+        _set_current_project_path=MagicMock(),
+        _load_enhanced_table_state=MagicMock(return_value=0),
+        _load_flatmap_transform_status=MagicMock(return_value=""),
+        _set_region_query_buttons_enabled=MagicMock(),
+        _apply_saved_table_state_to_table=MagicMock(),
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._load_parquet_path.__globals__,
+        "NeuronDatabase",
+        lambda _path: new_db,
+    )
+
+    NeuronViewerWidget._load_parquet_path(widget, source)
+
+    assert widget._db is new_db
+    old_db.close.assert_called_once_with()
+    widget._set_current_project_path.assert_called_once_with(None)
+
+
+def test_save_current_project_cancel_does_not_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    project_path = tmp_path / "saved.swcv"
+    widget = SimpleNamespace(
+        _current_project_path=project_path,
+        _confirm_project_overwrite=MagicMock(return_value=False),
+        _save_project_to_path=MagicMock(),
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._save_current_project.__globals__,
+        "is_recognized_project_bundle",
+        lambda _path: True,
+    )
+
+    NeuronViewerWidget._save_current_project(widget)
+
+    widget._confirm_project_overwrite.assert_called_once_with(project_path)
+    widget._save_project_to_path.assert_not_called()
+
+
+def test_save_current_project_confirms_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    project_path = tmp_path / "saved.swcv"
+    widget = SimpleNamespace(
+        _current_project_path=project_path,
+        _confirm_project_overwrite=MagicMock(return_value=True),
+        _save_project_to_path=MagicMock(),
+    )
+    monkeypatch.setitem(
+        NeuronViewerWidget._save_current_project.__globals__,
+        "is_recognized_project_bundle",
+        lambda _path: True,
+    )
+
+    NeuronViewerWidget._save_current_project(widget)
+
+    widget._save_project_to_path.assert_called_once_with(
+        project_path,
+        overwrite=True,
+    )
+
+
+def _project_save_widget(source: Path, current: Path | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        _db=SimpleNamespace(parquet_path=source),
+        _current_project_path=current,
+        _project_progress=MagicMock(),
+        _project_status_label=MagicMock(),
+        _regions_status_label=MagicMock(),
+        _flatmap_tab=SimpleNamespace(active_cache_reference=lambda: None),
+        _set_project_save_in_progress=MagicMock(),
+        _set_current_project_path=MagicMock(),
+        _current_table_state=lambda: _table_state(),
+        _iter_viewer_layers=lambda: [],
+        _current_atlas_name=lambda: None,
+        _analysis_project_metadata=lambda: {},
+    )
+
+
+def test_successful_save_as_sets_current_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    source = tmp_path / "source.parquet"
+    project_path = tmp_path / "saved.swcv"
+    widget = _project_save_widget(source)
+    method_globals = NeuronViewerWidget._save_project_to_path.__globals__
+    save_calls: list[dict[str, object]] = []
+
+    def fake_save(path, **kwargs):
+        save_calls.append({"path": path, **kwargs})
+        return project_path
+
+    monkeypatch.setitem(method_globals, "save_project_bundle", fake_save)
+    monkeypatch.setitem(
+        method_globals,
+        "QApplication",
+        SimpleNamespace(processEvents=lambda: None),
+    )
+    monkeypatch.setitem(method_globals, "show_info", lambda _message: None)
+
+    NeuronViewerWidget._save_project_to_path(
+        widget,
+        project_path,
+        overwrite=False,
+    )
+
+    assert save_calls[0]["path"] == project_path
+    assert save_calls[0]["overwrite"] is False
+    widget._set_current_project_path.assert_called_once_with(project_path)
+    assert widget._set_project_save_in_progress.call_args_list == [
+        call(True),
+        call(False),
+    ]
+
+
+def test_failed_overwrite_retains_recognized_current_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    source = tmp_path / "source.parquet"
+    project_path = tmp_path / "saved.swcv"
+    widget = _project_save_widget(source, current=project_path)
+    method_globals = NeuronViewerWidget._save_project_to_path.__globals__
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("save failed")
+
+    monkeypatch.setitem(method_globals, "save_project_bundle", fail_save)
+    monkeypatch.setitem(
+        method_globals,
+        "is_recognized_project_bundle",
+        lambda _path: True,
+    )
+    monkeypatch.setitem(
+        method_globals,
+        "QApplication",
+        SimpleNamespace(processEvents=lambda: None),
+    )
+    monkeypatch.setitem(method_globals, "show_warning", lambda _message: None)
+
+    NeuronViewerWidget._save_project_to_path(
+        widget,
+        project_path,
+        overwrite=True,
+    )
+
+    widget._set_current_project_path.assert_not_called()
+    assert widget._set_project_save_in_progress.call_args_list == [
+        call(True),
+        call(False),
+    ]
+    assert "save failed" in widget._project_status_label.setText.call_args.args[0]
