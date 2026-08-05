@@ -930,9 +930,9 @@ stale files from the previous version.
 
 **Manual verification**
 
-- Status: Not run
-- Last verified: Never
-- Notes: None
+- Status: Passed
+- Last verified: 2026-08-05
+- Notes: Verified by removing Heatmap layers. Two clusterings were retained.
 
 ## Use-Case Template
 
