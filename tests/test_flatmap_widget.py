@@ -250,11 +250,51 @@ class _DummyLayer:
         }
 
 
+class _DummyEmitter:
+    """Minimal stand-in for a napari event emitter."""
+
+    def __init__(self) -> None:
+        self.callbacks: list[object] = []
+
+    def connect(self, callback) -> None:
+        self.callbacks.append(callback)
+
+    def disconnect(self, callback) -> None:
+        self.callbacks.remove(callback)
+
+    def emit(self) -> None:
+        for callback in list(self.callbacks):
+            callback()
+
+
+class _DummyDims:
+    """Stand-in for ``viewer.dims`` with the fields the widget reads."""
+
+    def __init__(self) -> None:
+        self.ndisplay = 3
+        self.ndim = 3
+        self.axis_labels = ("0", "1", "2")
+        self.current_step = (0, 0, 0)
+        self.events = types.SimpleNamespace(current_step=_DummyEmitter())
+
+    def set_current_step(self, index: int) -> None:
+        """Move the plane slider and notify listeners, as napari would."""
+        self.current_step = (int(index),) + tuple(self.current_step[1:])
+        self.events.current_step.emit()
+
+
 class _DummyViewer:
     def __init__(self) -> None:
         self.layers: list[_DummyLayer] = []
-        self.dims = types.SimpleNamespace(ndisplay=3)
+        self.dims = _DummyDims()
         self.camera = types.SimpleNamespace(center=None, zoom=None)
+        self.axes = types.SimpleNamespace(visible=False, labels=True)
+        self.text_overlay = types.SimpleNamespace(
+            visible=False,
+            text="",
+            position="top_left",
+            font_size=10,
+        )
 
     def add_shapes(self, data, **kwargs) -> _DummyLayer:
         layer = _DummyLayer(data, **kwargs)
@@ -319,6 +359,141 @@ def _widget(module):
     widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
     widget._flatmap_correlation_source_changed_callback = None
     return widget
+
+
+class _DummySection:
+    """Stand-in for ``CollapsibleSection`` recording its expanded state."""
+
+    def __init__(self, expanded: bool = True) -> None:
+        self.expanded = bool(expanded)
+
+    def is_expanded(self) -> bool:
+        return self.expanded
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.expanded = bool(expanded)
+
+
+class _DummyDatabase:
+    """Parquet-backed database double answering only schema questions."""
+
+    def __init__(self, columns) -> None:
+        self.columns = set(columns)
+        self.described = 0
+
+    def has_column(self, name: str) -> bool:
+        self.described += 1
+        return str(name) in self.columns
+
+
+_LEGACY_FLATMAP_COLUMNS = ("file_id", "x_flat", "y_flat", "depth_um")
+_V3_FLATMAP_COLUMNS = (
+    "file_id",
+    "x_flat_shaped",
+    "y_flat_shaped",
+    "x_flat_square",
+    "y_flat_square",
+    "depth_um",
+)
+
+
+def _lookup_files_widget(module, columns=None):
+    widget = _widget(module)
+    widget._lookup_files_section = _DummySection()
+    widget._database_provider = lambda: (
+        _DummyDatabase(columns) if columns is not None else None
+    )
+    return widget
+
+
+def test_lookup_files_section_collapses_for_version_3_flatmap_parquet(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _lookup_files_widget(module, _V3_FLATMAP_COLUMNS)
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert widget._lookup_files_section.is_expanded() is False
+
+
+def test_lookup_files_section_collapses_for_legacy_flatmap_parquet(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _lookup_files_widget(module, _LEGACY_FLATMAP_COLUMNS)
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert widget._lookup_files_section.is_expanded() is False
+
+
+def test_lookup_files_section_stays_open_without_flatmap_columns(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _lookup_files_widget(module, ("file_id", "x", "y", "z", "region_id"))
+    widget._lookup_files_section.set_expanded(False)
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert widget._lookup_files_section.is_expanded() is True
+
+
+def test_lookup_files_section_stays_open_for_partial_flatmap_columns(
+    monkeypatch,
+) -> None:
+    """Half a column family cannot drive a projection, so the files still matter."""
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _lookup_files_widget(
+        module,
+        ("file_id", "x_flat_shaped", "y_flat_shaped", "depth_um"),
+    )
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert widget._lookup_files_section.is_expanded() is True
+
+
+def test_lookup_files_section_stays_open_without_a_loaded_parquet(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _lookup_files_widget(module)
+    widget._lookup_files_section.set_expanded(False)
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert widget._lookup_files_section.is_expanded() is True
+
+
+def test_lookup_files_section_reads_schema_not_rows(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+
+    def refuse_rows(*_args, **_kwargs):
+        pytest.fail("sizing the UI must not query neuron rows")
+
+    database = _DummyDatabase(_V3_FLATMAP_COLUMNS)
+    database.get_neurons_for_rendering = refuse_rows
+    widget = _widget(module)
+    widget._lookup_files_section = _DummySection()
+    widget._database_provider = lambda: database
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert database.described > 0
+    assert widget._lookup_files_section.is_expanded() is False
+
+
+def test_lookup_files_section_survives_an_unreadable_schema(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._lookup_files_section = _DummySection(expanded=False)
+
+    def raising_has_column(_name):
+        raise RuntimeError("schema unavailable")
+
+    widget._database_provider = lambda: types.SimpleNamespace(
+        has_column=raising_has_column
+    )
+
+    widget.invalidate_loaded_parquet_projection()
+
+    assert widget._lookup_files_section.is_expanded() is True
 
 
 def test_lookup_stats_cache_reuses_matching_file_and_sentinel_settings(
@@ -2118,7 +2293,7 @@ def test_allen_layer_stack_uses_one_2d_categorical_image(monkeypatch) -> None:
     assert layer.name == module._ALLEN_LAYER_HEATMAP_LAYER_NAME
     assert widget._viewer.layers == [layer]
     assert widget._viewer.dims.ndisplay == 2
-    assert layer.axis_labels[0].startswith("Allen layer (0:L1")
+    assert layer.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
     assert layer.metadata["flatmap_plane_mode"] == "allen_layers"
     assert layer.metadata["allen_layer_labels"] == [
         "L1",
@@ -2134,6 +2309,219 @@ def test_allen_layer_stack_uses_one_2d_categorical_image(monkeypatch) -> None:
         "version": "1.2.3",
     }
     assert layer.metadata["flatmap_projection_source"] == "legacy_auto"
+
+
+def _render_allen_layer_stack(module, widget, *, color_mode=None):
+    """Render a six-plane Allen stack through the widget's normal entry point."""
+    color_mode = color_mode or module._HEATMAP_COLOR_SINGLE
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: color_mode
+    )
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc"],
+            "render_valid": [True, True],
+            "allen_layer_index": [0, 1],
+            "allen_layer_label": ["L1", "L2/3"],
+            "y_flat_bin": [1, 2],
+            "x_flat_bin": [2, 3],
+        }
+    )
+    volume = np.zeros((6, 4, 4), dtype=np.float32)
+    volume[0, 1, 2] = 1.0
+    volume[1, 2, 3] = 1.0
+    stack = module.AllenLayerStackResult(
+        projected_nodes=projected,
+        volume=volume,
+        summary=_simple_allen_layer_summary(module),
+    )
+    return widget._create_or_update_allen_layer_stack(
+        stack,
+        _simple_projection_summary(module, total_nodes=2),
+        flatmap_style="both_shaped",
+        coordinate_mode="parquet_columns",
+    )
+
+
+def test_allen_layer_stack_names_the_viewer_axes_and_current_plane(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    _render_allen_layer_stack(module, widget)
+
+    viewer = widget._viewer
+    # napari draws the slider caption and the axes overlay from viewer.dims,
+    # never from layer.axis_labels.
+    assert viewer.dims.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
+    assert viewer.axes.visible is True
+    assert viewer.axes.labels is True
+    assert viewer.text_overlay.visible is True
+    assert viewer.text_overlay.text == "Allen layer: L1  (plane 1 of 6)"
+    assert viewer.text_overlay.position == "top_left"
+    assert viewer.text_overlay.font_size == 12
+
+
+def test_allen_layer_plane_label_follows_the_dims_slider(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    _render_allen_layer_stack(module, widget)
+    widget._viewer.dims.set_current_step(3)
+
+    assert widget._viewer.text_overlay.text == "Allen layer: L5  (plane 4 of 6)"
+
+    widget._viewer.dims.set_current_step(5)
+
+    assert widget._viewer.text_overlay.text == "Allen layer: L6b  (plane 6 of 6)"
+
+
+def test_grouped_allen_layer_stack_names_the_current_plane(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    layer = _render_allen_layer_stack(
+        module,
+        widget,
+        color_mode=module._HEATMAP_COLOR_INDIVIDUAL,
+    )
+
+    assert layer.name.startswith(module._GROUPED_ALLEN_LAYER_PREFIX)
+    assert layer.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
+    assert widget._viewer.dims.axis_labels == (
+        "Allen layer",
+        "Flatmap Y",
+        "Flatmap X",
+    )
+    assert widget._viewer.text_overlay.text == "Allen layer: L1  (plane 1 of 6)"
+
+
+def test_depth_heatmap_plane_label_reports_the_depth_range(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    projected = pd.DataFrame({"file_id": ["a.swc"]})
+    volume = np.zeros((3, 4, 4), dtype=np.float32)
+    volume[1, 1, 2] = 1.0
+    render_summary = module.FlatmapRenderSummary(
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+        1,
+        1,
+        4,
+        3,
+        25.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        75.0,
+        False,
+    )
+    render_result = module.FlatmapRenderResult(
+        projected_nodes=projected,
+        volume=volume,
+        points=np.zeros((1, 3), dtype=float),
+        point_file_ids=["a.swc"],
+        summary=render_summary,
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+
+    layer = widget._create_or_update_render_layer(
+        render_result,
+        _simple_projection_summary(module),
+        flatmap_style="flatmap_both_shaped.nrrd",
+        coordinate_mode="microns",
+        render_mode=module._RENDER_HEATMAP,
+    )
+
+    assert layer.axis_labels == ("Depth bin", "Flatmap Y", "Flatmap X")
+    assert widget._viewer.dims.axis_labels == ("Depth bin", "Flatmap Y", "Flatmap X")
+    assert widget._viewer.text_overlay.text == "Depth bin: 0-25 um  (plane 1 of 3)"
+
+    widget._viewer.dims.set_current_step(2)
+
+    assert widget._viewer.text_overlay.text == "Depth bin: 50-75 um  (plane 3 of 3)"
+
+
+def test_plane_label_reports_position_when_planes_are_unnamed(monkeypatch) -> None:
+    """A depth-mode region-labels layer records no bin size; do not invent one."""
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    labels = np.zeros((5, 4, 4), dtype=np.uint16)
+    layer = widget._viewer.add_labels(
+        labels,
+        name=module._REGION_LABELS_LAYER_NAME,
+        metadata={"projection_kind": "flatmap_region_labels"},
+        axis_labels=widget._depth_axis_labels(),
+    )
+
+    widget._apply_display_axis_annotations(layer)
+
+    assert widget._viewer.text_overlay.text == "Depth bin: plane 1 of 5"
+
+    widget._viewer.dims.set_current_step(4)
+
+    assert widget._viewer.text_overlay.text == "Depth bin: plane 5 of 5"
+
+
+def test_points_render_leaves_the_viewer_overlays_untouched(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    points = widget._viewer.add_points(
+        np.zeros((2, 3), dtype=float),
+        name=module._POINTS_LAYER_NAME,
+        metadata={},
+    )
+
+    widget._apply_display_axis_annotations(points)
+
+    assert widget._viewer.dims.axis_labels == ("0", "1", "2")
+    assert widget._viewer.axes.visible is False
+    assert widget._viewer.text_overlay.text == ""
+
+
+def test_removing_render_layers_restores_the_viewer_overlays(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    viewer = widget._viewer
+
+    _render_allen_layer_stack(module, widget)
+    assert viewer.text_overlay.visible is True
+
+    widget._remove_projection_layer()
+
+    assert viewer.dims.axis_labels == ("0", "1", "2")
+    assert viewer.axes.visible is False
+    assert viewer.text_overlay.visible is False
+    assert viewer.text_overlay.text == ""
+    assert viewer.dims.events.current_step.callbacks == []
+
+
+def test_release_display_viewer_stops_following_the_slider(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._last_display_viewer = widget._viewer
+    widget._region_surfaces_layers = []
+    widget._region_outlines_layers = []
+    viewer = widget._viewer
+
+    _render_allen_layer_stack(module, widget)
+    assert viewer.dims.events.current_step.callbacks != []
+
+    assert widget._release_display_viewer(viewer) is True
+
+    assert viewer.dims.events.current_step.callbacks == []
+    assert widget._display_axis_annotation_state is None
+    assert viewer.text_overlay.visible is False
 
 
 def test_allen_layer_mode_enables_cached_labels_but_disables_depth_and_geometry(

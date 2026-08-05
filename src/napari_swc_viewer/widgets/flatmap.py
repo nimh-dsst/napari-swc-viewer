@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 import re
 from time import perf_counter
@@ -34,6 +35,7 @@ from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_XY_BINS,
     FLATMAP_PLANE_MODE_ALLEN_LAYERS,
+    FLATMAP_PLANE_MODE_DEPTH,
     AllenLayerHeatmapVolumeResult,
     AllenLayerStackResult,
     AllenLayerStackSummary,
@@ -49,6 +51,7 @@ from ..flatmap_heatmap import (
     build_flatmap_render_data,
     build_flatmap_render_data_from_projected_nodes,
     compute_flatmap_lookup_stats,
+    depth_plane_labels,
 )
 from ..flatmap_labels import (
     FlatmapRegionLabelsResult,
@@ -119,6 +122,23 @@ _FLATMAP_RENDER_LAYER_NAMES = {
 }
 _DEFAULT_TRACE_COLOR = np.asarray([0.5, 0.5, 0.5, 1.0], dtype=float)
 
+# Axis captions shown on the display viewer's dims sliders and axes overlay.
+# The flatmap images are binned in index space, so these name the axes without
+# claiming physical units or anatomical direction.
+_FLATMAP_AXIS_LABEL_X = "Flatmap X"
+_FLATMAP_AXIS_LABEL_Y = "Flatmap Y"
+_ALLEN_LAYER_AXIS_LABEL = "Allen layer"
+_DEPTH_AXIS_LABEL = "Depth bin"
+_PLANE_TEXT_OVERLAY_FONT_SIZE = 12
+_PLANE_TEXT_OVERLAY_POSITION = "top_left"
+
+_LOOKUP_FILES_PURPOSE_TEXT = (
+    "These lookup files generate flatmap coordinates from CCF coordinates. "
+    "They are needed only when the loaded Parquet has no flatmap columns, or "
+    "to write them into one with Prepare Whole Parquet. A Parquet that already "
+    "carries flatmap coordinates projects without them."
+)
+
 
 class _CacheCompatibilityUnavailable(RuntimeError):
     """Compatibility cannot be decided until required viewer state is loaded."""
@@ -155,6 +175,7 @@ class FlatmapProjectionWidget(QWidget):
         self._display_viewer_ready_callback = display_viewer_ready_callback
         self._display_viewer_failed_callback = display_viewer_failed_callback
         self._last_display_viewer = None
+        self._display_axis_annotation_state: dict | None = None
         self._database_provider = database_provider
         self._selected_file_ids_provider = selected_file_ids_provider
         self._table_file_ids_provider = table_file_ids_provider
@@ -274,6 +295,7 @@ class FlatmapProjectionWidget(QWidget):
         if getattr(self, "_last_display_viewer", None) is not viewer:
             return False
 
+        self._clear_display_axis_annotations(viewer)
         self._last_display_viewer = None
         self._projection_layer = None
         self._region_labels_layer = None
@@ -321,6 +343,10 @@ class FlatmapProjectionWidget(QWidget):
 
     def _setup_ui(self) -> None:
         """Build the tab UI."""
+        # Imported here because the sibling package's ``__init__`` pulls in every
+        # widget module, which is more than this module needs at import time.
+        from .collapsible_section import CollapsibleSection
+
         parent_layout = QVBoxLayout(self)
 
         scroll_area = QScrollArea()
@@ -333,8 +359,12 @@ class FlatmapProjectionWidget(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        files_group = QGroupBox("Flatmap Lookup Files")
-        files_layout = QVBoxLayout(files_group)
+        self._lookup_files_section = CollapsibleSection("Flatmap Lookup Files")
+        files_layout = self._lookup_files_section.content_layout()
+
+        lookup_files_purpose_label = QLabel(_LOOKUP_FILES_PURPOSE_TEXT)
+        lookup_files_purpose_label.setWordWrap(True)
+        files_layout.addWidget(lookup_files_purpose_label)
 
         projection_source_row = QHBoxLayout()
         projection_source_row.addWidget(QLabel("Source:"))
@@ -402,7 +432,7 @@ class FlatmapProjectionWidget(QWidget):
         self._lookup_resolution_spin.setSuffix(" um")
         lookup_resolution_row.addWidget(self._lookup_resolution_spin)
         files_layout.addLayout(lookup_resolution_row)
-        layout.addWidget(files_group)
+        layout.addWidget(self._lookup_files_section)
 
         cache_group = QGroupBox("Flatmap Region Cache")
         cache_layout = QVBoxLayout(cache_group)
@@ -622,6 +652,7 @@ class FlatmapProjectionWidget(QWidget):
         self._update_expected_filename_label()
         self._update_render_mode_controls()
         self._update_cached_region_controls()
+        self._update_lookup_files_section()
 
     def set_flatmap_path(self, path: str | Path | None) -> None:
         """Set the flatmap path, primarily for tests and scripted use."""
@@ -1301,6 +1332,7 @@ class FlatmapProjectionWidget(QWidget):
     def invalidate_loaded_parquet_projection(self) -> None:
         """Clear flatmap state before associating the tab with a new Parquet."""
         self._invalidate_flatmap_grid_layers()
+        self._update_lookup_files_section()
 
     def _deactivate_cache_profile(self) -> None:
         if getattr(self, "_active_cache_profile", None) is not None:
@@ -2052,19 +2084,55 @@ class FlatmapProjectionWidget(QWidget):
         if self._depth_path is None:
             raise RuntimeError("Choose depth.nrrd before this action.")
 
-    @staticmethod
-    def _has_parquet_flatmap_depth_columns(nodes: pd.DataFrame) -> bool:
+    # Either column family is enough to project without the lookup NRRDs: the
+    # legacy single-style set, or the version-3 bilateral shaped/square set.
+    _FLATMAP_COLUMN_FAMILIES = (
+        ("x_flat", "y_flat", "depth_um"),
+        (
+            "x_flat_shaped",
+            "y_flat_shaped",
+            "x_flat_square",
+            "y_flat_square",
+            "depth_um",
+        ),
+    )
+
+    @classmethod
+    def _has_parquet_flatmap_depth_columns(cls, nodes: pd.DataFrame) -> bool:
         names = set(nodes.columns)
-        return bool(
-            {"x_flat", "y_flat", "depth_um"}.issubset(names)
-            or {
-                "x_flat_shaped",
-                "y_flat_shaped",
-                "x_flat_square",
-                "y_flat_square",
-                "depth_um",
-            }.issubset(names)
+        return any(
+            set(family).issubset(names) for family in cls._FLATMAP_COLUMN_FAMILIES
         )
+
+    def _loaded_parquet_has_flatmap_columns(self) -> bool:
+        """Report whether the loaded Parquet already carries flatmap columns.
+
+        Reads the database schema rather than querying rows, so it is cheap
+        enough to call whenever a Parquet is loaded.
+        """
+        db = self._database_provider()
+        has_column = getattr(db, "has_column", None)
+        if not callable(has_column):
+            return False
+        for family in self._FLATMAP_COLUMN_FAMILIES:
+            try:
+                if all(has_column(name) for name in family):
+                    return True
+            except Exception:
+                logger.debug(
+                    "Failed to inspect the loaded Parquet for flatmap columns.",
+                    exc_info=True,
+                )
+                return False
+        return False
+
+    def _update_lookup_files_section(self) -> None:
+        """Collapse the lookup-file controls when the Parquet does not need them."""
+        section = getattr(self, "_lookup_files_section", None)
+        set_expanded = getattr(section, "set_expanded", None)
+        if not callable(set_expanded):
+            return
+        set_expanded(not self._loaded_parquet_has_flatmap_columns())
 
     def _resolve_projection_plan(self, projection_source: str) -> tuple[bool, int]:
         """Decide whether to use lookup NRRDs and how many progress steps."""
@@ -3584,6 +3652,7 @@ class FlatmapProjectionWidget(QWidget):
                 include_surfaces=False,
                 include_outlines=False,
             )
+            axis_labels = self._depth_axis_labels()
         if result.summary.labeled_bins == 0:
             self._clear_named_region_layers(_REGION_LABELS_LAYER_NAME)
             self._region_labels_layer = None
@@ -4380,6 +4449,13 @@ class FlatmapProjectionWidget(QWidget):
             or not self._layer_is_in_viewer(self._projection_layer)
         ):
             self._projection_layer = None
+        if not any(
+            self._is_flatmap_render_layer_name(getattr(layer, "name", None))
+            for layer in list(layers)
+        ):
+            # Nothing plane-stacked is left on screen; a stale plane name would
+            # describe a layer the user can no longer see.
+            self._clear_display_axis_annotations()
 
     def _render_metadata(
         self,
@@ -4409,7 +4485,7 @@ class FlatmapProjectionWidget(QWidget):
             metadata["flatmap_heatmap_color_mode"] = (
                 heatmap_color_mode or _HEATMAP_COLOR_SINGLE
             )
-            metadata["flatmap_plane_mode"] = "depth"
+            metadata["flatmap_plane_mode"] = FLATMAP_PLANE_MODE_DEPTH
         elif render_mode == _RENDER_ALLEN_LAYERS:
             metadata["flatmap_heatmap_color_mode"] = (
                 heatmap_color_mode or _HEATMAP_COLOR_SINGLE
@@ -4496,14 +4572,20 @@ class FlatmapProjectionWidget(QWidget):
 
     @staticmethod
     def _allen_layer_axis_labels() -> tuple[str, str, str]:
-        mapping = ", ".join(
-            f"{index}:{label}"
-            for index, label in enumerate(ALLEN_ISOCORTEX_LAYER_LABELS)
-        )
+        """Return dims captions for a categorical Allen-layer plane stack."""
         return (
-            f"Allen layer ({mapping})",
-            "Flatmap Y",
-            "Flatmap X",
+            _ALLEN_LAYER_AXIS_LABEL,
+            _FLATMAP_AXIS_LABEL_Y,
+            _FLATMAP_AXIS_LABEL_X,
+        )
+
+    @staticmethod
+    def _depth_axis_labels() -> tuple[str, str, str]:
+        """Return dims captions for a depth-binned flatmap volume."""
+        return (
+            _DEPTH_AXIS_LABEL,
+            _FLATMAP_AXIS_LABEL_Y,
+            _FLATMAP_AXIS_LABEL_X,
         )
 
     def _create_or_update_allen_layer_stack(
@@ -4697,6 +4779,9 @@ class FlatmapProjectionWidget(QWidget):
         layer_name: str = _HEATMAP_LAYER_NAME,
         axis_labels: tuple[str, str, str] | None = None,
     ):
+        # Every heatmap volume is a plane stack over flatmap XY; callers that do
+        # not name their plane axis are rendering depth bins.
+        axis_labels = axis_labels or self._depth_axis_labels()
         contrast_limits = self._heatmap_contrast_limits(volume)
         metadata = dict(metadata)
         metadata["flatmap_heatmap_contrast_limits"] = contrast_limits
@@ -4850,6 +4935,7 @@ class FlatmapProjectionWidget(QWidget):
         render_mode: str = _RENDER_HEATMAP,
         axis_labels: tuple[str, str, str] | None = None,
     ):
+        axis_labels = axis_labels or self._depth_axis_labels()
         volume = group.volume
         contrast_limits = self._heatmap_contrast_limits(volume)
         group_metadata = dict(metadata)
@@ -5260,6 +5346,8 @@ class FlatmapProjectionWidget(QWidget):
                     exc_info=True,
                 )
         self._reslice_layer_for_current_dims(layer)
+        # Applied before the camera work below, which has early returns.
+        self._apply_display_axis_annotations(layer)
 
         layers = getattr(viewer, "layers", None)
         selection = getattr(layers, "selection", None)
@@ -5306,6 +5394,226 @@ class FlatmapProjectionWidget(QWidget):
                 camera.zoom = float(np.clip(600.0 / span, 0.01, 10_000.0))
             except Exception:
                 logger.debug("Failed to zoom camera to flatmap layer.", exc_info=True)
+
+    def _plane_labels_for_layer(self, layer) -> tuple[str, ...] | None:
+        """Return one label per plane of a flatmap layer, or ``None`` if unknown.
+
+        ``None`` is a real answer: the depth-mode region-labels layer records no
+        depth bin size, so naming its planes in microns would be invented.
+        """
+        metadata = getattr(layer, "metadata", None) or {}
+        try:
+            plane_mode = metadata.get("flatmap_plane_mode")
+        except AttributeError:
+            return None
+        if plane_mode == FLATMAP_PLANE_MODE_ALLEN_LAYERS:
+            labels = metadata.get("allen_layer_labels") or ALLEN_ISOCORTEX_LAYER_LABELS
+            return tuple(str(label) for label in labels)
+        if plane_mode == FLATMAP_PLANE_MODE_DEPTH:
+            render_summary = metadata.get("render_summary")
+            if isinstance(render_summary, Mapping):
+                return depth_plane_labels(render_summary) or None
+        return None
+
+    @staticmethod
+    def _flatmap_axis_labels_for_layer(layer) -> tuple[str, ...] | None:
+        """Return a layer's axis captions only when this widget set them.
+
+        Points renders and any foreign layer keep napari's generic ``axis -1``
+        style names, which must not be copied onto the viewer.
+        """
+        axis_labels = getattr(layer, "axis_labels", None)
+        if not axis_labels:
+            return None
+        try:
+            labels = tuple(str(label) for label in axis_labels)
+        except TypeError:
+            return None
+        if labels[-2:] != (_FLATMAP_AXIS_LABEL_Y, _FLATMAP_AXIS_LABEL_X):
+            return None
+        return labels
+
+    def _apply_display_axis_annotations(self, layer) -> None:
+        """Name the display viewer's axes and show which plane is on screen.
+
+        napari renders the dims slider caption and the axes overlay from
+        ``viewer.dims.axis_labels``; ``layer.axis_labels`` never reaches either.
+        """
+        viewer = self._current_display_viewer()
+        if viewer is None or layer is None:
+            return
+        dims = getattr(viewer, "dims", None)
+        if dims is None:
+            return
+
+        axis_labels = self._flatmap_axis_labels_for_layer(layer)
+        if axis_labels is None:
+            self._clear_display_axis_annotations()
+            return
+
+        state = self._capture_display_axis_annotation_state(viewer)
+        if state is None:
+            return
+
+        try:
+            dims.axis_labels = axis_labels
+        except Exception:
+            logger.debug("Failed to set flatmap dims axis labels.", exc_info=True)
+
+        axes = getattr(viewer, "axes", None)
+        if axes is not None:
+            try:
+                axes.visible = True
+                axes.labels = True
+            except Exception:
+                logger.debug("Failed to show the flatmap axes overlay.", exc_info=True)
+
+        state["plane_labels"] = self._plane_labels_for_layer(layer)
+        state["plane_caption"] = axis_labels[0]
+        state["plane_count"] = self._plane_count_for_layer(layer, state["plane_labels"])
+        self._connect_display_dims_events(viewer)
+        self._on_display_dims_step_changed()
+
+    @staticmethod
+    def _plane_count_for_layer(layer, plane_labels: tuple[str, ...] | None) -> int:
+        if plane_labels:
+            return len(plane_labels)
+        data = getattr(layer, "data", None)
+        shape = getattr(data, "shape", None)
+        if shape is not None and len(shape) >= 3:
+            return int(shape[0])
+        return 0
+
+    def _capture_display_axis_annotation_state(self, viewer) -> dict | None:
+        """Remember a viewer's pre-existing overlay state so it can be restored."""
+        state = getattr(self, "_display_axis_annotation_state", None)
+        if state is not None and state.get("viewer") is viewer:
+            return state
+        if state is not None:
+            self._clear_display_axis_annotations(state.get("viewer"))
+
+        dims = getattr(viewer, "dims", None)
+        axes = getattr(viewer, "axes", None)
+        text_overlay = getattr(viewer, "text_overlay", None)
+        state = {
+            "viewer": viewer,
+            "connected": False,
+            "plane_labels": None,
+            "plane_caption": _DEPTH_AXIS_LABEL,
+            "plane_count": 0,
+            "previous_axis_labels": getattr(dims, "axis_labels", None),
+            "previous_axes_visible": getattr(axes, "visible", None),
+            "previous_axes_labels": getattr(axes, "labels", None),
+            "previous_text_visible": getattr(text_overlay, "visible", None),
+            "previous_text": getattr(text_overlay, "text", None),
+        }
+        self._display_axis_annotation_state = state
+        return state
+
+    def _connect_display_dims_events(self, viewer) -> None:
+        state = getattr(self, "_display_axis_annotation_state", None)
+        if state is None or state.get("connected"):
+            return
+        emitter = getattr(
+            getattr(getattr(viewer, "dims", None), "events", None),
+            "current_step",
+            None,
+        )
+        connect = getattr(emitter, "connect", None)
+        if not callable(connect):
+            return
+        try:
+            connect(self._on_display_dims_step_changed)
+        except Exception:
+            logger.debug(
+                "Failed to follow the flatmap display slider.",
+                exc_info=True,
+            )
+            return
+        state["connected"] = True
+
+    def _on_display_dims_step_changed(self, event=None) -> None:
+        """Write the on-canvas name of the plane currently under the slider."""
+        state = getattr(self, "_display_axis_annotation_state", None)
+        if state is None:
+            return
+        viewer = state.get("viewer")
+        text_overlay = getattr(viewer, "text_overlay", None)
+        if text_overlay is None:
+            return
+
+        plane_count = int(state.get("plane_count") or 0)
+        if plane_count <= 0:
+            return
+        current_step = getattr(getattr(viewer, "dims", None), "current_step", None)
+        try:
+            index = int(current_step[0])
+        except (IndexError, TypeError, ValueError):
+            index = 0
+        index = max(0, min(index, plane_count - 1))
+
+        caption = str(state.get("plane_caption") or _DEPTH_AXIS_LABEL)
+        plane_labels = state.get("plane_labels")
+        position = f"plane {index + 1} of {plane_count}"
+        if plane_labels:
+            text = f"{caption}: {plane_labels[index]}  ({position})"
+        else:
+            text = f"{caption}: {position}"
+
+        try:
+            text_overlay.text = text
+            text_overlay.position = _PLANE_TEXT_OVERLAY_POSITION
+            text_overlay.font_size = _PLANE_TEXT_OVERLAY_FONT_SIZE
+            text_overlay.visible = True
+        except Exception:
+            logger.debug("Failed to update the flatmap plane label.", exc_info=True)
+
+    def _clear_display_axis_annotations(self, viewer=None) -> None:
+        """Disconnect the slider follower and restore the viewer's own overlays."""
+        state = getattr(self, "_display_axis_annotation_state", None)
+        if state is None:
+            return
+        if viewer is not None and state.get("viewer") is not viewer:
+            return
+        self._display_axis_annotation_state = None
+
+        target = state.get("viewer")
+        if target is None:
+            return
+        dims = getattr(target, "dims", None)
+        if state.get("connected"):
+            emitter = getattr(getattr(dims, "events", None), "current_step", None)
+            disconnect = getattr(emitter, "disconnect", None)
+            if callable(disconnect):
+                try:
+                    disconnect(self._on_display_dims_step_changed)
+                except Exception:
+                    logger.debug(
+                        "Failed to stop following the flatmap display slider.",
+                        exc_info=True,
+                    )
+
+        for owner, attribute, key in (
+            (dims, "axis_labels", "previous_axis_labels"),
+            (getattr(target, "axes", None), "visible", "previous_axes_visible"),
+            (getattr(target, "axes", None), "labels", "previous_axes_labels"),
+            (
+                getattr(target, "text_overlay", None),
+                "visible",
+                "previous_text_visible",
+            ),
+            (getattr(target, "text_overlay", None), "text", "previous_text"),
+        ):
+            previous = state.get(key)
+            if owner is None or previous is None:
+                continue
+            try:
+                setattr(owner, attribute, previous)
+            except Exception:
+                logger.debug(
+                    "Failed to restore flatmap display overlay state.",
+                    exc_info=True,
+                )
 
     def _reslice_layer_for_current_dims(self, layer) -> None:
         viewer = self._current_display_viewer()

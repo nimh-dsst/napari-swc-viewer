@@ -1,0 +1,168 @@
+"""Flatmap axis annotations checked against a real napari viewer model.
+
+``tests/test_flatmap_widget.py`` covers these methods through the full render
+path, but with a stubbed ``napari`` module and a hand-written viewer double.
+That double cannot tell us whether napari still spells the overlay fields the
+way this code expects, nor that ``viewer.dims.axis_labels`` — rather than
+``layer.axis_labels`` — is what the slider caption and axes overlay read. This
+module fills that gap with ``ViewerModel``, which needs no Qt.
+
+napari is imported inside the fixtures, never at module scope: importing it
+during collection initializes Qt far enough that the widget tests in
+``tests/test_analysis_region_options.py`` abort rather than construct their
+widgets without a QApplication.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+# ``FlatmapProjectionWidget`` is a QWidget, and PyQt refuses attribute access on
+# an instance whose C++ base was never constructed. Bind just the annotation
+# methods onto a plain object so the real code runs without a QApplication.
+_ANNOTATION_METHODS = (
+    "_apply_display_axis_annotations",
+    "_capture_display_axis_annotation_state",
+    "_clear_display_axis_annotations",
+    "_connect_display_dims_events",
+    "_current_display_viewer",
+    "_flatmap_axis_labels_for_layer",
+    "_on_display_dims_step_changed",
+    "_plane_count_for_layer",
+    "_plane_labels_for_layer",
+    "_resolve_display_viewer",
+)
+
+
+@pytest.fixture
+def widget_class():
+    from napari_swc_viewer.widgets.flatmap import FlatmapProjectionWidget
+
+    return FlatmapProjectionWidget
+
+
+@pytest.fixture
+def viewer():
+    from napari.components.viewer_model import ViewerModel
+
+    return ViewerModel()
+
+
+@pytest.fixture
+def host(widget_class, viewer):
+    namespace = {name: widget_class.__dict__[name] for name in _ANNOTATION_METHODS}
+    namespace.update(
+        _viewer=viewer,
+        _display_viewer_provider=None,
+        _display_axis_annotation_state=None,
+    )
+    return type("_AnnotationHost", (), namespace)()
+
+
+def _allen_layer_image(widget_class, viewer):
+    volume = np.zeros((6, 8, 8), dtype=np.float32)
+    volume[0, 1, 2] = 1.0
+    layer = viewer.add_image(
+        volume,
+        name="Isocortex Flatmap Allen Layers",
+        axis_labels=widget_class._allen_layer_axis_labels(),
+        metadata={
+            "flatmap_plane_mode": "allen_layers",
+            "allen_layer_labels": ["L1", "L2/3", "L4", "L5", "L6a", "L6b"],
+        },
+    )
+    viewer.dims.ndisplay = 2
+    return layer
+
+
+def test_annotations_set_the_viewer_state_napari_renders(
+    widget_class,
+    viewer,
+    host,
+) -> None:
+    layer = _allen_layer_image(widget_class, viewer)
+
+    host._apply_display_axis_annotations(layer)
+
+    assert viewer.dims.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
+    assert viewer.axes.visible is True
+    assert viewer.axes.labels is True
+    # The two labels napari's axes overlay draws for the displayed axes.
+    displayed = [viewer.dims.axis_labels[axis] for axis in viewer.dims.displayed[::-1]]
+    assert displayed == ["Flatmap X", "Flatmap Y"]
+    assert viewer.text_overlay.visible is True
+    assert viewer.text_overlay.position.value == "top_left"
+    assert viewer.text_overlay.font_size == 12
+
+
+def test_plane_label_follows_a_real_dims_slider(widget_class, viewer, host) -> None:
+    layer = _allen_layer_image(widget_class, viewer)
+
+    host._apply_display_axis_annotations(layer)
+
+    # napari opens a new six-plane axis at its middle position, not at zero.
+    assert viewer.dims.current_step[0] == 2
+    assert viewer.text_overlay.text == "Allen layer: L4  (plane 3 of 6)"
+
+    viewer.dims.set_current_step(0, 0)
+    assert viewer.text_overlay.text == "Allen layer: L1  (plane 1 of 6)"
+
+    viewer.dims.set_current_step(0, 5)
+    assert viewer.text_overlay.text == "Allen layer: L6b  (plane 6 of 6)"
+
+
+def test_clearing_restores_the_viewer_and_stops_following(
+    widget_class,
+    viewer,
+    host,
+) -> None:
+    layer = _allen_layer_image(widget_class, viewer)
+
+    host._apply_display_axis_annotations(layer)
+    host._clear_display_axis_annotations()
+
+    assert viewer.dims.axis_labels == ("0", "1", "2")
+    assert viewer.axes.visible is False
+    assert viewer.text_overlay.visible is False
+    assert viewer.text_overlay.text == ""
+
+    viewer.dims.set_current_step(0, 4)
+
+    assert viewer.text_overlay.text == ""
+
+
+def test_depth_planes_are_named_by_micron_range(widget_class, viewer, host) -> None:
+    layer = viewer.add_image(
+        np.zeros((3, 8, 8), dtype=np.float32),
+        name="Isocortex Flatmap Heatmap",
+        axis_labels=widget_class._depth_axis_labels(),
+        metadata={
+            "flatmap_plane_mode": "depth",
+            "render_summary": {
+                "depth_bins": 3,
+                "depth_bin_um": 25.0,
+                "depth_min_um": 0.0,
+                "includes_depth_minus_one_plane": False,
+            },
+        },
+    )
+
+    host._apply_display_axis_annotations(layer)
+    viewer.dims.set_current_step(0, 2)
+
+    assert viewer.dims.axis_labels == ("Depth bin", "Flatmap Y", "Flatmap X")
+    assert viewer.text_overlay.text == "Depth bin: 50-75 um  (plane 3 of 3)"
+
+
+def test_foreign_layer_axis_labels_are_not_copied(viewer, host) -> None:
+    points = viewer.add_points(
+        np.zeros((2, 3), dtype=float),
+        name="Isocortex Flatmap Points",
+    )
+
+    host._apply_display_axis_annotations(points)
+
+    assert viewer.dims.axis_labels == ("0", "1", "2")
+    assert viewer.axes.visible is False
+    assert viewer.text_overlay.text == ""

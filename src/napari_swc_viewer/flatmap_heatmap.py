@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -580,6 +580,34 @@ def _depth_labels(
         upper = lower + depth_bin_um
         labels.append(f"{lower:g}-{upper:g} um")
     return labels
+
+
+def depth_plane_labels(render_summary: Mapping[str, object]) -> tuple[str, ...]:
+    """Return one human-readable label per depth plane of a flatmap render.
+
+    ``render_summary`` is a :meth:`FlatmapRenderSummary.to_dict` payload, which
+    is what render layers carry in ``layer.metadata["render_summary"]``. Returns
+    an empty tuple when the payload does not describe a depth-binned render.
+    """
+    try:
+        depth_bins = int(render_summary.get("depth_bins", 0))
+        depth_bin_um = float(render_summary.get("depth_bin_um", 0.0))
+        depth_min_um = float(render_summary.get("depth_min_um", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        return ()
+    if depth_bins <= 0 or depth_bin_um <= 0.0:
+        return ()
+    sentinel_offset = (
+        1 if bool(render_summary.get("includes_depth_minus_one_plane", False)) else 0
+    )
+    return tuple(
+        _depth_labels(
+            np.arange(depth_bins, dtype=np.int64),
+            depth_min_um=depth_min_um,
+            depth_bin_um=depth_bin_um,
+            sentinel_offset=sentinel_offset,
+        )
+    )
 
 
 def build_flatmap_render_data(

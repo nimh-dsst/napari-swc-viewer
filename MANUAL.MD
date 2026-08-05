@@ -222,6 +222,15 @@ version-3 augmentation in one cancellable, atomic background operation.
   not load NRRDs or `atlas.annotation`.
 - Single color creates one six-plane image stack. Individual and cluster color
   modes create one stack per neuron or cluster.
+- The flatmap window names what is on screen: the plane slider is captioned
+  **Allen layer**, the upper-left canvas corner reads the layer of the plane
+  under the slider (for example `Allen layer: L2/3  (plane 2 of 6)`, following
+  the slider as it moves), and
+  labelled **Flatmap X** / **Flatmap Y** axis arrows are drawn at the image
+  origin. In **3D Heatmap** the same readout reports the plane's depth range in
+  microns and the caption reads **Depth bin**. The images are binned in index
+  space, so the arrows orient and name the axes without asserting physical
+  units or anatomical direction.
 - CSV export is available for materialized NRRD recomputation and includes
   `allen_layer_index` and `allen_layer_label`. The fast precomputed,
   volume-only path remains non-exportable.

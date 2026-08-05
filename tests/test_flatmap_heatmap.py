@@ -23,6 +23,7 @@ from napari_swc_viewer.flatmap_heatmap import (
     compute_flatmap_bounds_from_parquet,
     compute_flatmap_lookup_stats,
     compute_flatmap_xy_bounds,
+    depth_plane_labels,
 )
 from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
 
@@ -895,3 +896,55 @@ def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
     assert empty.volume.shape == (6, 12, 12)
     assert float(empty.volume.sum()) == 0.0
     assert empty.summary.rendered_nodes == 0
+
+
+def test_depth_plane_labels_name_each_micron_interval() -> None:
+    labels = depth_plane_labels(
+        {
+            "depth_bins": 3,
+            "depth_bin_um": 25.0,
+            "depth_min_um": 0.0,
+            "includes_depth_minus_one_plane": False,
+        }
+    )
+
+    assert labels == ("0-25 um", "25-50 um", "50-75 um")
+
+
+def test_depth_plane_labels_name_the_sentinel_plane_first() -> None:
+    labels = depth_plane_labels(
+        {
+            "depth_bins": 3,
+            "depth_bin_um": 25.0,
+            "depth_min_um": 0.0,
+            "includes_depth_minus_one_plane": True,
+        }
+    )
+
+    assert labels == ("depth -1", "0-25 um", "25-50 um")
+
+
+def test_depth_plane_labels_offset_by_the_lower_depth_bound() -> None:
+    labels = depth_plane_labels(
+        {
+            "depth_bins": 2,
+            "depth_bin_um": 50.0,
+            "depth_min_um": 100.0,
+            "includes_depth_minus_one_plane": False,
+        }
+    )
+
+    assert labels == ("100-150 um", "150-200 um")
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {},
+        {"depth_bins": 0, "depth_bin_um": 25.0},
+        {"depth_bins": 4, "depth_bin_um": 0.0},
+        {"depth_bins": "many", "depth_bin_um": 25.0},
+    ],
+)
+def test_depth_plane_labels_return_empty_without_depth_binning(summary) -> None:
+    assert depth_plane_labels(summary) == ()

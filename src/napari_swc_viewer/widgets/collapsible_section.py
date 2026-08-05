@@ -45,6 +45,18 @@ class CollapsibleSection(QWidget):
         """Return the layout used for the section content."""
         return self._content_layout
 
+    def is_expanded(self) -> bool:
+        """Return whether the section content is currently shown."""
+        return bool(self._toggle_button.isChecked())
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Expand or collapse the section, keeping the toggle button in sync."""
+        expanded = bool(expanded)
+        if self._toggle_button.isChecked() == expanded:
+            return
+        # Drives ``_set_expanded`` through the button's ``toggled`` signal.
+        self._toggle_button.setChecked(expanded)
+
     def _set_expanded(self, expanded: bool) -> None:
         """Show or hide the section content."""
         prefix = "[-]" if expanded else "[+]"

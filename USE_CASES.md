@@ -461,6 +461,16 @@ The six images are one napari image stack, ordered from superficial to deep.
 The default single-color mode creates one stack; the existing individual and
 cluster color modes create one six-plane stack per color group.
 
+The flatmap window names what is on screen. The plane axis is captioned
+**Allen layer**, an on-canvas line reports the layer of the plane under the
+slider, and labelled **Flatmap X** / **Flatmap Y** axis arrows show the image
+orientation. The same annotations serve the depth-binned **3D Heatmap**, where
+the plane axis is captioned **Depth bin** and the on-canvas line reports the
+plane's depth range in microns.
+
+The images are binned in index space, so the axis arrows name and orient the
+axes without asserting physical units or anatomical direction.
+
 **Prerequisites**
 
 - Load a supported Allen mouse atlas in **Data** > **Atlas**.
@@ -496,14 +506,20 @@ cluster color modes create one six-plane stack per color group.
 3. **Action:** Keep **Heatmap colors** at **Single color** and click **Project
    to Flatmap**.
    **Expected:** The detached **SWC Viewer Flatmap** opens in 2D with one image
-   layer named **Isocortex Flatmap Allen Layers**. Its first axis identifies
-   indices `0` through `5` as `L1`, `L2/3`, `L4`, `L5`, `L6a`, and `L6b`.
+   layer named **Isocortex Flatmap Allen Layers**. The first-axis slider is
+   captioned **Allen layer** and the canvas names the plane the slider opened
+   on in its upper-left corner — napari starts a six-plane axis at its middle
+   position, so this reads `Allen layer: L4  (plane 3 of 6)`. Labelled
+   **Flatmap X** and **Flatmap Y** axis arrows are drawn at the image origin.
    The existing **Flatmap Region Labels** layer remains aligned with it.
 4. **Action:** Move the first-axis slider through all six positions.
-   **Expected:** The heatmap and Labels layer change planes together. Each
-   position shows only nodes and region labels assigned to that terminal Allen
-   Isocortex layer. A cortical area without layer 4 is blank in that area on
-   the `L4` plane; it is not filled by a depth estimate.
+   **Expected:** The heatmap and Labels layer change planes together, and the
+   canvas line tracks the slider through `L1`, `L2/3`, `L4`, `L5`, `L6a`, and
+   `L6b` — reading `Allen layer: L1  (plane 1 of 6)` at the first position and
+   `Allen layer: L6b  (plane 6 of 6)` at the last. Each position shows only
+   nodes and region labels assigned to that terminal Allen Isocortex layer. A
+   cortical area without layer 4 is blank in that area on the `L4` plane; it is
+   not filled by a depth estimate.
 5. **Action:** Choose **Custom Regions**, select terminal leaves from two
    layers, and click **Show Region Labels** again.
    **Expected:** The existing Labels layer is updated rather than duplicated.
@@ -529,10 +545,15 @@ cluster color modes create one six-plane stack per color group.
    node-count semantics. **Export CSV...** includes `allen_layer_index` and
    `allen_layer_label` for every classified node. Planar cached labels,
    surfaces, and outlines are unavailable in this explicit fallback mode.
-9. **Action:** Switch **Render** back to **3D Heatmap**.
+9. **Action:** Switch **Render** back to **3D Heatmap** and project, then
+   switch to **3D Points** and project again.
    **Expected:** The categorical stack is removed, numeric depth controls and
    compatible cached-region actions return, and a new projection uses the
-   original depth-binned behavior.
+   original depth-binned behavior. The plane axis is now captioned **Depth
+   bin** and the canvas line reports the current plane's micron range, for
+   example `Depth bin: 900-925 um  (plane 37 of 75)`. **3D Points** has no
+   plane axis, so the canvas line and axis arrows clear rather than keeping a
+   stale layer name.
 10. **Action:** Retry layer rendering without a loaded atlas, then with a
     Parquet missing `region_id`, and finally with selected neurons that have no
     flatmap-valid terminal Isocortex-layer nodes. Also try **Show Region
@@ -545,7 +566,10 @@ cluster color modes create one six-plane stack per color group.
 
 - Status: Not run
 - Last verified: Never
-- Notes: None
+- Notes: The plane-name and axis-arrow annotations in steps 3, 4, and 9 were
+  added on 2026-08-05 and have not been exercised in napari. Automated tests
+  cover them against a viewer double only, which cannot show whether the
+  overlays are legible or correctly placed on the canvas.
 
 ### UC-006: Inspect and Query Custom Isocortex Layer Regions
 
@@ -649,7 +673,8 @@ surfaces, and outlines.
     Repeat after switching between shaped and square styles.
     **Expected:** The selected custom terminal regions appear only on their
     corresponding `L1`, `L2/3`, `L4`, `L5`, `L6a`, or `L6b` planes. The
-    labels and heatmap remain synchronized and aligned on each style's grid.
+    labels and heatmap remain synchronized and aligned on each style's grid,
+    and the canvas plane line names the Allen layer under the slider.
     Cached surfaces and outlines remain disabled because they are depth-based.
 12. **Action:** Switch **Query source** to **Atlas Regions**, show its
     overlays, then switch to **Mask Layer** and try the same actions.
