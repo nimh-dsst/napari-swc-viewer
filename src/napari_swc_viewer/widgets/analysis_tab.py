@@ -44,7 +44,6 @@ from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_XY_BINS,
 )
-from ..swc import NodeType
 from .collapsible_section import CollapsibleSection
 from .node_type_selector import NodeTypeSelectorComboBox
 from .region_selector import RegionSelectorWidget
@@ -370,7 +369,6 @@ class AnalysisTabWidget(QWidget):
         self._flatmap_coords_available = False
         self._flatmap_available_styles: tuple[str, ...] = ()
         self._flatmap_coords_cache_path: str | None = None
-        self._skipped_terminus_file_ids: list[str] = []
         self._setup_ui()
 
         # Rebuild heatmap when the user reorders axes in napari
@@ -499,9 +497,6 @@ class AnalysisTabWidget(QWidget):
         busy = self._worker_thread is not None and self._worker_thread.isRunning()
         self._run_corr_btn.setEnabled(ready and not busy)
         self._run_heat_btn.setEnabled(ready and not busy)
-        if hasattr(self, "_find_termini_btn"):
-            # Terminus detection is pure topology, so it needs no atlas.
-            self._find_termini_btn.setEnabled(self._db is not None and not busy)
         has_cluster_heatmap_options = (
             ready
             and not busy
@@ -872,63 +867,6 @@ class AnalysisTabWidget(QWidget):
         heat_layout.addLayout(heat_action_row)
 
         layout.addWidget(self._heatmap_section)
-
-        # --- Termini (childless nodes) ---
-        self._termini_section = CollapsibleSection(
-            "Axon Termini",
-            expanded=False,
-        )
-        termini_layout = self._termini_section.content_layout()
-        termini_intro = QLabel(
-            "Finds childless nodes of the selected types. Axon termini are the "
-            "childless axon-typed nodes; neurons whose neurites are all "
-            "Undefined contribute none and are reported as skipped."
-        )
-        termini_intro.setWordWrap(True)
-        termini_layout.addWidget(termini_intro)
-
-        termini_scope_row = QHBoxLayout()
-        termini_scope_row.addWidget(QLabel("Neurons:"))
-        self._termini_scope_combo = QComboBox()
-        self._termini_scope_combo.addItem("Whole Parquet", _ANALYSIS_SCOPE_WHOLE)
-        self._termini_scope_combo.addItem("Current Table", _ANALYSIS_SCOPE_CURRENT)
-        self._termini_scope_combo.addItem("Selected Rows", _ANALYSIS_SCOPE_SELECTED)
-        termini_scope_row.addWidget(self._termini_scope_combo)
-        termini_layout.addLayout(termini_scope_row)
-
-        termini_type_row = QHBoxLayout()
-        termini_type_row.addWidget(QLabel("Node types:"))
-        self._termini_node_type_combo = NodeTypeSelectorComboBox()
-        self._termini_node_type_combo.set_selected_node_types((NodeType.AXON,))
-        termini_type_row.addWidget(self._termini_node_type_combo)
-        termini_layout.addLayout(termini_type_row)
-
-        termini_size_row = QHBoxLayout()
-        termini_size_row.addWidget(QLabel("Point size:"))
-        self._termini_point_size_spin = QDoubleSpinBox()
-        self._termini_point_size_spin.setRange(1.0, 500.0)
-        self._termini_point_size_spin.setValue(20.0)
-        self._termini_point_size_spin.setDecimals(1)
-        termini_size_row.addWidget(self._termini_point_size_spin)
-        termini_layout.addLayout(termini_size_row)
-
-        self._find_termini_btn = QPushButton("Find Termini")
-        self._find_termini_btn.setEnabled(False)
-        self._find_termini_btn.clicked.connect(self._run_terminus_detection)
-        termini_layout.addWidget(self._find_termini_btn)
-
-        self._termini_coverage_label = QLabel("")
-        self._termini_coverage_label.setWordWrap(True)
-        termini_layout.addWidget(self._termini_coverage_label)
-
-        self._copy_skipped_termini_btn = QPushButton("Copy Skipped Neuron IDs")
-        self._copy_skipped_termini_btn.setEnabled(False)
-        self._copy_skipped_termini_btn.clicked.connect(
-            self._copy_skipped_terminus_file_ids
-        )
-        termini_layout.addWidget(self._copy_skipped_termini_btn)
-
-        layout.addWidget(self._termini_section)
 
         # --- Progress bar ---
         self._progress_section = CollapsibleSection(
@@ -2171,170 +2109,6 @@ class AnalysisTabWidget(QWidget):
         self._update_button_states()
 
         thread.start()
-
-    def _selected_terminus_scope(self) -> str:
-        """Return the neuron scope selected for terminus detection."""
-        combo = getattr(self, "_termini_scope_combo", None)
-        data_getter = getattr(combo, "currentData", None)
-        if callable(data_getter):
-            value = data_getter()
-            if value in (
-                _ANALYSIS_SCOPE_WHOLE,
-                _ANALYSIS_SCOPE_CURRENT,
-                _ANALYSIS_SCOPE_SELECTED,
-            ):
-                return str(value)
-        return _ANALYSIS_SCOPE_WHOLE
-
-    def _selected_terminus_node_types(self) -> tuple[int, ...] | None:
-        """Return the node-type filter for terminus detection."""
-        combo = getattr(self, "_termini_node_type_combo", None)
-        getter = getattr(combo, "selected_node_types", None)
-        if callable(getter):
-            return getter()
-        return (NodeType.AXON,)
-
-    def _resolve_terminus_file_ids(self) -> tuple[bool, list[str] | None]:
-        """Resolve which neurons terminus detection should cover."""
-        scope = self._selected_terminus_scope()
-        if scope == _ANALYSIS_SCOPE_WHOLE:
-            return True, None
-
-        if scope == _ANALYSIS_SCOPE_SELECTED:
-            file_ids = self._selected_table_file_ids()
-            label = "No table rows are selected"
-        else:
-            file_ids = self._current_table_file_ids()
-            label = "Current table is empty"
-
-        if file_ids:
-            return True, file_ids
-
-        self._progress_label.setText(
-            f"{label}; switch the termini scope to Whole Parquet or populate "
-            "the table first."
-        )
-        return False, None
-
-    def _run_terminus_detection(self) -> None:
-        """Start terminus detection in a background thread."""
-        if self._db is None or self._parquet_path is None:
-            return
-        if self._worker_thread is not None and self._worker_thread.isRunning():
-            return
-
-        node_types = self._selected_terminus_node_types()
-        if node_types is not None and not node_types:
-            self._progress_label.setText(
-                "Select at least one node type before finding termini."
-            )
-            return
-
-        proceed, file_ids = self._resolve_terminus_file_ids()
-        if not proceed:
-            return
-
-        from ..workers import TerminusWorker
-
-        self._termini_coverage_label.setText("")
-        self._copy_skipped_termini_btn.setEnabled(False)
-        self._skipped_terminus_file_ids = []
-
-        worker = TerminusWorker(
-            parquet_path=self._parquet_path,
-            file_ids=file_ids,
-            node_types=(list(node_types) if node_types is not None else None),
-        )
-        self._progress_label.setText("Finding termini...")
-        self._start_background_worker(worker, self._on_termini_finished)
-
-    def _on_termini_finished(self, frame, coverage) -> None:
-        """Add a points layer for the detected termini and report coverage."""
-        self._progress_bar.setVisible(False)
-        self._progress_label.setText("Terminus detection complete.")
-
-        # Always show coverage: a node-type filter silently drops neurons that
-        # never use those types, and that exclusion must stay visible.
-        summary = coverage.summary()
-        skipped = list(getattr(coverage, "file_ids_without", []))
-        if getattr(coverage, "file_ids_without_truncated", False):
-            summary += (
-                f" Only the first {len(skipped):,} skipped neuron IDs are listed."
-            )
-        self._termini_coverage_label.setText(summary)
-        self._skipped_terminus_file_ids = skipped
-        self._copy_skipped_termini_btn.setEnabled(bool(skipped))
-
-        if frame is None or len(frame) == 0:
-            return
-
-        coords = frame[["x", "y", "z"]].to_numpy(dtype=float)
-        file_ids = frame["file_id"].astype(str).tolist()
-
-        # A whole-Parquet run yields millions of points, so only build a
-        # per-point color array when cluster colors actually vary.
-        color_map = self._cluster_color_map or {}
-        default_rgba = [1.0, 0.35, 0.0, 1.0]
-        if color_map:
-            colors = np.array(
-                [
-                    list(color_map.get(file_id, default_rgba))[:4]
-                    for file_id in file_ids
-                ],
-                dtype=float,
-            )
-        else:
-            colors = default_rgba
-
-        scale = None
-        if self._atlas is not None:
-            scale = [1.0 / res for res in self._atlas.resolution]
-
-        name = "Termini"
-        node_types = self._selected_terminus_node_types()
-        selection_text = NodeTypeSelectorComboBox.selection_text(node_types)
-        if selection_text:
-            name = f"Termini ({selection_text})"
-
-        existing = [layer for layer in self._viewer.layers if layer.name == name]
-        for layer in existing:
-            self._viewer.layers.remove(layer)
-
-        self._viewer.add_points(
-            coords,
-            size=float(self._termini_point_size_spin.value()),
-            face_color=colors,
-            border_color="white",
-            border_width=0.1,
-            name=name,
-            opacity=0.9,
-            scale=scale,
-            metadata={
-                "file_ids_per_point": file_ids,
-                "node_ids": frame["node_id"].astype(int).tolist(),
-                "point_types": frame["type"].astype(int).tolist(),
-                "node_type_labels": NodeTypeSelectorComboBox.metadata_labels(
-                    node_types
-                ),
-                "coverage_summary": summary,
-                "skipped_file_ids": skipped,
-            },
-        )
-
-    def _copy_skipped_terminus_file_ids(self) -> None:
-        """Put the skipped neuron IDs on the clipboard for inspection."""
-        skipped = list(getattr(self, "_skipped_terminus_file_ids", []))
-        if not skipped:
-            return
-
-        from qtpy.QtWidgets import QApplication
-
-        clipboard = QApplication.clipboard()
-        if clipboard is not None:
-            clipboard.setText("\n".join(skipped))
-        self._progress_label.setText(
-            f"Copied {len(skipped):,} skipped neuron IDs to the clipboard."
-        )
 
     def _on_progress(self, step_name: str, current: int, total: int) -> None:
         """Handle progress updates from workers."""

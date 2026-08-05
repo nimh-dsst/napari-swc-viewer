@@ -48,6 +48,35 @@ other 4,871 have every non-soma node typed `0` (undefined). Compartment-filtered
 results must report how many neurons were excluded rather than returning a
 partial answer silently.
 
+## Caution: `type` Is Not A Trustworthy Compartment Label
+
+**Some neurons in `isocortex_total_right_brainglobe_flatmap.parquet` have
+dendritic projections typed `2` (axon).** This was found on 2026-08-05 by
+visually inspecting detected termini in napari: points labelled as axon termini
+sat on arbors that are plainly dendritic.
+
+This is a defect in the source SWC annotations, not in this repository's code.
+The childless/leaf detection in `src/napari_swc_viewer/terminals.py` is correct —
+a reported node genuinely has no children. What is unreliable is the *meaning*
+of the `type` column on those nodes.
+
+Consequences for anything that filters by `type`:
+
+- Do not describe `type = 2` results as "axon" anything. They are **axon-typed**
+  nodes. A count of axon termini is an upper bound contaminated by an unknown
+  number of dendrite tips.
+- Do not claim that node types partition a neuron into clean subtrees, that axon
+  and dendrite compartments never interleave, or that an axon-typed terminus
+  cannot be a dendrite tip. All three are false for this dataset.
+- Compartment-based results need visual or geometric verification before they
+  support a biological conclusion. Type alone is not evidence.
+- The extent is **not quantified**. Nobody has counted how many neurons or nodes
+  are mislabelled, and there is no per-neuron flag for it. Do not state or imply
+  a rate until someone measures one.
+
+This does not affect purely topological work (childless tests, degree, branch
+points, path lengths) as long as it does not filter or interpret by `type`.
+
 ## Expected Workflow
 
 - Use `pixi` commands instead of creating a separate virtual environment or invoking `pip`, `pytest`, or `napari` directly.

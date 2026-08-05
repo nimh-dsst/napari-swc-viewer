@@ -108,6 +108,7 @@ from .neuron_table import NeuronTableWidget
 from .node_type_selector import NodeTypeSelectorComboBox
 from .region_selector import RegionSelectorWidget
 from .slice_projection import NeuronSliceProjector, SomaSliceProjector
+from .termini_section import TerminiSectionWidget
 
 if TYPE_CHECKING:
     import napari
@@ -3053,6 +3054,26 @@ class NeuronViewerWidget(QWidget):
         self._update_selected_neuron_heatmap_controls()
 
         layout.addWidget(neurons_section)
+
+        # --- Termini ---
+        # Lives next to the table because its main use is selecting the
+        # neurons that produced no termini so they can be removed before
+        # clustering.
+        self._termini_section_widget = TerminiSectionWidget(self.viewer)
+        self._termini_section_widget.set_current_table_file_ids_provider(
+            self._current_table_file_ids
+        )
+        self._termini_section_widget.set_selected_table_file_ids_provider(
+            self._neuron_table.get_selected_file_ids
+        )
+        self._termini_section_widget.set_table_color_map_provider(
+            self._neuron_table.get_full_color_map
+        )
+        self._termini_section_widget.set_select_table_file_ids_callback(
+            self._neuron_table.select_file_ids
+        )
+        layout.addWidget(self._termini_section_widget)
+
         layout.addStretch()
 
     def _configure_selected_heatmap_menu(self) -> None:
@@ -3723,6 +3744,7 @@ class NeuronViewerWidget(QWidget):
 
         self._set_region_query_buttons_enabled(True)
         self._analysis_tab.set_database(self._db)
+        self._termini_section_widget.set_database(self._db)
         self._regions_status_label.setText("")
         flatmap_tab = getattr(self, "_flatmap_tab", None)
         invalidate_flatmap = getattr(
@@ -4534,6 +4556,7 @@ class NeuronViewerWidget(QWidget):
             atlas=atlas_name,
         ):
             self._analysis_tab.set_atlas(atlas)
+        self._termini_section_widget.set_atlas(atlas)
         flatmap_tab = getattr(self, "_flatmap_tab", None)
         refresh_cache_profiles = getattr(
             flatmap_tab,

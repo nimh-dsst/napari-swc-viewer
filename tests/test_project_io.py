@@ -995,6 +995,7 @@ def test_loading_plain_parquet_clears_current_project(
         _stats_label=MagicMock(),
         _regions_status_label=MagicMock(),
         _analysis_tab=SimpleNamespace(set_database=MagicMock()),
+        _termini_section_widget=SimpleNamespace(set_database=MagicMock()),
         _flatmap_tab=flatmap_tab,
         _set_current_project_path=MagicMock(),
         _load_enhanced_table_state=MagicMock(return_value=0),
