@@ -35,6 +35,7 @@ Unless a use case says otherwise:
 | [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
 | [UC-008](#uc-008-create-combined-and-individual-neuron-heatmaps) | Create one combined heatmap or color-matched heatmaps for individual neurons | Not run |
 | [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
+| [UC-010](#uc-010-identify-axon-termini-for-selected-neurons) | Locate axon termini as childless axon-typed nodes, excluding dendrite tips | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -933,6 +934,110 @@ stale files from the previous version.
 - Status: Passed
 - Last verified: 2026-08-05
 - Notes: Verified by removing Heatmap layers. Two clusterings were retained.
+
+### UC-010: Identify Axon Termini for Selected Neurons
+
+**Capability**
+
+The user can locate the tips of traced axons. A terminus is a node no other node
+claims as its parent, so restricting termini to axon-typed nodes yields the axon
+tips and leaves dendrite tips out.
+
+This is trustworthy because SWC node types in these datasets label whole
+subtrees: axon and dendrite branches hang separately off the soma and never
+interleave, so an axon-typed terminus is never a dendrite tip. What the node-type
+restriction *does* risk is coverage. Reconstructions whose neurites are all typed
+`Undefined` contain no axon-typed nodes, so they contribute nothing. The plugin
+therefore always reports how many neurons were skipped instead of quietly
+returning a partial answer.
+
+Two rules keep the count correct, and both follow from the childless test needing
+to see the whole tree: the node-type restriction narrows only which termini are
+reported, and any region restriction is applied after detection. Filtering nodes
+away before the test would leave their parents looking childless.
+
+**Prerequisites**
+
+- A neuron Parquet with `file_id`, `node_id`, `parent_id`, `type`, `x`, `y`, and
+  `z` columns loaded into **Data** > **SWC Parquet Data**.
+- No atlas is required; terminus detection is pure topology.
+- For the reference numbers below, use
+  `isocortex_total_right_brainglobe_flatmap.parquet` (18,621 neurons,
+  728,703,227 nodes). Useful individual neurons in that file:
+  - `17099_002_reg.swc` — axon labelled, 295 axon termini, no dendrite nodes.
+  - `192309_031_reg.swc` — axon and dendrite labelled, 91 axon termini and 89
+    dendrite termini.
+  - `212064_001.swc` — every neurite typed `Undefined`, so 0 axon termini.
+
+**Steps and expected results**
+
+1. **Action:** Open the **Analysis** tab and expand **Axon Termini**.
+   **Expected:** The section explains that it finds childless nodes of the
+   selected types and that neurons typed entirely `Undefined` are reported as
+   skipped. **Neurons:** defaults to **Whole Parquet**, **Node types:** shows
+   **Axon**, and **Point size:** shows `20.0`. **Find Termini** is enabled once a
+   Parquet is loaded, with or without an atlas.
+2. **Action:** Add `17099_002_reg.swc` to **Selected Neurons**, set **Neurons:**
+   to **Selected Rows**, and click **Find Termini**.
+   **Expected:** Progress is shown, then a **Termini (Axon)** points layer
+   appears. The coverage line reads **295 termini (Axon) in 1 of 1 neurons** with
+   no skipped-neuron clause, and **Copy Skipped Neuron IDs** stays disabled.
+3. **Action:** Hide every layer except the neuron trace and the new points layer,
+   then inspect the arbor in 3D.
+   **Expected:** Points sit at the visible free ends of the axon branches, not
+   mid-branch and not at branch points. The soma carries no point.
+4. **Action:** Select `192309_031_reg.swc` alone and click **Find Termini** with
+   **Node types:** still **Axon**.
+   **Expected:** The coverage line reads **91 termini (Axon) in 1 of 1 neurons**,
+   and it also reports that **89 childless nodes of other types** were not
+   counted. Points land on the far-reaching axon branches, none on the compact
+   arbor next to the soma.
+5. **Action:** Change **Node types:** to **Basal dendrite** only and click **Find
+   Termini** again.
+   **Expected:** A **Termini (Basal dendrite)** layer replaces nothing — it is a
+   separate layer — and reports **89 termini (Basal dendrite) in 1 of 1
+   neurons**. Its points form a compact cluster close to the soma, clearly
+   distinct from the axon termini of the previous step. This is the visible proof
+   that the two compartments do not mix.
+6. **Action:** Select `212064_001.swc` alone, set **Node types:** back to
+   **Axon**, and click **Find Termini**.
+   **Expected:** No points layer is added, and the coverage line still appears,
+   reading **0 termini (Axon) in 0 of 1 neurons — 1 neurons skipped (no nodes of
+   the selected types)** along with the count of childless nodes not counted.
+   **Copy Skipped Neuron IDs** becomes enabled.
+7. **Action:** Click **Copy Skipped Neuron IDs** and paste into a text editor.
+   **Expected:** The status line reports how many IDs were copied, and the
+   clipboard holds `212064_001.swc`.
+8. **Action:** Set **Neurons:** to **Whole Parquet**, keep **Node types:** as
+   **Axon**, and click **Find Termini**.
+   **Expected:** Progress advances in neuron batches, reporting
+   **Scanning neurons for termini (N/18,621)**, and napari stays responsive
+   throughout. The run takes roughly 70 seconds on a workstation with the file on
+   local disk. The coverage line then reads **3,207,618 termini (Axon) in 13,750
+   of 18,621 neurons — 4,871 neurons skipped (no nodes of the selected types);
+   1,521,610 childless nodes of other types not counted**. Because more than 200
+   neurons were skipped, the line also states that only the first 200 skipped
+   neuron IDs are listed. Memory use stays bounded: detection runs a batch of
+   neurons at a time rather than the whole file in one query.
+9. **Action:** Set **Neurons:** to **Selected Rows** with no table rows selected
+   and click **Find Termini**.
+   **Expected:** No worker starts and no layer is added. The status line reports
+   that no table rows are selected and suggests switching to **Whole Parquet** or
+   populating the table.
+10. **Action:** Select the **Termini (Axon)** layer and inspect its metadata (for
+    example through the napari console).
+    **Expected:** `file_ids_per_point`, `node_ids`, and `point_types` are present
+    and the same length as the point data, so each point traces back to its
+    source node. `coverage_summary` and `skipped_file_ids` are also recorded.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: The counts in steps 2, 4, 5, 6, and 8 were confirmed against
+  `isocortex_total_right_brainglobe_flatmap.parquet` by running the detection
+  functions over all 728,703,227 rows, but the napari UI workflow itself has not
+  been exercised.
 
 ## Use-Case Template
 

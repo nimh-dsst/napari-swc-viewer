@@ -2091,3 +2091,81 @@ class AnalysisExportWorker(QObject):
         except Exception as e:
             logger.exception("Analysis export failed")
             self.error.emit(str(e))
+
+
+class TerminusWorker(QObject):
+    """Find termini (childless nodes) of the selected node types in the background.
+
+    Signals
+    -------
+    progress(str, int, int)
+        (step_name, current_step, total_steps)
+    finished(object, object)
+        Emitted with ``(DataFrame, TerminusCoverage)`` on success.
+    error(str)
+        Emitted with an error message on failure.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(object, object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        parquet_path: str,
+        file_ids: list[str] | None,
+        node_types: list[int] | tuple[int, ...] | None,
+    ):
+        """Store the query parameters.
+
+        Parameters
+        ----------
+        parquet_path : str
+            Source Parquet file.
+        file_ids : list[str] or None
+            Neurons to cover; ``None`` covers every neuron in the source.
+        node_types : list[int] or None
+            SWC types to report; ``None`` reports every childless node. Stated
+            explicitly rather than defaulted, so "all types" is never implied by
+            omission.
+        """
+        super().__init__()
+        self._parquet_path = str(parquet_path)
+        self._file_ids = file_ids
+        self._node_types = node_types
+
+    def run(self) -> None:
+        """Query termini and emit them with their coverage report."""
+        try:
+            import duckdb
+
+            from .terminals import query_termini
+
+            self.progress.emit("Finding termini...", 0, 1)
+            source_path = self._parquet_path.replace("\\", "/")
+
+            def report(done: int, total: int) -> None:
+                self.progress.emit(
+                    f"Scanning neurons for termini ({done:,}/{total:,})",
+                    done,
+                    max(total, 1),
+                )
+
+            conn = duckdb.connect()
+            try:
+                frame, coverage = query_termini(
+                    conn,
+                    f"read_parquet('{source_path}')",
+                    node_types=self._node_types,
+                    file_ids=self._file_ids,
+                    progress_callback=report,
+                )
+            finally:
+                conn.close()
+
+            self.progress.emit("Done", 1, 1)
+            self.finished.emit(frame, coverage)
+
+        except Exception as e:
+            logger.exception("Terminus detection failed")
+            self.error.emit(str(e))

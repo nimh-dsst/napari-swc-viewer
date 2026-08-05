@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 
 from napari_swc_viewer.analysis.clustering import (
     ClusterRegionSelection,
@@ -95,12 +96,16 @@ class _DummyLabel(_DummyWidget):
     def __init__(self, text: str = "", *_args, **_kwargs) -> None:
         super().__init__()
         self._text = text
+        self._word_wrap = False
 
     def setText(self, text: str) -> None:
         self._text = text
 
     def text(self) -> str:
         return self._text
+
+    def setWordWrap(self, wrap: bool) -> None:
+        self._word_wrap = bool(wrap)
 
 
 class _DummyButton(_DummyWidget):
@@ -552,6 +557,24 @@ class _DummyViewer:
         self.last_image_kwargs = dict(kwargs)
         return layer
 
+    def add_points(self, data, **kwargs):
+        layer = _DummyPointsLayer(data, **kwargs)
+        self.layers.append(layer)
+        self.last_points_kwargs = dict(kwargs)
+        return layer
+
+
+class _DummyPointsLayer:
+    """Minimal points layer stand-in for terminus tests."""
+
+    def __init__(self, data, **kwargs) -> None:
+        self.data = np.asarray(data)
+        self.name = str(kwargs["name"])
+        self.metadata = dict(kwargs.get("metadata", {}))
+        self.size = kwargs.get("size")
+        self.face_color = kwargs.get("face_color")
+        self.scale = kwargs.get("scale")
+
 
 class _DummyImageLayer:
     """Minimal image layer stand-in for analysis heatmap tests."""
@@ -771,11 +794,12 @@ def test_analysis_region_sections_are_collapsed_by_default():
         "Select Target Region",
         "Node Count Heatmap",
         "Select Heatmap Region",
+        "Axon Termini",
         "Progress",
         "Clustermap",
         "Export Results",
     ]
-    assert expanded == [True, False, True, False, True, False, False]
+    assert expanded == [True, False, True, False, False, True, False, False]
 
 
 def test_analysis_tab_wraps_content_in_scroll_area():
@@ -2520,3 +2544,233 @@ def test_on_correlation_finished_emits_debug_logs(caplog):
     assert widget._clustermap_status_label.text() == (
         "Clustering complete. Click 'Build Dendrogram' to render the cluster map."
     )
+
+
+# --- Axon termini section ---------------------------------------------------
+
+
+def _termini_widget():
+    """Return an Analysis tab wired up enough to run terminus detection."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._parquet_path = "neurons.parquet"
+    return widget
+
+
+class _FakeCoverage:
+    """Stand-in for TerminusCoverage carrying a prebuilt summary."""
+
+    def __init__(self, summary, file_ids_without=(), truncated=False) -> None:
+        self._summary = summary
+        self.file_ids_without = list(file_ids_without)
+        self.file_ids_without_truncated = truncated
+
+    def summary(self) -> str:
+        return self._summary
+
+
+def test_termini_section_defaults_to_axon_node_type() -> None:
+    """The default selection must be axon so dendrite tips are excluded."""
+    widget = _termini_widget()
+    assert widget._selected_terminus_node_types() == (2,)
+
+
+def test_find_termini_button_enabled_without_an_atlas() -> None:
+    """Terminus detection is pure topology, so it must not require an atlas."""
+    widget = _termini_widget()
+    widget._atlas = None
+    widget._update_button_states()
+    assert widget._find_termini_btn.isEnabled() is True
+
+
+def _install_fake_terminus_worker(monkeypatch, created):
+    class _FakeTerminusWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.TerminusWorker = _FakeTerminusWorker
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+
+def test_run_terminus_detection_whole_parquet_passes_no_file_ids(monkeypatch) -> None:
+    widget = _termini_widget()
+    widget._start_background_worker = MagicMock()
+    created: list = []
+    _install_fake_terminus_worker(monkeypatch, created)
+
+    widget._termini_scope_combo.setCurrentText("Whole Parquet")
+    widget._run_terminus_detection()
+
+    assert len(created) == 1
+    assert created[0].kwargs == {
+        "parquet_path": "neurons.parquet",
+        "file_ids": None,
+        "node_types": [2],
+    }
+    widget._start_background_worker.assert_called_once()
+
+
+def test_run_terminus_detection_selected_rows_passes_file_ids(monkeypatch) -> None:
+    widget = _termini_widget()
+    widget._start_background_worker = MagicMock()
+    widget.set_selected_table_file_ids_provider(lambda: ["b.swc", "a.swc", "b.swc"])
+    created: list = []
+    _install_fake_terminus_worker(monkeypatch, created)
+
+    widget._termini_scope_combo.setCurrentText("Selected Rows")
+    widget._run_terminus_detection()
+
+    assert created[0].kwargs["file_ids"] == ["b.swc", "a.swc"]
+
+
+def test_run_terminus_detection_selected_rows_without_selection_reports(
+    monkeypatch,
+) -> None:
+    widget = _termini_widget()
+    widget._start_background_worker = MagicMock()
+    widget.set_selected_table_file_ids_provider(lambda: [])
+    created: list = []
+    _install_fake_terminus_worker(monkeypatch, created)
+
+    widget._termini_scope_combo.setCurrentText("Selected Rows")
+    widget._run_terminus_detection()
+
+    assert created == []
+    assert "No table rows are selected" in widget._progress_label.text()
+
+
+def test_clearing_node_types_falls_back_to_all_types(monkeypatch) -> None:
+    """The selector treats an empty selection as 'all', so detection proceeds."""
+    widget = _termini_widget()
+    widget._start_background_worker = MagicMock()
+    widget._termini_node_type_combo.set_selected_node_types(())
+    created: list = []
+    _install_fake_terminus_worker(monkeypatch, created)
+
+    widget._run_terminus_detection()
+
+    assert widget._selected_terminus_node_types() is None
+    assert created[0].kwargs["node_types"] is None
+
+
+def test_run_terminus_detection_rejects_an_empty_node_type_selection(
+    monkeypatch,
+) -> None:
+    """Guard for callers that do supply an empty selection."""
+    widget = _termini_widget()
+    widget._start_background_worker = MagicMock()
+    widget._selected_terminus_node_types = lambda: ()
+    created: list = []
+    _install_fake_terminus_worker(monkeypatch, created)
+
+    widget._run_terminus_detection()
+
+    assert created == []
+    assert "Select at least one node type" in widget._progress_label.text()
+
+
+def test_on_termini_finished_adds_points_layer_with_node_metadata() -> None:
+    widget = _termini_widget()
+    frame = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc"],
+            "node_id": [3, 7],
+            "type": [2, 2],
+            "x": [1.0, 4.0],
+            "y": [2.0, 5.0],
+            "z": [3.0, 6.0],
+        }
+    )
+    coverage = _FakeCoverage("2 termini (Axon) in 2 of 2 neurons")
+
+    widget._on_termini_finished(frame, coverage)
+
+    layers = [layer for layer in widget._viewer.layers if "Termini" in layer.name]
+    assert len(layers) == 1
+    layer = layers[0]
+    assert layer.data.tolist() == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    assert layer.metadata["file_ids_per_point"] == ["a.swc", "b.swc"]
+    assert layer.metadata["node_ids"] == [3, 7]
+    assert widget._termini_coverage_label.text() == (
+        "2 termini (Axon) in 2 of 2 neurons"
+    )
+
+
+def test_on_termini_finished_always_reports_skipped_neurons() -> None:
+    """The skipped-neuron count must never be silent."""
+    widget = _termini_widget()
+    frame = pd.DataFrame(
+        {
+            "file_id": ["a.swc"],
+            "node_id": [3],
+            "type": [2],
+            "x": [1.0],
+            "y": [2.0],
+            "z": [3.0],
+        }
+    )
+    coverage = _FakeCoverage(
+        "1 termini (Axon) in 1 of 2 neurons — 1 neurons skipped",
+        file_ids_without=["u.swc"],
+    )
+
+    widget._on_termini_finished(frame, coverage)
+
+    assert "1 neurons skipped" in widget._termini_coverage_label.text()
+    assert widget._skipped_terminus_file_ids == ["u.swc"]
+    assert widget._copy_skipped_termini_btn.isEnabled() is True
+
+
+def test_on_termini_finished_reports_coverage_even_with_no_termini() -> None:
+    """An empty result still has to explain why nothing was found."""
+    widget = _termini_widget()
+    coverage = _FakeCoverage(
+        "0 termini (Axon) in 0 of 3 neurons — 3 neurons skipped",
+        file_ids_without=["u1.swc", "u2.swc", "u3.swc"],
+    )
+
+    widget._on_termini_finished(pd.DataFrame(), coverage)
+
+    assert "3 neurons skipped" in widget._termini_coverage_label.text()
+    assert widget._copy_skipped_termini_btn.isEnabled() is True
+    assert not [layer for layer in widget._viewer.layers if "Termini" in layer.name]
+
+
+def test_on_termini_finished_flags_truncated_skipped_list() -> None:
+    """A capped skipped list must say so rather than look complete."""
+    widget = _termini_widget()
+    coverage = _FakeCoverage(
+        "0 termini (Axon) in 0 of 300 neurons — 300 neurons skipped",
+        file_ids_without=[f"u{i}.swc" for i in range(200)],
+        truncated=True,
+    )
+
+    widget._on_termini_finished(pd.DataFrame(), coverage)
+
+    assert "Only the first 200 skipped neuron IDs are listed." in (
+        widget._termini_coverage_label.text()
+    )
+
+
+def test_on_termini_finished_replaces_a_previous_layer() -> None:
+    widget = _termini_widget()
+    frame = pd.DataFrame(
+        {
+            "file_id": ["a.swc"],
+            "node_id": [3],
+            "type": [2],
+            "x": [1.0],
+            "y": [2.0],
+            "z": [3.0],
+        }
+    )
+    coverage = _FakeCoverage("1 termini")
+
+    widget._on_termini_finished(frame, coverage)
+    widget._on_termini_finished(frame, coverage)
+
+    layers = [layer for layer in widget._viewer.layers if "Termini" in layer.name]
+    assert len(layers) == 1

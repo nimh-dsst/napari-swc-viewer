@@ -1949,3 +1949,88 @@ def test_flatmap_heatmap_worker_emits_allen_layer_stack(tmp_path):
     assert result.volume.shape == (6, 16, 16)
     assert result.summary.rendered_nodes == 1500
     assert float(result.volume.sum()) == 1500.0
+
+
+def _write_terminus_parquet(path: Path) -> None:
+    """One axon-labelled cell with two tips, plus an undefined-only cell."""
+    pd.DataFrame(
+        {
+            "file_id": ["a.swc"] * 4 + ["u.swc"] * 3,
+            "node_id": [1, 2, 3, 4, 1, 2, 3],
+            "parent_id": [-1, 1, 2, 2, -1, 1, 2],
+            "type": [1, 2, 2, 2, 1, 0, 0],
+            "x": [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0],
+            "y": [0.0] * 7,
+            "z": [0.0] * 7,
+            "neuron_id": ["a"] * 4 + ["u"] * 3,
+        }
+    ).to_parquet(path, index=False)
+
+
+def test_terminus_worker_emits_termini_and_coverage(tmp_path):
+    """The worker returns axon tips plus the report of skipped neurons."""
+    workers = _import_workers_module()
+    path = tmp_path / "neurons.parquet"
+    _write_terminus_parquet(path)
+
+    worker = workers.TerminusWorker(
+        parquet_path=str(path), file_ids=None, node_types=[2]
+    )
+    results = []
+    errors = []
+    progress = []
+    worker.finished.connect(lambda frame, cov: results.append((frame, cov)))
+    worker.error.connect(errors.append)
+    worker.progress.connect(lambda *args: progress.append(args))
+
+    worker.run()
+
+    assert errors == []
+    assert len(results) == 1
+    frame, coverage = results[0]
+    assert list(zip(frame["file_id"], frame["node_id"])) == [
+        ("a.swc", 3),
+        ("a.swc", 4),
+    ]
+    # u.swc has a childless node but no axon-typed nodes, so it is reported.
+    assert coverage.cells_without_selected_types == 1
+    assert coverage.file_ids_without == ["u.swc"]
+    assert progress[-1][0] == "Done"
+
+
+def test_terminus_worker_honours_file_ids_and_node_types(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "neurons.parquet"
+    _write_terminus_parquet(path)
+
+    worker = workers.TerminusWorker(
+        parquet_path=str(path),
+        file_ids=["u.swc"],
+        node_types=[0],
+    )
+    results = []
+    worker.finished.connect(lambda frame, cov: results.append((frame, cov)))
+    worker.run()
+
+    frame, coverage = results[0]
+    assert list(zip(frame["file_id"], frame["node_id"])) == [("u.swc", 3)]
+    assert coverage.cells_requested == 1
+    assert coverage.cells_without_selected_types == 0
+
+
+def test_terminus_worker_reports_errors(tmp_path):
+    workers = _import_workers_module()
+    worker = workers.TerminusWorker(
+        parquet_path=str(tmp_path / "missing.parquet"),
+        file_ids=None,
+        node_types=[2],
+    )
+    errors = []
+    results = []
+    worker.error.connect(errors.append)
+    worker.finished.connect(lambda frame, cov: results.append(frame))
+
+    worker.run()
+
+    assert results == []
+    assert len(errors) == 1
