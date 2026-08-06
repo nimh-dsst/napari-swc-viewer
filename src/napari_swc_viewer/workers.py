@@ -19,6 +19,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 from qtpy.QtCore import QObject, Signal
 
+from .analysis.flatmap_correlation import (
+    DEFAULT_FLATMAP_DEPTH_SCALE,
+    DEFAULT_FLATMAP_SOMA_DBSCAN_EPS,
+)
 from .logging_utils import startup_timing
 
 if TYPE_CHECKING:
@@ -324,6 +328,7 @@ class ClusteringPreflightWorker(QObject):
         flatmap_xy_bins: int = 0,
         flatmap_depth_bin_um: float = 0.0,
         flatmap_include_depth_minus_one: bool = True,
+        flatmap_collapse_depth: bool = False,
     ) -> None:
         super().__init__()
         self._parquet_path = str(parquet_path)
@@ -339,6 +344,9 @@ class ClusteringPreflightWorker(QObject):
         self._flatmap_xy_bins = int(flatmap_xy_bins)
         self._flatmap_depth_bin_um = float(flatmap_depth_bin_um)
         self._flatmap_include_depth_minus_one = bool(flatmap_include_depth_minus_one)
+        # Collapsing does not change the node count, but it shrinks the voxel
+        # grid the size guard checks, so the preflight must agree with the run.
+        self._flatmap_collapse_depth = bool(flatmap_collapse_depth)
 
     def run(self) -> None:
         """Prepare an optional region map and count method-specific node rows."""
@@ -398,6 +406,7 @@ class ClusteringPreflightWorker(QObject):
                     depth_bin_um=self._flatmap_depth_bin_um,
                     include_depth_minus_one=(self._flatmap_include_depth_minus_one),
                     file_ids=self._file_ids,
+                    collapse_depth=self._flatmap_collapse_depth,
                 )
             else:
                 from .analysis.flatmap_correlation import (
@@ -1380,6 +1389,12 @@ class FlatmapParquetCorrelationWorker(QObject):
     rendered heatmap source.  It bins the precomputed flatmap/depth Parquet
     columns via DuckDB, so it is available whenever the coordinates exist in
     the loaded Parquet.
+
+    ``collapse_depth`` removes the depth axis from the voxel grid so neurons
+    correlate on flat map footprint alone.  There is deliberately no depth
+    *weight* here: the correlation compares voxel occupancy, which has no notion
+    of distance between voxels, and scaling depth would merely duplicate
+    ``depth_bin_um``.
     """
 
     progress = Signal(str, int, int)
@@ -1398,6 +1413,7 @@ class FlatmapParquetCorrelationWorker(QObject):
         linkage_method: str = "average",
         n_clusters: int = 5,
         file_ids: list[str] | None = None,
+        collapse_depth: bool = False,
     ):
         super().__init__()
         self._parquet_path = parquet_path
@@ -1411,6 +1427,7 @@ class FlatmapParquetCorrelationWorker(QObject):
         self._file_ids = (
             None if file_ids is None else [str(file_id) for file_id in file_ids]
         )
+        self._collapse_depth = bool(collapse_depth)
 
     def run(self) -> None:
         """Execute the parquet-driven flatmap correlation pipeline."""
@@ -1431,6 +1448,7 @@ class FlatmapParquetCorrelationWorker(QObject):
                     method=self._linkage_method,
                     n_clusters=self._n_clusters,
                     file_ids=self._file_ids,
+                    collapse_depth=self._collapse_depth,
                 )
             )
 
@@ -1444,6 +1462,7 @@ class FlatmapParquetCorrelationWorker(QObject):
                     provenance.include_depth_minus_one
                 ),
                 "flatmap_volume_shape": [int(size) for size in provenance.volume_shape],
+                "flatmap_collapse_depth": bool(provenance.collapse_depth),
                 "flatmap_input_neuron_count": int(
                     len(result.neuron_ids) + len(result.unassigned_neuron_ids)
                 ),
@@ -1461,7 +1480,11 @@ class FlatmapParquetCorrelationWorker(QObject):
                 region_selection=None,
                 analysis_method="flatmap_voxel_correlation",
                 clustering_algorithm="hierarchical",
-                distance_metric="one_minus_pearson_r",
+                distance_metric=(
+                    "one_minus_pearson_r_flatmap_xy"
+                    if provenance.collapse_depth
+                    else "one_minus_pearson_r"
+                ),
                 clustering_linkage=self._linkage_method,
                 dendrogram_linkage=self._linkage_method,
                 dilation_fraction=0.0,
@@ -1484,6 +1507,12 @@ class FlatmapSomaClusterWorker(QObject):
     flatmap ``(x_flat, y_flat, depth_um)`` space using the precomputed
     Parquet columns.  Region filtering is intentionally not applied here; it
     is handled separately for flatmap space.
+
+    The raw columns mix units — ``x_flat``/``y_flat`` are normalized floats
+    while ``depth_um`` is microns — so coordinates are normalized to a unit
+    hemisphere cube before any distance is computed.  ``depth_scale`` weights
+    the depth axis relative to the flat map, and ``include_depth=False`` drops
+    depth entirely for a purely tangential clustering.
     """
 
     progress = Signal(str, int, int)
@@ -1499,9 +1528,11 @@ class FlatmapSomaClusterWorker(QObject):
         algorithm: str = "hierarchical",
         linkage_method: str = "ward",
         n_clusters: int = 5,
-        eps: float = 100.0,
+        eps: float = DEFAULT_FLATMAP_SOMA_DBSCAN_EPS,
         min_samples: int = 5,
         file_ids: list[str] | None = None,
+        depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE,
+        include_depth: bool = True,
     ):
         super().__init__()
         self._parquet_path = parquet_path
@@ -1515,6 +1546,8 @@ class FlatmapSomaClusterWorker(QObject):
         self._file_ids = (
             None if file_ids is None else [str(file_id) for file_id in file_ids]
         )
+        self._depth_scale = float(depth_scale)
+        self._include_depth = bool(include_depth)
 
     def run(self) -> None:
         """Execute the flatmap-space soma clustering pipeline."""
@@ -1525,12 +1558,14 @@ class FlatmapSomaClusterWorker(QObject):
                 cluster_somas_kmeans,
             )
             from .analysis.flatmap_correlation import (
+                normalize_flatmap_soma_coordinates,
                 query_flatmap_soma_coordinates,
+                resolve_flatmap_depth_normalization,
             )
 
             total = 3
             self.progress.emit("Querying soma flatmap coordinates...", 1, total)
-            filtered_ids, filtered_coords = query_flatmap_soma_coordinates(
+            filtered_ids, raw_coords = query_flatmap_soma_coordinates(
                 self._parquet_path,
                 style=self._style,
                 file_ids=self._file_ids,
@@ -1542,6 +1577,20 @@ class FlatmapSomaClusterWorker(QObject):
                     "coordinates — need at least 2 for clustering."
                 )
                 return
+
+            # The raw columns mix normalized flat map units with microns, so
+            # depth would otherwise supply >99.99% of the Euclidean variance and
+            # reduce the run to a laminar partition.
+            normalization = resolve_flatmap_depth_normalization(
+                self._parquet_path,
+                style=self._style,
+                depth_scale=self._depth_scale,
+                include_depth=self._include_depth,
+            )
+            filtered_coords = normalize_flatmap_soma_coordinates(
+                raw_coords,
+                normalization,
+            )
 
             self.progress.emit(
                 f"Clustering {len(filtered_ids)} somas ({self._algorithm})...",
@@ -1589,7 +1638,11 @@ class FlatmapSomaClusterWorker(QObject):
                 region_selection=None,
                 analysis_method="flatmap_soma_location",
                 clustering_algorithm=self._algorithm,
-                distance_metric="euclidean_flatmap_depth",
+                distance_metric=(
+                    "euclidean_flatmap_depth_unit_hemisphere"
+                    if normalization.include_depth
+                    else "euclidean_flatmap_xy_unit_hemisphere"
+                ),
                 clustering_linkage=clustering_linkage,
                 dendrogram_linkage=dendrogram_linkage,
                 dilation_fraction=0.0,
@@ -1598,7 +1651,15 @@ class FlatmapSomaClusterWorker(QObject):
                 dbscan_min_samples=self._min_samples
                 if self._algorithm == "dbscan"
                 else None,
-                extra_metadata={"flatmap_style": self._style},
+                extra_metadata={
+                    "flatmap_style": self._style,
+                    "flatmap_normalization": normalization.to_dict(),
+                    # eps is in normalized hemisphere-cube units here, not the
+                    # microns the CCF soma clustering uses.
+                    "dbscan_eps_units": (
+                        "normalized_hemisphere" if self._algorithm == "dbscan" else None
+                    ),
+                },
             )
 
             self.progress.emit("Done", 3, total)

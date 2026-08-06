@@ -40,6 +40,10 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ..analysis.flatmap_correlation import (
+    DEFAULT_FLATMAP_DEPTH_SCALE,
+    DEFAULT_FLATMAP_SOMA_DBSCAN_EPS,
+)
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_XY_BINS,
@@ -72,6 +76,31 @@ _FLATMAP_STYLE_LABELS = {
 _FLATMAP_COORDS_INFO_TEXT = (
     "Clustering uses flatmap/depth coordinates in the loaded Parquet. "
     "Target-region filtering in flat map space is not yet available."
+)
+_DEPTH_SCALE_TOOLTIP = (
+    "Weight of cortical depth relative to flat map position.\n\n"
+    "Soma coordinates are normalized so one hemisphere spans 1.0 along each "
+    "flat map axis and one full cortical thickness spans 1.0 in depth.\n\n"
+    "Higher values weight depth MORE, pulling clusters toward cortical layers "
+    "(laminar grouping).\n"
+    "Lower values weight depth LESS, pulling clusters toward flat map "
+    "position (areal grouping).\n\n"
+    "1.0 treats a full cortical thickness of depth separation as equivalent "
+    "to one hemisphere width of tangential separation.\n\n"
+    "These are fractions of each axis, not physical distances. The flat map "
+    "projection distorts the cortical surface, so flat map X/Y have no "
+    "reliable conversion to microns and this weight cannot be read as a "
+    "physical ratio."
+)
+_IGNORE_DEPTH_TOOLTIP = (
+    "Cluster on flat map X/Y only, dropping the depth axis entirely.\n\n"
+    "Groups neurons by where they sit across the cortical sheet regardless of "
+    "which layer they occupy.\n\n"
+    "Soma Location: drops depth from the coordinates, leaving a 2-D distance.\n"
+    "Voxel Correlation: collapses the voxel grid's depth planes, so nodes at "
+    "one flat map position share a voxel whatever their depth. Depth still "
+    "decides which nodes are counted, so the node count does not change and "
+    "Include depth -1 plane keeps its meaning."
 )
 
 
@@ -109,6 +138,8 @@ class _ClusteringRequest:
     flatmap_xy_bins: int
     flatmap_depth_bin_um: float
     flatmap_include_depth_minus_one: bool
+    flatmap_depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE
+    flatmap_include_depth: bool = True
 
 
 @dataclass(frozen=True)
@@ -704,13 +735,18 @@ class AnalysisTabWidget(QWidget):
         self._clusters_row.addWidget(self._n_clusters_spin)
         corr_layout.addLayout(self._clusters_row)
 
-        # DBSCAN eps
+        # DBSCAN eps.  Units depend on the coordinate space: microns for CCFv3,
+        # normalized hemisphere fractions for flat map space.  Both remembered
+        # values live here so switching spaces preserves each setting.
+        self._eps_value_um = 100.0
+        self._eps_value_normalized = float(DEFAULT_FLATMAP_SOMA_DBSCAN_EPS)
+        self._eps_units_normalized: bool | None = None
         self._eps_row = QHBoxLayout()
         self._eps_label = QLabel("Eps (μm):")
         self._eps_row.addWidget(self._eps_label)
         self._eps_spin = QDoubleSpinBox()
         self._eps_spin.setRange(1.0, 10000.0)
-        self._eps_spin.setValue(100.0)
+        self._eps_spin.setValue(self._eps_value_um)
         self._eps_spin.setSuffix(" μm")
         self._eps_spin.setDecimals(1)
         self._eps_row.addWidget(self._eps_spin)
@@ -733,6 +769,28 @@ class AnalysisTabWidget(QWidget):
         self._flatmap_style_combo = QComboBox()
         self._flatmap_style_row.addWidget(self._flatmap_style_combo)
         corr_layout.addLayout(self._flatmap_style_row)
+
+        # Flat map soma clustering: depth weighting.  Raw Parquet coordinates
+        # mix normalized flat map units with microns, so soma coordinates are
+        # normalized to a unit hemisphere cube and depth is then weighted here.
+        self._flatmap_ignore_depth_cb = QCheckBox("Ignore depth (flat map X/Y only)")
+        self._flatmap_ignore_depth_cb.setChecked(False)
+        self._flatmap_ignore_depth_cb.setToolTip(_IGNORE_DEPTH_TOOLTIP)
+        self._flatmap_ignore_depth_cb.toggled.connect(self._on_ignore_depth_toggled)
+        corr_layout.addWidget(self._flatmap_ignore_depth_cb)
+
+        self._flatmap_depth_scale_row = QHBoxLayout()
+        self._flatmap_depth_scale_label = QLabel("Depth scale:")
+        self._flatmap_depth_scale_label.setToolTip(_DEPTH_SCALE_TOOLTIP)
+        self._flatmap_depth_scale_row.addWidget(self._flatmap_depth_scale_label)
+        self._flatmap_depth_scale_spin = QDoubleSpinBox()
+        self._flatmap_depth_scale_spin.setRange(0.0, 100.0)
+        self._flatmap_depth_scale_spin.setDecimals(2)
+        self._flatmap_depth_scale_spin.setSingleStep(0.25)
+        self._flatmap_depth_scale_spin.setValue(float(DEFAULT_FLATMAP_DEPTH_SCALE))
+        self._flatmap_depth_scale_spin.setToolTip(_DEPTH_SCALE_TOOLTIP)
+        self._flatmap_depth_scale_row.addWidget(self._flatmap_depth_scale_spin)
+        corr_layout.addLayout(self._flatmap_depth_scale_row)
 
         self._flatmap_xy_bins_row = QHBoxLayout()
         self._flatmap_xy_bins_label = QLabel("XY bins:")
@@ -1489,6 +1547,28 @@ class AnalysisTabWidget(QWidget):
             if widget is not None:
                 widget.setVisible(flatmap_voxel)
 
+        # Ignoring depth is meaningful for both flat map methods: soma
+        # clustering drops the axis from its distance, voxel correlation
+        # collapses the grid's depth planes.
+        flatmap_soma = is_flatmap and is_soma
+        ignore_depth_cb = getattr(self, "_flatmap_ignore_depth_cb", None)
+        if ignore_depth_cb is not None:
+            ignore_depth_cb.setVisible(is_flatmap)
+
+        # A depth *weight*, by contrast, only applies to soma clustering.  The
+        # correlation compares voxel occupancy, which has no notion of distance
+        # between voxels, so scaling depth there would merely duplicate the
+        # Depth bin control.
+        for widget in (
+            getattr(self, "_flatmap_depth_scale_label", None),
+            getattr(self, "_flatmap_depth_scale_spin", None),
+        ):
+            if widget is not None:
+                widget.setVisible(flatmap_soma)
+        if is_flatmap and ignore_depth_cb is not None:
+            self._on_ignore_depth_toggled(ignore_depth_cb.isChecked())
+        self._apply_eps_units(flatmap_soma)
+
         # Algorithm row: only for soma (in either coordinate space).
         self._algorithm_label.setVisible(is_soma)
         self._algorithm_combo.setVisible(is_soma)
@@ -1505,6 +1585,79 @@ class AnalysisTabWidget(QWidget):
             self._eps_spin.setVisible(False)
             self._min_samples_label.setVisible(False)
             self._min_samples_spin.setVisible(False)
+
+    def _on_ignore_depth_toggled(self, ignored: bool) -> None:
+        """Disable the controls that stop meaning anything without depth.
+
+        The depth scale has nothing to weight once the axis is gone, and a
+        collapsed voxel grid has no depth bins to size.  ``Include depth -1
+        plane`` stays enabled either way, because depth still decides which
+        nodes are counted even when the axis is collapsed.
+        """
+        for name in (
+            "_flatmap_depth_scale_spin",
+            "_flatmap_depth_scale_label",
+            "_flatmap_depth_bin_spin",
+            "_flatmap_depth_bin_label",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not ignored)
+
+    def _apply_eps_units(self, normalized_space: bool) -> None:
+        """Retarget the DBSCAN eps control at the active coordinate space.
+
+        Flat map soma clustering measures distance in normalized hemisphere-cube
+        units, where a whole hemisphere spans 1.0 — the micron range the CCFv3
+        clustering needs would collapse every soma into a single cluster.  Each
+        space keeps its own remembered value so switching back and forth does
+        not destroy the user's setting.
+        """
+        spin = getattr(self, "_eps_spin", None)
+        label = getattr(self, "_eps_label", None)
+        if spin is None:
+            return
+        if getattr(self, "_eps_units_normalized", None) == normalized_space:
+            return
+
+        # Remember the outgoing value before the range change clamps it.
+        previous = getattr(self, "_eps_units_normalized", None)
+        if previous is not None:
+            attr = "_eps_value_normalized" if previous else "_eps_value_um"
+            setattr(self, attr, float(spin.value()))
+
+        if normalized_space:
+            restored = getattr(
+                self,
+                "_eps_value_normalized",
+                float(DEFAULT_FLATMAP_SOMA_DBSCAN_EPS),
+            )
+            spin.setDecimals(3)
+            spin.setRange(0.001, 10.0)
+            spin.setSingleStep(0.01)
+            spin.setSuffix("")
+            if label is not None:
+                label.setText("Eps (hemisphere fraction):")
+                label.setToolTip(
+                    "DBSCAN neighbourhood radius in normalized units, where "
+                    "1.0 is one hemisphere width."
+                )
+            spin.setToolTip(
+                "DBSCAN neighbourhood radius in normalized units, where 1.0 is "
+                "one hemisphere width."
+            )
+        else:
+            restored = getattr(self, "_eps_value_um", 100.0)
+            spin.setDecimals(1)
+            spin.setRange(1.0, 10000.0)
+            spin.setSingleStep(1.0)
+            spin.setSuffix(" μm")
+            if label is not None:
+                label.setText("Eps (μm):")
+                label.setToolTip("DBSCAN neighbourhood radius in microns.")
+            spin.setToolTip("DBSCAN neighbourhood radius in microns.")
+        spin.setValue(float(restored))
+        self._eps_units_normalized = bool(normalized_space)
 
     def _on_algorithm_changed(self, text: str) -> None:
         """Show/hide UI rows based on the selected soma algorithm."""
@@ -1592,6 +1745,8 @@ class AnalysisTabWidget(QWidget):
             flatmap_include_depth_minus_one=(
                 self._flatmap_include_depth_minus_one_cb.isChecked()
             ),
+            flatmap_depth_scale=float(self._flatmap_depth_scale_spin.value()),
+            flatmap_include_depth=(not self._flatmap_ignore_depth_cb.isChecked()),
         )
         self._capture_cluster_run_context(
             clustering_method,
@@ -1619,6 +1774,7 @@ class AnalysisTabWidget(QWidget):
             flatmap_xy_bins=request.flatmap_xy_bins,
             flatmap_depth_bin_um=request.flatmap_depth_bin_um,
             flatmap_include_depth_minus_one=(request.flatmap_include_depth_minus_one),
+            flatmap_collapse_depth=not request.flatmap_include_depth,
         )
         thread = QThread()
         worker.moveToThread(thread)
@@ -1720,6 +1876,8 @@ class AnalysisTabWidget(QWidget):
                     eps=request.eps,
                     min_samples=request.min_samples,
                     file_ids=file_ids,
+                    depth_scale=request.flatmap_depth_scale,
+                    include_depth=request.flatmap_include_depth,
                 )
             else:
                 worker = FlatmapParquetCorrelationWorker(
@@ -1731,6 +1889,7 @@ class AnalysisTabWidget(QWidget):
                     linkage_method=request.linkage_method,
                     n_clusters=request.n_clusters,
                     file_ids=file_ids,
+                    collapse_depth=not request.flatmap_include_depth,
                 )
         elif request.clustering_method == _CLUSTER_METHOD_SOMA:
             worker = SomaClusterWorker(

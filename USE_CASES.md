@@ -1246,6 +1246,175 @@ mode uses, so soma points land on the visible render in all five modes.
   vector endpoints round to exactly their heatmap bin). None of that shows
   whether the overlay reads correctly on the canvas, so step 7 still needs eyes.
 
+### UC-012: Balance Cortical Depth Against Flat Map Position When Clustering Somas
+
+**Capability**
+
+The user can control how heavily cortical depth counts when clustering neurons
+by soma location in **Flat map + Depth** space, and can ignore depth entirely —
+in either **Soma Location** or **Voxel Correlation** — to cluster on flat map
+position alone.
+
+This exists because the raw Parquet columns mix units. `x_flat` and `y_flat` are
+normalized floats — a hemisphere spans 1.0 — while `depth_um` is raw microns
+spanning up to about 1,856. Clustering those together with an unweighted
+Euclidean metric let depth supply over 99.99% of the variance, so results were a
+laminar partition with no flat map contribution: measured on
+`isocortex_total_right_brainglobe_flatmap.parquet`, every k-means cluster at
+k=10 spanned essentially the whole hemisphere tangentially while carving depth
+into contiguous bands, and the labels matched a depth-only clustering at
+ARI 0.85.
+
+Soma coordinates are now divided by their own per-hemisphere span before any
+distance is computed, making one hemisphere a unit cube. **Depth scale** then
+weights the depth axis:
+
+- `1.0` (default) treats a full cortical thickness of depth separation as
+  equivalent to one hemisphere width of tangential separation.
+- Higher values weight depth **more**, pulling clusters toward cortical layers.
+- Lower values weight depth **less**, pulling clusters toward flat map position.
+- **Ignore depth (flat map X/Y only)** drops the depth axis outright, clustering
+  in two dimensions.
+
+**Depth scale is a ratio of axis fractions, not of physical distances.** The
+flat map projection — produced by a separate research group, not this
+repository — distorts the cortical surface, so flat map `x`/`y` have no reliable
+conversion to microns. Measuring the local scale empirically against CCF
+coordinates gives values that vary by roughly 2x across the map and drift
+systematically with the separation being measured, which is the distortion
+showing through. Do not convert flat map `x`/`y` to microns, and do not describe
+a depth scale as equivalent to some number of microns of tangential distance.
+Normalizing each axis by its own span is what keeps the metric well defined
+without making that claim.
+
+The `x` divisor is **half** the canonical `x` span, because the bilateral flat
+map lays the two hemispheres side by side along `x`. For the bilateral square
+style that leaves `x` and `y` untouched; the bilateral shaped style is about 4%
+off square and gets its own divisors.
+
+DBSCAN's **Eps** changes units with the coordinate space: microns in **CCFv3
+Coordinates**, normalized hemisphere fractions in **Flat map + Depth**, where
+1.0 is one hemisphere width. Each space remembers its own value.
+
+**Ignore depth in Voxel Correlation** collapses the voxel grid's depth planes,
+so nodes at one flat map position share a voxel whatever their depth. Two
+neurons then correlate on flat map footprint regardless of which layers they
+occupy. Depth still decides which nodes are counted, so the rendered node count
+is unchanged and **Include depth -1 plane** keeps its meaning; **Depth bin**
+greys out because a collapsed grid has no depth bins to size.
+
+There is deliberately **no depth scale for Voxel Correlation.** That path
+compares voxel occupancy with a Pearson correlation, which treats voxels as an
+unordered set of categories — two neurons in adjacent voxels correlate exactly
+as poorly as two in opposite corners of the volume, so there is no distance for a
+weight to act on. Scaling depth would also be redundant: since
+`depth_bin = floor(depth / depth_bin_um)`, multiplying depth by *k* is identical
+to setting **Depth bin** to `depth_bin_um / k`. Bin *resolution* is the real knob
+there, and it already exists.
+
+**Prerequisites**
+
+- A version-3 Parquet with flatmap and depth columns from UC-003; the canonical
+  bounds in its metadata are what make the metric independent of which neurons
+  are in scope. `isocortex_total_right_brainglobe_flatmap.parquet` works.
+- Neurons whose somas span several cortical layers *and* a wide area of the flat
+  map, so laminar and areal groupings are visibly different. A single small
+  region will not show the difference.
+- A Parquet lacking canonical bounds is still usable but falls back to observed
+  data bounds; results are then comparable only within that fixed dataset.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** Open the **Analysis** tab, expand **Clustering**, and set
+   **Coordinate space** to **Flat map + Depth** and **Method** to **Soma
+   Location**.
+   **Expected:** **Ignore depth (flat map X/Y only)** and **Depth scale** appear.
+   **Depth scale** reads `1.00` and is enabled. **XY bins**, **Depth bin**, and
+   **Include depth -1 plane** stay hidden, since binning applies only to voxel
+   correlation.
+2. **Action:** Hover over **Depth scale**.
+   **Expected:** The tooltip states that higher values weight depth MORE
+   (laminar grouping) and lower values weight depth LESS (areal grouping), and
+   explains that 1.0 equates one cortical thickness with one hemisphere width.
+3. **Action:** Set **Method** to **Voxel Correlation**, then back to **Soma
+   Location**.
+   **Expected:** **Depth scale** hides for voxel correlation and reappears for
+   soma location, while **Ignore depth (flat map X/Y only)** stays visible for
+   both. Switching **Coordinate space** to **CCFv3 Coordinates** hides both.
+4. **Action:** With **Algorithm** set to **Hierarchical**, **Clusters** to 10,
+   and **Depth scale** at `1.00`, click **Run Clustering**. Color the table by
+   cluster and project the somas to the flatmap.
+   **Expected:** Clusters are compact patches on the flat map that each still
+   cover a range of depths — not hemisphere-wide laminar sheets. This is the
+   check automated tests cannot make.
+5. **Action:** Set **Depth scale** to `20.00` and re-run.
+   **Expected:** Clusters become depth bands: each spans a wide area of the flat
+   map but a narrow depth range, reproducing the old depth-dominated behavior on
+   purpose.
+6. **Action:** Set **Depth scale** back to `1.00`, check **Ignore depth (flat
+   map X/Y only)**, and re-run.
+   **Expected:** **Depth scale** greys out. Clusters are flat map patches that
+   ignore layer entirely, so one cluster contains both superficial and deep
+   somas at the same tangential position.
+7. **Action:** Set **Algorithm** to **DBSCAN** and read the **Eps** row.
+   **Expected:** The label reads **Eps (hemisphere fraction):** with no micron
+   suffix and a value of `0.050`. Switching **Coordinate space** to **CCFv3
+   Coordinates** restores **Eps (μm):** at `100.0`; switching back restores the
+   normalized value. Editing one space's value and returning to the other leaves
+   that other value intact.
+8. **Action:** Run DBSCAN in flat map space at **Eps** `0.050`, then at `1.000`.
+   **Expected:** `0.050` produces multiple clusters plus noise. `1.000` — one
+   whole hemisphere width — collapses nearly everything into a single cluster,
+   confirming the control now spans a useful range rather than saturating.
+9. **Action:** Export the clustering result and inspect the run metadata.
+   **Expected:** `distance_metric` reads
+   `euclidean_flatmap_depth_unit_hemisphere`, or
+   `euclidean_flatmap_xy_unit_hemisphere` when depth was ignored. A
+   `flatmap_normalization` entry records the axis divisors, `depth_scale`,
+   `include_depth`, `axis_count`, and whether bounds came from `canonical`
+   metadata or `observed` data.
+10. **Action:** Set **Method** to **Voxel Correlation** with **XY bins** 128 and
+    **Depth bin** 25 µm, note the reported rendered-node count from a run, then
+    check **Ignore depth (flat map X/Y only)** and run again.
+    **Expected:** **Depth bin** greys out while **XY bins** and **Include depth
+    -1 plane** stay enabled. The rendered-node count is **identical** across the
+    two runs — collapsing changes how nodes are grouped, not which are counted —
+    while the occupied-voxel count drops sharply as depth planes merge.
+11. **Action:** Color the table by cluster after the collapsed run and project
+    the neurons to the flatmap in **2D Heatmap**.
+    **Expected:** Clusters group neurons whose flat map footprints overlap, even
+    when their arbors sit in different layers. Neurons that overlap in flat map
+    projection but not in depth now cluster together, which the uncollapsed run
+    cannot do.
+12. **Action:** Export the collapsed correlation result and inspect the metadata.
+    **Expected:** `distance_metric` reads `one_minus_pearson_r_flatmap_xy`,
+    `flatmap_collapse_depth` is `true`, and `flatmap_volume_shape` has two
+    entries instead of three.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: Added on 2026-08-06 and not yet exercised in napari. Automated tests in
+  `tests/test_flatmap_depth_normalization.py` cover the divisor math, the
+  bilateral-`x` halving trap, depth exclusion versus a zero weight, monotonic
+  reweighting, the observed-bounds fallback, and provenance;
+  `tests/test_flatmap_clustering_from_parquet.py` covers the collapsed
+  correlation, including that collapsing preserves the node count while shrinking
+  the grid, and that neurons sharing a footprint across layers correlate at 1.0
+  once collapsed but below 0.5 before. The variance rebalance was confirmed
+  numerically against `isocortex_total_right_brainglobe_flatmap.parquet`: depth's
+  share of the feature-space variance drops from 99.9998% to 11.9% at **Depth
+  scale** `1.00` for the bilateral square style, and falls monotonically as the
+  scale is lowered. The collapse invariant was confirmed on a 40-neuron subset of
+  the same file — 575,098 nodes counted either way, with occupied voxels falling
+  from 11,321 to 1,538. None of that shows whether the resulting clusters read as
+  sensible anatomy on the canvas, so steps 4-6 and 11 still need eyes. Choosing a
+  defensible depth scale is a judgement about the biological question, not
+  something the numbers settle — the flat map distortion rules out calibrating it
+  against physical distance.
+
 ## Use-Case Template
 
 Copy this section when adding a use case. Remove guidance in parentheses and
