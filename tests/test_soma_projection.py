@@ -17,7 +17,7 @@ import pytest
 from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
 from napari_swc_viewer.neuron_table_ops import (
     ClusterFilterSelection,
-    turbo_colors_for_file_ids,
+    distinct_colors_for_file_ids,
 )
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -5036,7 +5036,7 @@ def test_cluster_selection_actions_apply_full_selection() -> None:
     selection = ClusterFilterSelection({1, 2}, include_unclustered=True)
     table = types.SimpleNamespace(
         hide_all_not_in_cluster=MagicMock(),
-        recolor_cluster_turbo=MagicMock(),
+        recolor_cluster_distinct=MagicMock(),
     )
     widget = types.SimpleNamespace(
         _cluster_filter_combo=_DummyClusterFilterCombo(selection),
@@ -5048,7 +5048,7 @@ def test_cluster_selection_actions_apply_full_selection() -> None:
     NeuronViewerWidget._recolor_selected_cluster(widget)
 
     table.hide_all_not_in_cluster.assert_called_once_with(selection)
-    table.recolor_cluster_turbo.assert_called_once_with(
+    table.recolor_cluster_distinct.assert_called_once_with(
         selection,
         gray_others=True,
     )
@@ -5464,7 +5464,7 @@ def test_individual_heatmaps_recolor_only_monochrome_selected_neurons() -> None:
 
     NeuronViewerWidget._add_selected_neurons_individual_heatmaps(widget)
 
-    expected_colors = turbo_colors_for_file_ids(["n1", "n2"])
+    expected_colors = distinct_colors_for_file_ids(["n1", "n2"])
     table.update_colors.assert_called_once_with(expected_colors)
     assert "n3" not in table.update_colors.call_args.args[0]
     requests = widget._start_selected_neuron_heatmap_requests.call_args.args[0]

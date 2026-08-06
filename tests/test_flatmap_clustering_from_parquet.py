@@ -22,6 +22,33 @@ from napari_swc_viewer.analysis.flatmap_correlation import (
 from napari_swc_viewer.flatmap_parquet import read_flatmap_parquet_transform_info
 
 
+_V3_COLUMNS = (
+    "file_id",
+    "node_id",
+    "parent_id",
+    "type",
+    "x",
+    "y",
+    "z",
+    "x_flat_shaped",
+    "y_flat_shaped",
+    "flatmap_shaped_valid",
+    "flatmap_shaped_projection_valid",
+    "flatmap_shaped_invalid_code",
+    "flatmap_shaped_lookup_mode",
+    "x_flat_square",
+    "y_flat_square",
+    "flatmap_square_valid",
+    "flatmap_square_projection_valid",
+    "flatmap_square_invalid_code",
+    "flatmap_square_lookup_mode",
+    "depth_um",
+    "depth_valid",
+    "depth_invalid_code",
+    "depth_lookup_mode",
+)
+
+
 def _v3_augmented_frame(
     *,
     n_neurons: int = 4,
@@ -30,34 +57,7 @@ def _v3_augmented_frame(
 ) -> pd.DataFrame:
     """Build a version-3-style neuron frame with the full augmented columns."""
     rng = np.random.default_rng(seed)
-    rows: dict[str, list] = {
-        name: []
-        for name in (
-            "file_id",
-            "node_id",
-            "parent_id",
-            "type",
-            "x",
-            "y",
-            "z",
-            "x_flat_shaped",
-            "y_flat_shaped",
-            "flatmap_shaped_valid",
-            "flatmap_shaped_projection_valid",
-            "flatmap_shaped_invalid_code",
-            "flatmap_shaped_lookup_mode",
-            "x_flat_square",
-            "y_flat_square",
-            "flatmap_square_valid",
-            "flatmap_square_projection_valid",
-            "flatmap_square_invalid_code",
-            "flatmap_square_lookup_mode",
-            "depth_um",
-            "depth_valid",
-            "depth_invalid_code",
-            "depth_lookup_mode",
-        )
-    }
+    rows: dict[str, list] = {name: [] for name in _V3_COLUMNS}
     node_id = 0
     for neuron in range(n_neurons):
         # Cluster each neuron's nodes around a distinct flatmap centroid so
@@ -154,6 +154,209 @@ def test_compute_flatmap_voxel_correlation_from_parquet(flatmap_parquet) -> None
     assert result.metadata is None  # metadata attached by the worker, not here
 
 
+def _layered_frame() -> pd.DataFrame:
+    """Build neuron pairs that share a flat map footprint across depths.
+
+    ``neuron_0``/``neuron_1`` occupy identical flat map positions but sit in
+    different depth bins, and ``neuron_2``/``neuron_3`` do the same at a
+    different footprint.  Uncollapsed, each pair occupies disjoint voxels; once
+    depth is collapsed, each pair's count vectors become identical.
+    """
+    footprints = {
+        "neuron_0": [((0.1, 0.1), 10), ((0.9, 0.9), 5)],
+        "neuron_1": [((0.1, 0.1), 10), ((0.9, 0.9), 5)],
+        "neuron_2": [((0.1, 0.9), 10), ((0.9, 0.1), 5)],
+        "neuron_3": [((0.1, 0.9), 10), ((0.9, 0.1), 5)],
+    }
+    depths = {
+        "neuron_0": 100.0,
+        "neuron_1": 900.0,
+        "neuron_2": 100.0,
+        "neuron_3": 900.0,
+    }
+    rows: dict[str, list] = {name: [] for name in _V3_COLUMNS}
+    node_id = 0
+    for file_id, places in footprints.items():
+        depth = depths[file_id]
+        local = 0
+        for (xf, yf), repeats in places:
+            for _ in range(repeats):
+                rows["file_id"].append(file_id)
+                rows["node_id"].append(node_id)
+                rows["parent_id"].append(-1 if local == 0 else node_id - 1)
+                rows["type"].append(1 if local == 0 else 3)
+                rows["x"].append(xf * 1000.0)
+                rows["y"].append(yf * 1000.0)
+                rows["z"].append(depth)
+                rows["x_flat_shaped"].append(xf)
+                rows["y_flat_shaped"].append(yf)
+                rows["flatmap_shaped_valid"].append(True)
+                rows["flatmap_shaped_projection_valid"].append(True)
+                rows["flatmap_shaped_invalid_code"].append(0)
+                rows["flatmap_shaped_lookup_mode"].append("direct")
+                rows["x_flat_square"].append(xf + 1.0)
+                rows["y_flat_square"].append(yf)
+                rows["flatmap_square_valid"].append(True)
+                rows["flatmap_square_projection_valid"].append(True)
+                rows["flatmap_square_invalid_code"].append(0)
+                rows["flatmap_square_lookup_mode"].append("direct")
+                rows["depth_um"].append(depth)
+                rows["depth_valid"].append(True)
+                rows["depth_invalid_code"].append(0)
+                rows["depth_lookup_mode"].append("direct")
+                node_id += 1
+                local += 1
+    frame = pd.DataFrame(rows)
+    frame["node_id"] = frame["node_id"].astype(np.int32)
+    frame["parent_id"] = frame["parent_id"].astype(np.int32)
+    frame["type"] = frame["type"].astype(np.int32)
+    for name in (
+        "x",
+        "y",
+        "z",
+        "x_flat_shaped",
+        "y_flat_shaped",
+        "x_flat_square",
+        "y_flat_square",
+        "depth_um",
+    ):
+        frame[name] = frame[name].astype(np.float32)
+    return frame
+
+
+@pytest.fixture()
+def layered_parquet(tmp_path):
+    frame = _layered_frame()
+    path = tmp_path / "layered_v3.parquet"
+    frame.to_parquet(path, index=False)
+    return frame, str(path)
+
+
+def test_collapse_depth_keeps_node_count_and_shrinks_the_grid(
+    layered_parquet,
+) -> None:
+    """Collapsing removes the depth axis without changing which nodes count."""
+    _frame, path = layered_parquet
+    kwargs = dict(style="both_shaped", xy_bins=8, depth_bin_um=50.0, n_clusters=2)
+
+    _r3, counts_3d, prov_3d = compute_flatmap_voxel_correlation_from_parquet(
+        path, **kwargs
+    )
+    _r2, counts_2d, prov_2d = compute_flatmap_voxel_correlation_from_parquet(
+        path, collapse_depth=True, **kwargs
+    )
+
+    assert prov_3d.collapse_depth is False
+    assert prov_2d.collapse_depth is True
+    assert len(prov_3d.volume_shape) == 3
+    assert prov_2d.volume_shape == (8, 8)
+
+    # Same nodes counted either way -- only their grouping changes.
+    assert counts_2d.rendered_node_count == counts_3d.rendered_node_count
+    # Merging depth planes can only reduce the number of distinct voxels.
+    assert len(counts_2d.voxel_ids) < len(counts_3d.voxel_ids)
+
+
+def test_collapse_depth_merges_layers_at_one_flatmap_position(
+    layered_parquet,
+) -> None:
+    """Neurons sharing a footprint across layers must correlate once collapsed.
+
+    Uncollapsed they occupy disjoint voxels, so the correlation cannot see that
+    they cover the same part of the cortical sheet.
+    """
+    from napari_swc_viewer.analysis.flatmap_correlation import (
+        pearson_correlation_from_counts,
+    )
+
+    _frame, path = layered_parquet
+    kwargs = dict(style="both_shaped", xy_bins=8, depth_bin_um=50.0, n_clusters=2)
+
+    _r3, counts_3d, _p3 = compute_flatmap_voxel_correlation_from_parquet(path, **kwargs)
+    result_2d, counts_2d, _p2 = compute_flatmap_voxel_correlation_from_parquet(
+        path, collapse_depth=True, **kwargs
+    )
+
+    def _r(count_data, matrix, left, right):
+        i = count_data.neuron_ids.index(left)
+        j = count_data.neuron_ids.index(right)
+        return float(matrix[i, j])
+
+    corr_3d = pearson_correlation_from_counts(counts_3d.count_matrix)
+    corr_2d = pearson_correlation_from_counts(counts_2d.count_matrix)
+
+    # Same footprint, different layers: invisible in 3-D, identical in 2-D.
+    assert _r(counts_3d, corr_3d, "neuron_0", "neuron_1") < 0.5
+    assert _r(counts_2d, corr_2d, "neuron_0", "neuron_1") == pytest.approx(1.0)
+    assert _r(counts_2d, corr_2d, "neuron_2", "neuron_3") == pytest.approx(1.0)
+    # Different footprints stay distinguishable.
+    assert _r(counts_2d, corr_2d, "neuron_0", "neuron_2") < 0.5
+
+    labels = dict(zip(result_2d.neuron_ids, result_2d.labels.tolist()))
+    assert labels["neuron_0"] == labels["neuron_1"]
+    assert labels["neuron_2"] == labels["neuron_3"]
+    assert labels["neuron_0"] != labels["neuron_2"]
+
+
+def test_collapse_depth_preflight_count_matches_the_run(layered_parquet) -> None:
+    """The preflight count must not change when the depth axis is collapsed."""
+    _frame, path = layered_parquet
+    kwargs = dict(style="both_shaped", xy_bins=8, depth_bin_um=50.0)
+
+    flat = count_flatmap_voxel_correlation_nodes(path, collapse_depth=True, **kwargs)
+    deep = count_flatmap_voxel_correlation_nodes(path, collapse_depth=False, **kwargs)
+    assert flat == deep
+
+    _result, counts, _prov = compute_flatmap_voxel_correlation_from_parquet(
+        path, collapse_depth=True, n_clusters=2, **kwargs
+    )
+    assert counts.rendered_node_count == flat
+
+
+def test_count_matrix_rejects_3d_shape_without_depth_bins() -> None:
+    """A 3-D volume needs a depth_bin column; the rank decides, not the column."""
+    from napari_swc_viewer.analysis.flatmap_correlation import (
+        build_flatmap_count_matrix_from_bin_counts,
+    )
+
+    collapsed = pd.DataFrame(
+        {
+            "file_id": ["a", "b"],
+            "y_bin": [0, 1],
+            "x_bin": [0, 1],
+            "node_count": [3, 4],
+        }
+    )
+    with pytest.raises(ValueError, match="missing required column"):
+        build_flatmap_count_matrix_from_bin_counts(
+            collapsed,
+            (4, 4, 4),
+            input_file_ids=("a", "b"),
+        )
+
+    # The same counts are valid against a 2-D volume.
+    matrix = build_flatmap_count_matrix_from_bin_counts(
+        collapsed,
+        (4, 4),
+        input_file_ids=("a", "b"),
+    )
+    assert matrix.count_matrix.shape == (2, 2)
+    assert matrix.rendered_node_count == 7
+
+
+def test_count_matrix_rejects_unsupported_volume_rank() -> None:
+    from napari_swc_viewer.analysis.flatmap_correlation import (
+        build_flatmap_count_matrix_from_bin_counts,
+    )
+
+    with pytest.raises(ValueError, match="must be 2D or 3D"):
+        build_flatmap_count_matrix_from_bin_counts(
+            pd.DataFrame(),
+            (4,),
+            input_file_ids=(),
+        )
+
+
 def test_compute_flatmap_correlation_respects_file_id_subset(
     flatmap_parquet,
 ) -> None:
@@ -230,6 +433,38 @@ def test_flatmap_parquet_correlation_worker(flatmap_parquet) -> None:
     assert len(result.neuron_ids) == 4
     assert result.metadata is not None
     assert result.metadata.analysis_method == "flatmap_voxel_correlation"
+
+
+def test_flatmap_correlation_worker_records_collapse_provenance(
+    layered_parquet,
+) -> None:
+    """A collapsed run must be identifiable from its recorded metadata."""
+    from napari_swc_viewer import workers
+
+    _frame, path = layered_parquet
+    finished: list = []
+    errors: list = []
+    worker = workers.FlatmapParquetCorrelationWorker(
+        parquet_path=path,
+        atlas=_fake_atlas(),
+        style="both_shaped",
+        xy_bins=8,
+        depth_bin_um=50.0,
+        n_clusters=2,
+        collapse_depth=True,
+    )
+    worker.finished.connect(finished.append)
+    worker.error.connect(errors.append)
+    worker.run()
+
+    assert errors == []
+    assert len(finished) == 1
+    result = finished[0]
+    assert result.metadata is not None
+    assert result.metadata.analysis_method == "flatmap_voxel_correlation"
+    assert result.metadata.distance_metric == "one_minus_pearson_r_flatmap_xy"
+    assert result.metadata.extra_metadata["flatmap_collapse_depth"] is True
+    assert result.metadata.extra_metadata["flatmap_volume_shape"] == [8, 8]
 
 
 def test_flatmap_soma_cluster_worker(flatmap_parquet) -> None:

@@ -208,7 +208,8 @@ version-3 augmentation in one cancellable, atomic background operation.
   without layer 4 remain empty on the `L4` plane.
 - **XY bins**, shaped/square style, neuron selection, and heatmap color mode
   continue to apply. Depth-bin controls and cached surfaces/outlines are
-  unavailable while this categorical mode is selected.
+  unavailable while this categorical mode is selected. For a flatmap with no
+  plane axis at all, see **Depth-free 2D flatmap modes** below.
 - With **Precomputed Parquet + Cache** and a compatible cache profile active,
   select **Atlas Regions** or **Custom Regions** and click **Show Region
   Labels** to create a cache-backed six-plane **Flatmap Region Labels** stack.
@@ -222,9 +223,66 @@ version-3 augmentation in one cancellable, atomic background operation.
   not load NRRDs or `atlas.annotation`.
 - Single color creates one six-plane image stack. Individual and cluster color
   modes create one stack per neuron or cluster.
+- The flatmap window names what is on screen: the plane slider is captioned
+  **Allen layer**, the upper-left canvas corner reads the layer of the plane
+  under the slider (for example `Allen layer: L2/3  (plane 2 of 6)`, following
+  the slider as it moves), and
+  labelled **Flatmap X** / **Flatmap Y** axis arrows are drawn at the image
+  origin. In **3D Heatmap** the same readout reports the plane's depth range in
+  microns and the caption reads **Depth bin**. The images are binned in index
+  space, so the arrows orient and name the axes without asserting physical
+  units or anatomical direction.
 - CSV export is available for materialized NRRD recomputation and includes
   `allen_layer_index` and `allen_layer_label`. The fast precomputed,
   volume-only path remains non-exportable.
+
+### Depth-free 2D flatmap modes
+
+- In **Flatmap**, choose **2D Heatmap** or **2D Vector** under **Render** for a
+  plain flatmap with no depth axis at all. Both open the flatmap window in 2D
+  with only **Flatmap Y** / **Flatmap X** axes and no plane slider or plane
+  caption.
+- Collapsing removes the depth *axis*, not any node: **Exclude depth -1 nodes**
+  still decides whether depth `-1` nodes are rendered, so a 2D Heatmap is
+  exactly the matching **3D Heatmap** summed over its planes. The summary panel
+  reports the same node counts plus `Depth: collapsed into one flatmap plane`.
+  The depth-bin size control is disabled because there are no depth bins to
+  size.
+- **2D Heatmap** produces one raw node-count image over the flatmap XY grid.
+  **XY bins**, shaped/square style, neuron selection, and **Heatmap colors** all
+  apply, so Individual and cluster coloring create one tinted 2D image per
+  neuron or cluster. With **Precomputed Parquet + Cache** the binning runs in
+  DuckDB, matching the 3D heatmap's speed on whole-Parquet renders.
+- **2D Vector** draws one line per parent-child edge, colored per neuron from
+  the table, over the same pixel grid the 2D Heatmap uses. Edges are selected by
+  the render's own validity, so the traces cover exactly the nodes the matching
+  2D Heatmap counts. Vectors always use per-neuron colors, so **Heatmap colors**
+  is disabled.
+- 2D Vector is a per-node render and is limited to 250,000 segments. Above that
+  it reports the count and the limit and draws nothing, rather than silently
+  omitting whole neurons; select fewer neurons, or use 2D Heatmap for the whole
+  set.
+- Cached region labels, surfaces, and outlines are unavailable in both 2D modes
+  because their geometry is built on the depth grid.
+
+### Flatmap soma overlay
+
+- **Add Soma** projects only soma nodes (`type == 1`) into the separate
+  **Isocortex Flatmap Somas** point layer, leaving the main projection layer in
+  place.
+- The somas are built for the **Render** mode that is currently selected, so
+  they land in the coordinate space of the visible render: depth bins in **3D
+  Heatmap** / **3D Points**, Allen layer planes in **Allen Layer Heatmap (2D
+  stack)**, and a single flat plane in **2D Heatmap** / **2D Vector**. The
+  flatmap window's display dimensionality, axis captions, and plane caption are
+  preserved rather than reset.
+- **Add Soma** in Allen Layer mode needs a Parquet with `region_id` so somas can
+  be assigned to the same six layer planes. Without it the action reports the
+  requirement instead of falling back to depth bins, which would place the somas
+  off the six-plane stack.
+- Changing **Render**, the flatmap style, or the cache profile removes the soma
+  layer, because its bin coordinates belong to the retired grid. Re-run **Add
+  Soma** after switching.
 
 ### Flatmap region cache and overlays
 
@@ -257,7 +315,8 @@ version-3 augmentation in one cancellable, atomic background operation.
   (2D stack)** mode, cached labels collapse the same version-1 occupancy into
   six synchronized Allen planes. Existing caches do not need to be rebuilt,
   and surfaces/outlines remain unavailable in the planar mode because their
-  geometry is depth-based.
+  geometry is depth-based. In **2D Heatmap** and **2D Vector** modes labels,
+  surfaces, and outlines are all unavailable for the same reason.
 - Label paths preserve majority-region collision handling with smaller-ID
   tie-breaking. **Mask Layer** is not an atlas-region source and reports an
   actionable error instead of reusing a retained Atlas selection.
@@ -427,8 +486,8 @@ Buttons:
   - `Single Heatmap`: create one `hot` heatmap containing all selected neurons.
   - `Individual Heatmaps`: create one Greek-named heatmap per selected neuron,
     colored to match that neuron. If two or more selected neurons initially
-    have the same RGB color, they are first assigned distinct Turbo colors;
-    other table neurons are not recolored. Each individual layer initially
+    have the same RGB color, they are first assigned distinct colors from the
+    shared neuron palette; other table neurons are not recolored. Each individual layer initially
     displays a contrast range from zero to 20% of its maximum node count so
     lower-density structure remains visible; this can still be adjusted in
     napari's layer controls.

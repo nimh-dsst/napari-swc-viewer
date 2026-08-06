@@ -10,6 +10,7 @@ from napari_swc_viewer.flatmap_heatmap import (
     FLATMAP_HEATMAP_COLOR_INDIVIDUAL,
     FLATMAP_HEATMAP_COLOR_SINGLE,
     MAX_FLATMAP_HEATMAP_VOXELS,
+    _bin_flat_values,
     build_allen_layer_cluster_volumes,
     build_allen_layer_file_id_volumes,
     build_allen_layer_heatmap_volume_result,
@@ -19,10 +20,14 @@ from napari_swc_viewer.flatmap_heatmap import (
     build_flatmap_heatmap_volume_result,
     build_flatmap_render_data,
     build_flatmap_render_data_from_projected_nodes,
+    build_flatmap_segment_vectors,
     compute_depth_range,
     compute_flatmap_bounds_from_parquet,
     compute_flatmap_lookup_stats,
     compute_flatmap_xy_bounds,
+    depth_plane_labels,
+    flatmap_pixel_coordinates,
+    rendered_plane_points,
 )
 from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
 
@@ -364,6 +369,293 @@ def test_build_flatmap_cluster_volumes_groups_by_cluster_with_unclustered_last()
     assert groups[2].volume[1, 0, 1] == 1.0
 
 
+def _flat_binned_projected_nodes() -> pd.DataFrame:
+    """Rendered nodes as a depth-collapsed render writes them: no depth bin."""
+    return pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "b.swc", "c.swc", "skip.swc"],
+            "render_valid": [True, True, True, True, False],
+            "y_flat_bin": [1, 1, 2, 0, 0],
+            "x_flat_bin": [2, 2, 0, 1, 0],
+        }
+    )
+
+
+@pytest.mark.parametrize("include", [False, True])
+def test_collapsed_render_equals_depth_render_summed_over_planes(include) -> None:
+    kwargs = dict(
+        xy_bins=4,
+        depth_bin_um=25.0,
+        include_depth_minus_one=include,
+        x_bounds=(0.0, 6.0),
+        y_bounds=(0.0, 6.0),
+        depth_range_um=(0.0, 150.0),
+    )
+    depth = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        **kwargs,
+    )
+    flat = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        collapse_depth=True,
+        **kwargs,
+    )
+
+    assert depth.volume.ndim == 3
+    assert flat.volume.shape == (4, 4)
+    np.testing.assert_array_equal(flat.volume, depth.volume.sum(axis=0))
+    # Collapsing removes the depth axis, never a node: the checkbox alone
+    # decides which nodes render.
+    assert flat.summary.rendered_nodes == depth.summary.rendered_nodes
+    assert flat.summary.depth_valid_nodes == depth.summary.depth_valid_nodes
+    assert flat.summary.depth_minus_one_nodes == depth.summary.depth_minus_one_nodes
+
+
+def test_collapsed_render_reports_no_depth_binning() -> None:
+    flat = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        xy_bins=4,
+        depth_bin_um=25.0,
+        collapse_depth=True,
+        x_bounds=(0.0, 6.0),
+        y_bounds=(0.0, 6.0),
+        depth_range_um=(0.0, 150.0),
+    )
+
+    # Zeros mean "no depth axis", so no plane labels get invented for it.
+    assert flat.summary.depth_bins == 0
+    assert flat.summary.depth_bin_um == 0.0
+    assert depth_plane_labels(flat.summary.to_dict()) == ()
+    assert "depth_bin" not in flat.projected_nodes.columns
+    assert "depth_bin_label" not in flat.projected_nodes.columns
+    assert flat.points.shape[1] == 2
+
+
+def test_collapsed_render_excludes_depth_minus_one_when_requested() -> None:
+    included = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        xy_bins=4,
+        depth_bin_um=25.0,
+        include_depth_minus_one=True,
+        collapse_depth=True,
+        x_bounds=(0.0, 6.0),
+        y_bounds=(0.0, 6.0),
+        depth_range_um=(0.0, 150.0),
+    )
+    excluded = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        xy_bins=4,
+        depth_bin_um=25.0,
+        include_depth_minus_one=False,
+        collapse_depth=True,
+        x_bounds=(0.0, 6.0),
+        y_bounds=(0.0, 6.0),
+        depth_range_um=(0.0, 150.0),
+    )
+
+    # b.swc carries the only depth == -1 node in the fixture.
+    assert included.summary.rendered_nodes == excluded.summary.rendered_nodes + 1
+    assert float(included.volume.sum()) == float(excluded.volume.sum()) + 1.0
+
+
+def test_collapsed_lookup_render_matches_summed_depth_volume() -> None:
+    flatmap, depth_volume = _lookup_volumes()
+    kwargs = dict(xy_bins=4, depth_bin_um=25.0)
+    depth = build_flatmap_render_data(
+        _projected_nodes(), flatmap, depth_volume, **kwargs
+    )
+    flat = build_flatmap_render_data(
+        _projected_nodes(), flatmap, depth_volume, collapse_depth=True, **kwargs
+    )
+
+    np.testing.assert_array_equal(flat.volume, depth.volume.sum(axis=0))
+
+
+def test_flatmap_pixel_coordinates_center_on_image_pixels() -> None:
+    bounds, bins = (0.0, 10.0), 16
+    rng = np.random.default_rng(3)
+    values = rng.uniform(*bounds, size=500)
+
+    pixels = flatmap_pixel_coordinates(values, bounds, bins)
+    bin_indices = _bin_flat_values(values, bounds, bins)
+
+    # napari centers pixel k on coordinate k, so rounding a pixel coordinate
+    # must return the bin that holds the value.  A missing 0.5 offset shifts
+    # every overlay half a pixel off the heatmap it is drawn over.
+    np.testing.assert_array_equal(np.floor(pixels + 0.5).astype(np.int64), bin_indices)
+
+    bin_centers = (np.arange(bins) + 0.5) * (bounds[1] - bounds[0]) / bins
+    np.testing.assert_allclose(
+        flatmap_pixel_coordinates(bin_centers, bounds, bins),
+        np.arange(bins, dtype=float),
+    )
+
+
+def test_flatmap_pixel_coordinates_clip_to_the_image_edges() -> None:
+    pixels = flatmap_pixel_coordinates(
+        np.asarray([-100.0, 100.0]),
+        (0.0, 10.0),
+        16,
+    )
+
+    np.testing.assert_allclose(pixels, [-0.5, 15.5])
+
+
+def _segment_endpoints() -> tuple[np.ndarray, list[str]]:
+    # (M, 2, 2): [parent, child] x (x_flat, y_flat), matching
+    # build_projected_segments' output layout.
+    data = np.asarray(
+        [
+            [[0.0, 0.0], [10.0, 20.0]],
+            [[10.0, 20.0], [20.0, 40.0]],
+        ],
+        dtype=float,
+    )
+    return data, ["a.swc", "a.swc"]
+
+
+def test_build_flatmap_segment_vectors_uses_row_col_start_direction() -> None:
+    endpoints, file_ids = _segment_endpoints()
+    bounds, bins = (0.0, 40.0), 8
+
+    vectors = build_flatmap_segment_vectors(
+        endpoints,
+        file_ids,
+        x_bounds=bounds,
+        y_bounds=bounds,
+        xy_bins=bins,
+    )
+
+    assert vectors.data.shape == (2, 2, 2)
+    assert vectors.data.dtype == np.float32
+    assert vectors.total_segments == 2
+    assert vectors.file_ids == ("a.swc", "a.swc")
+
+    expected_start = np.column_stack(
+        (
+            flatmap_pixel_coordinates(endpoints[:, 0, 1], bounds, bins),
+            flatmap_pixel_coordinates(endpoints[:, 0, 0], bounds, bins),
+        )
+    )
+    expected_end = np.column_stack(
+        (
+            flatmap_pixel_coordinates(endpoints[:, 1, 1], bounds, bins),
+            flatmap_pixel_coordinates(endpoints[:, 1, 0], bounds, bins),
+        )
+    )
+    # Row leads column, and the second entry is a direction, not an endpoint.
+    np.testing.assert_allclose(vectors.data[:, 0], expected_start, atol=1e-5)
+    np.testing.assert_allclose(
+        vectors.data[:, 0] + vectors.data[:, 1],
+        expected_end,
+        atol=1e-5,
+    )
+
+
+def test_build_flatmap_segment_vectors_refuses_above_the_limit() -> None:
+    endpoints, file_ids = _segment_endpoints()
+
+    with pytest.raises(ValueError, match="2D Vector mode would draw 2"):
+        build_flatmap_segment_vectors(
+            endpoints,
+            file_ids,
+            x_bounds=(0.0, 40.0),
+            y_bounds=(0.0, 40.0),
+            xy_bins=8,
+            max_segments=1,
+        )
+
+
+def test_build_flatmap_segment_vectors_handles_an_empty_selection() -> None:
+    vectors = build_flatmap_segment_vectors(
+        np.empty((0, 2, 2), dtype=float),
+        [],
+        x_bounds=(0.0, 40.0),
+        y_bounds=(0.0, 40.0),
+        xy_bins=8,
+    )
+
+    assert vectors.data.shape == (0, 2, 2)
+    assert vectors.file_ids == ()
+    assert vectors.total_segments == 0
+
+
+def test_build_flatmap_file_id_volumes_accepts_a_two_dimensional_shape() -> None:
+    groups = build_flatmap_file_id_volumes(
+        _flat_binned_projected_nodes(),
+        (3, 3),
+    )
+
+    assert [group.label for group in groups] == ["a.swc", "b.swc", "c.swc"]
+    assert [group.volume.shape for group in groups] == [(3, 3)] * 3
+    assert [group.rendered_nodes for group in groups] == [2, 1, 1]
+    assert groups[0].volume[1, 2] == 2.0
+    assert groups[1].volume[2, 0] == 1.0
+    assert groups[2].volume[0, 1] == 1.0
+
+
+def test_build_flatmap_cluster_volumes_accepts_a_two_dimensional_shape() -> None:
+    groups = build_flatmap_cluster_volumes(
+        _flat_binned_projected_nodes(),
+        (3, 3),
+        {"a.swc": 2, "b.swc": 1},
+    )
+
+    assert [group.label for group in groups] == [
+        "Cluster 1",
+        "Cluster 2",
+        "Unclustered",
+    ]
+    assert groups[0].volume[2, 0] == 1.0
+    assert groups[1].volume[1, 2] == 2.0
+    assert groups[2].volume[0, 1] == 1.0
+
+
+def test_rendered_plane_points_reads_the_named_plane_column() -> None:
+    points, file_ids = rendered_plane_points(
+        _binned_projected_nodes(),
+        plane_column="depth_bin",
+    )
+
+    np.testing.assert_array_equal(
+        points,
+        [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [1.0, 2.0, 0.0], [1.0, 0.0, 1.0]],
+    )
+    assert file_ids == ["a.swc", "a.swc", "b.swc", "c.swc"]
+
+
+def test_rendered_plane_points_returns_two_columns_without_a_plane() -> None:
+    points, file_ids = rendered_plane_points(
+        _flat_binned_projected_nodes(),
+        plane_column=None,
+    )
+
+    np.testing.assert_array_equal(
+        points,
+        [[1.0, 2.0], [1.0, 2.0], [2.0, 0.0], [0.0, 1.0]],
+    )
+    assert file_ids == ["a.swc", "a.swc", "b.swc", "c.swc"]
+
+
+def test_rendered_plane_points_match_a_depth_render_points_array() -> None:
+    render = build_flatmap_render_data_from_projected_nodes(
+        _projected_nodes(),
+        xy_bins=4,
+        depth_bin_um=25.0,
+        x_bounds=(0.0, 6.0),
+        y_bounds=(0.0, 6.0),
+        depth_range_um=(0.0, 150.0),
+    )
+
+    points, file_ids = rendered_plane_points(
+        render.projected_nodes,
+        plane_column="depth_bin",
+    )
+
+    np.testing.assert_array_equal(points, render.points)
+    assert file_ids == render.point_file_ids
+
+
 def _allen_layer_map() -> AllenIsocortexLayerMap:
     region_ids = (101, 102, 103, 104, 105, 106)
     return AllenIsocortexLayerMap(
@@ -525,6 +817,7 @@ def _pandas_reference_volume(
     x_bounds,
     y_bounds,
     depth_range_um,
+    collapse_depth: bool = False,
 ):
     projected = pd.DataFrame(
         {
@@ -544,6 +837,7 @@ def _pandas_reference_volume(
         x_bounds=x_bounds,
         y_bounds=y_bounds,
         depth_range_um=depth_range_um,
+        collapse_depth=collapse_depth,
     )
 
 
@@ -602,6 +896,111 @@ def test_duckdb_single_volume_matches_pandas(
     assert (
         result.render_summary.depth_valid_nodes == reference.summary.depth_valid_nodes
     )
+
+
+@pytest.mark.parametrize("include", [False, True])
+@pytest.mark.parametrize(
+    "style_key,suffix", [("both_shaped", "shaped"), ("both_square", "square")]
+)
+def test_duckdb_collapsed_volume_matches_pandas(
+    _flatmap_parquet, include, style_key, suffix
+):
+    _frame, path = _flatmap_parquet
+    x_bounds, y_bounds, depth_range = (0.0, 118.0), (0.0, 88.0), (0.0, 890.0)
+    reference = _pandas_reference_volume(
+        _frame,
+        suffix=suffix,
+        xy_bins=32,
+        depth_bin_um=50.0,
+        include=include,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range,
+        collapse_depth=True,
+    )
+    conn = duckdb.connect()
+    try:
+        result = build_flatmap_heatmap_volume_result(
+            conn,
+            path,
+            style_key=style_key,
+            color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            depth_range_um=depth_range,
+            xy_bins=32,
+            depth_bin_um=50.0,
+            include_depth_minus_one=include,
+            collapse_depth=True,
+        )
+    finally:
+        conn.close()
+
+    assert result.volume.shape == (32, 32)
+    assert result.volume_shape == (32, 32)
+    np.testing.assert_array_equal(result.volume, reference.volume)
+    assert result.render_summary.rendered_nodes == reference.summary.rendered_nodes
+    assert result.render_summary.depth_bins == 0
+    assert result.render_summary.depth_bin_um == 0.0
+
+
+@pytest.mark.parametrize("include", [False, True])
+def test_duckdb_collapsed_volume_equals_summed_depth_volume(_flatmap_parquet, include):
+    _frame, path = _flatmap_parquet
+    x_bounds, y_bounds, depth_range = (0.0, 118.0), (0.0, 88.0), (0.0, 890.0)
+    shared = dict(
+        style_key="both_shaped",
+        color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range,
+        xy_bins=24,
+        depth_bin_um=75.0,
+        include_depth_minus_one=include,
+    )
+    conn = duckdb.connect()
+    try:
+        depth = build_flatmap_heatmap_volume_result(conn, path, **shared)
+        flat = build_flatmap_heatmap_volume_result(
+            conn, path, collapse_depth=True, **shared
+        )
+    finally:
+        conn.close()
+
+    np.testing.assert_array_equal(flat.volume, depth.volume.sum(axis=0))
+    assert flat.render_summary.rendered_nodes == depth.render_summary.rendered_nodes
+
+
+def test_duckdb_collapsed_grouped_volumes_sum_to_single(_flatmap_parquet):
+    _frame, path = _flatmap_parquet
+    x_bounds, y_bounds, depth_range = (0.0, 118.0), (0.0, 88.0), (0.0, 890.0)
+    shared = dict(
+        style_key="both_shaped",
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        depth_range_um=depth_range,
+        xy_bins=24,
+        depth_bin_um=75.0,
+        collapse_depth=True,
+    )
+    conn = duckdb.connect()
+    try:
+        single = build_flatmap_heatmap_volume_result(
+            conn, path, color_mode=FLATMAP_HEATMAP_COLOR_SINGLE, **shared
+        )
+        individual = build_flatmap_heatmap_volume_result(
+            conn, path, color_mode=FLATMAP_HEATMAP_COLOR_INDIVIDUAL, **shared
+        )
+    finally:
+        conn.close()
+
+    assert individual.volume is None
+    assert individual.grouped_volumes
+    assert all(
+        group.volume.shape == (24, 24) for group in individual.grouped_volumes
+    )
+    combined = sum(group.volume for group in individual.grouped_volumes)
+    np.testing.assert_array_equal(combined, single.volume)
 
 
 @pytest.mark.parametrize("include", [False, True])
@@ -895,3 +1294,55 @@ def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
     assert empty.volume.shape == (6, 12, 12)
     assert float(empty.volume.sum()) == 0.0
     assert empty.summary.rendered_nodes == 0
+
+
+def test_depth_plane_labels_name_each_micron_interval() -> None:
+    labels = depth_plane_labels(
+        {
+            "depth_bins": 3,
+            "depth_bin_um": 25.0,
+            "depth_min_um": 0.0,
+            "includes_depth_minus_one_plane": False,
+        }
+    )
+
+    assert labels == ("0-25 um", "25-50 um", "50-75 um")
+
+
+def test_depth_plane_labels_name_the_sentinel_plane_first() -> None:
+    labels = depth_plane_labels(
+        {
+            "depth_bins": 3,
+            "depth_bin_um": 25.0,
+            "depth_min_um": 0.0,
+            "includes_depth_minus_one_plane": True,
+        }
+    )
+
+    assert labels == ("depth -1", "0-25 um", "25-50 um")
+
+
+def test_depth_plane_labels_offset_by_the_lower_depth_bound() -> None:
+    labels = depth_plane_labels(
+        {
+            "depth_bins": 2,
+            "depth_bin_um": 50.0,
+            "depth_min_um": 100.0,
+            "includes_depth_minus_one_plane": False,
+        }
+    )
+
+    assert labels == ("100-150 um", "150-200 um")
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {},
+        {"depth_bins": 0, "depth_bin_um": 25.0},
+        {"depth_bins": 4, "depth_bin_um": 0.0},
+        {"depth_bins": "many", "depth_bin_um": 25.0},
+    ],
+)
+def test_depth_plane_labels_return_empty_without_depth_binning(summary) -> None:
+    assert depth_plane_labels(summary) == ()

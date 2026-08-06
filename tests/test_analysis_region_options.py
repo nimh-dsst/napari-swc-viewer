@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from napari_swc_viewer.analysis.clustering import (
     ClusterRegionSelection,
@@ -55,6 +56,7 @@ class _DummyWidget:
     def __init__(self, *_args, **_kwargs) -> None:
         self._enabled = True
         self._visible = True
+        self._tooltip = ""
         self.geometry_updates = 0
 
     def setEnabled(self, enabled: bool) -> None:
@@ -65,6 +67,12 @@ class _DummyWidget:
 
     def setVisible(self, visible: bool) -> None:
         self._visible = bool(visible)
+
+    def setToolTip(self, text: str) -> None:
+        self._tooltip = str(text)
+
+    def toolTip(self) -> str:
+        return self._tooltip
 
     def updateGeometry(self) -> None:
         self.geometry_updates += 1
@@ -124,7 +132,6 @@ class _DummyCheckBox(_DummyWidget):
         self._text = text
         self._checked = False
         self.toggled = _BoundSignal()
-        self._tooltip = ""
 
     def setChecked(self, checked: bool) -> None:
         checked = bool(checked)
@@ -135,9 +142,6 @@ class _DummyCheckBox(_DummyWidget):
 
     def isChecked(self) -> bool:
         return self._checked
-
-    def setToolTip(self, text: str) -> None:
-        self._tooltip = str(text)
 
 
 class _DummyLineEdit(_DummyWidget):
@@ -258,7 +262,7 @@ class _DummySpinBox(_DummyWidget):
     def setDecimals(self, *_args) -> None:
         return None
 
-    def setToolTip(self, *_args) -> None:
+    def setSingleStep(self, *_args) -> None:
         return None
 
 
@@ -1508,6 +1512,195 @@ def test_flatmap_soma_hides_binning_and_shows_algorithm() -> None:
     assert widget._flatmap_include_depth_minus_one_cb._visible is False
 
 
+def test_depth_scale_is_soma_only_but_ignore_depth_serves_both() -> None:
+    """A depth weight only makes sense where a distance is measured.
+
+    Voxel correlation compares voxel occupancy, which has no notion of distance
+    between voxels, so a depth scale there would merely duplicate the Depth bin
+    control.  Ignoring depth is meaningful for both methods, though: soma
+    clustering drops the axis and correlation collapses the grid's depth planes.
+    """
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+
+    # CCFv3 space has no flat map depth handling at all.
+    widget._coordinate_space_combo.setCurrentText("CCFv3 Coordinates")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    assert widget._flatmap_depth_scale_spin._visible is False
+    assert widget._flatmap_ignore_depth_cb._visible is False
+
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    assert widget._flatmap_ignore_depth_cb._visible is True
+    assert widget._flatmap_depth_scale_spin._visible is False
+
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    assert widget._flatmap_ignore_depth_cb._visible is True
+    assert widget._flatmap_depth_scale_spin._visible is True
+
+
+def test_collapsing_depth_disables_the_depth_bin_size() -> None:
+    """A collapsed voxel grid has no depth bins left to size.
+
+    ``Include depth -1 plane`` must stay enabled, because depth still decides
+    which nodes are counted even once the axis is gone.
+    """
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+
+    assert widget._flatmap_depth_bin_spin.isEnabled() is True
+    widget._flatmap_ignore_depth_cb.setChecked(True)
+    assert widget._flatmap_depth_bin_spin.isEnabled() is False
+    assert widget._flatmap_include_depth_minus_one_cb.isEnabled() is True
+    assert widget._flatmap_xy_bins_spin.isEnabled() is True
+
+    widget._flatmap_ignore_depth_cb.setChecked(False)
+    assert widget._flatmap_depth_bin_spin.isEnabled() is True
+
+
+def test_collapse_depth_reaches_the_correlation_worker(monkeypatch) -> None:
+    """The checkbox must drive the correlation worker, not just the UI."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Voxel Correlation")
+    widget._flatmap_ignore_depth_cb.setChecked(True)
+    widget._start_background_worker = MagicMock()
+    widget._start_clustering_preflight = MagicMock()
+
+    created_workers = []
+
+    class _FakeWorker:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created_workers.append(self)
+
+    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module.FlatmapParquetCorrelationWorker = _FakeWorker
+    workers_module.CorrelationWorker = object
+    workers_module.FlatmapSomaClusterWorker = object
+    workers_module.SomaClusterWorker = object
+    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+
+    widget._run_clustering_pipeline()
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.flatmap_include_depth is False
+    widget._launch_clustering_request(request, None)
+
+    assert len(created_workers) == 1
+    assert created_workers[0].kwargs["collapse_depth"] is True
+
+
+def test_depth_scale_tooltip_states_which_direction_weights_depth() -> None:
+    """The tooltip must say which way the knob moves, not just that it exists."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    tooltip = widget._flatmap_depth_scale_spin.toolTip()
+    assert "Higher values weight depth MORE" in tooltip
+    assert "Lower values weight depth LESS" in tooltip
+    assert widget._flatmap_depth_scale_label.toolTip() == tooltip
+
+
+def test_depth_scale_tooltip_disclaims_micron_equivalence() -> None:
+    """The depth scale is a ratio of axis fractions, not of physical distances.
+
+    The flat map projection distorts the cortical surface, so flat map x/y have
+    no reliable micron conversion and the weight must not be presented as a
+    physical ratio.  The tooltip has to say so rather than stay silent, since a
+    reader who assumes a micron equivalence would misinterpret every value.
+    """
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+
+    tooltip = widget._flatmap_depth_scale_spin.toolTip()
+    assert "not physical distances" in tooltip
+    assert "distorts" in tooltip
+    assert "no reliable conversion to microns" in tooltip
+
+
+def test_ignoring_depth_disables_the_depth_scale() -> None:
+    """A disabled scale makes it obvious the value is no longer in play."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+
+    assert widget._flatmap_depth_scale_spin.isEnabled() is True
+    widget._flatmap_ignore_depth_cb.setChecked(True)
+    assert widget._flatmap_depth_scale_spin.isEnabled() is False
+    widget._flatmap_ignore_depth_cb.setChecked(False)
+    assert widget._flatmap_depth_scale_spin.isEnabled() is True
+
+
+def test_ignore_depth_reaches_the_clustering_request() -> None:
+    """The checkbox must actually change the request, not just the UI."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    widget._db = object()
+    widget._atlas = object()
+    widget._parquet_path = "neurons.parquet"
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    widget._flatmap_ignore_depth_cb.setChecked(True)
+    widget._flatmap_depth_scale_spin.setValue(3.5)
+    widget._start_clustering_preflight = MagicMock()
+
+    widget._run_clustering_pipeline()
+
+    request = widget._start_clustering_preflight.call_args.args[0]
+    assert request.flatmap_include_depth is False
+    assert request.flatmap_depth_scale == 3.5
+
+
+def test_eps_units_switch_between_microns_and_hemisphere_fraction() -> None:
+    """Flat map space measures eps in normalized units, not microns.
+
+    A micron-valued eps in normalized space would exceed the whole hemisphere
+    and collapse every soma into one cluster, so the control has to retarget.
+    """
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("CCFv3 Coordinates")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+
+    assert widget._eps_label.text() == "Eps (μm):"
+    assert widget._eps_spin.value() == 100.0
+
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    assert "hemisphere" in widget._eps_label.text()
+    assert widget._eps_spin.value() == pytest.approx(0.05)
+
+
+def test_eps_remembers_each_spaces_value_across_switches() -> None:
+    """Switching coordinate space must not destroy the other space's setting."""
+    AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
+    widget = AnalysisTabWidget(_DummyViewer())
+    _enable_flatmap_coords(widget, styles=("both_shaped",))
+    widget._coordinate_space_combo.setCurrentText("CCFv3 Coordinates")
+    widget._clustering_method_combo.setCurrentText("Soma Location")
+    widget._eps_spin.setValue(250.0)
+
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    widget._eps_spin.setValue(0.2)
+    widget._coordinate_space_combo.setCurrentText("CCFv3 Coordinates")
+    assert widget._eps_spin.value() == 250.0
+
+    widget._coordinate_space_combo.setCurrentText("Flat map + Depth")
+    assert widget._eps_spin.value() == pytest.approx(0.2)
+
+
 def test_ccf_voxel_correlation_unaffected_by_flatmap_availability() -> None:
     """CCFv3 space still runs atlas voxel correlation even when coords exist."""
     AnalysisTabWidget = _import_analysis_tab_module().AnalysisTabWidget
@@ -1580,6 +1773,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
         "linkage_method": "complete",
         "n_clusters": 7,
         "file_ids": None,
+        "collapse_depth": False,
     }
     widget._start_background_worker.assert_called_once_with(
         created_workers[0],
@@ -1634,6 +1828,8 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
         "eps": 120.0,
         "min_samples": 6,
         "file_ids": None,
+        "depth_scale": 1.0,
+        "include_depth": True,
     }
     widget._start_background_worker.assert_called_once_with(
         created_workers[0],

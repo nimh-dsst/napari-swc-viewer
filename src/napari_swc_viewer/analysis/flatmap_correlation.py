@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,6 +10,18 @@ import pandas as pd
 
 from .clustering import ClusterResult, compute_clustermap_data
 from ..flatmap_heatmap import FlatmapLookupStats
+
+logger = logging.getLogger(__name__)
+
+#: Depth axis weight that makes one full cortical thickness count for exactly
+#: one hemisphere width of tangential flat map distance.
+DEFAULT_FLATMAP_DEPTH_SCALE = 1.0
+
+#: DBSCAN neighbourhood radius for flat map soma clustering, in normalized
+#: hemisphere-cube units rather than microns.  A hemisphere spans 1.0 per axis,
+#: so this is 5% of the hemisphere width.  The CCF soma clustering keeps its own
+#: micron-valued default; the two spaces are not interchangeable.
+DEFAULT_FLATMAP_SOMA_DBSCAN_EPS = 0.05
 
 
 @dataclass(frozen=True)
@@ -318,6 +331,168 @@ def query_flatmap_soma_coordinates(
 
 
 @dataclass(frozen=True)
+class FlatmapDepthNormalization:
+    """Axis divisors that put flatmap + depth coordinates on a common scale.
+
+    The raw Parquet columns mix units: ``x_flat``/``y_flat`` are normalized
+    floats spanning the *bilateral* flat map while ``depth_um`` is raw microns
+    spanning the full cortical thickness.  Clustering those together with an
+    unweighted Euclidean metric lets depth contribute >99.99% of the variance,
+    which reduces the result to a 1-D laminar partition.
+
+    Dividing each axis by its own span makes one hemisphere a unit cube, so a
+    full cortical thickness of depth separation counts for the same distance as
+    one hemisphere width of tangential separation.
+
+    ``x_divisor`` is **half** the canonical ``x`` span because the bilateral
+    flat map lays the two hemispheres side by side along ``x``.  Dividing by the
+    full span instead would squeeze each hemisphere to half width and silently
+    give ``y`` twice the weight of ``x``.  No offset is subtracted: Euclidean
+    distance is translation invariant, and leaving the origin alone keeps the
+    two hemispheres adjacent rather than superimposed.
+    """
+
+    style: str
+    x_divisor: float
+    y_divisor: float
+    depth_divisor_um: float
+    depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE
+    include_depth: bool = True
+    bounds_source: str = "canonical"
+
+    @property
+    def axis_count(self) -> int:
+        """Return the dimensionality of the normalized feature space."""
+        return 3 if self.include_depth else 2
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe mapping for export metadata."""
+        return {
+            "style": self.style,
+            "x_divisor": float(self.x_divisor),
+            "y_divisor": float(self.y_divisor),
+            "depth_divisor_um": float(self.depth_divisor_um),
+            "depth_scale": float(self.depth_scale),
+            "include_depth": bool(self.include_depth),
+            "bounds_source": self.bounds_source,
+            "axis_count": self.axis_count,
+        }
+
+
+def resolve_flatmap_depth_normalization(
+    parquet_path: str,
+    *,
+    style: str,
+    depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE,
+    include_depth: bool = True,
+) -> FlatmapDepthNormalization:
+    """Return per-hemisphere axis divisors for one flat map style.
+
+    Prefers the canonical bounds recorded in version-3 Parquet metadata so the
+    metric does not depend on which neurons happen to be in scope.  Falls back
+    to data-derived bounds for Parquets that never recorded canonical bounds,
+    which is reproducible only within a fixed dataset — the fallback is recorded
+    in ``bounds_source`` so exports stay honest about it.
+    """
+    from ..flatmap_heatmap import _style_suffix
+
+    if depth_scale < 0.0:
+        raise ValueError(f"depth_scale must be non-negative; got {depth_scale!r}.")
+
+    grid = _flatmap_canonical_grid_spec(parquet_path, style)
+    if grid is not None:
+        bounds_source = "canonical"
+        x_bounds = grid.x_bounds
+        y_bounds = grid.y_bounds
+        depth_bounds = grid.depth_bounds_um
+        x_divisor = float(x_bounds[1] - x_bounds[0]) / 2.0
+    else:
+        bounds_source = "observed"
+        logger.warning(
+            "Parquet %s records no canonical flat map bounds for style %r; "
+            "normalizing soma coordinates against observed data bounds instead. "
+            "The resulting metric is comparable only within this dataset.",
+            parquet_path,
+            style,
+        )
+        x_bounds, y_bounds, depth_bounds = _resolve_flatmap_render_bounds(
+            parquet_path,
+            style,
+            _style_suffix(style),
+        )
+        # Observed bounds already cover only the hemispheres present in the
+        # data, so the bilateral halving that canonical bounds require would
+        # wrongly stretch the x axis here.
+        x_divisor = float(x_bounds[1] - x_bounds[0])
+    y_divisor = float(y_bounds[1] - y_bounds[0])
+    depth_divisor = float(depth_bounds[1] - depth_bounds[0])
+
+    for name, value in (
+        ("x", x_divisor),
+        ("y", y_divisor),
+        ("depth_um", depth_divisor),
+    ):
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"Flat map style {style!r} has a non-positive {name} span "
+                f"({value!r}); cannot normalize soma coordinates."
+            )
+
+    return FlatmapDepthNormalization(
+        style=style,
+        x_divisor=x_divisor,
+        y_divisor=y_divisor,
+        depth_divisor_um=depth_divisor,
+        depth_scale=float(depth_scale),
+        include_depth=bool(include_depth),
+        bounds_source=bounds_source,
+    )
+
+
+def _flatmap_canonical_grid_spec(parquet_path: str, style: str):
+    """Return the canonical v3 grid spec for a style, or ``None`` if absent."""
+    from ..flatmap_parquet import read_flatmap_parquet_transform_info
+
+    try:
+        info = read_flatmap_parquet_transform_info(parquet_path)
+    except Exception:  # noqa: BLE001 - fall back to observed bounds
+        return None
+    return info.grid_spec(style)
+
+
+def normalize_flatmap_soma_coordinates(
+    coords: np.ndarray,
+    normalization: FlatmapDepthNormalization,
+) -> np.ndarray:
+    """Scale raw ``(x_flat, y_flat, depth_um)`` rows onto the unit hemisphere cube.
+
+    Returns an ``(N, 3)`` array when ``normalization.include_depth`` is set and
+    an ``(N, 2)`` array otherwise, so excluding depth genuinely clusters on flat
+    map position rather than merely down-weighting the depth axis to zero.
+    """
+    raw = np.asarray(coords, dtype=np.float64)
+    if raw.ndim != 2 or raw.shape[1] != 3:
+        raise ValueError(
+            "coords must be an (N, 3) array of (x_flat, y_flat, depth_um) rows; "
+            f"got shape {raw.shape}."
+        )
+
+    scaled_xy = np.column_stack(
+        [
+            raw[:, 0] / normalization.x_divisor,
+            raw[:, 1] / normalization.y_divisor,
+        ]
+    )
+    if not normalization.include_depth:
+        return scaled_xy
+
+    scaled_depth = (
+        raw[:, 2] / normalization.depth_divisor_um
+    ) * normalization.depth_scale
+    return np.column_stack([scaled_xy, scaled_depth])
+
+
+@dataclass(frozen=True)
 class FlatmapParquetCorrelationProvenance:
     """Binning provenance for a parquet-driven flatmap correlation run."""
 
@@ -325,10 +500,11 @@ class FlatmapParquetCorrelationProvenance:
     xy_bins: int
     depth_bin_um: float
     include_depth_minus_one: bool
-    volume_shape: tuple[int, int, int]
+    volume_shape: tuple[int, ...]
     x_bounds: tuple[float, float]
     y_bounds: tuple[float, float]
     depth_range_um: tuple[float, float]
+    collapse_depth: bool = False
 
 
 def _resolve_flatmap_render_bounds(
@@ -385,18 +561,38 @@ def _resolve_flatmap_render_bounds(
 
 def build_flatmap_count_matrix_from_bin_counts(
     counts: pd.DataFrame,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
     *,
     input_file_ids: tuple[str, ...],
 ) -> FlatmapCountMatrix:
     """Build per-neuron node-count vectors from DuckDB per-file bin counts.
 
-    ``counts`` must have ``file_id``, ``depth_bin``, ``y_bin``, ``x_bin`` and
-    ``node_count`` columns, exactly as produced by
+    ``counts`` must have ``file_id``, ``y_bin``, ``x_bin`` and ``node_count``
+    columns, exactly as produced by
     :func:`napari_swc_viewer.flatmap_heatmap._query_flatmap_bin_counts` with
     ``include_file_id=True``.
+
+    A 2-length ``volume_shape`` selects a depth-collapsed matrix, whose counts
+    carry no ``depth_bin`` column: every node at one flat map position lands in
+    the same voxel regardless of its depth.  As in
+    :func:`napari_swc_viewer.flatmap_heatmap._rendered_binned_nodes`, the rank of
+    the volume decides that -- never the presence of a column -- so a stray
+    ``depth_bin`` cannot silently change the grouping.
     """
-    depth_size, y_size, x_size = (int(size) for size in volume_shape)
+    if len(volume_shape) not in (2, 3):
+        raise ValueError(f"volume_shape must be 2D or 3D; got {volume_shape}.")
+    has_depth_axis = len(volume_shape) == 3
+    # Only the trailing y/x extents enter the linear voxel id; the depth extent
+    # is implied by whichever depth bins the counts actually contain.
+    y_size, x_size = (int(size) for size in volume_shape[-2:])
+
+    required = ("file_id", "y_bin", "x_bin", "node_count")
+    if has_depth_axis:
+        required = (*required, "depth_bin")
+    missing = [column for column in required if column not in counts.columns]
+    if missing:
+        raise ValueError(f"Bin counts are missing required column(s): {missing}")
+
     ordered_inputs = tuple(str(file_id) for file_id in input_file_ids)
     if counts.empty:
         return FlatmapCountMatrix(
@@ -408,11 +604,11 @@ def build_flatmap_count_matrix_from_bin_counts(
         )
 
     file_ids = counts["file_id"].map(str).to_numpy()
-    linear = (
-        counts["depth_bin"].to_numpy(dtype=np.int64) * y_size * x_size
-        + counts["y_bin"].to_numpy(dtype=np.int64) * x_size
-        + counts["x_bin"].to_numpy(dtype=np.int64)
-    )
+    linear = counts["y_bin"].to_numpy(dtype=np.int64) * x_size + counts[
+        "x_bin"
+    ].to_numpy(dtype=np.int64)
+    if has_depth_axis:
+        linear = counts["depth_bin"].to_numpy(dtype=np.int64) * y_size * x_size + linear
     node_counts = counts["node_count"].to_numpy(dtype=np.float64)
 
     rendered_ids = set(file_ids.tolist())
@@ -448,8 +644,14 @@ def count_flatmap_voxel_correlation_nodes(
     depth_bin_um: float,
     include_depth_minus_one: bool = True,
     file_ids: list[str] | None = None,
+    collapse_depth: bool = False,
 ) -> int:
-    """Return the exact rendered-node count for flatmap voxel correlation."""
+    """Return the exact rendered-node count for flatmap voxel correlation.
+
+    ``collapse_depth`` only shrinks the voxel grid that the size guard checks;
+    the node count itself is unchanged, because collapsing removes the depth
+    axis without changing which nodes are counted.
+    """
     import duckdb
 
     from ..flatmap_heatmap import (
@@ -476,10 +678,13 @@ def count_flatmap_voxel_correlation_nodes(
     valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
-    if total_depth_bins * xy_bins * xy_bins > MAX_FLATMAP_HEATMAP_VOXELS:
+    grid_shape: tuple[int, ...] = (
+        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
+    )
+    if int(np.prod(grid_shape)) > MAX_FLATMAP_HEATMAP_VOXELS:
+        shape_text = "x".join(str(int(size)) for size in grid_shape)
         raise ValueError(
-            "Flatmap voxel grid is too large: "
-            f"{total_depth_bins}x{xy_bins}x{xy_bins} voxels. "
+            f"Flatmap voxel grid is too large: {shape_text} voxels. "
             "Use fewer XY bins or a larger depth bin."
         )
 
@@ -527,6 +732,7 @@ def compute_flatmap_voxel_correlation_from_parquet(
     method: str = "average",
     n_clusters: int = 5,
     file_ids: list[str] | None = None,
+    collapse_depth: bool = False,
 ) -> tuple[ClusterResult, FlatmapCountMatrix, FlatmapParquetCorrelationProvenance]:
     """Cluster neurons by flatmap-space voxel correlation straight from Parquet.
 
@@ -534,6 +740,14 @@ def compute_flatmap_voxel_correlation_from_parquet(
     with a ``GROUP BY`` (mirroring the heatmap fast path), so no rendered
     heatmap is required.  Requires the version-3 bilateral ``*_shaped`` /
     ``*_square`` coordinate columns.
+
+    ``collapse_depth`` drops the depth *axis* from the voxel grid, so two
+    neurons correlate on flat map footprint regardless of which layer their
+    nodes occupy.  Depth still decides which nodes are counted, so
+    ``include_depth_minus_one`` keeps its meaning and the rendered node count is
+    unchanged.  This is not reachable by widening ``depth_bin_um``: collapsing
+    changes voxel identity rather than voxel resolution, and a single wide depth
+    bin still separates the depth ``-1`` sentinel plane from the valid one.
     """
     import duckdb
 
@@ -564,13 +778,15 @@ def compute_flatmap_voxel_correlation_from_parquet(
     valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
-    volume_shape = (total_depth_bins, xy_bins, xy_bins)
+    volume_shape: tuple[int, ...] = (
+        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
+    )
 
-    voxel_count = int(total_depth_bins * xy_bins * xy_bins)
+    voxel_count = int(np.prod(volume_shape))
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
+        shape_text = "x".join(str(int(size)) for size in volume_shape)
         raise ValueError(
-            "Flatmap voxel grid is too large: "
-            f"{total_depth_bins}x{xy_bins}x{xy_bins} voxels. "
+            f"Flatmap voxel grid is too large: {shape_text} voxels. "
             "Use fewer XY bins or a larger depth bin."
         )
 
@@ -608,6 +824,7 @@ def compute_flatmap_voxel_correlation_from_parquet(
             where_sql,
             file_params,
             include_file_id=True,
+            include_depth_bin=not collapse_depth,
         )
     finally:
         conn.close()
@@ -649,6 +866,7 @@ def compute_flatmap_voxel_correlation_from_parquet(
         x_bounds=(x_lower, x_upper),
         y_bounds=(y_lower, y_upper),
         depth_range_um=(depth_lower, depth_upper),
+        collapse_depth=bool(collapse_depth),
     )
     return result, count_data, provenance
 
