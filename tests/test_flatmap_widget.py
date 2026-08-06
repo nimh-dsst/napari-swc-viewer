@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from napari_swc_viewer.flatmap_heatmap import flatmap_pixel_coordinates
 from napari_swc_viewer.flatmap_labels import (
     FlatmapRegionLabelsResult,
     FlatmapRegionLabelsSummary,
@@ -169,6 +170,9 @@ class _DummyCombo:
 
 class _DummyLayer:
     def __init__(self, data, **kwargs) -> None:
+        # Kept verbatim so a test can assert what was and was not passed at
+        # construction time (napari's Vectors color mode depends on it).
+        self.init_kwargs = dict(kwargs)
         self.data = np.asarray(data)
         self.name = kwargs["name"]
         self.metadata = kwargs.get("metadata", {})
@@ -1510,6 +1514,46 @@ def test_project_with_nrrds_overrides_augmented_parquet_columns(monkeypatch) -> 
     assert "lookup NRRDs" in widget._status_label.text
 
 
+def _soma_render_result(
+    *,
+    plane_column: str | None = "depth_bin",
+    plane_values: list[float] | None = None,
+    file_ids: list[str] | None = None,
+    layer_labels: tuple[str, ...] | None = None,
+):
+    """Build a fake render result in the shape the soma layer reads.
+
+    ``_create_or_update_soma_layer`` takes coordinates from the bin columns the
+    render wrote into ``projected_nodes``, so a fake has to carry them rather
+    than a ready-made ``points`` array.
+    """
+    resolved_file_ids = file_ids if file_ids is not None else ["a.swc", "b.swc"]
+    rows = len(resolved_file_ids)
+    frame = pd.DataFrame(
+        {
+            "file_id": resolved_file_ids,
+            "render_valid": [True] * rows,
+            "y_flat_bin": [1.0, 3.0][:rows],
+            "x_flat_bin": [2.0, 4.0][:rows],
+        }
+    )
+    if plane_column is not None:
+        frame[plane_column] = (
+            plane_values if plane_values is not None else [0.0, 1.0][:rows]
+        )
+    summary_fields = {
+        "rendered_nodes": rows,
+        "total_nodes": rows,
+        "to_dict": lambda: {"rendered_nodes": rows},
+    }
+    if layer_labels is not None:
+        summary_fields["layer_labels"] = layer_labels
+    return types.SimpleNamespace(
+        projected_nodes=frame,
+        summary=types.SimpleNamespace(**summary_fields),
+    )
+
+
 def test_add_soma_projects_only_soma_nodes_to_dedicated_layer(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -1518,15 +1562,7 @@ def test_add_soma_projects_only_soma_nodes_to_dedicated_layer(monkeypatch) -> No
 
     def fake_lookup(self, nodes, **_kwargs):
         captured["nodes"] = nodes
-        render = types.SimpleNamespace(
-            points=np.asarray([[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]]),
-            point_file_ids=["a.swc", "b.swc"],
-            summary=types.SimpleNamespace(
-                rendered_nodes=2,
-                total_nodes=2,
-                to_dict=lambda: {"rendered_nodes": 2},
-            ),
-        )
+        render = _soma_render_result()
         result = types.SimpleNamespace(
             projected_nodes=nodes,
             summary=types.SimpleNamespace(to_dict=lambda: {"total_nodes": 2}),
@@ -1591,13 +1627,7 @@ def test_add_soma_uses_duckdb_soma_query_not_full_node_scan(monkeypatch) -> None
 
     def fake_lookup(self, nodes, **_kwargs):
         captured["nodes"] = nodes
-        render = types.SimpleNamespace(
-            points=np.asarray([[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]]),
-            point_file_ids=["a.swc", "b.swc"],
-            summary=types.SimpleNamespace(
-                rendered_nodes=2, total_nodes=2, to_dict=lambda: {}
-            ),
-        )
+        render = _soma_render_result()
         result = types.SimpleNamespace(
             projected_nodes=nodes,
             summary=types.SimpleNamespace(to_dict=lambda: {}),
@@ -1618,15 +1648,7 @@ def test_add_soma_reuses_existing_layer_on_reprojection(monkeypatch) -> None:
     _configure_projection_widget(widget, module, _augmented_nodes())
 
     def fake_lookup(self, nodes, **_kwargs):
-        render = types.SimpleNamespace(
-            points=np.asarray([[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]]),
-            point_file_ids=["a.swc", "b.swc"],
-            summary=types.SimpleNamespace(
-                rendered_nodes=2,
-                total_nodes=2,
-                to_dict=lambda: {},
-            ),
-        )
+        render = _soma_render_result()
         result = types.SimpleNamespace(
             projected_nodes=nodes,
             summary=types.SimpleNamespace(to_dict=lambda: {}),
@@ -1646,6 +1668,179 @@ def test_add_soma_reuses_existing_layer_on_reprojection(monkeypatch) -> None:
         if layer.name == module._SOMA_POINTS_LAYER_NAME
     ]
     assert len(soma_layers) == 1
+
+
+def _add_soma_with_render(module, widget, render, *, nodes=None):
+    """Run Add Soma with a stubbed projection returning ``render``."""
+    _configure_projection_widget(widget, module, nodes or _augmented_nodes())
+
+    def fake_lookup(self, soma_nodes, **_kwargs):
+        return (
+            types.SimpleNamespace(
+                projected_nodes=soma_nodes,
+                summary=types.SimpleNamespace(to_dict=lambda: {}),
+            ),
+            render,
+            None,
+        )
+
+    widget._project_from_lookup_files = types.MethodType(fake_lookup, widget)
+    widget._add_soma()
+    return widget._soma_layer
+
+
+def test_add_soma_uses_allen_layer_planes_in_allen_mode(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+
+    layer = _add_soma_with_render(
+        module,
+        widget,
+        _soma_render_result(
+            plane_column="allen_layer_index",
+            plane_values=[0.0, 3.0],
+            layer_labels=("L1", "L2/3", "L4", "L5", "L6a", "L6b"),
+        ),
+    )
+
+    # Axis 0 is the Allen layer index, not a depth bin: a depth bin of 30-80
+    # would place the somas outside the six-plane stack entirely.
+    np.testing.assert_array_equal(layer.data[:, 0], [0.0, 3.0])
+    assert layer.data.shape == (2, 3)
+    assert widget._viewer.dims.ndisplay == 2
+    assert layer.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_plane_mode"] == "allen_layers"
+    assert layer.metadata["flatmap_soma_space_render_mode"] == (
+        module._RENDER_ALLEN_LAYERS
+    )
+    assert layer.metadata["allen_layer_labels"][1] == "L2/3"
+
+
+def test_add_soma_preserves_the_allen_plane_caption(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    _render_allen_layer_stack(module, widget)
+    assert widget._viewer.text_overlay.text == "Allen layer: L1  (plane 1 of 6)"
+
+    _add_soma_with_render(
+        module,
+        widget,
+        _soma_render_result(
+            plane_column="allen_layer_index",
+            plane_values=[0.0, 1.0],
+            layer_labels=("L1", "L2/3", "L4", "L5", "L6a", "L6b"),
+        ),
+    )
+
+    # A soma layer without flatmap axis captions used to read as a foreign
+    # layer and wipe all of this.
+    assert widget._viewer.dims.axis_labels == (
+        "Allen layer",
+        "Flatmap Y",
+        "Flatmap X",
+    )
+    assert widget._viewer.axes.visible is True
+    assert widget._viewer.text_overlay.visible is True
+    assert widget._viewer.text_overlay.text == "Allen layer: L1  (plane 1 of 6)"
+    assert widget._viewer.dims.ndisplay == 2
+
+
+@pytest.mark.parametrize(
+    "render_mode_name", ["_RENDER_FLAT_HEATMAP", "_RENDER_FLAT_VECTOR"]
+)
+def test_add_soma_uses_two_dimensional_points_in_flat_modes(
+    monkeypatch, render_mode_name
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    render_mode = getattr(module, render_mode_name)
+    widget._render_mode_combo = types.SimpleNamespace(currentData=lambda: render_mode)
+
+    layer = _add_soma_with_render(
+        module,
+        widget,
+        _soma_render_result(plane_column=None),
+    )
+
+    assert layer.data.shape == (2, 2)
+    np.testing.assert_array_equal(layer.data, [[1.0, 2.0], [3.0, 4.0]])
+    assert widget._viewer.dims.ndisplay == 2
+    assert layer.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_plane_mode"] == "flat"
+
+
+def test_add_soma_keeps_depth_space_in_depth_modes(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_HEATMAP
+    )
+
+    layer = _add_soma_with_render(
+        module,
+        widget,
+        _soma_render_result(plane_column="depth_bin", plane_values=[0.0, 7.0]),
+    )
+
+    np.testing.assert_array_equal(layer.data[:, 0], [0.0, 7.0])
+    assert layer.data.shape == (2, 3)
+    assert widget._viewer.dims.ndisplay == 3
+    assert layer.axis_labels == ("Depth bin", "Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_plane_mode"] == "depth"
+
+
+def test_add_soma_in_allen_mode_without_region_id_reports_the_fix(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_ALLEN_LAYERS
+    )
+    nodes = _augmented_nodes().drop(columns=["region_id"])
+
+    def fail_lookup(self, _nodes, **_kwargs):
+        raise AssertionError(
+            "Allen soma projection must not fall back to depth space"
+        )
+
+    _configure_projection_widget(widget, module, nodes)
+    widget._project_from_lookup_files = types.MethodType(fail_lookup, widget)
+
+    widget._add_soma()
+
+    assert "region_id" in widget._status_label.text
+    assert widget._viewer.layers == []
+    assert getattr(widget, "_soma_layer", None) is None
+
+
+def test_render_mode_change_removes_a_stale_soma_layer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_HEATMAP
+    )
+    layer = _add_soma_with_render(
+        module,
+        widget,
+        _soma_render_result(plane_column="depth_bin"),
+    )
+    assert layer in widget._viewer.layers
+    widget._region_surfaces_layers = []
+    widget._region_outlines_layers = []
+    widget._cache_grid_locked = False
+    widget._heatmap_color_mode_combo = _DummyButton()
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+
+    widget._on_render_mode_changed()
+
+    # Depth-bin soma coordinates are meaningless in the new 2D space.
+    assert layer not in widget._viewer.layers
+    assert widget._soma_layer is None
 
 
 def test_add_soma_without_soma_nodes_reports_and_adds_no_layer(
@@ -1966,6 +2161,12 @@ def test_latest_flatmap_correlation_source_requires_heatmap_render(monkeypatch) 
     widget._last_render_mode = module._RENDER_POINTS
     assert widget.latest_flatmap_correlation_source() is None
 
+    # Flatmap voxel correlation is defined on the depth grid, so a
+    # depth-collapsed render is not a source for it.
+    for flat_mode in (module._RENDER_FLAT_HEATMAP, module._RENDER_FLAT_VECTOR):
+        widget._last_render_mode = flat_mode
+        assert widget.latest_flatmap_correlation_source() is None
+
     widget._last_render_mode = module._RENDER_HEATMAP
     assert widget.latest_flatmap_correlation_source() is None
 
@@ -2067,6 +2268,118 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     assert widget._viewer.camera.zoom == 300.0
 
 
+def _grouped_volume(module, *, peak: float = 200.0):
+    """One neuron's volume: a dense soma bin plus a one-node-per-bin projection."""
+    volume = np.zeros((2, 8, 8), dtype=np.float32)
+    volume[0, 4, 4] = peak
+    volume[0, 4, 5:8] = 1.0
+    return module.FlatmapGroupedVolume(
+        group_key="a.swc",
+        label="a.swc",
+        source_file_ids=("a.swc",),
+        volume=volume,
+        rendered_nodes=int(peak) + 3,
+        nonzero_voxels=4,
+    )
+
+
+def test_individual_heatmap_opens_at_a_fraction_of_its_own_maximum(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    layer = widget._add_grouped_heatmap_layer(
+        _grouped_volume(module),
+        {},
+        np.asarray([1.0, 0.0, 0.0, 1.0]),
+        heatmap_color_mode=module._HEATMAP_COLOR_INDIVIDUAL,
+    )
+
+    fraction = module._INDIVIDUAL_HEATMAP_CONTRAST_FRACTION
+    assert layer.contrast_limits == (0.0, 200.0 * fraction)
+    assert layer.metadata["flatmap_heatmap_contrast_limits"] == (0.0, 200.0 * fraction)
+    # The slider still spans the real data, so the dense core stays reachable.
+    assert layer.contrast_limits_range == (0.0, 200.0)
+    assert layer.metadata["flatmap_heatmap_contrast_limits_range"] == (0.0, 200.0)
+
+
+@pytest.mark.parametrize(
+    "color_mode_name", ["_HEATMAP_COLOR_CLUSTER", "_HEATMAP_COLOR_SINGLE"]
+)
+def test_non_individual_grouped_heatmaps_keep_the_full_range(
+    monkeypatch, color_mode_name
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    layer = widget._add_grouped_heatmap_layer(
+        _grouped_volume(module),
+        {},
+        np.asarray([1.0, 0.0, 0.0, 1.0]),
+        heatmap_color_mode=getattr(module, color_mode_name),
+    )
+
+    # A cluster group aggregates many neurons, so it is not dominated by one
+    # neuron's soma the way a per-neuron layer is.
+    assert layer.contrast_limits == (0.0, 200.0)
+    assert layer.contrast_limits_range == (0.0, 200.0)
+
+
+def test_single_color_heatmap_keeps_the_full_range(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    volume = _grouped_volume(module).volume
+
+    layer = widget._create_or_update_heatmap_layer_from_volume(None, volume, {})
+
+    assert layer.contrast_limits == (0.0, 200.0)
+    assert layer.metadata["flatmap_heatmap_contrast_limits"] == (0.0, 200.0)
+
+
+def test_individual_heatmap_contrast_survives_a_napari_reset(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = widget._add_grouped_heatmap_layer(
+        _grouped_volume(module),
+        {},
+        np.asarray([1.0, 0.0, 0.0, 1.0]),
+        heatmap_color_mode=module._HEATMAP_COLOR_INDIVIDUAL,
+    )
+    layer._slice_input = types.SimpleNamespace(ndisplay=3)
+
+    layer.reset_contrast_limits()
+    layer.reset_contrast_limits_range()
+
+    fraction = module._INDIVIDUAL_HEATMAP_CONTRAST_FRACTION
+    assert layer.contrast_limits == (0.0, 200.0 * fraction)
+    # The range must not collapse onto the opening window.
+    assert layer.contrast_limits_range == (0.0, 200.0)
+
+
+def test_individual_heatmap_keeps_the_full_range_for_a_flat_volume(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    empty = module.FlatmapGroupedVolume(
+        group_key="a.swc",
+        label="a.swc",
+        source_file_ids=("a.swc",),
+        volume=np.zeros((2, 4, 4), dtype=np.float32),
+        rendered_nodes=0,
+        nonzero_voxels=0,
+    )
+
+    layer = widget._add_grouped_heatmap_layer(
+        empty,
+        {},
+        np.asarray([1.0, 0.0, 0.0, 1.0]),
+        heatmap_color_mode=module._HEATMAP_COLOR_INDIVIDUAL,
+    )
+
+    # An all-zero volume has no maximum to scale, so the fallback range stands
+    # and the limits stay ascending rather than collapsing to (0, 0).
+    assert layer.contrast_limits == (0.0, 1.0)
+    assert layer.contrast_limits_range == (0.0, 1.0)
+
+
 def test_flatmap_render_layers_use_display_viewer_provider(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -2124,8 +2437,8 @@ def test_first_render_reports_ready_after_layer_focus(
     events = []
     original_focus = widget._focus_projection_view
 
-    def record_focus(layer, data) -> None:
-        original_focus(layer, data)
+    def record_focus(layer, data, **kwargs) -> None:
+        original_focus(layer, data, **kwargs)
         events.append(("focused", layer))
 
     def record_ready(viewer, layer) -> None:
@@ -2344,6 +2657,482 @@ def _render_allen_layer_stack(module, widget, *, color_mode=None):
         flatmap_style="both_shaped",
         coordinate_mode="parquet_columns",
     )
+
+
+def _flat_render_summary(
+    module,
+    total_nodes: int = 2,
+    *,
+    xy_bins: int = 4,
+    bounds: tuple[float, float] = (0.0, 1.0),
+):
+    """A depth-collapsed summary: real depth counts, no depth axis."""
+    return module.FlatmapRenderSummary(
+        total_nodes,
+        total_nodes,
+        total_nodes,
+        0,
+        total_nodes,
+        0,
+        total_nodes,
+        1,
+        xy_bins,
+        0,  # depth_bins
+        0.0,  # depth_bin_um
+        bounds[0],
+        bounds[1],
+        bounds[0],
+        bounds[1],
+        0.0,
+        25.0,
+        True,
+    )
+
+
+def _render_flat_heatmap(module, widget, *, color_mode=None):
+    """Render a depth-collapsed 2D heatmap through the normal entry point."""
+    color_mode = color_mode or module._HEATMAP_COLOR_SINGLE
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: color_mode
+    )
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc"],
+            "render_valid": [True, True],
+            "y_flat_bin": [1, 2],
+            "x_flat_bin": [2, 3],
+        }
+    )
+    volume = np.zeros((4, 4), dtype=np.float32)
+    volume[1, 2] = 1.0
+    volume[2, 3] = 1.0
+    render_result = module.FlatmapRenderResult(
+        projected_nodes=projected,
+        volume=volume,
+        points=np.asarray([[1.0, 2.0], [2.0, 3.0]]),
+        point_file_ids=["a.swc", "b.swc"],
+        summary=_flat_render_summary(module),
+    )
+    return widget._create_or_update_render_layer(
+        render_result,
+        _simple_projection_summary(module, total_nodes=2),
+        flatmap_style="both_shaped",
+        coordinate_mode="parquet_columns",
+        render_mode=module._RENDER_FLAT_HEATMAP,
+    )
+
+
+def _flat_vector_render_result(module, *, rendered_nodes: int = 3):
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "b.swc"],
+            "node_id": [1, 2, 1],
+            "parent_id": [-1, 1, -1],
+            "x_flat": [0.0, 2.0, 4.0],
+            "y_flat": [0.0, 4.0, 2.0],
+            "render_valid": [True, True, True],
+        }
+    )
+    return module.FlatmapRenderResult(
+        projected_nodes=projected,
+        volume=np.zeros((4, 4), dtype=np.float32),
+        points=np.asarray([[0.0, 0.0], [2.0, 1.0], [1.0, 2.0]]),
+        point_file_ids=["a.swc", "a.swc", "b.swc"],
+        summary=_flat_render_summary(module, rendered_nodes, bounds=(0.0, 4.0)),
+    )
+
+
+def _render_flat_vector(module, widget, *, rendered_nodes: int = 3):
+    """Render 2D vectors through the normal entry point."""
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_VECTOR
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    return widget._create_or_update_render_layer(
+        _flat_vector_render_result(module, rendered_nodes=rendered_nodes),
+        _simple_projection_summary(module, total_nodes=3),
+        flatmap_style="both_shaped",
+        coordinate_mode="parquet_columns",
+        render_mode=module._RENDER_FLAT_VECTOR,
+    )
+
+
+def test_flat_heatmap_render_uses_one_two_dimensional_image(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    layer = _render_flat_heatmap(module, widget)
+
+    assert layer.name == module._FLAT_HEATMAP_LAYER_NAME
+    assert layer.data.ndim == 2
+    assert layer.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_render_mode"] == module._RENDER_FLAT_HEATMAP
+    assert layer.metadata["flatmap_plane_mode"] == "flat"
+    assert widget._viewer.dims.ndisplay == 2
+    assert widget._viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert widget._viewer.axes.visible is True
+    # No plane axis means no plane caption to write.
+    assert widget._viewer.text_overlay.visible is False
+
+
+def test_flat_heatmap_render_retires_a_stale_plane_caption(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    _render_allen_layer_stack(module, widget)
+    assert widget._viewer.text_overlay.text.startswith("Allen layer")
+
+    _render_flat_heatmap(module, widget)
+
+    # A stale "plane 1 of 6" caption would describe a stack that is no longer
+    # on screen.
+    assert widget._viewer.text_overlay.visible is False
+    assert widget._viewer.text_overlay.text == ""
+
+
+def test_flat_heatmap_grouped_colors_add_one_layer_per_neuron(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    _render_flat_heatmap(module, widget, color_mode=module._HEATMAP_COLOR_INDIVIDUAL)
+
+    grouped = [
+        layer
+        for layer in widget._viewer.layers
+        if layer.name.startswith(module._GROUPED_FLAT_HEATMAP_PREFIX)
+    ]
+    assert [layer.name for layer in grouped] == [
+        f"{module._GROUPED_FLAT_HEATMAP_PREFIX}a.swc",
+        f"{module._GROUPED_FLAT_HEATMAP_PREFIX}b.swc",
+    ]
+    assert all(layer.data.shape == (4, 4) for layer in grouped)
+    assert all(
+        layer.axis_labels == ("Flatmap Y", "Flatmap X") for layer in grouped
+    )
+    assert widget.__class__._is_flatmap_render_layer_name(grouped[0].name)
+
+
+def test_flat_vector_render_sets_edge_color_after_creation(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    layer = _render_flat_vector(module, widget)
+
+    assert layer.name == module._FLAT_VECTOR_LAYER_NAME
+    # napari only enters DIRECT per-vector color mode when edge_color is
+    # assigned after construction.
+    assert "edge_color" not in layer.init_kwargs
+    assert layer.init_kwargs["vector_style"] == "line"
+    assert layer.axis_labels == ("Flatmap Y", "Flatmap X")
+    # One color per drawn segment; the fixture's only edge belongs to a.swc.
+    np.testing.assert_allclose(layer.edge_color, [[1.0, 0.0, 0.0, 1.0]])
+
+
+def test_flat_vector_render_uses_row_col_start_direction_data(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    layer = _render_flat_vector(module, widget)
+
+    # One edge per valid parent-child pair; b.swc is a lone root.
+    assert layer.data.shape == (1, 2, 2)
+    expected_start = np.column_stack(
+        (
+            flatmap_pixel_coordinates(np.asarray([0.0]), (0.0, 4.0), 4),
+            flatmap_pixel_coordinates(np.asarray([0.0]), (0.0, 4.0), 4),
+        )
+    )
+    expected_end = np.column_stack(
+        (
+            flatmap_pixel_coordinates(np.asarray([4.0]), (0.0, 4.0), 4),
+            flatmap_pixel_coordinates(np.asarray([2.0]), (0.0, 4.0), 4),
+        )
+    )
+    np.testing.assert_allclose(layer.data[:, 0], expected_start, atol=1e-5)
+    np.testing.assert_allclose(
+        layer.data[:, 0] + layer.data[:, 1],
+        expected_end,
+        atol=1e-5,
+    )
+    assert layer.metadata["flatmap_vector_segments"] == 1
+    assert widget._viewer.dims.ndisplay == 2
+
+
+def test_flat_vector_render_updates_the_existing_layer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    first = _render_flat_vector(module, widget)
+    second = _render_flat_vector(module, widget)
+
+    assert second is first
+    vector_layers = [
+        layer
+        for layer in widget._viewer.layers
+        if layer.name == module._FLAT_VECTOR_LAYER_NAME
+    ]
+    assert len(vector_layers) == 1
+    assert first.refresh_count >= 1
+
+
+def test_flat_vector_render_refuses_too_many_segments(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    monkeypatch.setattr(module, "MAX_FLATMAP_VECTOR_SEGMENTS", 2)
+
+    with pytest.raises(RuntimeError, match="above the 2 limit"):
+        _render_flat_vector(module, widget, rendered_nodes=3)
+
+    assert widget._viewer.layers == []
+
+
+def test_flat_vector_render_reports_a_selection_without_edges(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_VECTOR
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    render_result = _flat_vector_render_result(module)
+    # Every node is its own root, so no parent-child pair shares an edge.
+    render_result.projected_nodes.loc[:, "parent_id"] = -1
+
+    with pytest.raises(RuntimeError, match="parent-child edges"):
+        widget._create_or_update_render_layer(
+            render_result,
+            _simple_projection_summary(module, total_nodes=3),
+            flatmap_style="both_shaped",
+            coordinate_mode="parquet_columns",
+            render_mode=module._RENDER_FLAT_VECTOR,
+        )
+
+    assert widget._viewer.layers == []
+
+
+def test_flat_vector_projection_failure_reaches_the_status_label(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_projection_widget(widget, module, _augmented_nodes())
+    widget._summary_label = _DummyLabel()
+    widget._export_btn = _DummyButton()
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_VECTOR
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    monkeypatch.setattr(module, "MAX_FLATMAP_VECTOR_SEGMENTS", 1)
+
+    def fake_lookup(self, nodes, **_kwargs):
+        return (
+            types.SimpleNamespace(
+                projected_nodes=nodes,
+                summary=_simple_projection_summary(module, total_nodes=3),
+            ),
+            _flat_vector_render_result(module),
+            None,
+        )
+
+    widget._project_from_lookup_files = types.MethodType(fake_lookup, widget)
+
+    widget._project()
+
+    assert "above the 1 limit" in widget._status_label.text
+    assert widget._viewer.layers == []
+
+
+def test_flat_modes_disable_depth_bin_but_keep_the_depth_minus_one_checkbox(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._xy_bins_spin = _DummyButton()
+    widget._depth_bin_spin = _DummyButton()
+    widget._exclude_depth_minus_one_cb = _DummyButton()
+    widget._negative_one_sentinel_cb = _DummyButton()
+    widget._zero_sentinel_cb = _DummyButton()
+    widget._heatmap_color_mode_combo = _DummyButton()
+    widget._cache_grid_locked = False
+
+    for render_mode, color_combo_enabled in (
+        (module._RENDER_FLAT_HEATMAP, True),
+        (module._RENDER_FLAT_VECTOR, False),
+    ):
+        widget._render_mode_combo = types.SimpleNamespace(
+            currentData=lambda mode=render_mode: mode
+        )
+        widget._update_render_mode_controls()
+
+        assert widget._xy_bins_spin.enabled is True
+        # No depth bins to size, but the checkbox still selects nodes.
+        assert widget._depth_bin_spin.enabled is False
+        assert widget._exclude_depth_minus_one_cb.enabled is True
+        assert widget._heatmap_color_mode_combo.enabled is color_combo_enabled
+
+
+def test_flat_modes_disable_cached_region_geometry_controls(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._active_cache_profile = object()
+    widget._region_surfaces_btn = _DummyButton()
+    widget._region_outlines_btn = _DummyButton()
+    widget._clear_region_geometry_btn = _DummyButton()
+
+    for render_mode in (module._RENDER_FLAT_HEATMAP, module._RENDER_FLAT_VECTOR):
+        widget._render_mode_combo = types.SimpleNamespace(
+            currentData=lambda mode=render_mode: mode
+        )
+        widget._update_cached_region_controls()
+
+        assert widget._region_surfaces_btn.enabled is False
+        assert widget._region_outlines_btn.enabled is False
+        assert widget._region_labels_btn.enabled is False
+        assert widget._region_label_atlas_combo.enabled is False
+
+    # 3D Points still uses the depth grid, so its geometry stays available.
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_POINTS
+    )
+    widget._update_cached_region_controls()
+
+    assert widget._region_surfaces_btn.enabled is True
+    assert widget._region_outlines_btn.enabled is True
+
+
+def test_region_labels_are_refused_in_flat_modes(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+
+    with pytest.raises(RuntimeError, match="not"):
+        widget._create_region_labels_from_current_state()
+
+
+def test_flat_render_summary_reports_the_collapsed_depth_axis(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+
+    text = module.FlatmapProjectionWidget._format_flat_render_summary(
+        _simple_projection_summary(module, total_nodes=2),
+        _flat_render_summary(module),
+    )
+
+    assert "collapsed into one flatmap plane" in text
+    # The depth counts stay honest because the same depth rules applied.
+    assert "Depth-valid nodes: 2" in text
+
+
+def test_precomputed_flat_heatmap_uses_the_duckdb_worker(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+    started = []
+    widget._start_precomputed_heatmap_worker = lambda: started.append(True)
+    widget._project_from_lookup_files = types.MethodType(
+        lambda self, *_args, **_kwargs: pytest.fail(
+            "2D Heatmap must take the DuckDB fast path"
+        ),
+        widget,
+    )
+
+    widget._project()
+
+    assert started == [True]
+    assert widget._current_plane_mode() == "flat"
+
+
+def test_matching_cache_profile_preserves_a_live_flat_heatmap(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    layer = _configure_cache_activation_widget(widget, module)
+    layer.name = module._FLAT_HEATMAP_LAYER_NAME
+    layer.data = np.ones((4, 4), dtype=np.float32)
+    layer.metadata["flatmap_render_mode"] = module._RENDER_FLAT_HEATMAP
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+    widget._last_render_mode = module._RENDER_FLAT_HEATMAP
+    widget._last_render_summary = _flat_render_summary(module)
+    widget._last_volume_shape = (4, 4)
+    widget._queue_gui_callback = lambda callback: pytest.fail(
+        "A matching XY grid must not retire the 2D heatmap"
+    )
+
+    widget._activate_cache_profile(_CacheProfile("matching-flat-profile"),
+                                   force_transition=True)
+
+    assert widget._viewer.layers == [layer]
+    assert widget._last_cache_profile_id == "matching-flat-profile"
+
+
+def test_flat_vector_render_is_not_preserved_across_cache_profiles(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    _configure_cache_activation_widget(widget, module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_VECTOR
+    )
+    widget._last_render_mode = module._RENDER_FLAT_VECTOR
+    widget._last_render_summary = _flat_render_summary(module)
+    widget._last_volume_shape = (4, 4)
+
+    # A per-node vector render is not a volume on the cache grid.
+    assert widget._render_matches_cache_profile(_CacheProfile("any-profile")) is False
+
+
+def test_focus_projection_view_bounds_a_two_dimensional_image(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    volume = np.zeros((8, 8), dtype=np.float32)
+    volume[3, 5] = 1.0
+    layer = _DummyLayer(volume, name="flat")
+    widget._viewer.layers.append(layer)
+
+    widget._focus_projection_view(layer, volume, ndisplay=2)
+
+    assert widget._viewer.dims.ndisplay == 2
+    assert widget._viewer.camera.center == (3.0, 5.0)
+
+
+def test_focus_projection_view_bounds_vector_starts_and_endpoints(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    # Start (2, 2) with direction (4, 6) reaches (6, 8).
+    vectors = np.asarray([[[2.0, 2.0], [4.0, 6.0]]], dtype=np.float32)
+    layer = _DummyLayer(vectors, name="vectors")
+    widget._viewer.layers.append(layer)
+
+    widget._focus_projection_view(layer, vectors, ndisplay=2, data_kind="vectors")
+
+    assert widget._viewer.camera.center == (4.0, 5.0)
+
+
+def test_focus_projection_view_bounds_two_dimensional_points(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    points = np.asarray([[1.0, 2.0], [5.0, 8.0]])
+    layer = _DummyLayer(points, name="points")
+    widget._viewer.layers.append(layer)
+
+    widget._focus_projection_view(layer, points, ndisplay=2, data_kind="points")
+
+    assert widget._viewer.camera.center == (3.0, 5.0)
 
 
 def test_allen_layer_stack_names_the_viewer_axes_and_current_plane(monkeypatch) -> None:

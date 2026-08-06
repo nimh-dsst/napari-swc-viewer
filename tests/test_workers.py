@@ -1854,6 +1854,45 @@ def test_flatmap_heatmap_worker_emits_single_volume(tmp_path):
     assert float(result.volume.sum()) == 1500.0
 
 
+def test_flatmap_heatmap_worker_emits_collapsed_volume(tmp_path):
+    workers = _import_workers_module()
+    path = tmp_path / "flatmap_v3.parquet"
+    _write_flatmap_v3_parquet(path)
+
+    def _run(plane_mode):
+        worker = workers.FlatmapHeatmapWorker(
+            str(path),
+            style_key="both_shaped",
+            color_mode="single",
+            x_bounds=(0.0, 100.0),
+            y_bounds=(0.0, 80.0),
+            depth_range_um=(0.0, 700.0),
+            xy_bins=16,
+            depth_bin_um=50.0,
+            include_depth_minus_one=False,
+            plane_mode=plane_mode,
+        )
+        finished = []
+        errors = []
+        worker.finished.connect(finished.append)
+        worker.error.connect(errors.append)
+        worker.run()
+        assert errors == []
+        assert len(finished) == 1
+        return finished[0]
+
+    flat = _run("flat")
+    depth = _run("depth")
+
+    assert flat.volume.shape == (16, 16)
+    assert flat.volume_shape == (16, 16)
+    assert float(flat.volume.sum()) == 1500.0
+    assert flat.render_summary.rendered_nodes == 1500
+    assert flat.render_summary.depth_bins == 0
+    # The flat plane mode drops only the depth axis, not any node.
+    np.testing.assert_array_equal(flat.volume, depth.volume.sum(axis=0))
+
+
 def test_flatmap_heatmap_worker_derives_bounds_when_missing(tmp_path):
     workers = _import_workers_module()
     path = tmp_path / "flatmap_v3.parquet"

@@ -1,8 +1,6 @@
 """Tests for pure neuron-table helper logic."""
 
-import numpy as np
-from matplotlib import colormaps
-
+from napari_swc_viewer.neuron_palette import neuron_palette
 from napari_swc_viewer.neuron_table_ops import (
     ClusterFilterSelection,
     GRAY_RGBA,
@@ -11,10 +9,10 @@ from napari_swc_viewer.neuron_table_ops import (
     cluster_filter_matches,
     cluster_ids_available,
     cluster_sort_value,
+    distinct_colors_for_file_ids,
     has_unclustered_entries,
-    recolor_cluster_turbo,
+    recolor_cluster_distinct,
     summarize_neuron_table,
-    turbo_colors_for_file_ids,
     visibility_for_selected_cluster,
 )
 
@@ -101,67 +99,50 @@ def test_visibility_for_cluster_selection_with_unclustered() -> None:
     assert visibility == {"n1": False, "n2": True, "n3": True, "n4": False}
 
 
-def test_recolor_cluster_turbo_grays_others() -> None:
-    """Selected cluster gets turbo ramp while non-selected become gray."""
+def test_recolor_cluster_distinct_grays_others() -> None:
+    """Selected cluster gets palette colors while non-selected become gray."""
     cluster_by_file = {"n10": 2, "n2": 1, "n1": 1}
-    colors = recolor_cluster_turbo(cluster_by_file, 1, gray_others=True)
+    colors = recolor_cluster_distinct(cluster_by_file, 1, gray_others=True)
 
     # Deterministic order is by file_id ascending within the selected cluster.
-    selected_ids = sorted(["n1", "n2"])
-    expected_samples = np.linspace(0.0, 1.0, 2)
-    expected_colors = [
-        [float(c) for c in colormaps["turbo"](float(expected_samples[0]))],
-        [float(c) for c in colormaps["turbo"](float(expected_samples[1]))],
-    ]
-
-    assert colors[selected_ids[0]] == expected_colors[0]
-    assert colors[selected_ids[1]] == expected_colors[1]
+    expected = neuron_palette(2)
+    assert colors["n1"] == expected[0]
+    assert colors["n2"] == expected[1]
     assert colors["n10"] == list(GRAY_RGBA)
 
 
-def test_recolor_cluster_turbo_handles_multi_selection_and_unclustered() -> None:
-    """Turbo recoloring samples across all selected groups together."""
+def test_recolor_cluster_distinct_handles_multi_selection_and_unclustered() -> None:
+    """Recoloring draws one palette across all selected groups together."""
     cluster_by_file = {"n3": None, "n2": 2, "n1": 1, "n4": 3}
     selection = ClusterFilterSelection({1, 2}, include_unclustered=True)
 
-    colors = recolor_cluster_turbo(cluster_by_file, selection, gray_others=True)
+    colors = recolor_cluster_distinct(cluster_by_file, selection, gray_others=True)
 
-    selected_ids = sorted(["n1", "n2", "n3"])
-    expected_samples = np.linspace(0.0, 1.0, 3)
-    expected_colors = [
-        [float(c) for c in colormaps["turbo"](float(sample))]
-        for sample in expected_samples
-    ]
-    for file_id, expected_color in zip(selected_ids, expected_colors):
+    for file_id, expected_color in zip(["n1", "n2", "n3"], neuron_palette(3)):
         assert colors[file_id] == expected_color
     assert colors["n4"] == list(GRAY_RGBA)
 
 
-def test_turbo_colors_for_file_ids_is_stable_and_deduplicates() -> None:
-    colors = turbo_colors_for_file_ids(["n2", "n10", "n2", "n1"])
+def test_distinct_colors_for_file_ids_is_stable_and_deduplicates() -> None:
+    colors = distinct_colors_for_file_ids(["n2", "n10", "n2", "n1"])
 
     expected_ids = ["n1", "n10", "n2"]
-    expected_samples = np.linspace(0.0, 1.0, 3)
     assert list(colors) == expected_ids
-    for file_id, sample in zip(expected_ids, expected_samples):
-        assert colors[file_id] == [
-            float(channel) for channel in colormaps["turbo"](float(sample))
-        ]
+    for file_id, expected_color in zip(expected_ids, neuron_palette(3)):
+        assert colors[file_id] == expected_color
 
 
-def test_turbo_colors_for_file_ids_handles_empty_and_singleton_inputs() -> None:
-    assert turbo_colors_for_file_ids([]) == {}
-    assert turbo_colors_for_file_ids(["only"]) == {
-        "only": [float(channel) for channel in colormaps["turbo"](0.0)]
-    }
+def test_distinct_colors_for_file_ids_handles_empty_and_singleton_inputs() -> None:
+    assert distinct_colors_for_file_ids([]) == {}
+    assert distinct_colors_for_file_ids(["only"]) == {"only": neuron_palette(1)[0]}
 
 
-def test_recolor_cluster_turbo_uses_shared_turbo_palette() -> None:
+def test_recolor_cluster_distinct_uses_the_shared_palette() -> None:
     cluster_by_file = {"n3": 2, "n2": 1, "n1": 1}
 
-    colors = recolor_cluster_turbo(cluster_by_file, 1, gray_others=False)
+    colors = recolor_cluster_distinct(cluster_by_file, 1, gray_others=False)
 
-    assert colors == turbo_colors_for_file_ids(["n1", "n2"])
+    assert colors == distinct_colors_for_file_ids(["n1", "n2"])
 
 
 def test_available_cluster_ids_sorted_unique() -> None:

@@ -1945,6 +1945,7 @@ class FlatmapHeatmapWorker(QObject):
 
             from .flatmap_heatmap import (
                 FLATMAP_PLANE_MODE_ALLEN_LAYERS,
+                FLATMAP_PLANE_MODE_FLAT,
                 build_allen_layer_heatmap_volume_result,
                 build_flatmap_heatmap_volume_result,
                 compute_flatmap_bounds_from_parquet,
@@ -1994,6 +1995,9 @@ class FlatmapHeatmapWorker(QObject):
                         progress_total=total_steps,
                     )
                 else:
+                    # A flat render collapses the depth axis but keeps depth's
+                    # say over which nodes are counted, so it takes the same
+                    # builder with the same bounds.
                     result = build_flatmap_heatmap_volume_result(
                         conn,
                         self._parquet_path,
@@ -2009,6 +2013,9 @@ class FlatmapHeatmapWorker(QObject):
                         cluster_map=self._cluster_map,
                         progress_callback=self.progress.emit,
                         progress_total=total_steps,
+                        collapse_depth=(
+                            self._plane_mode == FLATMAP_PLANE_MODE_FLAT
+                        ),
                     )
             finally:
                 conn.close()

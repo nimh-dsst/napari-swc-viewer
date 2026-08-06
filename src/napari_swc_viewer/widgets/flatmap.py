@@ -36,6 +36,8 @@ from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_XY_BINS,
     FLATMAP_PLANE_MODE_ALLEN_LAYERS,
     FLATMAP_PLANE_MODE_DEPTH,
+    FLATMAP_PLANE_MODE_FLAT,
+    MAX_FLATMAP_VECTOR_SEGMENTS,
     AllenLayerHeatmapVolumeResult,
     AllenLayerStackResult,
     AllenLayerStackSummary,
@@ -43,6 +45,7 @@ from ..flatmap_heatmap import (
     FlatmapLookupStats,
     FlatmapRenderResult,
     FlatmapRenderSummary,
+    FlatmapSegmentVectors,
     build_allen_layer_cluster_volumes,
     build_allen_layer_file_id_volumes,
     build_allen_layer_stack_from_projected_nodes,
@@ -50,8 +53,10 @@ from ..flatmap_heatmap import (
     build_flatmap_file_id_volumes,
     build_flatmap_render_data,
     build_flatmap_render_data_from_projected_nodes,
+    build_flatmap_segment_vectors,
     compute_flatmap_lookup_stats,
     depth_plane_labels,
+    rendered_plane_points,
 )
 from ..flatmap_labels import (
     FlatmapRegionLabelsResult,
@@ -93,9 +98,19 @@ _SOURCE_ALL = "all"
 _RENDER_HEATMAP = "heatmap"
 _RENDER_POINTS = "points"
 _RENDER_ALLEN_LAYERS = "allen_layer_heatmap"
+# The two depth-free renders: flatmap XY only, with the depth axis collapsed.
+_RENDER_FLAT_HEATMAP = "flat_heatmap"
+_RENDER_FLAT_VECTOR = "flat_vector"
 _HEATMAP_COLOR_SINGLE = "single"
 _HEATMAP_COLOR_INDIVIDUAL = "individual"
 _HEATMAP_COLOR_CLUSTER = "cluster"
+# One neuron's heatmap is dominated by a few dense bins -- the soma and tight
+# local arbor -- while its long-range projections leave one or two nodes per
+# bin.  Against the full range those projections are nearly black, so a
+# per-neuron layer opens with its upper limit at this fraction of its own
+# maximum.  The slider still spans the full range, so the dense core remains
+# one drag away.
+_INDIVIDUAL_HEATMAP_CONTRAST_FRACTION = 0.1
 _PROJECTION_SOURCE_PRECOMPUTED = "precomputed"
 _PROJECTION_SOURCE_RECOMPUTE = "recompute"
 _OLD_SHAPES_LAYER_NAME = "Isocortex Flatmap Traces"
@@ -103,6 +118,9 @@ _HEATMAP_LAYER_NAME = "Isocortex Flatmap Heatmap"
 _GROUPED_HEATMAP_LAYER_PREFIX = f"{_HEATMAP_LAYER_NAME}: "
 _ALLEN_LAYER_HEATMAP_LAYER_NAME = "Isocortex Flatmap Allen Layers"
 _GROUPED_ALLEN_LAYER_PREFIX = f"{_ALLEN_LAYER_HEATMAP_LAYER_NAME}: "
+_FLAT_HEATMAP_LAYER_NAME = "Isocortex Flatmap 2D Heatmap"
+_GROUPED_FLAT_HEATMAP_PREFIX = f"{_FLAT_HEATMAP_LAYER_NAME}: "
+_FLAT_VECTOR_LAYER_NAME = "Isocortex Flatmap 2D Vectors"
 _POINTS_LAYER_NAME = "Isocortex Flatmap Points"
 _SOMA_POINTS_LAYER_NAME = "Isocortex Flatmap Somas"
 _REGION_LABELS_LAYER_NAME = "Flatmap Region Labels"
@@ -118,6 +136,8 @@ _FLATMAP_RENDER_LAYER_NAMES = {
     _OLD_SHAPES_LAYER_NAME,
     _HEATMAP_LAYER_NAME,
     _ALLEN_LAYER_HEATMAP_LAYER_NAME,
+    _FLAT_HEATMAP_LAYER_NAME,
+    _FLAT_VECTOR_LAYER_NAME,
     _POINTS_LAYER_NAME,
 }
 _DEFAULT_TRACE_COLOR = np.asarray([0.5, 0.5, 0.5, 1.0], dtype=float)
@@ -298,6 +318,7 @@ class FlatmapProjectionWidget(QWidget):
         self._clear_display_axis_annotations(viewer)
         self._last_display_viewer = None
         self._projection_layer = None
+        self._soma_layer = None
         self._region_labels_layer = None
         self._region_surfaces_layers = []
         self._region_outlines_layers = []
@@ -516,9 +537,17 @@ class FlatmapProjectionWidget(QWidget):
         self._render_mode_combo = QComboBox()
         self._render_mode_combo.addItem("3D Heatmap", _RENDER_HEATMAP)
         self._render_mode_combo.addItem("3D Points", _RENDER_POINTS)
+        self._render_mode_combo.addItem("2D Heatmap", _RENDER_FLAT_HEATMAP)
+        self._render_mode_combo.addItem("2D Vector", _RENDER_FLAT_VECTOR)
         self._render_mode_combo.addItem(
             "Allen Layer Heatmap (2D stack)",
             _RENDER_ALLEN_LAYERS,
+        )
+        self._render_mode_combo.setToolTip(
+            "2D Heatmap and 2D Vector collapse the depth axis into a single "
+            "flatmap image; Exclude depth -1 nodes still applies. 2D Vector "
+            "draws one line per parent-child edge and is limited to "
+            f"{MAX_FLATMAP_VECTOR_SEGMENTS:,} segments."
         )
         self._render_mode_combo.currentIndexChanged.connect(
             self._on_render_mode_changed
@@ -747,6 +776,7 @@ class FlatmapProjectionWidget(QWidget):
     def _invalidate_flatmap_grid_layers(self) -> None:
         """Remove render state that belongs to a previous style/cache grid."""
         self._remove_projection_layer(create=False)
+        self._remove_soma_layer()
         self._clear_named_region_layers(_REGION_LABELS_LAYER_NAME)
         self._clear_region_surface_layers()
         self._clear_region_outline_layers()
@@ -840,11 +870,16 @@ class FlatmapProjectionWidget(QWidget):
 
     def _defer_flatmap_grid_layer_removal(self) -> None:
         """Retire a stale grid without deleting live GPU resources inline."""
+        soma_layer = self._cached_soma_layer()
         targets = (
             self._current_flatmap_render_layers() + self._current_cached_region_layers()
         )
+        if soma_layer is not None:
+            # Soma bin coordinates belong to the retired grid too.
+            targets.append(soma_layer)
         self._hide_and_queue_layer_removal(targets)
         self._projection_layer = None
+        self._soma_layer = None
         self._region_labels_layer = None
         self._region_surfaces_layers = []
         self._region_outlines_layers = []
@@ -905,7 +940,8 @@ class FlatmapProjectionWidget(QWidget):
         if (
             getattr(self, "_last_projection_source", None)
             != _PROJECTION_SOURCE_PRECOMPUTED
-            or render_mode not in {_RENDER_HEATMAP, _RENDER_ALLEN_LAYERS}
+            or render_mode
+            not in {_RENDER_HEATMAP, _RENDER_FLAT_HEATMAP, _RENDER_ALLEN_LAYERS}
             or getattr(self, "_last_flatmap_style", None) != self._current_style_key()
             or not self._latest_render_mode_is_rendered(render_mode)
         ):
@@ -942,6 +978,15 @@ class FlatmapProjectionWidget(QWidget):
                 layer_labels == tuple(ALLEN_ISOCORTEX_LAYER_LABELS)
                 and tuple(int(value) for value in volume_shape)
                 == (len(layer_labels), xy_bins, xy_bins)
+                and int(summary.xy_bins) == xy_bins
+                and xy_bounds_match
+            )
+
+        if render_mode == _RENDER_FLAT_HEATMAP:
+            # A collapsed render has no depth axis, so the XY grid alone decides
+            # whether the live layer still matches the profile.
+            return bool(
+                tuple(int(value) for value in volume_shape) == (xy_bins, xy_bins)
                 and int(summary.xy_bins) == xy_bins
                 and xy_bounds_match
             )
@@ -1642,7 +1687,10 @@ class FlatmapProjectionWidget(QWidget):
             self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
             and getattr(self, "_active_cache_profile", None) is not None
         )
-        geometry_enabled = cache_available and not self._is_allen_layer_mode()
+        # Cached region geometry lives on the depth grid, so it is only offered
+        # for the depth-binned renders.
+        depth_grid_mode = self._is_depth_grid_mode()
+        geometry_enabled = cache_available and depth_grid_mode
         for name in (
             "_region_surfaces_btn",
             "_region_outlines_btn",
@@ -1654,9 +1702,9 @@ class FlatmapProjectionWidget(QWidget):
         labels_button = getattr(self, "_region_labels_btn", None)
         if labels_button is not None:
             labels_button.setEnabled(
-                cache_available
+                (cache_available and not self._is_flat_render_mode())
                 or (
-                    not self._is_allen_layer_mode()
+                    depth_grid_mode
                     and self._current_projection_source()
                     != _PROJECTION_SOURCE_PRECOMPUTED
                 )
@@ -1664,7 +1712,7 @@ class FlatmapProjectionWidget(QWidget):
         atlas_combo = getattr(self, "_region_label_atlas_combo", None)
         if atlas_combo is not None:
             atlas_combo.setEnabled(
-                not self._is_allen_layer_mode()
+                depth_grid_mode
                 and self._current_projection_source() != _PROJECTION_SOURCE_PRECOMPUTED
             )
 
@@ -1877,6 +1925,41 @@ class FlatmapProjectionWidget(QWidget):
     def _is_allen_layer_mode(self) -> bool:
         return self._current_render_mode() == _RENDER_ALLEN_LAYERS
 
+    def _is_flat_render_mode(self) -> bool:
+        """Return whether the render collapses depth into one flatmap plane."""
+        return self._current_render_mode() in {
+            _RENDER_FLAT_HEATMAP,
+            _RENDER_FLAT_VECTOR,
+        }
+
+    def _is_depth_grid_mode(self) -> bool:
+        """Return whether the render's plane axis is the cached depth grid.
+
+        Cached region geometry is built per depth bin, so it only describes the
+        depth-binned renders.  Both 2D modes and the Allen layer stack use a
+        different plane axis (or none at all).
+        """
+        return self._current_render_mode() in {_RENDER_HEATMAP, _RENDER_POINTS}
+
+    def _current_plane_mode(self) -> str:
+        """Return the plane-axis mode of the current render mode."""
+        if self._is_allen_layer_mode():
+            return FLATMAP_PLANE_MODE_ALLEN_LAYERS
+        if self._is_flat_render_mode():
+            return FLATMAP_PLANE_MODE_FLAT
+        return FLATMAP_PLANE_MODE_DEPTH
+
+    @staticmethod
+    def _render_ndisplay(render_mode: str) -> int:
+        """Return the display dimensionality a render mode needs."""
+        if render_mode in {
+            _RENDER_FLAT_HEATMAP,
+            _RENDER_FLAT_VECTOR,
+            _RENDER_ALLEN_LAYERS,
+        }:
+            return 2
+        return 3
+
     def _on_render_mode_changed(self, *_args) -> None:
         self._invalidate_flatmap_grid_layers()
         self._update_render_mode_controls()
@@ -1887,17 +1970,29 @@ class FlatmapProjectionWidget(QWidget):
                 "Allen layer mode uses atlas region annotations and a "
                 "six-plane 2D stack."
             )
+        elif status is not None and self._is_flat_render_mode():
+            status.setText(
+                "2D mode collapses the depth axis into one flatmap plane; "
+                "Exclude depth -1 nodes still decides whether depth -1 nodes "
+                "are rendered."
+            )
         self._notify_flatmap_correlation_source_changed()
 
     def _update_render_mode_controls(self) -> None:
         layer_mode = self._is_allen_layer_mode()
+        flat_mode = self._is_flat_render_mode()
+        vector_mode = self._current_render_mode() == _RENDER_FLAT_VECTOR
         cache_locked = bool(getattr(self, "_cache_grid_locked", False))
         control_states = {
             "_xy_bins_spin": not cache_locked,
-            "_depth_bin_spin": not cache_locked and not layer_mode,
+            # A collapsed render has no depth bins to size, but the depth -1
+            # checkbox still selects which nodes it counts.
+            "_depth_bin_spin": not cache_locked and not layer_mode and not flat_mode,
             "_exclude_depth_minus_one_cb": not cache_locked and not layer_mode,
             "_negative_one_sentinel_cb": not cache_locked,
             "_zero_sentinel_cb": not cache_locked,
+            # Vectors are always colored per neuron from the table's colors.
+            "_heatmap_color_mode_combo": not vector_mode,
         }
         for name, enabled in control_states.items():
             widget = getattr(self, name, None)
@@ -2153,7 +2248,6 @@ class FlatmapProjectionWidget(QWidget):
         *,
         projection_source: str,
         total_steps: int,
-        force_depth_render: bool = False,
     ) -> tuple[
         FlatmapProjectionResult,
         FlatmapRenderResult | AllenLayerStackResult,
@@ -2168,7 +2262,6 @@ class FlatmapProjectionWidget(QWidget):
                 nodes,
                 progress_callback=self._set_projection_progress,
                 progress_total=total_steps,
-                force_depth_render=force_depth_render,
             )
             flatmap_style = self._current_style_filename()
             coordinate_mode = self._current_coordinate_mode()
@@ -2192,7 +2285,6 @@ class FlatmapProjectionWidget(QWidget):
                 nodes,
                 progress_callback=self._set_projection_progress,
                 progress_total=total_steps,
-                force_depth_render=force_depth_render,
             )
             flatmap_style = (
                 "precomputed_parquet"
@@ -2215,7 +2307,9 @@ class FlatmapProjectionWidget(QWidget):
 
         Mirrors the Data tab's "Add Soma Only" action but renders into the
         separate flatmap + depth viewer as an independent point layer that
-        does not replace the main projection layer.
+        does not replace the main projection layer.  The somas are built for the
+        *current* render mode so they land in the coordinate space the visible
+        render uses -- depth bins, Allen layer planes, or a single flat plane.
         """
         projection_source = self._current_projection_source()
         # Soma projection always renders per-node points, so the DuckDB
@@ -2230,6 +2324,15 @@ class FlatmapProjectionWidget(QWidget):
         try:
             file_ids = self._file_ids_for_source()
             soma_nodes = self._query_soma_nodes(file_ids)
+            if self._is_allen_layer_mode() and "region_id" not in soma_nodes.columns:
+                # Falling back to depth bins here would put the somas on planes
+                # the six-plane Allen stack does not have.
+                raise RuntimeError(
+                    "Add Soma in Allen Layer Heatmap mode requires a region_id "
+                    "column so somas land on the same six layer planes. "
+                    "Regenerate the Parquet with Allen region annotations, or "
+                    "switch Render to a depth or 2D mode."
+                )
 
             (
                 result,
@@ -2243,7 +2346,6 @@ class FlatmapProjectionWidget(QWidget):
                 use_lookup_files,
                 projection_source=projection_source,
                 total_steps=total_steps,
-                force_depth_render=True,
             )
 
             self._set_projection_progress(
@@ -2253,7 +2355,7 @@ class FlatmapProjectionWidget(QWidget):
             )
             layer = self._create_or_update_soma_layer(render_result, result.summary)
             if layer is None:
-                raise RuntimeError("No soma nodes mapped into flatmap + depth space.")
+                raise RuntimeError("No soma nodes mapped into the flatmap render.")
             self._set_projection_progress("Done", total_steps, total_steps)
             self._status_label.setText(
                 f"Rendered {render_result.summary.rendered_nodes:,} of "
@@ -2272,9 +2374,9 @@ class FlatmapProjectionWidget(QWidget):
     def _project(self) -> None:
         """Run projection from the current UI state and render the layer."""
         projection_source = self._current_projection_source()
-        if (
-            projection_source == _PROJECTION_SOURCE_PRECOMPUTED
-            and self._current_render_mode() in {_RENDER_HEATMAP, _RENDER_ALLEN_LAYERS}
+        if projection_source == _PROJECTION_SOURCE_PRECOMPUTED and (
+            self._current_render_mode()
+            in {_RENDER_HEATMAP, _RENDER_FLAT_HEATMAP, _RENDER_ALLEN_LAYERS}
         ):
             # Fast path: bin the precomputed flatmap columns inside DuckDB on a
             # worker thread instead of loading every node into pandas.
@@ -2405,11 +2507,7 @@ class FlatmapProjectionWidget(QWidget):
             include_depth_minus_one=(not self._exclude_depth_minus_one_cb.isChecked()),
             file_ids=list(file_ids),
             cluster_map=cluster_map,
-            plane_mode=(
-                FLATMAP_PLANE_MODE_ALLEN_LAYERS
-                if self._is_allen_layer_mode()
-                else "depth"
-            ),
+            plane_mode=self._current_plane_mode(),
             allen_layer_map=layer_map,
         )
         thread = QThread()
@@ -2513,11 +2611,20 @@ class FlatmapProjectionWidget(QWidget):
         )
 
     def _apply_precomputed_heatmap_result(self, result) -> None:
-        """Render a DuckDB-built flatmap heatmap and record volume-only state."""
+        """Render a DuckDB-built flatmap heatmap and record volume-only state.
+
+        The same worker result type serves the depth-binned and the
+        depth-collapsed heatmap; the volume's rank is what differs, so the
+        current render mode decides the layer name, axis captions, and display
+        dimensionality.
+        """
         render_summary = result.render_summary
         projection_summary = self._projection_summary_from_stats(result.stats)
         color_mode = result.color_mode
         style_key = self._current_style_key()
+        render_mode = (
+            _RENDER_FLAT_HEATMAP if self._is_flat_render_mode() else _RENDER_HEATMAP
+        )
 
         # The fast path never materializes a per-node table.  Clearing it keeps
         # the per-node features (Export CSV, flatmap correlation, region-mask
@@ -2525,7 +2632,7 @@ class FlatmapProjectionWidget(QWidget):
         self._last_projected_nodes = None
         self._last_summary = projection_summary
         self._last_render_summary = render_summary
-        self._last_render_mode = _RENDER_HEATMAP
+        self._last_render_mode = render_mode
         self._last_flatmap_style = style_key
         self._last_coordinate_mode = "parquet_columns"
         self._last_volume_shape = tuple(int(size) for size in result.volume_shape)
@@ -2545,7 +2652,9 @@ class FlatmapProjectionWidget(QWidget):
         self._last_cache_profile_id = self._cache_profile_id(active_profile)
 
         self._summary_label.setText(
-            self._format_render_summary(projection_summary, render_summary)
+            self._format_flat_render_summary(projection_summary, render_summary)
+            if render_mode == _RENDER_FLAT_HEATMAP
+            else self._format_render_summary(projection_summary, render_summary)
         )
 
         if render_summary.rendered_nodes == 0:
@@ -2557,10 +2666,14 @@ class FlatmapProjectionWidget(QWidget):
                 render_summary,
                 flatmap_style=self._current_style_filename(),
                 coordinate_mode="parquet_columns",
-                render_mode=_RENDER_HEATMAP,
+                render_mode=render_mode,
                 heatmap_color_mode=color_mode,
             )
-            layer = self._render_precomputed_heatmap_layers(result, metadata)
+            layer = self._render_precomputed_heatmap_layers(
+                result,
+                metadata,
+                render_mode=render_mode,
+            )
             if layer is None:
                 self._notify_display_viewer_failed("no_render_layer")
 
@@ -2702,18 +2815,25 @@ class FlatmapProjectionWidget(QWidget):
         self,
         result,
         metadata: dict[str, object],
+        *,
+        render_mode: str = _RENDER_HEATMAP,
     ):
         """Create/update napari image layers from DuckDB-built volume(s)."""
         color_mode = result.color_mode
+        layer_name = self._render_layer_name(render_mode)
+        axis_labels = self._axis_labels_for_render_mode(render_mode)
+        ndisplay = self._render_ndisplay(render_mode)
         if color_mode == _HEATMAP_COLOR_SINGLE:
-            self._remove_projection_layer(except_name=_HEATMAP_LAYER_NAME)
+            self._remove_projection_layer(except_name=layer_name)
             layer = self._cached_projection_layer_for_name(
-                _HEATMAP_LAYER_NAME
-            ) or self._find_layer_by_name(_HEATMAP_LAYER_NAME)
+                layer_name
+            ) or self._find_layer_by_name(layer_name)
             layer = self._create_or_update_heatmap_layer_from_volume(
                 layer,
                 result.volume,
                 metadata,
+                layer_name=layer_name,
+                axis_labels=axis_labels,
             )
             self._projection_layer = layer
             if layer is None:
@@ -2724,7 +2844,7 @@ class FlatmapProjectionWidget(QWidget):
                 self._last_summary,
                 result.render_summary,
             )
-            self._focus_projection_view(layer, result.volume)
+            self._focus_projection_view(layer, result.volume, ndisplay=ndisplay)
             self._notify_display_viewer_ready(layer)
             return layer
 
@@ -2742,6 +2862,8 @@ class FlatmapProjectionWidget(QWidget):
                 metadata,
                 color,
                 heatmap_color_mode=color_mode,
+                render_mode=render_mode,
+                axis_labels=axis_labels,
             )
             self._set_layer_state(
                 layer,
@@ -2755,7 +2877,7 @@ class FlatmapProjectionWidget(QWidget):
         self._projection_layer = first_layer
         if first_layer is None:
             return None
-        self._focus_projection_view(first_layer, focus_volume)
+        self._focus_projection_view(first_layer, focus_volume, ndisplay=ndisplay)
         self._notify_display_viewer_ready(first_layer)
         return first_layer
 
@@ -2808,13 +2930,12 @@ class FlatmapProjectionWidget(QWidget):
         *,
         progress_callback: Callable[[str, int, int], None] | None = None,
         progress_total: int = 6,
-        force_depth_render: bool = False,
     ) -> tuple[
         FlatmapProjectionResult,
         FlatmapRenderResult | AllenLayerStackResult,
         FlatmapLookupStats,
     ]:
-        use_allen_layers = self._is_allen_layer_mode() and not force_depth_render
+        use_allen_layers = self._is_allen_layer_mode()
         if use_allen_layers and "region_id" not in nodes.columns:
             raise RuntimeError(
                 "Allen layer rendering requires a region_id column. "
@@ -2886,6 +3007,7 @@ class FlatmapProjectionWidget(QWidget):
                     self._negative_one_sentinel_cb.isChecked()
                 ),
                 lookup_stats=lookup_stats,
+                collapse_depth=self._is_flat_render_mode(),
             )
         return result, render_result, lookup_stats
 
@@ -2895,7 +3017,6 @@ class FlatmapProjectionWidget(QWidget):
         *,
         progress_callback: Callable[[str, int, int], None] | None = None,
         progress_total: int = 4,
-        force_depth_render: bool = False,
     ) -> tuple[
         FlatmapProjectionResult,
         FlatmapRenderResult | AllenLayerStackResult,
@@ -2915,7 +3036,7 @@ class FlatmapProjectionWidget(QWidget):
             progress_total,
         )
         canonical_bounds = self._canonical_render_bounds()
-        if self._is_allen_layer_mode() and not force_depth_render:
+        if self._is_allen_layer_mode():
             if "region_id" not in nodes.columns:
                 raise RuntimeError(
                     "Allen layer rendering requires a region_id column. "
@@ -2943,6 +3064,7 @@ class FlatmapProjectionWidget(QWidget):
                 include_depth_minus_one=(
                     not self._exclude_depth_minus_one_cb.isChecked()
                 ),
+                collapse_depth=self._is_flat_render_mode(),
                 **canonical_bounds,
             )
         return result, render_result, None
@@ -3385,15 +3507,18 @@ class FlatmapProjectionWidget(QWidget):
         else:
             self._last_cache_dir = None
             self._last_cache_profile_id = None
+        render_mode = self._current_render_mode()
         self._summary_label.setText(
-            self._format_render_summary(result.summary, render_result.summary)
+            self._format_flat_render_summary(result.summary, render_result.summary)
+            if render_mode in {_RENDER_FLAT_HEATMAP, _RENDER_FLAT_VECTOR}
+            else self._format_render_summary(result.summary, render_result.summary)
         )
         layer = self._create_or_update_render_layer(
             render_result,
             result.summary,
             flatmap_style=flatmap_style or self._current_style_filename(),
             coordinate_mode=coordinate_mode or self._current_coordinate_mode(),
-            render_mode=self._current_render_mode(),
+            render_mode=render_mode,
         )
         if layer is None:
             self._notify_display_viewer_failed("no_render_layer")
@@ -3546,6 +3671,14 @@ class FlatmapProjectionWidget(QWidget):
 
     def _create_region_labels_from_current_state(self):
         """Build a flatmap region-label volume and show it as a Labels layer."""
+        if self._is_flat_render_mode():
+            # The button is disabled in 2D modes; this guards a programmatic
+            # call from silently building a depth stack next to a 2D render.
+            raise RuntimeError(
+                "Region labels are built on the depth grid and are not "
+                "available in 2D render modes. Switch Render to 3D Heatmap or "
+                "3D Points to show them."
+            )
         if self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED:
             return self._create_cached_region_labels()
         self._projection_request_ready()
@@ -3890,21 +4023,18 @@ class FlatmapProjectionWidget(QWidget):
                     self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
                     and getattr(self, "_active_cache_profile", None) is not None
                 )
+                depth_grid_mode = self._is_depth_grid_mode()
                 if widget_name in {
                     "_region_surfaces_btn",
                     "_region_outlines_btn",
                     "_clear_region_geometry_btn",
                 }:
-                    effective = (
-                        effective
-                        and cache_available
-                        and not self._is_allen_layer_mode()
-                    )
+                    effective = effective and cache_available and depth_grid_mode
                 elif widget_name == "_region_labels_btn":
                     effective = effective and (
-                        cache_available
+                        (cache_available and not self._is_flat_render_mode())
                         or (
-                            not self._is_allen_layer_mode()
+                            depth_grid_mode
                             and self._current_projection_source()
                             != _PROJECTION_SOURCE_PRECOMPUTED
                         )
@@ -3912,7 +4042,7 @@ class FlatmapProjectionWidget(QWidget):
                 elif widget_name == "_region_label_atlas_combo":
                     effective = (
                         effective
-                        and not self._is_allen_layer_mode()
+                        and depth_grid_mode
                         and self._current_projection_source()
                         != _PROJECTION_SOURCE_PRECOMPUTED
                     )
@@ -3958,7 +4088,7 @@ class FlatmapProjectionWidget(QWidget):
         metadata: dict[str, object],
         *,
         atlas=None,
-        axis_labels: tuple[str, str, str] | None = None,
+        axis_labels: tuple[str, ...] | None = None,
     ):
         viewer = self._display_viewer()
         layer = self._region_labels_layer
@@ -4356,6 +4486,10 @@ class FlatmapProjectionWidget(QWidget):
             return _POINTS_LAYER_NAME
         if render_mode == _RENDER_ALLEN_LAYERS:
             return _ALLEN_LAYER_HEATMAP_LAYER_NAME
+        if render_mode == _RENDER_FLAT_HEATMAP:
+            return _FLAT_HEATMAP_LAYER_NAME
+        if render_mode == _RENDER_FLAT_VECTOR:
+            return _FLAT_VECTOR_LAYER_NAME
         return _HEATMAP_LAYER_NAME
 
     @staticmethod
@@ -4366,6 +4500,7 @@ class FlatmapProjectionWidget(QWidget):
                 (
                     _GROUPED_HEATMAP_LAYER_PREFIX,
                     _GROUPED_ALLEN_LAYER_PREFIX,
+                    _GROUPED_FLAT_HEATMAP_PREFIX,
                 )
             )
         )
@@ -4486,6 +4621,13 @@ class FlatmapProjectionWidget(QWidget):
                 heatmap_color_mode or _HEATMAP_COLOR_SINGLE
             )
             metadata["flatmap_plane_mode"] = FLATMAP_PLANE_MODE_DEPTH
+        elif render_mode == _RENDER_FLAT_HEATMAP:
+            metadata["flatmap_heatmap_color_mode"] = (
+                heatmap_color_mode or _HEATMAP_COLOR_SINGLE
+            )
+            metadata["flatmap_plane_mode"] = FLATMAP_PLANE_MODE_FLAT
+        elif render_mode == _RENDER_FLAT_VECTOR:
+            metadata["flatmap_plane_mode"] = FLATMAP_PLANE_MODE_FLAT
         elif render_mode == _RENDER_ALLEN_LAYERS:
             metadata["flatmap_heatmap_color_mode"] = (
                 heatmap_color_mode or _HEATMAP_COLOR_SINGLE
@@ -4542,6 +4684,30 @@ class FlatmapProjectionWidget(QWidget):
             f"{projection_summary.unmapped_lookup_nodes:,}"
         )
 
+    @classmethod
+    def _format_flat_render_summary(
+        cls,
+        projection_summary: ProjectionSummary,
+        render_summary: FlatmapRenderSummary,
+        *,
+        rendered_segments: int | None = None,
+        total_segments: int | None = None,
+    ) -> str:
+        """Return the depth render summary annotated as depth-collapsed.
+
+        The depth counts stay meaningful because a collapsed render applies the
+        same depth rules; only the depth *axis* is gone.
+        """
+        text = cls._format_render_summary(projection_summary, render_summary)
+        text += "\nDepth: collapsed into one flatmap plane"
+        if rendered_segments is not None:
+            text += f"\nRendered segments: {int(rendered_segments):,}"
+            if total_segments is not None and int(total_segments) != int(
+                rendered_segments
+            ):
+                text += f" of {int(total_segments):,}"
+        return text
+
     @staticmethod
     def _format_allen_layer_summary(
         projection_summary: ProjectionSummary,
@@ -4587,6 +4753,22 @@ class FlatmapProjectionWidget(QWidget):
             _FLATMAP_AXIS_LABEL_Y,
             _FLATMAP_AXIS_LABEL_X,
         )
+
+    @staticmethod
+    def _flat_axis_labels() -> tuple[str, str]:
+        """Return dims captions for a depth-collapsed flatmap render.
+
+        Only two axes: a flat render has no plane axis to name.
+        """
+        return (_FLATMAP_AXIS_LABEL_Y, _FLATMAP_AXIS_LABEL_X)
+
+    def _axis_labels_for_render_mode(self, render_mode: str) -> tuple[str, ...]:
+        """Return the dims captions matching a render mode's coordinate space."""
+        if render_mode == _RENDER_ALLEN_LAYERS:
+            return self._allen_layer_axis_labels()
+        if render_mode in {_RENDER_FLAT_HEATMAP, _RENDER_FLAT_VECTOR}:
+            return self._flat_axis_labels()
+        return self._depth_axis_labels()
 
     def _create_or_update_allen_layer_stack(
         self,
@@ -4702,16 +4884,14 @@ class FlatmapProjectionWidget(QWidget):
             self._remove_projection_layer(create=False)
             return None
 
+        grouped_capable = render_mode in {_RENDER_HEATMAP, _RENDER_FLAT_HEATMAP}
         heatmap_color_mode = (
             self._current_heatmap_color_mode()
-            if render_mode == _RENDER_HEATMAP
+            if grouped_capable
             else _HEATMAP_COLOR_SINGLE
         )
         layer_name = self._render_layer_name(render_mode)
-        if (
-            render_mode == _RENDER_HEATMAP
-            and heatmap_color_mode != _HEATMAP_COLOR_SINGLE
-        ):
+        if grouped_capable and heatmap_color_mode != _HEATMAP_COLOR_SINGLE:
             self._remove_projection_layer()
         else:
             self._remove_projection_layer(except_name=layer_name)
@@ -4727,16 +4907,43 @@ class FlatmapProjectionWidget(QWidget):
             layer_name
         ) or self._find_layer_by_name(layer_name)
 
-        if render_mode == _RENDER_POINTS:
+        axis_labels = self._axis_labels_for_render_mode(render_mode)
+        data: np.ndarray = render_result.volume
+        data_kind = "image"
+
+        if render_mode == _RENDER_FLAT_VECTOR:
+            vectors = self._flat_vector_data(render_result)
+            metadata = dict(metadata)
+            metadata["flatmap_vector_segments"] = int(len(vectors.data))
+            metadata["flatmap_vector_total_segments"] = int(vectors.total_segments)
+            layer = self._create_or_update_flat_vector_layer(
+                layer,
+                vectors,
+                metadata,
+                axis_labels=axis_labels,
+            )
+            data = vectors.data
+            data_kind = "vectors"
+        elif render_mode == _RENDER_POINTS:
             layer = self._create_or_update_points_layer(layer, render_result, metadata)
+            data = render_result.points
+            data_kind = "points"
         elif heatmap_color_mode == _HEATMAP_COLOR_SINGLE:
-            layer = self._create_or_update_heatmap_layer(layer, render_result, metadata)
+            layer = self._create_or_update_heatmap_layer_from_volume(
+                layer,
+                render_result.volume,
+                metadata,
+                layer_name=layer_name,
+                axis_labels=axis_labels,
+            )
         else:
             layers = self._create_grouped_heatmap_layers(
                 render_result,
                 projection_summary,
                 metadata,
                 heatmap_color_mode=heatmap_color_mode,
+                render_mode=render_mode,
+                axis_labels=axis_labels,
             )
             layer = layers[0] if layers else None
 
@@ -4749,26 +4956,106 @@ class FlatmapProjectionWidget(QWidget):
             projection_summary,
             render_result.summary,
         )
-        data = (
-            render_result.points
-            if render_mode == _RENDER_POINTS
-            else render_result.volume
+        self._focus_projection_view(
+            layer,
+            data,
+            ndisplay=self._render_ndisplay(render_mode),
+            data_kind=data_kind,
         )
-        self._focus_projection_view(layer, data)
         self._notify_display_viewer_ready(layer)
         return layer
 
-    def _create_or_update_heatmap_layer(
+    def _flat_vector_data(
+        self,
+        render_result: FlatmapRenderResult,
+    ) -> FlatmapSegmentVectors:
+        """Build napari vector data for a depth-collapsed flatmap render.
+
+        Edges are selected with the render's own ``render_valid`` column so the
+        drawn traces cover exactly the nodes the render included, and the grid
+        comes from the render summary so vectors land on the same pixels a 2D
+        heatmap of the same projection would.
+        """
+        summary = render_result.summary
+        rendered_nodes = int(summary.rendered_nodes)
+        if rendered_nodes > MAX_FLATMAP_VECTOR_SEGMENTS:
+            # Each node contributes at most one parent edge, so this refuses
+            # before the segment merge instead of after building millions of rows.
+            raise RuntimeError(
+                f"2D Vector mode would draw up to {rendered_nodes:,} flatmap "
+                f"segments, above the {MAX_FLATMAP_VECTOR_SEGMENTS:,} limit "
+                "napari can render interactively. Select fewer neurons, or use "
+                "2D Heatmap to see the whole set."
+            )
+        segments = build_projected_segments(
+            render_result.projected_nodes,
+            validity_column="render_valid",
+        )
+        if len(segments.data) == 0:
+            # An empty Vectors layer draws nothing and napari would warn about
+            # its empty color array, so say why instead of rendering a blank.
+            raise RuntimeError(
+                "2D Vector mode draws parent-child edges, and no rendered node "
+                "pair shares an edge. Select neurons with more than one "
+                "flatmap-valid node, or use 2D Heatmap."
+            )
+        return build_flatmap_segment_vectors(
+            segments.data,
+            segments.file_ids,
+            x_bounds=(summary.x_flat_min, summary.x_flat_max),
+            y_bounds=(summary.y_flat_min, summary.y_flat_max),
+            xy_bins=summary.xy_bins,
+        )
+
+    def _create_or_update_flat_vector_layer(
         self,
         layer,
-        render_result: FlatmapRenderResult,
+        vectors: FlatmapSegmentVectors,
         metadata: dict[str, object],
+        *,
+        axis_labels: tuple[str, ...],
     ):
-        return self._create_or_update_heatmap_layer_from_volume(
-            layer,
-            render_result.volume,
-            metadata,
-        )
+        """Create or update the 2D flatmap Vectors layer."""
+        colors = self._colors_for_file_ids(list(vectors.file_ids))
+        if layer is None:
+            # edge_color is assigned after creation so napari enters DIRECT
+            # color mode and honors one color per vector.
+            layer = self._display_viewer().add_vectors(
+                vectors.data,
+                name=_FLAT_VECTOR_LAYER_NAME,
+                edge_width=0.5,
+                opacity=0.9,
+                vector_style="line",
+                blending="translucent",
+                metadata=metadata,
+                axis_labels=axis_labels,
+            )
+            layer.edge_color = colors
+            return layer
+
+        # Data and edge_color must land together: setting them separately lets
+        # vispy rebuild the mesh against the old color array and mismatch face
+        # counts.
+        blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
+        if callable(blocker):
+            with blocker():
+                layer.data = vectors.data
+                layer.edge_color = colors
+                layer.metadata = metadata
+                if hasattr(layer, "axis_labels"):
+                    layer.axis_labels = axis_labels
+                layer.visible = True
+        else:
+            layer.data = vectors.data
+            layer.edge_color = colors
+            layer.metadata = metadata
+            if hasattr(layer, "axis_labels"):
+                layer.axis_labels = axis_labels
+            layer.visible = True
+        refresh = getattr(layer, "refresh", None)
+        if callable(refresh):
+            refresh()
+        return layer
 
     def _create_or_update_heatmap_layer_from_volume(
         self,
@@ -4777,7 +5064,7 @@ class FlatmapProjectionWidget(QWidget):
         metadata: dict[str, object],
         *,
         layer_name: str = _HEATMAP_LAYER_NAME,
-        axis_labels: tuple[str, str, str] | None = None,
+        axis_labels: tuple[str, ...] | None = None,
     ):
         # Every heatmap volume is a plane stack over flatmap XY; callers that do
         # not name their plane axis are rendering depth bins.
@@ -4832,6 +5119,8 @@ class FlatmapProjectionWidget(QWidget):
         metadata: dict[str, object],
         *,
         heatmap_color_mode: str,
+        render_mode: str = _RENDER_HEATMAP,
+        axis_labels: tuple[str, ...] | None = None,
     ) -> list[object]:
         groups = self._grouped_heatmap_volumes(
             render_result,
@@ -4848,6 +5137,8 @@ class FlatmapProjectionWidget(QWidget):
                 metadata,
                 color,
                 heatmap_color_mode=heatmap_color_mode,
+                render_mode=render_mode,
+                axis_labels=axis_labels,
             )
             self._set_layer_state(
                 layer,
@@ -4884,11 +5175,12 @@ class FlatmapProjectionWidget(QWidget):
         heatmap_color_mode: str,
         render_mode: str = _RENDER_HEATMAP,
     ) -> str:
-        prefix = (
-            _GROUPED_ALLEN_LAYER_PREFIX
-            if render_mode == _RENDER_ALLEN_LAYERS
-            else _GROUPED_HEATMAP_LAYER_PREFIX
-        )
+        if render_mode == _RENDER_ALLEN_LAYERS:
+            prefix = _GROUPED_ALLEN_LAYER_PREFIX
+        elif render_mode == _RENDER_FLAT_HEATMAP:
+            prefix = _GROUPED_FLAT_HEATMAP_PREFIX
+        else:
+            prefix = _GROUPED_HEATMAP_LAYER_PREFIX
         if heatmap_color_mode == _HEATMAP_COLOR_CLUSTER:
             return f"{prefix}{group.label}"
         return f"{prefix}{group.label}"
@@ -4933,11 +5225,14 @@ class FlatmapProjectionWidget(QWidget):
         *,
         heatmap_color_mode: str,
         render_mode: str = _RENDER_HEATMAP,
-        axis_labels: tuple[str, str, str] | None = None,
+        axis_labels: tuple[str, ...] | None = None,
     ):
         axis_labels = axis_labels or self._depth_axis_labels()
         volume = group.volume
-        contrast_limits = self._heatmap_contrast_limits(volume)
+        contrast_limits, contrast_limits_range = self._grouped_heatmap_contrast_limits(
+            volume,
+            heatmap_color_mode=heatmap_color_mode,
+        )
         group_metadata = dict(metadata)
         color_values = [float(value) for value in np.asarray(color)[:4]]
         group_metadata.update(
@@ -4952,6 +5247,7 @@ class FlatmapProjectionWidget(QWidget):
                 "file_ids": list(group.source_file_ids),
                 "color": color_values,
                 "flatmap_heatmap_contrast_limits": contrast_limits,
+                "flatmap_heatmap_contrast_limits_range": contrast_limits_range,
             }
         )
         layer_name = self._grouped_heatmap_layer_name(
@@ -4972,8 +5268,49 @@ class FlatmapProjectionWidget(QWidget):
             kwargs["axis_labels"] = axis_labels
         layer = self._display_viewer().add_image(volume, **kwargs)
         self._install_heatmap_layer_workarounds(layer)
-        self._store_heatmap_contrast_limits(layer, contrast_limits)
+        self._store_heatmap_contrast_limits(
+            layer,
+            contrast_limits,
+            limits_range=contrast_limits_range,
+        )
+        if contrast_limits_range != contrast_limits:
+            # napari narrows the slider range to whatever contrast_limits it was
+            # given, so widen it back to the real data span. Without this the
+            # user could not raise the limit past the opening fraction.
+            self._apply_heatmap_contrast_limits(
+                layer,
+                contrast_limits,
+                limits_range=contrast_limits_range,
+            )
         return layer
+
+    @classmethod
+    def _grouped_heatmap_contrast_limits(
+        cls,
+        volume: np.ndarray,
+        *,
+        heatmap_color_mode: str,
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Return ``(display limits, slider range)`` for a grouped heatmap layer.
+
+        Per-neuron layers open at a fraction of their own maximum so long-range
+        projections are visible, while the slider keeps the full data range so
+        the dense core can still be inspected.  Cluster groups aggregate many
+        neurons and keep the full range as their opening window.
+        """
+        full_range = cls._heatmap_contrast_limits(volume)
+        if heatmap_color_mode != _HEATMAP_COLOR_INDIVIDUAL:
+            return full_range, full_range
+        peak = float(np.nanmax(volume)) if volume.size else 0.0
+        if not np.isfinite(peak) or peak <= 0.0:
+            # No counts to take a fraction of, so the neutral unit fallback
+            # from _heatmap_contrast_limits stands unscaled.
+            return full_range, full_range
+        lower, upper = full_range
+        scaled = upper * _INDIVIDUAL_HEATMAP_CONTRAST_FRACTION
+        if not np.isfinite(scaled) or scaled <= lower:
+            return full_range, full_range
+        return (lower, scaled), full_range
 
     def _install_heatmap_layer_workarounds(self, layer) -> None:
         self._install_heatmap_status_guard(layer)
@@ -5054,7 +5391,11 @@ class FlatmapProjectionWidget(QWidget):
                 if limits is None:
                     original_reset_contrast_limits(mode)
                     return
-                widget._apply_heatmap_contrast_limits(bound_layer, limits)
+                widget._apply_heatmap_contrast_limits(
+                    bound_layer,
+                    limits,
+                    widget._heatmap_stored_contrast_limits_range(bound_layer),
+                )
 
             layer.reset_contrast_limits = MethodType(
                 stable_reset_contrast_limits, layer
@@ -5071,7 +5412,7 @@ class FlatmapProjectionWidget(QWidget):
                 if not widget._heatmap_requires_stable_limits(bound_layer):
                     original_reset_contrast_limits_range(mode)
                     return
-                limits = widget._heatmap_stored_contrast_limits(bound_layer)
+                limits = widget._heatmap_stored_contrast_limits_range(bound_layer)
                 if limits is None:
                     original_reset_contrast_limits_range(mode)
                     return
@@ -5101,7 +5442,11 @@ class FlatmapProjectionWidget(QWidget):
 
                 limits = widget._heatmap_stored_contrast_limits(bound_layer)
                 if limits is not None:
-                    widget._apply_heatmap_contrast_limits(bound_layer, limits)
+                    widget._apply_heatmap_contrast_limits(
+                        bound_layer,
+                        limits,
+                        widget._heatmap_stored_contrast_limits_range(bound_layer),
+                    )
                 return result
 
             layer._update_slice_response = MethodType(
@@ -5132,19 +5477,10 @@ class FlatmapProjectionWidget(QWidget):
         return self._heatmap_ndisplay(layer, response) == 3
 
     @staticmethod
-    def _heatmap_stored_contrast_limits(layer) -> tuple[float, float] | None:
-        raw_limits = getattr(
-            layer,
-            "_napari_swc_flatmap_heatmap_contrast_limits",
-            None,
-        )
-        if raw_limits is None:
-            metadata = getattr(layer, "metadata", None)
-            if isinstance(metadata, dict):
-                raw_limits = metadata.get("flatmap_heatmap_contrast_limits")
+    def _coerce_contrast_limits(raw_limits) -> tuple[float, float] | None:
+        """Return a finite, ascending ``(lower, upper)`` pair, or ``None``."""
         if raw_limits is None:
             return None
-
         try:
             values = np.asarray(raw_limits, dtype=float).reshape(-1)
         except (TypeError, ValueError):
@@ -5158,20 +5494,80 @@ class FlatmapProjectionWidget(QWidget):
             return None
         return (lower, upper)
 
+    @classmethod
+    def _heatmap_stored_contrast_limits(cls, layer) -> tuple[float, float] | None:
+        raw_limits = getattr(
+            layer,
+            "_napari_swc_flatmap_heatmap_contrast_limits",
+            None,
+        )
+        if raw_limits is None:
+            metadata = getattr(layer, "metadata", None)
+            if isinstance(metadata, dict):
+                raw_limits = metadata.get("flatmap_heatmap_contrast_limits")
+        return cls._coerce_contrast_limits(raw_limits)
+
     @staticmethod
-    def _store_heatmap_contrast_limits(layer, limits: tuple[float, float]) -> None:
+    def _store_heatmap_contrast_limits(
+        layer,
+        limits: tuple[float, float],
+        *,
+        limits_range: tuple[float, float] | None = None,
+    ) -> None:
         setattr(layer, "_napari_swc_flatmap_heatmap_contrast_limits", limits)
+        resolved_range = limits_range or limits
+        setattr(
+            layer,
+            "_napari_swc_flatmap_heatmap_contrast_limits_range",
+            resolved_range,
+        )
         metadata = getattr(layer, "metadata", None)
         if isinstance(metadata, dict):
             metadata["flatmap_heatmap_contrast_limits"] = limits
+            metadata["flatmap_heatmap_contrast_limits_range"] = resolved_range
+
+    @classmethod
+    def _heatmap_stored_contrast_limits_range(
+        cls,
+        layer,
+    ) -> tuple[float, float] | None:
+        """Return a layer's stored slider range, or its display limits.
+
+        Layers stored before the range was tracked separately -- and every layer
+        whose opening window already spans the data -- fall back to the display
+        limits, which is what the range used to be pinned to.
+        """
+        stored = cls._coerce_contrast_limits(
+            getattr(
+                layer,
+                "_napari_swc_flatmap_heatmap_contrast_limits_range",
+                None,
+            )
+        )
+        if stored is not None:
+            return stored
+        metadata = getattr(layer, "metadata", None)
+        if isinstance(metadata, dict):
+            stored = cls._coerce_contrast_limits(
+                metadata.get("flatmap_heatmap_contrast_limits_range")
+            )
+            if stored is not None:
+                return stored
+        return cls._heatmap_stored_contrast_limits(layer)
 
     @staticmethod
-    def _apply_heatmap_contrast_limits(layer, limits: tuple[float, float]) -> None:
+    def _apply_heatmap_contrast_limits(
+        layer,
+        limits: tuple[float, float],
+        limits_range: tuple[float, float] | None = None,
+    ) -> None:
         keep_auto = bool(getattr(layer, "_keep_auto_contrast", False))
         if keep_auto:
             layer._keep_auto_contrast = False
         try:
-            layer.contrast_limits_range = limits
+            # The range is set first so a narrower display window is not clamped
+            # to a stale, smaller range.
+            layer.contrast_limits_range = limits_range or limits
             layer.contrast_limits = limits
         finally:
             if hasattr(layer, "_keep_auto_contrast"):
@@ -5266,26 +5662,80 @@ class FlatmapProjectionWidget(QWidget):
             return None
         return layer
 
+    def _soma_plane_column(self) -> str | None:
+        """Return the axis-0 bin column of the current render's point space.
+
+        ``None`` means the render has no plane axis, so soma points are 2-D.
+        """
+        if self._is_allen_layer_mode():
+            return "allen_layer_index"
+        if self._is_flat_render_mode():
+            return None
+        return "depth_bin"
+
+    def _remove_soma_layer(self) -> None:
+        """Drop a soma layer whose bin space belongs to a previous render.
+
+        The soma layer is deliberately absent from
+        ``_FLATMAP_RENDER_LAYER_NAMES`` so an ordinary re-projection leaves it
+        alone.  Only a change of render mode, style, or cache grid invalidates
+        its coordinates, and those all route through here.
+        """
+        layer = self._cached_soma_layer() or self._find_layer_by_name(
+            _SOMA_POINTS_LAYER_NAME,
+            create=False,
+        )
+        self._soma_layer = None
+        if layer is None:
+            return
+        layers = self._display_layers(create=False)
+        if layers is None:
+            return
+        try:
+            layers.remove(layer)
+        except (ValueError, KeyError, RuntimeError):
+            logger.debug(
+                "Flatmap soma layer was already removed.",
+                exc_info=True,
+            )
+
     def _create_or_update_soma_layer(
         self,
-        render_result: FlatmapRenderResult,
+        render_result: FlatmapRenderResult | AllenLayerStackResult,
         projection_summary: ProjectionSummary,
     ):
-        """Create or update the dedicated flatmap soma point layer."""
-        points = render_result.points
-        if points is None or len(points) == 0:
+        """Create or update the dedicated flatmap soma point layer.
+
+        Coordinates come from the bin columns the render itself wrote, so the
+        somas share the visible render's plane axis instead of always using
+        depth bins.
+        """
+        render_mode = self._current_render_mode()
+        plane_column = self._soma_plane_column()
+        points, point_file_ids = rendered_plane_points(
+            render_result.projected_nodes,
+            plane_column=plane_column,
+        )
+        if len(points) == 0:
             return None
 
-        colors = self._colors_for_file_ids(render_result.point_file_ids)
+        colors = self._colors_for_file_ids(point_file_ids)
+        axis_labels = self._axis_labels_for_render_mode(render_mode)
         metadata = {
             "projection_kind": "isocortex_flatmap",
             "flatmap_render_mode": _RENDER_POINTS,
             "flatmap_soma_only": True,
+            "flatmap_soma_space_render_mode": render_mode,
+            "flatmap_plane_mode": self._current_plane_mode(),
             "projection_summary": projection_summary.to_dict(),
             "render_summary": render_result.summary.to_dict(),
             "flatmap_path": str(self._flatmap_path) if self._flatmap_path else "",
             "depth_path": str(self._depth_path) if self._depth_path else "",
         }
+        layer_labels = getattr(render_result.summary, "layer_labels", None)
+        if layer_labels is not None:
+            # Name the planes from this render rather than the module default.
+            metadata["allen_layer_labels"] = [str(label) for label in layer_labels]
 
         layer = self._cached_soma_layer() or self._find_layer_by_name(
             _SOMA_POINTS_LAYER_NAME
@@ -5299,6 +5749,10 @@ class FlatmapProjectionWidget(QWidget):
                 border_width=0.0,
                 blending="translucent",
                 metadata=metadata,
+                # Without axis captions the soma layer looks like a foreign
+                # layer to _apply_display_axis_annotations, which would then
+                # clear the render's plane caption and axis names.
+                axis_labels=axis_labels,
             )
         else:
             blocker = getattr(getattr(layer, "events", None), "blocker_all", None)
@@ -5307,20 +5761,71 @@ class FlatmapProjectionWidget(QWidget):
                     layer.data = points
                     layer.face_color = colors
                     layer.metadata = metadata
+                    if hasattr(layer, "axis_labels"):
+                        layer.axis_labels = axis_labels
                     layer.visible = True
             else:
                 layer.data = points
                 layer.face_color = colors
                 layer.metadata = metadata
+                if hasattr(layer, "axis_labels"):
+                    layer.axis_labels = axis_labels
                 layer.visible = True
             refresh = getattr(layer, "refresh", None)
             if callable(refresh):
                 refresh()
 
         self._soma_layer = layer
-        self._focus_projection_view(layer, points)
+        self._focus_projection_view(
+            layer,
+            points,
+            ndisplay=self._render_ndisplay(render_mode),
+            data_kind="points",
+        )
         self._notify_display_viewer_ready(layer)
         return layer
+
+    @staticmethod
+    def _render_bounds_for_focus(
+        data: np.ndarray,
+        data_kind: str,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return ``(lower, upper)`` coordinate bounds of rendered data.
+
+        ``data_kind`` names the layout: ``"image"`` for a node-count array of any
+        rank, ``"points"`` for ``(N, ndim)`` coordinates, and ``"vectors"`` for
+        napari's ``(M, 2, ndim)`` ``[start, direction]`` pairs.  Returns ``None``
+        when nothing finite is present to bound.
+        """
+        array = np.asarray(data, dtype=float)
+        if data_kind == "image":
+            coords = np.argwhere(array > 0)
+            if len(coords) == 0:
+                return (
+                    np.zeros(array.ndim, dtype=float),
+                    np.asarray(array.shape, dtype=float) - 1.0,
+                )
+            return (
+                np.min(coords, axis=0).astype(float),
+                np.max(coords, axis=0).astype(float),
+            )
+
+        if data_kind == "vectors":
+            if array.ndim != 3 or array.shape[0] == 0:
+                return None
+            starts = array[:, 0, :]
+            # Vectors store a direction, so the far end has to be reconstructed.
+            coords = np.vstack((starts, starts + array[:, 1, :]))
+        else:
+            coords = array.reshape(len(array), -1) if array.ndim > 1 else array
+            if coords.ndim != 2 or coords.shape[0] == 0:
+                return None
+
+        finite_mask = np.all(np.isfinite(coords), axis=1)
+        if not finite_mask.any():
+            return None
+        finite = coords[finite_mask]
+        return np.min(finite, axis=0), np.max(finite, axis=0)
 
     def _focus_projection_view(
         self,
@@ -5328,6 +5833,7 @@ class FlatmapProjectionWidget(QWidget):
         data: np.ndarray,
         *,
         ndisplay: int = 3,
+        data_kind: str = "image",
     ) -> None:
         """Set display dimensionality and center on the flatmap render bounds."""
         try:
@@ -5357,23 +5863,10 @@ class FlatmapProjectionWidget(QWidget):
             except Exception:
                 logger.debug("Failed to activate flatmap layer.", exc_info=True)
 
-        array = np.asarray(data, dtype=float)
-        if array.ndim == 3:
-            coords = np.argwhere(array > 0)
-            if len(coords) == 0:
-                lower = np.zeros(3, dtype=float)
-                upper = np.asarray(array.shape, dtype=float) - 1.0
-            else:
-                lower = np.min(coords, axis=0).astype(float)
-                upper = np.max(coords, axis=0).astype(float)
-        else:
-            coords = array.reshape(-1, 3)
-            finite_mask = np.all(np.isfinite(coords), axis=1)
-            if not finite_mask.any():
-                return
-            finite = coords[finite_mask]
-            lower = np.min(finite, axis=0)
-            upper = np.max(finite, axis=0)
+        bounds = self._render_bounds_for_focus(data, data_kind)
+        if bounds is None:
+            return
+        lower, upper = bounds
         center = tuple(((lower + upper) / 2.0).tolist())
         span = float(np.max(upper - lower))
 
@@ -5409,6 +5902,10 @@ class FlatmapProjectionWidget(QWidget):
         if plane_mode == FLATMAP_PLANE_MODE_ALLEN_LAYERS:
             labels = metadata.get("allen_layer_labels") or ALLEN_ISOCORTEX_LAYER_LABELS
             return tuple(str(label) for label in labels)
+        if plane_mode == FLATMAP_PLANE_MODE_FLAT:
+            # A collapsed render has a single unnamed plane; there is no depth
+            # bin or atlas layer to caption.
+            return None
         if plane_mode == FLATMAP_PLANE_MODE_DEPTH:
             render_summary = metadata.get("render_summary")
             if isinstance(render_summary, Mapping):
@@ -5470,17 +5967,35 @@ class FlatmapProjectionWidget(QWidget):
 
         state["plane_labels"] = self._plane_labels_for_layer(layer)
         state["plane_caption"] = axis_labels[0]
-        state["plane_count"] = self._plane_count_for_layer(layer, state["plane_labels"])
+        state["plane_count"] = self._plane_count_for_layer(
+            layer,
+            state["plane_labels"],
+            axis_labels,
+        )
         self._connect_display_dims_events(viewer)
         self._on_display_dims_step_changed()
 
     @staticmethod
-    def _plane_count_for_layer(layer, plane_labels: tuple[str, ...] | None) -> int:
+    def _plane_count_for_layer(
+        layer,
+        plane_labels: tuple[str, ...] | None,
+        axis_labels: tuple[str, ...],
+    ) -> int:
+        """Return how many planes a layer stacks, or ``0`` for none.
+
+        ``axis_labels`` decides whether a plane axis exists at all: a
+        depth-collapsed render names two axes and has no planes.  The data-shape
+        fallback then applies only to layers whose array rank matches the axis
+        count -- an image.  A Points array is ``(N, ndim)`` and a Vectors array
+        is ``(M, 2, ndim)``, so their leading size counts records, not planes.
+        """
         if plane_labels:
             return len(plane_labels)
+        if len(axis_labels) < 3:
+            return 0
         data = getattr(layer, "data", None)
         shape = getattr(data, "shape", None)
-        if shape is not None and len(shape) >= 3:
+        if shape is not None and len(shape) == len(axis_labels):
             return int(shape[0])
         return 0
 
@@ -5544,6 +6059,18 @@ class FlatmapProjectionWidget(QWidget):
 
         plane_count = int(state.get("plane_count") or 0)
         if plane_count <= 0:
+            # A depth-collapsed render has no planes to name.  Leaving the
+            # overlay alone would keep a previous render's caption (for example
+            # "Allen layer: L2/3  (plane 2 of 6)") on a canvas that no longer
+            # shows a plane stack, so retire it instead.
+            try:
+                text_overlay.text = ""
+                text_overlay.visible = False
+            except Exception:
+                logger.debug(
+                    "Failed to hide the flatmap plane label.",
+                    exc_info=True,
+                )
             return
         current_step = getattr(getattr(viewer, "dims", None), "current_step", None)
         try:

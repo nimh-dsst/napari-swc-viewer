@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -22,6 +22,13 @@ DEFAULT_FLATMAP_DEPTH_BIN_UM = 25.0
 MAX_FLATMAP_HEATMAP_VOXELS = 100_000_000
 DEFAULT_LOOKUP_STATS_CHUNK_VOXELS = 10_000_000
 
+# Upper bound on segments drawn by a 2D flatmap Vectors layer.  napari builds a
+# mesh per vector, so a whole-file render (tens of millions of parent-child
+# edges) stalls vispy.  Rendering only the first N would draw some neurons
+# completely and omit others with no indication which, so callers refuse
+# instead of truncating.
+MAX_FLATMAP_VECTOR_SEGMENTS = 250_000
+
 # Heatmap color modes. These values match the widget-side ``_HEATMAP_COLOR_*``
 # constants so a mode selected in the UI can be passed straight through.
 FLATMAP_HEATMAP_COLOR_SINGLE = "single"
@@ -29,6 +36,8 @@ FLATMAP_HEATMAP_COLOR_INDIVIDUAL = "individual"
 FLATMAP_HEATMAP_COLOR_CLUSTER = "cluster"
 FLATMAP_PLANE_MODE_DEPTH = "depth"
 FLATMAP_PLANE_MODE_ALLEN_LAYERS = "allen_layers"
+# A flat render has no plane axis at all: flatmap XY only, depth collapsed.
+FLATMAP_PLANE_MODE_FLAT = "flat"
 
 # Bilateral precomputed styles map onto the ``*_shaped``/``*_square`` column
 # families that carry ready-to-render flatmap coordinates.
@@ -142,6 +151,20 @@ class FlatmapGroupedVolume:
     volume: np.ndarray
     rendered_nodes: int
     nonzero_voxels: int
+
+
+@dataclass(frozen=True)
+class FlatmapSegmentVectors:
+    """Parent-child flatmap segments in napari ``Vectors`` layout.
+
+    ``data`` is ``(M, 2, 2)``: ``data[:, 0]`` holds each segment's start and
+    ``data[:, 1]`` its direction, both in ``(row, col)`` image-pixel order --
+    the ``[start, direction]`` form a napari ``Vectors`` layer expects.
+    """
+
+    data: np.ndarray
+    file_ids: tuple[object, ...]
+    total_segments: int
 
 
 @dataclass(frozen=True)
@@ -465,6 +488,91 @@ def _bin_flat_values(
     return np.clip(out, 0, bins - 1)
 
 
+def flatmap_pixel_coordinates(
+    values: np.ndarray,
+    bounds: tuple[float, float],
+    bins: int,
+) -> np.ndarray:
+    """Return continuous image-pixel coordinates for raw flatmap values.
+
+    :func:`_bin_flat_values` floors a scaled value to an integer bin index.
+    napari draws image pixel ``k`` centered on coordinate ``k``, spanning
+    ``[k - 0.5, k + 0.5]``, so a value at the center of bin ``k`` scales to
+    ``k + 0.5`` and its pixel-aligned coordinate is ``k``.  Hence the 0.5
+    subtraction: without it every overlay built from these coordinates sits half
+    a pixel off the heatmap it is drawn over.
+
+    Results are clipped to ``[-0.5, bins - 0.5]``, the image's outer edges, so a
+    value outside ``bounds`` cannot drag the camera away from the render.
+    """
+    lower, upper = _nondegenerate_bounds(bounds[0], bounds[1])
+    scaled = (np.asarray(values, dtype=float) - lower) / (upper - lower)
+    out = scaled * int(bins) - 0.5
+    return np.clip(out, -0.5, int(bins) - 0.5)
+
+
+def build_flatmap_segment_vectors(
+    segment_endpoints: np.ndarray,
+    file_ids: Sequence[object],
+    *,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    xy_bins: int,
+    max_segments: int = MAX_FLATMAP_VECTOR_SEGMENTS,
+) -> FlatmapSegmentVectors:
+    """Convert projected parent-child segments into napari vector data.
+
+    ``segment_endpoints`` is the ``(M, 2, 2)`` array
+    :func:`napari_swc_viewer.flatmap_projection.build_projected_segments`
+    returns: ``[:, 0]`` is the parent endpoint, ``[:, 1]`` the child endpoint,
+    and the last axis is ``(x_flat, y_flat)`` in raw flatmap units.  Output
+    coordinates are image pixels in ``(row, col)`` order so the vectors land on
+    the same grid as a flatmap heatmap built with the same bounds and bin count.
+
+    Raises ``ValueError`` above ``max_segments`` rather than truncating, because
+    a truncated render silently omits whole neurons.
+    """
+    endpoints = np.asarray(segment_endpoints, dtype=float)
+    if endpoints.ndim != 3 or endpoints.shape[1:] != (2, 2):
+        raise ValueError(
+            "segment_endpoints must have shape (M, 2, 2); "
+            f"got {endpoints.shape}."
+        )
+    total_segments = int(endpoints.shape[0])
+    resolved_file_ids = tuple(file_ids)
+    if len(resolved_file_ids) != total_segments:
+        raise ValueError(
+            "file_ids must name one neuron per segment; got "
+            f"{len(resolved_file_ids)} for {total_segments} segment(s)."
+        )
+    if total_segments > int(max_segments):
+        raise ValueError(
+            f"2D Vector mode would draw {total_segments:,} flatmap segments, "
+            f"above the {int(max_segments):,} limit napari can render "
+            "interactively. Select fewer neurons, or use 2D Heatmap to see the "
+            "whole set."
+        )
+
+    if total_segments == 0:
+        return FlatmapSegmentVectors(
+            data=np.empty((0, 2, 2), dtype=np.float32),
+            file_ids=(),
+            total_segments=0,
+        )
+
+    columns = flatmap_pixel_coordinates(endpoints[:, :, 0], x_bounds, xy_bins)
+    rows = flatmap_pixel_coordinates(endpoints[:, :, 1], y_bounds, xy_bins)
+    # napari image axes are (row, col), so y leads x.
+    start = np.column_stack((rows[:, 0], columns[:, 0]))
+    end = np.column_stack((rows[:, 1], columns[:, 1]))
+    data = np.stack([start, end - start], axis=1).astype(np.float32)
+    return FlatmapSegmentVectors(
+        data=data,
+        file_ids=resolved_file_ids,
+        total_segments=total_segments,
+    )
+
+
 def _depth_bin_count(
     depth_range_um: tuple[float, float],
     depth_bin_um: float,
@@ -622,8 +730,13 @@ def build_flatmap_render_data(
     invalid_negative_one_sentinel: bool = True,
     lookup_stats: FlatmapLookupStats | None = None,
     lookup_stats_chunk_voxels: int = DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
+    collapse_depth: bool = False,
 ) -> FlatmapRenderResult:
-    """Build a depth-aware flatmap node-count volume and point coordinates."""
+    """Build a depth-aware flatmap node-count volume and point coordinates.
+
+    ``collapse_depth`` drops the depth *axis* while keeping depth's say over
+    which nodes render; see :func:`_build_flatmap_render_data_for_bounds`.
+    """
     xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
     flatmap = _validate_flatmap_volume(flatmap_volume)
     depth = _validate_depth_volume(depth_volume)
@@ -657,6 +770,7 @@ def build_flatmap_render_data(
         xy_bins=xy_bins,
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include_depth_minus_one,
+        collapse_depth=collapse_depth,
     )
 
 
@@ -669,6 +783,7 @@ def build_flatmap_render_data_from_projected_nodes(
     x_bounds: tuple[float, float] | None = None,
     y_bounds: tuple[float, float] | None = None,
     depth_range_um: tuple[float, float] | None = None,
+    collapse_depth: bool = False,
 ) -> FlatmapRenderResult:
     """Build a depth-aware render using coordinates already stored in a table.
 
@@ -707,6 +822,7 @@ def build_flatmap_render_data_from_projected_nodes(
         xy_bins=xy_bins,
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include_depth_minus_one,
+        collapse_depth=collapse_depth,
     )
 
 
@@ -832,40 +948,85 @@ def build_allen_layer_stack_from_projected_nodes(
 
 def _rendered_binned_nodes(
     projected_nodes: pd.DataFrame,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
 ) -> pd.DataFrame:
-    required = ("render_valid", "depth_bin", "y_flat_bin", "x_flat_bin", "file_id")
+    """Filter a projected table to the rows a flatmap volume actually rendered.
+
+    A 2-length ``volume_shape`` selects a depth-collapsed render, which carries
+    no ``depth_bin`` column at all.  The rank of the volume decides that -- never
+    the presence of a column -- so a stray ``depth_bin`` cannot change behavior.
+    """
+    if len(volume_shape) not in (2, 3):
+        raise ValueError(f"volume_shape must be 2D or 3D; got {volume_shape}.")
+    has_depth_axis = len(volume_shape) == 3
+
+    bin_columns = ("depth_bin", "y_flat_bin", "x_flat_bin") if has_depth_axis else (
+        "y_flat_bin",
+        "x_flat_bin",
+    )
+    required = ("render_valid", *bin_columns, "file_id")
     missing = [column for column in required if column not in projected_nodes.columns]
     if missing:
         raise ValueError(f"Projected nodes are missing render column(s): {missing}")
 
-    if len(volume_shape) != 3:
-        raise ValueError(f"volume_shape must be 3D; got {volume_shape}.")
-    depth_size, y_size, x_size = (int(size) for size in volume_shape)
-
     table = projected_nodes.copy()
     render_valid = table["render_valid"].fillna(False).astype(bool).to_numpy()
-    depth_bins = pd.to_numeric(table["depth_bin"], errors="coerce").to_numpy(
-        dtype=float
-    )
-    y_bins = pd.to_numeric(table["y_flat_bin"], errors="coerce").to_numpy(dtype=float)
-    x_bins = pd.to_numeric(table["x_flat_bin"], errors="coerce").to_numpy(dtype=float)
-    finite_bins = np.isfinite(depth_bins) & np.isfinite(y_bins) & np.isfinite(x_bins)
-    in_bounds = (
-        finite_bins
-        & (depth_bins >= 0)
-        & (depth_bins < depth_size)
-        & (y_bins >= 0)
-        & (y_bins < y_size)
-        & (x_bins >= 0)
-        & (x_bins < x_size)
-    )
+    in_bounds = np.ones(len(table), dtype=bool)
+    for column, size in zip(bin_columns, volume_shape, strict=True):
+        bins = pd.to_numeric(table[column], errors="coerce").to_numpy(dtype=float)
+        in_bounds &= np.isfinite(bins) & (bins >= 0) & (bins < int(size))
+
     filtered = table.loc[render_valid & in_bounds].copy()
-    for column in ("depth_bin", "y_flat_bin", "x_flat_bin"):
+    for column in bin_columns:
         filtered.loc[:, column] = pd.to_numeric(
             filtered[column], errors="coerce"
         ).astype(np.int64)
     return filtered
+
+
+def rendered_plane_points(
+    projected_nodes: pd.DataFrame,
+    *,
+    plane_column: str | None,
+) -> tuple[np.ndarray, list[object]]:
+    """Return ``(points, file_ids)`` for the rows a render marked ``render_valid``.
+
+    ``plane_column`` names the axis-0 bin column of the render's coordinate
+    space -- ``"depth_bin"`` for a depth stack, ``"allen_layer_index"`` for an
+    Allen layer stack -- and ``None`` yields 2-D ``(y_bin, x_bin)`` points for a
+    depth-collapsed render.  Every render family writes ``render_valid``,
+    ``y_flat_bin`` and ``x_flat_bin``, so this reads coordinates the render
+    already assigned instead of each result type carrying its own point array.
+    """
+    bin_columns = ("y_flat_bin", "x_flat_bin")
+    if plane_column is not None:
+        bin_columns = (plane_column, *bin_columns)
+    required = ("render_valid", *bin_columns)
+    missing = [column for column in required if column not in projected_nodes.columns]
+    if missing:
+        raise ValueError(f"Projected nodes are missing render column(s): {missing}")
+
+    render_valid = (
+        projected_nodes["render_valid"].fillna(False).astype(bool).to_numpy()
+    )
+    columns = [
+        pd.to_numeric(projected_nodes[column], errors="coerce").to_numpy(dtype=float)
+        for column in bin_columns
+    ]
+    finite = np.ones(len(projected_nodes), dtype=bool)
+    for values in columns:
+        finite &= np.isfinite(values) & (values >= 0)
+    keep = np.flatnonzero(render_valid & finite)
+    if keep.size == 0:
+        return np.empty((0, len(bin_columns)), dtype=np.float64), []
+
+    points = np.column_stack([values[keep] for values in columns]).astype(np.float64)
+    file_ids = (
+        projected_nodes.iloc[keep]["file_id"].tolist()
+        if "file_id" in projected_nodes.columns
+        else []
+    )
+    return points, file_ids
 
 
 def _unique_in_order(values) -> tuple[object, ...]:
@@ -881,18 +1042,19 @@ def _unique_in_order(values) -> tuple[object, ...]:
 
 def _volume_for_node_group(
     group: pd.DataFrame,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
 ) -> np.ndarray:
     volume = np.zeros(volume_shape, dtype=np.float32)
     if group.empty:
         return volume
+    bin_columns = (
+        ("depth_bin", "y_flat_bin", "x_flat_bin")
+        if len(volume_shape) == 3
+        else ("y_flat_bin", "x_flat_bin")
+    )
     np.add.at(
         volume,
-        (
-            group["depth_bin"].to_numpy(dtype=np.int64),
-            group["y_flat_bin"].to_numpy(dtype=np.int64),
-            group["x_flat_bin"].to_numpy(dtype=np.int64),
-        ),
+        tuple(group[column].to_numpy(dtype=np.int64) for column in bin_columns),
         1.0,
     )
     return volume
@@ -900,7 +1062,7 @@ def _volume_for_node_group(
 
 def build_flatmap_file_id_volumes(
     projected_nodes: pd.DataFrame,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
 ) -> list[FlatmapGroupedVolume]:
     """Split rendered flatmap nodes into one scalar heatmap volume per file ID."""
     rendered = _rendered_binned_nodes(projected_nodes, volume_shape)
@@ -938,7 +1100,7 @@ def _cluster_for_file_id(
 
 def build_flatmap_cluster_volumes(
     projected_nodes: pd.DataFrame,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
     cluster_map: dict[object, int | None],
 ) -> list[FlatmapGroupedVolume]:
     """Split rendered flatmap nodes into scalar heatmap volumes by cluster ID."""
@@ -1126,15 +1288,30 @@ def _build_flatmap_render_data_for_bounds(
     xy_bins: int,
     depth_bin_um: float,
     include_depth_minus_one: bool,
+    collapse_depth: bool = False,
 ) -> FlatmapRenderResult:
+    """Bin projected nodes into a flatmap node-count volume.
+
+    ``collapse_depth`` removes the depth *axis* only: ``render_valid`` is
+    computed exactly as for a depth-binned render, so ``include_depth_minus_one``
+    still decides whether depth ``-1`` nodes contribute, and the result is the
+    depth volume summed over its plane axis.  The volume becomes
+    ``(xy_bins, xy_bins)``, points become ``(N, 2)``, and no ``depth_bin``
+    column is written.
+    """
     valid_depth_bins = _depth_bin_count(depth_range, depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
-    voxel_count = int(total_depth_bins * xy_bins * xy_bins)
+    volume_shape: tuple[int, ...] = (
+        (xy_bins, xy_bins)
+        if collapse_depth
+        else (total_depth_bins, xy_bins, xy_bins)
+    )
+    voxel_count = int(np.prod(volume_shape))
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
         raise ValueError(
             "Flatmap heatmap is too large: "
-            f"{total_depth_bins}x{xy_bins}x{xy_bins} voxels. "
+            f"{'x'.join(str(size) for size in volume_shape)} voxels. "
             "Use fewer XY bins or a larger depth bin."
         )
 
@@ -1185,29 +1362,26 @@ def _build_flatmap_render_data_for_bounds(
             raw_depth_bins = np.clip(raw_depth_bins, 0, valid_depth_bins - 1)
             depth_bins[valid_depth_nodes] = raw_depth_bins + sentinel_offset
 
-    volume = np.zeros((total_depth_bins, xy_bins, xy_bins), dtype=np.float32)
+    volume = np.zeros(volume_shape, dtype=np.float32)
     render_indices = np.flatnonzero(render_valid)
-    if render_indices.size:
-        np.add.at(
-            volume,
-            (
-                depth_bins[render_indices],
-                y_bins[render_indices],
-                x_bins[render_indices],
-            ),
-            1.0,
+    if collapse_depth:
+        scatter_columns: tuple[np.ndarray, ...] = (
+            y_bins[render_indices],
+            x_bins[render_indices],
         )
+    else:
+        scatter_columns = (
+            depth_bins[render_indices],
+            y_bins[render_indices],
+            x_bins[render_indices],
+        )
+    if render_indices.size:
+        np.add.at(volume, scatter_columns, 1.0)
 
     points = (
-        np.column_stack(
-            (
-                depth_bins[render_indices],
-                y_bins[render_indices],
-                x_bins[render_indices],
-            )
-        ).astype(np.float64)
+        np.column_stack(scatter_columns).astype(np.float64)
         if render_indices.size
-        else np.empty((0, 3), dtype=np.float64)
+        else np.empty((0, len(volume_shape)), dtype=np.float64)
     )
     point_file_ids = (
         table.iloc[render_indices]["file_id"].tolist()
@@ -1218,13 +1392,14 @@ def _build_flatmap_render_data_for_bounds(
     table.loc[:, "render_valid"] = render_valid
     table.loc[:, "x_flat_bin"] = x_bins
     table.loc[:, "y_flat_bin"] = y_bins
-    table.loc[:, "depth_bin"] = depth_bins
-    table.loc[:, "depth_bin_label"] = _depth_labels(
-        depth_bins,
-        depth_min_um=depth_range[0],
-        depth_bin_um=depth_bin_um,
-        sentinel_offset=sentinel_offset,
-    )
+    if not collapse_depth:
+        table.loc[:, "depth_bin"] = depth_bins
+        table.loc[:, "depth_bin_label"] = _depth_labels(
+            depth_bins,
+            depth_min_um=depth_range[0],
+            depth_bin_um=depth_bin_um,
+            sentinel_offset=sentinel_offset,
+        )
 
     if render_indices.size and "file_id" in table.columns:
         traces_represented = int(table.iloc[render_indices]["file_id"].nunique())
@@ -1244,8 +1419,11 @@ def _build_flatmap_render_data_for_bounds(
         nonzero_voxels=int(np.count_nonzero(volume)),
         traces_represented=traces_represented,
         xy_bins=xy_bins,
-        depth_bins=total_depth_bins,
-        depth_bin_um=depth_bin_um,
+        # A collapsed render has no depth planes and no depth bin size.  Zeros
+        # say exactly that: ``depth_plane_labels`` returns an empty tuple for
+        # them rather than inventing plane names for an axis that is not there.
+        depth_bins=0 if collapse_depth else total_depth_bins,
+        depth_bin_um=0.0 if collapse_depth else depth_bin_um,
         x_flat_min=x_bounds[0],
         x_flat_max=x_bounds[1],
         y_flat_min=y_bounds[0],
@@ -1299,7 +1477,7 @@ class FlatmapHeatmapVolumeResult:
     grouped_volumes: tuple[FlatmapGroupedVolume, ...]
     render_summary: FlatmapRenderSummary
     stats: FlatmapAggregateStats
-    volume_shape: tuple[int, int, int]
+    volume_shape: tuple[int, ...]
 
 
 def _sql_number(value: float) -> str:
@@ -1496,16 +1674,23 @@ def _scatter_bin_counts(
     volume: np.ndarray,
     frame: pd.DataFrame,
 ) -> None:
-    """Accumulate ``node_count`` into ``volume`` at (depth_bin, y_bin, x_bin)."""
+    """Accumulate ``node_count`` into ``volume`` at its bin coordinates.
+
+    A 3D ``volume`` is indexed by ``(depth_bin, y_bin, x_bin)``; a 2D one -- a
+    depth-collapsed render -- by ``(y_bin, x_bin)``, and the query that built
+    ``frame`` selected no depth column at all.
+    """
     if frame.empty:
         return
+    if volume.ndim == 3:
+        bin_columns = ("depth_bin", "y_bin", "x_bin")
+    elif volume.ndim == 2:
+        bin_columns = ("y_bin", "x_bin")
+    else:
+        raise ValueError(f"volume must be 2D or 3D; got {volume.ndim}D.")
     np.add.at(
         volume,
-        (
-            frame["depth_bin"].to_numpy(dtype=np.intp),
-            frame["y_bin"].to_numpy(dtype=np.intp),
-            frame["x_bin"].to_numpy(dtype=np.intp),
-        ),
+        tuple(frame[column].to_numpy(dtype=np.intp) for column in bin_columns),
         frame["node_count"].to_numpy(dtype=np.float32),
     )
 
@@ -1518,18 +1703,31 @@ def _query_flatmap_bin_counts(
     params: list[object],
     *,
     include_file_id: bool,
+    include_depth_bin: bool = True,
 ) -> pd.DataFrame:
+    """Group rendered nodes into sparse bin counts.
+
+    ``include_depth_bin=False`` collapses the depth axis: the depth bin is
+    dropped from both the projection and the grouping keys, so DuckDB returns
+    one row per flatmap XY bin.  ``where_sql`` is unchanged either way, so depth
+    still decides which nodes are counted.
+    """
     file_select = "file_id, " if include_file_id else ""
     file_group = ", file_id" if include_file_id else ""
+    depth_select = (
+        f"{expressions['depth_bin']} AS depth_bin,\n            "
+        if include_depth_bin
+        else ""
+    )
+    depth_group = "depth_bin, " if include_depth_bin else ""
     query = f"""
         SELECT
-            {file_select}{expressions["depth_bin"]} AS depth_bin,
-            {expressions["y_bin"]} AS y_bin,
+            {file_select}{depth_select}{expressions["y_bin"]} AS y_bin,
             {expressions["x_bin"]} AS x_bin,
             COUNT(*) AS node_count
         FROM {source_sql}
         WHERE {where_sql}
-        GROUP BY depth_bin, y_bin, x_bin{file_group}
+        GROUP BY {depth_group}y_bin, x_bin{file_group}
     """
     return (
         conn.execute(query, params).fetchdf()
@@ -1540,7 +1738,7 @@ def _query_flatmap_bin_counts(
 
 def _build_grouped_flatmap_volumes(
     counts: pd.DataFrame,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
     *,
     color_mode: str,
     cluster_map: dict[object, int | None] | None,
@@ -1614,7 +1812,7 @@ def _build_grouped_flatmap_volumes(
 
 def _empty_flatmap_volume_result(
     color_mode: str,
-    volume_shape: tuple[int, int, int],
+    volume_shape: tuple[int, ...],
     render_summary: FlatmapRenderSummary,
     stats: FlatmapAggregateStats,
 ) -> FlatmapHeatmapVolumeResult:
@@ -1649,6 +1847,7 @@ def build_flatmap_heatmap_volume_result(
     cluster_map: dict[object, int | None] | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
     progress_total: int = 3,
+    collapse_depth: bool = False,
 ) -> FlatmapHeatmapVolumeResult:
     """Build a flatmap heatmap volume from precomputed Parquet columns via DuckDB.
 
@@ -1679,6 +1878,12 @@ def build_flatmap_heatmap_volume_result(
     cluster_map
         ``file_id -> cluster id`` mapping used only when ``color_mode`` is
         ``cluster``.
+    collapse_depth
+        Drop the depth axis, yielding an ``(xy_bins, xy_bins)`` volume equal to
+        the depth volume summed over its planes.  Which nodes are counted is
+        unchanged -- ``depth_range_um``, ``depth_bin_um``, and
+        ``include_depth_minus_one`` still govern the ``WHERE`` clause -- so only
+        the grouping keys differ.
     """
     suffix = _style_suffix(style_key)
     xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
@@ -1692,13 +1897,17 @@ def build_flatmap_heatmap_volume_result(
     valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
-    volume_shape = (total_depth_bins, xy_bins, xy_bins)
+    volume_shape: tuple[int, ...] = (
+        (xy_bins, xy_bins)
+        if collapse_depth
+        else (total_depth_bins, xy_bins, xy_bins)
+    )
 
-    voxel_count = int(total_depth_bins * xy_bins * xy_bins)
+    voxel_count = int(np.prod(volume_shape))
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
         raise ValueError(
             "Flatmap heatmap is too large: "
-            f"{total_depth_bins}x{xy_bins}x{xy_bins} voxels. "
+            f"{'x'.join(str(size) for size in volume_shape)} voxels. "
             "Use fewer XY bins or a larger depth bin."
         )
 
@@ -1737,8 +1946,9 @@ def build_flatmap_heatmap_volume_result(
             nonzero_voxels=int(nonzero_voxels),
             traces_represented=stats.traces_represented,
             xy_bins=xy_bins,
-            depth_bins=total_depth_bins,
-            depth_bin_um=depth_bin_um,
+            # Zeros mark "no depth axis", matching the pandas collapsed render.
+            depth_bins=0 if collapse_depth else total_depth_bins,
+            depth_bin_um=0.0 if collapse_depth else depth_bin_um,
             x_flat_min=x_lower,
             x_flat_max=x_upper,
             y_flat_min=y_lower,
@@ -1777,6 +1987,7 @@ def build_flatmap_heatmap_volume_result(
             where_sql,
             file_params,
             include_file_id=False,
+            include_depth_bin=not collapse_depth,
         )
         volume = np.zeros(volume_shape, dtype=np.float32)
         _scatter_bin_counts(volume, counts)
@@ -1803,6 +2014,7 @@ def build_flatmap_heatmap_volume_result(
         where_sql,
         file_params,
         include_file_id=True,
+        include_depth_bin=not collapse_depth,
     )
     groups, combined = _build_grouped_flatmap_volumes(
         counts,

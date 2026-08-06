@@ -519,6 +519,53 @@ def test_build_projected_segments_skips_only_invalid_edges() -> None:
     assert result.summary.unmapped_lookup_nodes == 1
 
 
+def test_build_projected_segments_honors_a_chosen_validity_column() -> None:
+    # A depth-collapsed render marks nodes valid on flatmap XY alone, so the
+    # middle node here is rendered even though its depth is invalid.  Selecting
+    # that render's own column has to keep the edges the render included.
+    nodes = pd.DataFrame(
+        {
+            "file_id": ["a.swc"] * 3,
+            "node_id": [1, 2, 3],
+            "parent_id": [-1, 1, 2],
+            "x_flat": [0.0, 1.0, 2.0],
+            "y_flat": [0.0, 1.0, 2.0],
+            "valid": [True, False, True],
+            "render_valid": [True, True, True],
+        }
+    )
+
+    depth_gated = build_projected_segments(nodes)
+    collapsed = build_projected_segments(nodes, validity_column="render_valid")
+
+    assert depth_gated.data.shape == (0, 2, 2)
+    assert collapsed.data.shape == (2, 2, 2)
+    assert collapsed.source_node_ids == [1, 2]
+    assert collapsed.target_node_ids == [2, 3]
+
+
+def test_build_projected_segments_keeps_neurons_separate_by_file_id() -> None:
+    # node_id is only unique within a file_id, so two neurons reusing the same
+    # ids must not be joined into a cross-neuron edge.
+    nodes = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "a.swc", "b.swc", "b.swc"],
+            "node_id": [1, 2, 1, 2],
+            "parent_id": [-1, 1, -1, 1],
+            "x_flat": [0.0, 1.0, 10.0, 11.0],
+            "y_flat": [0.0, 1.0, 10.0, 11.0],
+            "valid": [True] * 4,
+        }
+    )
+
+    segments = build_projected_segments(nodes)
+
+    assert segments.data.shape == (2, 2, 2)
+    assert segments.file_ids == ["a.swc", "b.swc"]
+    np.testing.assert_allclose(segments.data[0, 0], [0.0, 0.0])
+    np.testing.assert_allclose(segments.data[1, 0], [10.0, 10.0])
+
+
 def test_summarize_projection_counts_multiple_invalid_reasons() -> None:
     projected = pd.DataFrame(
         {

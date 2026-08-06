@@ -36,6 +36,7 @@ Unless a use case says otherwise:
 | [UC-008](#uc-008-create-combined-and-individual-neuron-heatmaps) | Create one combined heatmap or color-matched heatmaps for individual neurons | Not run |
 | [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
 | [UC-010](#uc-010-identify-axon-termini-and-prune-neurons-lacking-them) | Locate termini as childless axon-typed nodes, then select and remove the neurons that have none (see the annotation caution) | Partially run |
+| [UC-011](#uc-011-view-a-depth-free-2d-flatmap-and-per-neuron-vector-traces) | View a plain flatmap with no depth axis as a 2D heatmap or per-neuron vector traces, and place somas in the current render's space | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -545,16 +546,23 @@ axes without asserting physical units or anatomical direction.
    node-count semantics. **Export CSV...** includes `allen_layer_index` and
    `allen_layer_label` for every classified node. Planar cached labels,
    surfaces, and outlines are unavailable in this explicit fallback mode.
-9. **Action:** Switch **Render** back to **3D Heatmap** and project, then
-   switch to **3D Points** and project again.
+9. **Action:** With the categorical stack on screen, click **Add Soma**.
+   **Expected:** Somas appear on the layer plane their own `region_id` assigns,
+   not on a depth bin, so moving the plane slider shows each soma only on its own
+   layer. The window stays in 2D and the **Allen layer** plane caption and
+   **Flatmap X** / **Flatmap Y** labels remain. UC-011 covers the soma coordinate
+   space across every render mode.
+10. **Action:** Switch **Render** back to **3D Heatmap** and project, then
+    switch to **3D Points** and project again.
    **Expected:** The categorical stack is removed, numeric depth controls and
    compatible cached-region actions return, and a new projection uses the
    original depth-binned behavior. The plane axis is now captioned **Depth
    bin** and the canvas line reports the current plane's micron range, for
    example `Depth bin: 900-925 um  (plane 37 of 75)`. **3D Points** has no
    plane axis, so the canvas line and axis arrows clear rather than keeping a
-   stale layer name.
-10. **Action:** Retry layer rendering without a loaded atlas, then with a
+   stale layer name. Any soma layer from step 9 is removed with the stack,
+   because its layer-plane coordinates do not carry over.
+11. **Action:** Retry layer rendering without a loaded atlas, then with a
     Parquet missing `region_id`, and finally with selected neurons that have no
     flatmap-valid terminal Isocortex-layer nodes. Also try **Show Region
     Labels** with no active Atlas/Custom selection, a non-Isocortex-only Atlas
@@ -566,10 +574,13 @@ axes without asserting physical units or anatomical direction.
 
 - Status: Not run
 - Last verified: Never
-- Notes: The plane-name and axis-arrow annotations in steps 3, 4, and 9 were
+- Notes: The plane-name and axis-arrow annotations in steps 3, 4, and 10 were
   added on 2026-08-05 and have not been exercised in napari. Automated tests
   cover them against a viewer double only, which cannot show whether the
-  overlays are legible or correctly placed on the canvas.
+  overlays are legible or correctly placed on the canvas. Step 9 was added on
+  2026-08-05 with the per-render-mode soma fix and has not been exercised either;
+  before that fix, **Add Soma** placed somas on depth bins and forced the window
+  back to 3D.
 
 ### UC-006: Inspect and Query Custom Isocortex Layer Regions
 
@@ -819,7 +830,7 @@ The user can turn selected rows in the Data-tab neuron table into either one
 combined node-count heatmap or one color-matched heatmap per neuron. Individual
 layers preserve the selected cohort captured when the run starts and make it
 possible to compare neuron occupancy independently. A monochrome cohort is
-automatically assigned distinct Turbo colors so its rendered neurons, table
+automatically assigned distinct palette colors so its rendered neurons, table
 swatches, and heatmaps remain visually associated.
 
 **Prerequisites**
@@ -870,7 +881,7 @@ swatches, and heatmaps remain visually associated.
 5. **Action:** Select the same three cohort rows, set all three color swatches
    to the same RGB color, record the fourth neuron's color, and choose **Add
    Heatmap** > **Individual Heatmaps** again.
-   **Expected:** The three selected neurons receive distinct Turbo colors in
+   **Expected:** The three selected neurons receive distinct palette colors in
    stable neuron-ID order, and rendered versions of those neurons update to the
    same colors. The fourth neuron's color is unchanged. Each newly created
    heatmap matches its source neuron's new color.
@@ -1130,6 +1141,110 @@ away before the test would leave their parents looking childless.
   running the detection functions over all 728,703,227 rows, but those UI steps
   have not been exercised. Steps 1 and 12-17 cover the move to the **Data** tab
   and the table-selection dropdown and have not been exercised in napari either.
+
+### UC-011: View a Depth-Free 2D Flatmap and Per-Neuron Vector Traces
+
+**Capability**
+
+The user can view selected neuron morphology on a plain flatmap with no depth
+axis at all, either as one 2D node-count image (**2D Heatmap**) or as per-neuron
+line traces (**2D Vector**). This is for collaborators who want the flatmap
+footprint of an arbor without cortical-depth structure.
+
+Collapsing removes the depth *axis*, not any node: **Exclude depth -1 nodes**
+still decides whether depth `-1` nodes render, so a **2D Heatmap** is exactly the
+matching **3D Heatmap** summed over its planes and reports the same node counts.
+The flatmap window opens in 2D with only **Flatmap Y** / **Flatmap X** axes, no
+plane slider, and no plane caption.
+
+**2D Vector** draws one line per parent-child edge on the same pixel grid the
+**2D Heatmap** uses, colored per neuron from the table. It is a per-node render
+limited to 250,000 segments; above that it refuses rather than drawing an
+incomplete subset of neurons.
+
+**Add Soma** places somas in whichever coordinate space the current **Render**
+mode uses, so soma points land on the visible render in all five modes.
+
+**Prerequisites**
+
+- Load a neuron Parquet with valid flatmap coordinates. For **Precomputed
+  Parquet + Cache**, use a version-3 Parquet produced by UC-003.
+- Include neurons whose nodes span a range of cortical depths, so collapsing is
+  visibly different from a single depth plane.
+- To check the over-limit behavior, have a table large enough that all selected
+  neurons together exceed 250,000 rendered nodes.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** Select a few neuron rows, open **Flatmap**, choose **Precomputed
+   Parquet + Cache** and **Both hemispheres, shaped**, set **Render** to **2D
+   Heatmap**, and click **Project to Flatmap**.
+   **Expected:** The flatmap window shows one image named **Isocortex Flatmap 2D
+   Heatmap** in 2D. There is no plane slider and no plane caption in the
+   upper-left corner. Labelled **Flatmap X** / **Flatmap Y** axis arrows are
+   drawn at the image origin. The summary panel ends with `Depth: collapsed into
+   one flatmap plane`.
+2. **Action:** Inspect the control row.
+   **Expected:** **XY bins** is available unless locked by the cache profile.
+   **Depth bin** is disabled because there are no depth bins to size, while
+   **Exclude depth -1 nodes** stays enabled. **Show Region Labels**, cached
+   surfaces, and outlines are all disabled because their geometry is depth-based.
+3. **Action:** Note the rendered-node count, switch **Render** to **3D Heatmap**,
+   click **Project to Flatmap**, and compare.
+   **Expected:** The rendered-node and flatmap-valid counts match the 2D render
+   exactly for the same **Exclude depth -1 nodes** setting. The depth-binned
+   stack has a plane slider captioned **Depth bin**.
+4. **Action:** Switch back to **2D Heatmap**, toggle **Exclude depth -1 nodes**,
+   and project again.
+   **Expected:** The rendered-node count changes by the number of depth `-1`
+   nodes, confirming the checkbox still governs a depth-free render.
+5. **Action:** Set **Heatmap colors** to **Individual neurons** and project.
+   **Expected:** One tinted 2D image per neuron appears, each named `Isocortex
+   Flatmap 2D Heatmap: <file id>`, and the images overlay additively.
+6. **Action:** With a small selection, set **Render** to **2D Vector** and click
+   **Project to Flatmap**.
+   **Expected:** A layer named **Isocortex Flatmap 2D Vectors** draws each
+   neuron's arbor as connected lines in its table color. **Heatmap colors** is
+   disabled. The summary reports the rendered segment count.
+7. **Action:** Re-project **2D Heatmap** so both layers are present, then zoom in
+   on a soma and on a distal arbor tip.
+   **Expected:** The vector lines sit **on** the lit heatmap pixels with no
+   visible half-pixel offset in either direction. This is the check automated
+   tests cannot make.
+8. **Action:** Select every neuron in the table and project in **2D Vector**.
+   **Expected:** The projection is refused with a message naming the segment
+   count and the 250,000 limit and suggesting 2D Heatmap. No vector layer is
+   added, no blank detached flatmap window is left open, and the viewer stays
+   responsive.
+9. **Action:** In each of the five **Render** modes in turn — **3D Heatmap**, **3D
+   Points**, **2D Heatmap**, **2D Vector**, **Allen Layer Heatmap (2D stack)** —
+   project, then click **Add Soma**.
+   **Expected:** In every mode the somas appear on the render that is on screen.
+   In the two 2D modes and the Allen stack the window stays in 2D. In the Allen
+   stack the plane caption (for example `Allen layer: L2/3  (plane 2 of 6)`) and
+   the **Flatmap X** / **Flatmap Y** labels survive adding the somas, and moving
+   the plane slider shows somas only on their own layer's plane.
+10. **Action:** With a soma layer visible, change **Render** to a different mode.
+    **Expected:** The **Isocortex Flatmap Somas** layer is removed, because its
+    bin coordinates belong to the previous coordinate space. **Add Soma** can be
+    clicked again to rebuild it for the new mode.
+11. **Action:** With **Render** set to **Allen Layer Heatmap (2D stack)** and a
+    Parquet that has no `region_id` column, click **Add Soma**.
+    **Expected:** The action reports that `region_id` is required and names both
+    remedies (regenerate the Parquet, or switch to a depth or 2D mode). No soma
+    layer is added and no somas are silently placed on depth bins.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: Added on 2026-08-05 and not yet exercised in napari. Automated tests
+  cover the collapse invariant, the pixel-centering math, the segment limit, and
+  the per-mode soma coordinate space, and the vector/heatmap alignment was
+  confirmed numerically against `AUDpo_left_brainglobe_flatmap.parquet` (interior
+  vector endpoints round to exactly their heatmap bin). None of that shows
+  whether the overlay reads correctly on the canvas, so step 7 still needs eyes.
 
 ## Use-Case Template
 

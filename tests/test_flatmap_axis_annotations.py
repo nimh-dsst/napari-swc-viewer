@@ -155,6 +155,94 @@ def test_depth_planes_are_named_by_micron_range(widget_class, viewer, host) -> N
     assert viewer.text_overlay.text == "Depth bin: 50-75 um  (plane 3 of 3)"
 
 
+def test_flat_render_names_only_two_axes(widget_class, viewer, host) -> None:
+    image = np.zeros((8, 8), dtype=np.float32)
+    image[3, 5] = 1.0
+    layer = viewer.add_image(
+        image,
+        name="Isocortex Flatmap 2D Heatmap",
+        axis_labels=widget_class._flat_axis_labels(),
+        metadata={"flatmap_plane_mode": "flat"},
+    )
+    viewer.dims.ndisplay = 2
+
+    host._apply_display_axis_annotations(layer)
+
+    assert viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert viewer.axes.visible is True
+    # A collapsed render has no plane axis, so there is no plane to caption.
+    assert viewer.text_overlay.visible is False
+    assert viewer.text_overlay.text == ""
+
+
+def test_flat_render_retires_a_previous_plane_caption(
+    widget_class,
+    viewer,
+    host,
+) -> None:
+    stack = _allen_layer_image(widget_class, viewer)
+    host._apply_display_axis_annotations(stack)
+    assert viewer.text_overlay.text.startswith("Allen layer")
+
+    viewer.layers.remove(stack)
+    flat = viewer.add_image(
+        np.ones((8, 8), dtype=np.float32),
+        name="Isocortex Flatmap 2D Heatmap",
+        axis_labels=widget_class._flat_axis_labels(),
+        metadata={"flatmap_plane_mode": "flat"},
+    )
+    host._apply_display_axis_annotations(flat)
+
+    assert viewer.text_overlay.visible is False
+    assert viewer.text_overlay.text == ""
+
+
+def test_soma_points_layer_keeps_the_allen_plane_caption(
+    widget_class,
+    viewer,
+    host,
+) -> None:
+    stack = _allen_layer_image(widget_class, viewer)
+    host._apply_display_axis_annotations(stack)
+    viewer.dims.set_current_step(0, 1)
+    assert viewer.text_overlay.text == "Allen layer: L2/3  (plane 2 of 6)"
+
+    # napari 0.6 accepts axis_labels on a Points layer; that is what keeps the
+    # soma overlay from reading as a foreign layer.
+    somas = viewer.add_points(
+        np.asarray([[1.0, 2.0, 3.0]]),
+        name="Isocortex Flatmap Somas",
+        axis_labels=widget_class._allen_layer_axis_labels(),
+        metadata={
+            "flatmap_plane_mode": "allen_layers",
+            "allen_layer_labels": ["L1", "L2/3", "L4", "L5", "L6a", "L6b"],
+        },
+    )
+
+    host._apply_display_axis_annotations(somas)
+
+    assert viewer.dims.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
+    assert viewer.axes.visible is True
+    assert viewer.text_overlay.visible is True
+    assert viewer.text_overlay.text == "Allen layer: L2/3  (plane 2 of 6)"
+
+
+def test_flat_vector_layer_keeps_two_axis_labels(widget_class, viewer, host) -> None:
+    layer = viewer.add_vectors(
+        np.asarray([[[0.0, 0.0], [3.0, 4.0]]], dtype=np.float32),
+        name="Isocortex Flatmap 2D Vectors",
+        axis_labels=widget_class._flat_axis_labels(),
+        vector_style="line",
+        metadata={"flatmap_plane_mode": "flat"},
+    )
+    viewer.dims.ndisplay = 2
+
+    host._apply_display_axis_annotations(layer)
+
+    assert viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert viewer.text_overlay.visible is False
+
+
 def test_foreign_layer_axis_labels_are_not_copied(viewer, host) -> None:
     points = viewer.add_points(
         np.zeros((2, 3), dtype=float),

@@ -15,8 +15,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
-import numpy as np
 from qtpy.QtCore import QItemSelection, QItemSelectionModel, Qt, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -33,6 +31,7 @@ from qtpy.QtWidgets import (
 )
 
 from ..cluster_assignments import ClusterAssignmentStore
+from ..neuron_palette import neuron_palette
 from ..neuron_table_ops import (
     ClusterFilterSelection,
     GRAY_RGBA,
@@ -42,7 +41,7 @@ from ..neuron_table_ops import (
     cluster_ids_available,
     cluster_sort_value,
     has_unclustered_entries,
-    recolor_cluster_turbo,
+    recolor_cluster_distinct,
     summarize_neuron_table,
     visibility_for_selected_cluster,
 )
@@ -334,8 +333,7 @@ class NeuronTableWidget(QWidget):
         self._configure_header_resize_modes()
 
         n = len(neurons)
-        cmap = plt.get_cmap("turbo")
-        colors = [list(cmap(t)) for t in np.linspace(0, 1, max(n, 1))]
+        colors = neuron_palette(n)
 
         self._table.setRowCount(n)
 
@@ -1063,14 +1061,16 @@ class NeuronTableWidget(QWidget):
             self.visibility_changed.emit(self.get_visibility_map())
             self.state_changed.emit()
 
-    def recolor_cluster_turbo(
+    def recolor_cluster_distinct(
         self,
         selection: ClusterFilterSelection | int | None,
         gray_others: bool = True,
     ) -> None:
-        """Recolor selected groups with turbo; optionally gray non-selected neurons."""
+        """Recolor selected groups distinctly; optionally gray non-selected."""
         cluster_map = self.get_cluster_map()
-        updates = recolor_cluster_turbo(cluster_map, selection, gray_others=gray_others)
+        updates = recolor_cluster_distinct(
+            cluster_map, selection, gray_others=gray_others
+        )
         if not updates:
             return
 

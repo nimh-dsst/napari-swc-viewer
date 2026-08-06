@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from collections.abc import Iterable, Mapping
 
-import numpy as np
-from matplotlib import colormaps
+from .neuron_palette import neuron_palette
 
 GRAY_RGBA = [0.5, 0.5, 0.5, 1.0]
 
@@ -149,28 +148,24 @@ def visibility_for_selected_cluster(
     return cluster_filter_matches(cluster_by_file, selection)
 
 
-def turbo_colors_for_file_ids(
+def distinct_colors_for_file_ids(
     file_ids: Iterable[object],
 ) -> dict[object, list[float]]:
-    """Return deterministic Turbo colors for the supplied neuron IDs."""
+    """Return deterministic, dark-canvas-legible colors for the given neurons."""
     ordered_file_ids = sorted(set(file_ids), key=str)
     if not ordered_file_ids:
         return {}
 
-    cmap = colormaps["turbo"]
-    samples = np.linspace(0.0, 1.0, len(ordered_file_ids))
-    return {
-        file_id: [float(channel) for channel in cmap(float(sample))]
-        for file_id, sample in zip(ordered_file_ids, samples)
-    }
+    colors = neuron_palette(len(ordered_file_ids))
+    return dict(zip(ordered_file_ids, colors))
 
 
-def recolor_cluster_turbo(
+def recolor_cluster_distinct(
     cluster_by_file: Mapping[str, int | None],
     selection: ClusterFilterSelection | int | None,
     gray_others: bool = True,
 ) -> dict[str, list[float]]:
-    """Return color updates for a selected cluster using turbo linear sampling."""
+    """Return color updates giving a selected cluster distinct neuron colors."""
     selected = _coerce_cluster_selection(selection)
     if selected.is_all:
         return {}
@@ -180,7 +175,7 @@ def recolor_cluster_turbo(
     if not member_ids and not gray_others:
         return {}
 
-    updates = turbo_colors_for_file_ids(member_ids)
+    updates = distinct_colors_for_file_ids(member_ids)
 
     if gray_others:
         for file_id in cluster_by_file:

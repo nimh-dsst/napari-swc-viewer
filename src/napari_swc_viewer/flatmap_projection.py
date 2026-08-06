@@ -401,11 +401,21 @@ def project_neuron_nodes_to_flatmap(
     return selected
 
 
-def build_projected_segments(projected_nodes: pd.DataFrame) -> ProjectedSegments:
-    """Build 2D parent-child line segments where both endpoints are valid."""
+def build_projected_segments(
+    projected_nodes: pd.DataFrame,
+    *,
+    validity_column: str = "valid",
+) -> ProjectedSegments:
+    """Build 2D parent-child line segments where both endpoints are valid.
+
+    ``validity_column`` names the boolean column an endpoint must satisfy.  The
+    default ``"valid"`` requires flatmap *and* depth validity.  A depth-collapsed
+    render passes ``"render_valid"`` instead, so the drawn edges match exactly
+    the node set that render included.
+    """
     _require_columns(
         projected_nodes,
-        ("file_id", "node_id", "parent_id", "x_flat", "y_flat", "valid"),
+        ("file_id", "node_id", "parent_id", "x_flat", "y_flat", validity_column),
     )
 
     segment_arrays: list[np.ndarray] = []
@@ -416,22 +426,24 @@ def build_projected_segments(projected_nodes: pd.DataFrame) -> ProjectedSegments
     for file_id, group in projected_nodes.groupby("file_id", sort=False):
         child = group.reset_index(drop=True).loc[
             :,
-            ["node_id", "parent_id", "x_flat", "y_flat", "valid"],
+            ["node_id", "parent_id", "x_flat", "y_flat", validity_column],
         ]
         parent = group.reset_index(drop=True).loc[
             :,
-            ["node_id", "x_flat", "y_flat", "valid"],
+            ["node_id", "x_flat", "y_flat", validity_column],
         ]
         parent = parent.rename(
             columns={
                 "node_id": "parent_id",
                 "x_flat": "parent_x_flat",
                 "y_flat": "parent_y_flat",
-                "valid": "parent_valid",
+                validity_column: "parent_valid",
             }
         )
         merged = child.merge(parent, on="parent_id", how="left", sort=False)
-        valid_edges = merged["valid"].eq(True) & merged["parent_valid"].eq(True)
+        valid_edges = merged[validity_column].eq(True) & merged["parent_valid"].eq(
+            True
+        )
         if not bool(valid_edges.any()):
             continue
 

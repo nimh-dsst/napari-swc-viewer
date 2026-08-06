@@ -66,7 +66,10 @@ from ..auto_center import (
 from ..cluster_assignments import ClusterAssignmentStore
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
-from ..neuron_table_ops import ClusterFilterSelection, turbo_colors_for_file_ids
+from ..neuron_table_ops import (
+    ClusterFilterSelection,
+    distinct_colors_for_file_ids,
+)
 from ..flatmap_parquet import read_flatmap_parquet_transform_info
 from ..isocortex_layers import (
     CustomRegionSelectionGroup,
@@ -8297,11 +8300,11 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.set_all_visible()
 
     def _recolor_selected_cluster(self) -> None:
-        """Recolor selected cluster groups with turbo and gray non-selected neurons."""
+        """Recolor selected cluster groups distinctly and gray non-selected neurons."""
         selection = self._selected_cluster_filter()
         if selection.is_all:
             return
-        self._neuron_table.recolor_cluster_turbo(
+        self._neuron_table.recolor_cluster_distinct(
             selection,
             gray_others=True,
         )
@@ -8511,7 +8514,7 @@ class NeuronViewerWidget(QWidget):
         if self._selected_neuron_colors_are_monochrome(
             list(colors_by_file_id.values())
         ):
-            colors_by_file_id = turbo_colors_for_file_ids(selected_file_ids)
+            colors_by_file_id = distinct_colors_for_file_ids(selected_file_ids)
             self._neuron_table.update_colors(colors_by_file_id)
 
         requests = [
