@@ -16,6 +16,8 @@ from napari_swc_viewer.flatmap_region_cache import (
     RegionCacheValidationError,
     build_region_cache_profile,
     materialize_allen_layer_region_selection,
+    materialize_flat_region_outlines,
+    materialize_flat_region_selection,
     materialize_region_outlines,
     materialize_region_selection,
     materialize_region_surface,
@@ -289,6 +291,196 @@ def test_allen_layer_region_selection_reports_mapped_but_empty_regions(tmp_path)
     assert not np.any(result.labels)
 
 
+def _nested_structures():
+    """Two single-child parents that are absent from cache occupancy."""
+    return {
+        6: {"id": 6, "acronym": "P6", "structure_id_path": [6]},
+        7: {"id": 7, "acronym": "P7", "structure_id_path": [7]},
+        2: {"id": 2, "acronym": "C2", "structure_id_path": [6, 2]},
+        3: {"id": 3, "acronym": "C3", "structure_id_path": [7, 3]},
+    }
+
+
+@pytest.mark.parametrize("style", ["shaped", "square"])
+def test_flat_region_selection_collapses_depth_into_one_plane(tmp_path, style):
+    profile = _build_planar_cache(tmp_path / "cache")
+
+    result = materialize_flat_region_selection(
+        profile,
+        [1, 10, 11, 12],
+        style=style,
+    )
+
+    assert result.labels.shape == (2, 2)
+    assert result.labels.dtype == np.int32
+    # Regions 10 and 11 each contribute two source voxels after depth
+    # collapse, so the smaller region ID wins their shared planar bin.
+    assert result.labels[0, 0] == 10
+    assert result.summary.labeled_bins == 1
+    assert result.summary.collision_bins == 1
+    assert result.summary.source_voxel_count == 5
+    assert result.summary.output_shape == (2, 2)
+    assert result.summary.to_dict()["output_shape"] == [2, 2]
+    assert result.selected_region_ids == (1, 10, 11, 12)
+    assert result.represented_region_ids == (10, 11, 12)
+    assert result.represented_source_region_ids == (10, 11, 12)
+    assert result.grid_spec["coordinate_order"] == ["y", "x"]
+    assert result.grid_spec["plane_mode"] == "flat"
+    assert result.grid_spec["output_shape"] == [2, 2]
+    assert result.style == style
+
+
+def test_flat_region_selection_sums_one_root_across_its_descendants(tmp_path):
+    profile = _build(tmp_path / "cache")
+
+    result = materialize_flat_region_selection(
+        profile,
+        [2, 3],
+        style="shaped",
+        direct_region_ids=[1],
+    )
+
+    # The depth-grid materialiser reports one collision here because regions 2
+    # and 3 compete for a shared bin. Aggregating them under the selected root
+    # sums their counts instead, which is what makes a collapsed plane an area
+    # map rather than a thickest-descendant-wins patchwork.
+    assert result.summary.collision_bins == 0
+    assert result.represented_region_ids == (1,)
+    assert result.represented_source_region_ids == (2, 3)
+    assert result.grid_spec["label_grouping"] == "selected_root"
+    assert sorted(set(np.unique(result.labels).tolist())) == [0, 1]
+    assert np.array_equal(result.labels, np.array([[1, 1], [1, 0]], dtype=np.int32))
+    assert result.summary.labeled_bins == 3
+    assert result.summary.source_voxel_count == 4
+
+
+@pytest.mark.parametrize("hierarchy", ["region_descendants", "atlas_structures"])
+def test_flat_region_selection_assigns_members_to_several_roots(tmp_path, hierarchy):
+    profile = _build(tmp_path / "cache")
+    kwargs = (
+        {"region_descendants": {6: (2,), 7: (3,)}}
+        if hierarchy == "region_descendants"
+        else {"atlas_structures": _nested_structures()}
+    )
+
+    result = materialize_flat_region_selection(
+        profile,
+        [2, 3],
+        style="shaped",
+        direct_region_ids=[6, 7],
+        **kwargs,
+    )
+
+    assert result.represented_region_ids == (6, 7)
+    assert np.array_equal(result.labels, np.array([[6, 7], [6, 0]], dtype=np.int32))
+    # The one shared bin is a genuine boundary between two selections.
+    assert result.summary.collision_bins == 1
+    assert [outline.region_id for outline in result.outlines] == [6, 7]
+    assert result.outlines[0].represented_region_ids == (2,)
+    assert result.outlines[1].represented_region_ids == (3,)
+
+
+def test_flat_region_selection_requires_a_hierarchy_for_unmapped_members(tmp_path):
+    profile = _build(tmp_path / "cache")
+
+    with pytest.raises(ValueError, match="atlas_structures"):
+        materialize_flat_region_selection(
+            profile,
+            [2, 3],
+            style="shaped",
+            direct_region_ids=[6, 7],
+        )
+
+
+def test_flat_region_selection_labels_terminal_selections_without_a_hierarchy(tmp_path):
+    """Custom terminal selections name their own labels, so no atlas is needed."""
+    profile = _build(tmp_path / "cache")
+
+    result = materialize_flat_region_selection(
+        profile,
+        [2, 3],
+        style="shaped",
+        direct_region_ids=[2, 3],
+    )
+
+    assert result.represented_region_ids == (2, 3)
+    assert np.array_equal(result.labels, np.array([[2, 3], [2, 0]], dtype=np.int32))
+
+
+def test_flat_region_outlines_are_two_dimensional_and_occupancy_derived(tmp_path):
+    from napari_swc_viewer.flatmap_region_cache import _outlines_for_bins
+
+    profile = _build(tmp_path / "cache")
+
+    outlines = materialize_flat_region_outlines(
+        profile,
+        1,
+        style="shaped",
+        region_descendants={1: (2, 3)},
+    )
+
+    assert outlines is not None
+    assert outlines.region_id == 1
+    assert outlines.vectors.dtype == np.float32
+    assert outlines.vectors.shape[1:] == (2, 2)
+    assert outlines.planar_bin_count == 3
+    assert outlines.represented_region_ids == (2, 3)
+    # Regions 2 and 3 collapse onto planar bins 0, 1, and 2 -- an L of three
+    # cells whose perimeter is eight unit edges.
+    expected = _outlines_for_bins(np.array([0, 1, 2]), (1, 2, 2))[:, :, 1:]
+    assert np.array_equal(outlines.vectors, expected)
+    assert len(outlines.vectors) == 8
+
+    assert (
+        materialize_flat_region_outlines(
+            profile,
+            5,
+            style="shaped",
+            region_descendants={5: (5,)},
+        )
+        is None
+    )
+
+
+def test_flat_and_allen_layer_collapse_agree_bin_for_bin(tmp_path):
+    """Both collapses share one primitive, so their footprints must match."""
+    profile = _build_planar_cache(tmp_path / "cache")
+
+    flat = materialize_flat_region_selection(profile, [10, 11, 12], style="shaped")
+    allen = materialize_allen_layer_region_selection(
+        profile,
+        [10, 11, 12],
+        style="shaped",
+        layer_map=_allen_layer_map(),
+    )
+
+    assert np.array_equal((allen.labels != 0).any(axis=0), flat.labels != 0)
+
+
+def test_flat_materializers_do_not_change_profile_identity(tmp_path):
+    """The 2D overlays are read-time derivations, not a new cache format."""
+    first = _build(tmp_path / "first")
+    manifest_path = tmp_path / "first" / REGION_CACHE_MANIFEST_FILENAME
+    before = manifest_path.read_text(encoding="utf-8")
+
+    materialize_flat_region_selection(
+        first,
+        [2, 3],
+        style="shaped",
+        direct_region_ids=[1],
+    )
+    materialize_flat_region_outlines(
+        first,
+        1,
+        style="shaped",
+        region_descendants={1: (2, 3)},
+    )
+
+    second = _build(tmp_path / "second")
+    assert second.profile_id == first.profile_id
+    assert manifest_path.read_text(encoding="utf-8") == before
+
+
 def test_region_cache_close_releases_loaded_maps_and_is_terminal(tmp_path):
     profile = _build(tmp_path / "cache")
     cache = open_region_cache(tmp_path / "cache")
@@ -325,6 +517,11 @@ def test_surface_and_outline_are_voxel_faithful_for_adjacent_bins():
     assert vertices.shape == (12, 3)
     assert faces.shape == (20, 3)
     assert outlines.shape == (6, 2, 3)
+    # A single depth plane reduces the stored tracer to a 2D perimeter, which is
+    # what the flat overlays slice off. Both the start depth and every direction
+    # depth must be zero for that slice to be lossless.
+    assert np.all(outlines[:, :, 0] == 0)
+    assert outlines[:, :, 1:].shape == (6, 2, 2)
     undirected_edges = np.sort(
         np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]), axis=0),
         axis=1,

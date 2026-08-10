@@ -163,6 +163,15 @@ region arrays without loading NRRDs, `atlas.annotation`, or BrainGlobe meshes.
 It requires a matching atlas/version structure catalog for region selection and
 colors, but that viewing atlas may have a different voxel resolution.
 
+The two depth-free renders show cached regions too. In **2D Heatmap** and **2D
+Vector**, **Show Region Labels** builds one depth-collapsed label image and
+**Show Region Outlines** builds 2D perimeter vectors, both derived at read time
+from the same version-1 occupancy arrays — no cache rebuild and no format
+change. Collapsing sums source-voxel counts across depth **per selected
+region**, so a 2D overlay is a map of the areas you selected rather than of
+cortical layers; use **Allen Layer Heatmap (2D stack)** for per-layer questions.
+Cached surfaces stay 3D-only, since a voxel shell has no 2D form.
+
 Missing or incompatible cache data reports the specific mismatch and never
 recomputes automatically. Select **Recompute from NRRDs** explicitly to use the
 legacy runtime conversion path. Saved project bundles retain version-3 Parquet

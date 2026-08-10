@@ -262,8 +262,9 @@ version-3 augmentation in one cancellable, atomic background operation.
   it reports the count and the limit and draws nothing, rather than silently
   omitting whole neurons; select fewer neurons, or use 2D Heatmap for the whole
   set.
-- Cached region labels, surfaces, and outlines are unavailable in both 2D modes
-  because their geometry is built on the depth grid.
+- Cached region labels and outlines are available in both 2D modes, collapsed
+  into the same single plane as the render. Cached surfaces are not: they are 3D
+  voxel shells with no 2D form. See "Flatmap region cache and overlays" below.
 
 ### Flatmap soma overlay
 
@@ -298,7 +299,9 @@ version-3 augmentation in one cancellable, atomic background operation.
   settings, bounds, output shape, and algorithm versions.
 - Each style stores sparse region occupancy and source-voxel counts, closed
   voxel-faithful surface triangles, and per-depth XY perimeter vectors. Parent
-  region geometry is precomputed as the union of its descendants.
+  region geometry is precomputed as the union of its descendants. Depth-collapsed
+  2D footprints are **not** stored; they are unioned from descendant occupancy on
+  demand, which measures under 150 ms even for the whole isocortex.
 - New arrays are published before the manifest is atomically replaced. A
   cancelled or failed build does not invalidate existing profiles.
 - For viewing, choose **Precomputed Parquet + Cache**, click **Choose Cache
@@ -315,8 +318,39 @@ version-3 augmentation in one cancellable, atomic background operation.
   (2D stack)** mode, cached labels collapse the same version-1 occupancy into
   six synchronized Allen planes. Existing caches do not need to be rebuilt,
   and surfaces/outlines remain unavailable in the planar mode because their
-  geometry is depth-based. In **2D Heatmap** and **2D Vector** modes labels,
-  surfaces, and outlines are all unavailable for the same reason.
+  geometry is depth-based.
+- In **2D Heatmap** and **2D Vector** modes, **Show Region Labels** builds one
+  `XY bins × XY bins` image named **Flatmap Region Labels 2D**, and **Show Region
+  Outlines** builds one **Flatmap Region Outlines 2D** vector layer per directly
+  selected region. Both are derived at read time from the same version-1
+  occupancy arrays; existing caches are reused unchanged and the manifest is not
+  rewritten.
+- Both 2D overlays sum source-voxel counts across depth **per selected region**
+  before the majority vote. Selecting `Isocortex` therefore gives one solid
+  footprint, and selecting `MOp` plus `SSp` gives an area map with a shared
+  boundary. Collapsing the terminal *layer* regions instead would turn every
+  cortical column into a contest between its own layers: measured on the 25 µm
+  cache, 43,863 of 43,967 columns are contested and the thickest layer wins — L5
+  in 53% of columns and L2/3 in 33%. That reads as a layer patchwork rather than
+  anatomy, which is why **Allen Layer Heatmap (2D stack)** exists for per-layer
+  questions.
+- Combining more than one directly selected region into a 2D overlay needs a
+  loaded matching structure catalog, because the plugin has to decide which
+  cached region belongs to which selection. A single selected region, and any
+  selection of terminal regions that name their own labels, needs no catalog.
+- **Show Region Surfaces** stays disabled in the 2D modes. The cached surface is
+  a 3D exposed-face voxel shell with no 2D form; use **Show Region Labels** for a
+  filled 2D region, which also gives per-pixel value readout.
+- The 2D overlays cover depth-valid source voxels only, because every cache
+  profile records `excludes_depth_minus_one_plane: true`. Selecting a cache
+  profile also checks and locks **Exclude depth -1 nodes**, so the 2D heatmap
+  under the overlay counts the same nodes.
+- The 2D overlays set no layer `scale`, matching the 2D heatmap and 2D vector
+  layers, so they land on the same pixels even though the flat map's X axis spans
+  twice the range of its Y axis in the same number of bins.
+- Region outlines are drawn as unstyled line segments in both the depth and
+  collapsed modes, so a perimeter reads as a boundary rather than as a field of
+  direction arrows.
 - Label paths preserve majority-region collision handling with smaller-ID
   tie-breaking. **Mask Layer** is not an atlas-region source and reports an
   actionable error instead of reusing a retained Atlas selection.

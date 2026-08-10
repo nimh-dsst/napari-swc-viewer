@@ -126,6 +126,18 @@ _SOMA_POINTS_LAYER_NAME = "Isocortex Flatmap Somas"
 _REGION_LABELS_LAYER_NAME = "Flatmap Region Labels"
 _REGION_SURFACES_LAYER_NAME = "Flatmap Region Surfaces"
 _REGION_OUTLINES_LAYER_NAME = "Flatmap Region Outlines"
+# The depth-free overlays keep the depth-grid prefixes so every prefix-based
+# clear/retire path already covers them, but need their own names: assigning
+# 2D data to a layer created with a depth axis is a rank mismatch.
+_FLAT_REGION_LABELS_LAYER_NAME = f"{_REGION_LABELS_LAYER_NAME} 2D"
+_FLAT_REGION_OUTLINES_LAYER_NAME = f"{_REGION_OUTLINES_LAYER_NAME} 2D"
+# A collapsed perimeter traces one plane instead of 75 stacked ones, so it can
+# afford a thinner stroke than the depth-grid outlines.
+_FLAT_REGION_OUTLINE_EDGE_WIDTH = 0.6
+_REGION_SURFACES_2D_TOOLTIP = (
+    "Cached surfaces are 3D voxel shells. In 2D modes use Show Region Labels "
+    "for a filled region."
+)
 _REGION_LABEL_ATLAS_DEFAULT = "allen_mouse_10um"
 _REGION_LABEL_ATLAS_OPTIONS = (
     "allen_mouse_10um",
@@ -848,10 +860,17 @@ class FlatmapProjectionWidget(QWidget):
                 if isinstance(metadata, dict)
                 else ""
             )
+            layer_plane_mode = (
+                str(metadata.get("flatmap_plane_mode", ""))
+                if isinstance(metadata, dict)
+                else ""
+            )
             if (
                 not keep_profile_id
                 or layer_profile_id != keep_profile_id
                 or (keep_style is not None and layer_style != keep_style)
+                # A depth-grid overlay never belongs beside a collapsed render.
+                or (layer_plane_mode and layer_plane_mode != self._current_plane_mode())
             ):
                 targets.append(layer)
         self._hide_and_queue_layer_removal(targets)
@@ -1682,39 +1701,43 @@ class FlatmapProjectionWidget(QWidget):
         self._update_cached_region_controls()
         self._notify_flatmap_correlation_source_changed()
 
-    def _update_cached_region_controls(self) -> None:
-        cache_available = (
+    def _cached_region_control_states(self) -> dict[str, bool]:
+        """Return the single source of truth for cached-region button state.
+
+        Labels and outlines can be collapsed into one flatmap plane, so both are
+        offered in the depth-free renders. Cached surfaces are 3D voxel shells
+        with no 2D form and stay depth-grid only. The recompute path builds
+        labels from NRRDs on the depth grid, so it needs a depth render.
+        """
+        precomputed = (
             self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
-            and getattr(self, "_active_cache_profile", None) is not None
         )
-        # Cached region geometry lives on the depth grid, so it is only offered
-        # for the depth-binned renders.
+        cache_available = (
+            precomputed and getattr(self, "_active_cache_profile", None) is not None
+        )
         depth_grid_mode = self._is_depth_grid_mode()
-        geometry_enabled = cache_available and depth_grid_mode
-        for name in (
-            "_region_surfaces_btn",
-            "_region_outlines_btn",
-            "_clear_region_geometry_btn",
-        ):
+        flat_mode = self._is_flat_render_mode()
+        recompute_depth = depth_grid_mode and not precomputed
+        return {
+            "_region_labels_btn": cache_available or recompute_depth,
+            "_region_surfaces_btn": cache_available and depth_grid_mode,
+            "_region_outlines_btn": cache_available and (depth_grid_mode or flat_mode),
+            "_clear_region_geometry_btn": cache_available
+            and (depth_grid_mode or flat_mode),
+            "_region_label_atlas_combo": recompute_depth,
+        }
+
+    def _update_cached_region_controls(self) -> None:
+        for name, enabled in self._cached_region_control_states().items():
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.setEnabled(geometry_enabled)
-        labels_button = getattr(self, "_region_labels_btn", None)
-        if labels_button is not None:
-            labels_button.setEnabled(
-                (cache_available and not self._is_flat_render_mode())
-                or (
-                    depth_grid_mode
-                    and self._current_projection_source()
-                    != _PROJECTION_SOURCE_PRECOMPUTED
-                )
-            )
-        atlas_combo = getattr(self, "_region_label_atlas_combo", None)
-        if atlas_combo is not None:
-            atlas_combo.setEnabled(
-                depth_grid_mode
-                and self._current_projection_source() != _PROJECTION_SOURCE_PRECOMPUTED
-            )
+                widget.setEnabled(enabled)
+        surfaces_button = getattr(self, "_region_surfaces_btn", None)
+        set_tooltip = getattr(surfaces_button, "setToolTip", None)
+        if callable(set_tooltip) and self._is_flat_render_mode():
+            set_tooltip(_REGION_SURFACES_2D_TOOLTIP)
+        elif callable(set_tooltip):
+            set_tooltip("")
 
     def _set_cache_grid_locked(self, locked: bool) -> None:
         self._cache_grid_locked = bool(locked)
@@ -3671,16 +3694,18 @@ class FlatmapProjectionWidget(QWidget):
 
     def _create_region_labels_from_current_state(self):
         """Build a flatmap region-label volume and show it as a Labels layer."""
-        if self._is_flat_render_mode():
-            # The button is disabled in 2D modes; this guards a programmatic
-            # call from silently building a depth stack next to a 2D render.
-            raise RuntimeError(
-                "Region labels are built on the depth grid and are not "
-                "available in 2D render modes. Switch Render to 3D Heatmap or "
-                "3D Points to show them."
-            )
         if self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED:
             return self._create_cached_region_labels()
+        if self._is_flat_render_mode():
+            # Only the cache can collapse depth. The NRRD path builds a depth
+            # stack, so this guards a programmatic call from placing one next to
+            # a 2D render.
+            raise RuntimeError(
+                "Recomputed region labels are built on the depth grid and are "
+                "not available in 2D render modes. Choose Precomputed Parquet + "
+                "Cache to use the cached 2D region overlay, or switch Render to "
+                "3D Heatmap or 3D Points."
+            )
         self._projection_request_ready()
         selected_region_ids = self._selected_region_ids_for_labels()
         atlas_name = self._current_region_label_atlas_name()
@@ -3755,14 +3780,19 @@ class FlatmapProjectionWidget(QWidget):
     def _create_cached_region_labels(self):
         from ..flatmap_region_cache import (
             materialize_allen_layer_region_selection,
+            materialize_flat_region_selection,
             materialize_region_selection,
         )
 
         profile = self._require_active_cache_profile()
         selected_region_ids = self._selected_region_ids_for_labels()
+        atlas = self._atlas_provider()
+        plane_mode = self._current_plane_mode()
         layer_map = None
         axis_labels = None
-        if self._is_allen_layer_mode():
+        layer_name = _REGION_LABELS_LAYER_NAME
+        flat_result = None
+        if plane_mode == FLATMAP_PLANE_MODE_ALLEN_LAYERS:
             layer_map = self._current_allen_layer_map()
             result = materialize_allen_layer_region_selection(
                 profile,
@@ -3776,6 +3806,25 @@ class FlatmapProjectionWidget(QWidget):
                     "Isocortex layer regions."
                 )
             axis_labels = self._allen_layer_axis_labels()
+        elif plane_mode == FLATMAP_PLANE_MODE_FLAT:
+            try:
+                result = materialize_flat_region_selection(
+                    profile,
+                    selected_region_ids,
+                    style=self._current_style_key(),
+                    direct_region_ids=self._selected_geometry_region_ids(),
+                    atlas_structures=getattr(atlas, "structures", None),
+                    include_outlines=False,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Load a matching BrainGlobe atlas structure catalog to "
+                    "combine more than one selected region into a 2D map, or "
+                    "select a single region."
+                ) from exc
+            axis_labels = self._flat_axis_labels()
+            layer_name = _FLAT_REGION_LABELS_LAYER_NAME
+            flat_result = result
         else:
             result = materialize_region_selection(
                 profile,
@@ -3792,7 +3841,6 @@ class FlatmapProjectionWidget(QWidget):
             raise RuntimeError(
                 "The selected regions have no occupancy in the active flatmap cache."
             )
-        atlas = self._atlas_provider()
         metadata = {
             "projection_kind": "flatmap_region_labels",
             "source": "precomputed_cache",
@@ -3826,17 +3874,32 @@ class FlatmapProjectionWidget(QWidget):
                     ],
                 }
             )
+        elif flat_result is not None:
+            metadata.update(
+                {
+                    "flatmap_plane_mode": FLATMAP_PLANE_MODE_FLAT,
+                    "direct_region_ids": [
+                        int(value) for value in flat_result.direct_region_ids
+                    ],
+                    "represented_source_region_ids": [
+                        int(value)
+                        for value in flat_result.represented_source_region_ids
+                    ],
+                    "label_grouping": str(flat_result.grid_spec["label_grouping"]),
+                }
+            )
         layer = self._create_or_update_region_labels_layer(
             result,
             metadata,
             atlas=atlas,
             axis_labels=axis_labels,
+            layer_name=layer_name,
         )
         self._region_labels_layer = layer
         self._focus_projection_view(
             layer,
             result.labels,
-            ndisplay=2 if layer_map is not None else 3,
+            ndisplay=3 if plane_mode == FLATMAP_PLANE_MODE_DEPTH else 2,
         )
         self._notify_display_viewer_ready(layer)
         if layer_map is not None:
@@ -3844,6 +3907,12 @@ class FlatmapProjectionWidget(QWidget):
                 f"Loaded {result.summary.labeled_bins:,} cached planar region "
                 f"bin(s) across {len(result.layer_labels)} Allen layer planes "
                 f"from profile {result.profile_id}."
+            )
+        elif flat_result is not None:
+            message = (
+                f"Loaded {result.summary.labeled_bins:,} collapsed region bin(s) "
+                f"for {result.summary.represented_region_count} selected "
+                f"region(s) from profile {result.profile_id}."
             )
         else:
             message = (
@@ -4007,6 +4076,7 @@ class FlatmapProjectionWidget(QWidget):
             self._region_label_atlas_load_worker = None
 
     def _set_region_label_controls_enabled(self, enabled: bool) -> None:
+        states = self._cached_region_control_states()
         for widget_name in (
             "_region_label_atlas_combo",
             "_region_labels_btn",
@@ -4018,35 +4088,9 @@ class FlatmapProjectionWidget(QWidget):
             widget = getattr(self, widget_name, None)
             set_enabled = getattr(widget, "setEnabled", None)
             if callable(set_enabled):
-                effective = bool(enabled)
-                cache_available = (
-                    self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
-                    and getattr(self, "_active_cache_profile", None) is not None
-                )
-                depth_grid_mode = self._is_depth_grid_mode()
-                if widget_name in {
-                    "_region_surfaces_btn",
-                    "_region_outlines_btn",
-                    "_clear_region_geometry_btn",
-                }:
-                    effective = effective and cache_available and depth_grid_mode
-                elif widget_name == "_region_labels_btn":
-                    effective = effective and (
-                        (cache_available and not self._is_flat_render_mode())
-                        or (
-                            depth_grid_mode
-                            and self._current_projection_source()
-                            != _PROJECTION_SOURCE_PRECOMPUTED
-                        )
-                    )
-                elif widget_name == "_region_label_atlas_combo":
-                    effective = (
-                        effective
-                        and depth_grid_mode
-                        and self._current_projection_source()
-                        != _PROJECTION_SOURCE_PRECOMPUTED
-                    )
-                set_enabled(effective)
+                # The clear button only tracks the caller's gate; every other
+                # control also has to satisfy the render/source matrix.
+                set_enabled(bool(enabled) and states.get(widget_name, True))
 
     def _set_region_labels_status(self, message: str) -> None:
         status_label = getattr(self, "_status_label", None)
@@ -4089,19 +4133,23 @@ class FlatmapProjectionWidget(QWidget):
         *,
         atlas=None,
         axis_labels: tuple[str, ...] | None = None,
+        layer_name: str = _REGION_LABELS_LAYER_NAME,
     ):
         viewer = self._display_viewer()
         layer = self._region_labels_layer
         if not self._layer_is_in_viewer(layer, viewer=viewer):
             self._region_labels_layer = None
             layer = None
+        if layer is not None and str(getattr(layer, "name", "")) != layer_name:
+            # A depth-grid layer cannot take collapsed data, and vice versa.
+            layer = None
         layer = layer or self._find_layer_by_name(
-            _REGION_LABELS_LAYER_NAME,
+            layer_name,
             viewer=viewer,
         )
         colormap = self._region_label_colormap(atlas, result.represented_region_ids)
         kwargs: dict[str, object] = {
-            "name": _REGION_LABELS_LAYER_NAME,
+            "name": layer_name,
             "opacity": 0.35,
             "visible": True,
             "metadata": metadata,
@@ -4371,6 +4419,115 @@ class FlatmapProjectionWidget(QWidget):
             show_warning(f"Cached flatmap region surfaces failed: {exc}")
 
     def _create_region_outlines(self) -> None:
+        """Show cached XY perimeter vectors for the active region selections."""
+        if self._current_plane_mode() == FLATMAP_PLANE_MODE_FLAT:
+            self._create_flat_region_outlines()
+            return
+        self._create_depth_region_outlines()
+
+    def _create_flat_region_outlines(self) -> None:
+        """Show depth-collapsed 2D perimeter vectors for active selections."""
+        try:
+            from ..flatmap_region_cache import materialize_flat_region_selection
+
+            profile, geometry_ids, atlas = self._cached_geometry_inputs()
+            self._clear_region_outline_layers()
+            viewer = self._display_viewer()
+            # One call for the whole selection: it resolves the region hierarchy
+            # once and returns one collapsed perimeter per selected region.
+            try:
+                result = materialize_flat_region_selection(
+                    profile,
+                    self._selected_region_ids_for_labels(),
+                    style=self._current_style_key(),
+                    direct_region_ids=geometry_ids,
+                    atlas_structures=getattr(atlas, "structures", None),
+                    include_outlines=True,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Load a matching BrainGlobe atlas structure catalog to "
+                    "combine more than one selected region into a 2D outline, "
+                    "or select a single region."
+                ) from exc
+            created = []
+            for outlines in result.outlines:
+                if not len(outlines.vectors):
+                    continue
+                region_id = int(outlines.region_id)
+                metadata = self._cached_geometry_metadata(
+                    projection_kind="flatmap_flat_region_outlines",
+                    profile=profile,
+                    atlas=atlas,
+                    region_id=region_id,
+                    selected_region_ids=geometry_ids,
+                )
+                metadata.update(
+                    {
+                        "flatmap_plane_mode": FLATMAP_PLANE_MODE_FLAT,
+                        "union_region_ids": [
+                            int(value) for value in outlines.union_region_ids
+                        ],
+                        "represented_source_region_ids": [
+                            int(value) for value in outlines.represented_region_ids
+                        ],
+                        "planar_bin_count": int(outlines.planar_bin_count),
+                        "label_grouping": str(result.grid_spec["label_grouping"]),
+                    }
+                )
+                layer = viewer.add_vectors(
+                    np.array(outlines.vectors, dtype=np.float32, copy=True),
+                    name=self._cached_geometry_layer_name(
+                        _FLAT_REGION_OUTLINES_LAYER_NAME,
+                        atlas,
+                        region_id,
+                        selection_count=len(geometry_ids),
+                    ),
+                    edge_color=self._atlas_region_rgba(atlas, region_id),
+                    edge_width=_FLAT_REGION_OUTLINE_EDGE_WIDTH,
+                    opacity=0.9,
+                    # napari draws an arrowhead per segment by default, which
+                    # reads as a field of arrows rather than a boundary.
+                    vector_style="line",
+                    blending="translucent",
+                    axis_labels=self._flat_axis_labels(),
+                    metadata=metadata,
+                )
+                created.append(layer)
+            self._region_outlines_layers = created
+            if created:
+                # Deliberately not _focus_projection_view: re-centring would
+                # yank the user off the heatmap they are inspecting.
+                self._ensure_flat_overlay_ndisplay()
+                self._apply_display_axis_annotations(created[0])
+                self._notify_display_viewer_ready(created[0])
+            else:
+                self._notify_display_viewer_failed("region_outlines_empty")
+            message = (
+                f"Loaded {len(created)} collapsed region outline layer(s) "
+                f"from profile {result.profile_id}."
+            )
+            self._set_region_labels_status(message)
+            if not created:
+                show_warning(
+                    "The selected cache profile has no outlines for this selection."
+                )
+        except Exception as exc:
+            logger.exception("Collapsed flatmap region outlines failed")
+            self._notify_display_viewer_failed("region_outlines_failed")
+            show_warning(f"Collapsed flatmap region outlines failed: {exc}")
+
+    def _ensure_flat_overlay_ndisplay(self) -> None:
+        """Put the display viewer in 2D without disturbing the camera."""
+        viewer = self._display_viewer()
+        dims = getattr(viewer, "dims", None)
+        if dims is not None and getattr(dims, "ndisplay", None) != 2:
+            try:
+                dims.ndisplay = 2
+            except Exception:
+                logger.debug("Could not set ndisplay for flat overlay", exc_info=True)
+
+    def _create_depth_region_outlines(self) -> None:
         """Show cached per-depth XY perimeter vectors for active selections."""
         try:
             from ..flatmap_region_cache import materialize_region_outlines
@@ -4400,6 +4557,9 @@ class FlatmapProjectionWidget(QWidget):
                     edge_color=rgba,
                     edge_width=1.5,
                     opacity=0.9,
+                    # Perimeter segments are boundaries, not directed vectors;
+                    # napari's default style would put an arrowhead on each one.
+                    vector_style="line",
                     metadata=self._cached_geometry_metadata(
                         projection_kind="flatmap_region_outlines",
                         profile=profile,
