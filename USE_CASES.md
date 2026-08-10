@@ -1415,6 +1415,137 @@ there, and it already exists.
   something the numbers settle — the flat map distortion rules out calibrating it
   against physical distance.
 
+### UC-013: Overlay Cached Brain Regions on a 2D Flat Map
+
+**Capability**
+
+In the two depth-free renders (**2D Heatmap**, **2D Vector**) the user can draw
+the regions selected in **Regions** directly onto the flat map, either as a
+filled atlas-colored label image or as region outlines. Both are derived at read
+time from an existing flatmap region cache, without rebuilding it and without
+loading NRRDs, `atlas.annotation`, or BrainGlobe meshes. Before this, a 2D flat
+map had no anatomical frame of reference at all.
+
+Both overlays combine cortical depth **per selected region**, so selecting
+`Isocortex` produces one footprint and selecting several areas produces an area
+map. This is the whole point of the workflow: collapsing the terminal *layer*
+regions instead would make every cortical column a contest between its own
+layers, and the thickest layer would win in each one.
+
+**Prerequisites**
+
+- Complete UC-003 and keep its version-3 flatmap Parquet.
+- Complete UC-004 and keep a compatible flatmap region cache directory.
+- A loaded BrainGlobe atlas whose name/version structure catalog matches the
+  cache profile (`allen_mouse_25um` v1.2 for the UC-004 cache). Its voxel
+  resolution may differ from the cache's.
+- Neurons whose arbors span several isocortical areas, so area boundaries are
+  visible. `isocortex_total_right_brainglobe_flatmap.parquet` works.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** Select a few neuron rows, open **Flatmap**, set **Source** to
+   **Precomputed Parquet + Cache** and **Style** to **Both hemispheres, shaped**,
+   click **Choose Cache Directory...** and pick the compatible profile, set
+   **Render** to **2D Heatmap**, and click **Project to Flatmap**.
+   **Expected:** An **Isocortex Flatmap 2D Heatmap** layer appears in the flatmap
+   window with no plane slider. In **Cached Regions**, **Show Region Labels**,
+   **Show Region Outlines**, and **Clear Geometry** are enabled, while **Show
+   Region Surfaces** and the **Atlas** combo are disabled. Hovering **Show Region
+   Surfaces** explains that cached surfaces are 3D voxel shells and points to
+   **Show Region Labels**.
+2. **Action:** In **Regions**, set **Query source** to **Atlas Regions**, enable
+   **Include child regions**, check only `Isocortex`, and click **Show Region
+   Labels**.
+   **Expected:** A layer named **Flatmap Region Labels 2D** draws one solid
+   Isocortex-colored footprint. There is no plane slider and no plane caption,
+   and the **Flatmap X** / **Flatmap Y** axis captions are shown. The status line
+   reports the collapsed bin count, the number of selected regions represented,
+   and the profile ID.
+3. **Action:** Zoom into a boundary between lit heatmap pixels and unlabeled
+   background.
+   **Expected:** The label edge sits exactly on heatmap pixel boundaries, with no
+   half-pixel offset in either axis, even though the flat map's X axis spans twice
+   the range of its Y axis in the same number of bins. This is the check
+   automated tests cannot make.
+4. **Action:** Click **Show Region Outlines**.
+   **Expected:** A layer named **Flatmap Region Outlines 2D** draws a single
+   closed Isocortex perimeter in the Isocortex color, with **no arrowheads**,
+   tracing the same boundary as the label image and including interior holes. The
+   camera stays where it was rather than re-centring.
+5. **Action:** Uncheck `Isocortex`, check `MOp` and `SSp`, then click **Show
+   Region Labels** followed by **Show Region Outlines**.
+   **Expected:** The label image shows two differently colored areas meeting on a
+   shared boundary, not a patchwork of cortical layers. Two outline layers appear,
+   named `Flatmap Region Outlines 2D: MOp (985)` and
+   `Flatmap Region Outlines 2D: SSp (322)`.
+6. **Action:** Hover the cursor over a labeled pixel.
+   **Expected:** napari's status bar reports the ID of the area you selected
+   (`985` or `322`), not a terminal layer region such as `MOp5`.
+7. **Action:** Switch **Query source** to **Custom Regions**, check two terminal
+   layer regions, and click **Show Region Outlines**.
+   **Expected:** One acronym/ID-named, atlas-colored outline layer appears per
+   checked terminal region. No structure catalog beyond the loaded atlas is
+   required, because terminal selections name their own labels.
+8. **Action:** Switch **Render** to **2D Vector**, click **Project to Flatmap**,
+   then click **Show Region Outlines**.
+   **Expected:** The overlays built in the previous mode were removed when
+   **Render** changed and have to be rebuilt. The rebuilt region perimeters and
+   the neuron trace vectors sit on the same grid with no offset.
+9. **Action:** Switch **Render** to **3D Heatmap** and click **Project to
+   Flatmap**.
+   **Expected:** The 2D overlays are gone. **Show Region Surfaces** becomes
+   available, and **Show Region Outlines** now builds the per-depth 3D outline
+   layers — also without arrowheads.
+10. **Action:** Return to **2D Heatmap**, select **Recompute from NRRDs** as
+    **Source**, and click **Show Region Labels**.
+    **Expected:** The action reports that *recomputed* region labels are built on
+    the depth grid and names both remedies — choose **Precomputed Parquet +
+    Cache**, or switch to a 3D render. No layer is added.
+11. **Action:** Return to **Precomputed Parquet + Cache**, select a region with no
+    isocortical occupancy (for example a thalamic nucleus), and click **Show
+    Region Labels**.
+    **Expected:** The action reports that the selection has no occupancy in the
+    active flatmap cache. No empty layer is left behind.
+12. **Action:** Set **Query source** to **Mask Layer** and click **Show Region
+    Labels**.
+    **Expected:** The existing actionable error naming **Atlas Regions** and
+    **Custom Regions**; no layer is added.
+13. **Action:** Click **Clear Geometry**, then **Clear Region Labels**.
+    **Expected:** Both 2D overlay families are removed. The **Isocortex Flatmap
+    2D Heatmap** and **Isocortex Flatmap 2D Vectors** layers remain.
+14. **Action:** Note the `flatmap-region-cache.json` modification time and the
+    profile ID reported in the status line before step 2 and again after step 13.
+    **Expected:** Both are unchanged. No profile was rebuilt and no manifest was
+    rewritten — the 2D overlays are read-time derivations of the version-1 arrays.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: Added on 2026-08-10 and not yet exercised in napari. Automated tests in
+  `tests/test_flatmap_region_cache.py` cover the depth-collapse arithmetic,
+  per-selection aggregation (a single selected root reports zero collisions where
+  the depth-grid materializer reports one), assignment of members to several roots
+  from either an explicit descendant map or a structure catalog, the refusal when
+  neither is available, reuse of the stored depth-free perimeter tracer, agreement
+  between the flat and Allen-layer collapses, and that neither new materializer
+  changes `profile_id` or the manifest. `tests/test_flatmap_widget.py` covers the
+  button-enable matrix in both flat modes, agreement between the two gating call
+  sites across five render modes and two sources, the 2D layer names, axis
+  captions, plane-mode metadata, `ndisplay`, absence of `scale`/`translate`, a
+  single materializer call for a multi-region outline request, and overlay
+  retirement. Verified numerically against
+  `/Users/lawrimorejg/Downloads/flatmap_cache_25` (shaped, 240 leaf regions):
+  `Isocortex` collapses to 43,967 bins with **0** collisions and a 1,506-segment
+  perimeter in 0.105 s, while collapsing the same selection at leaf level leaves
+  43,863 of 43,967 columns contested (L5 winning 53%, L2/3 33%) — the patchwork
+  the per-selection rule exists to prevent. `MOp`+`SSp`+`VISp`+`AUD` gives four
+  labels with 247 of 16,816 columns contested, all at genuine area boundaries.
+  None of that shows whether the overlays read correctly on the canvas, so
+  steps 3, 4, 6, and 8 still need eyes.
+
 ## Use-Case Template
 
 Copy this section when adding a use case. Remove guidance in parentheses and

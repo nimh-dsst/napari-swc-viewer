@@ -1802,9 +1802,7 @@ def test_add_soma_in_allen_mode_without_region_id_reports_the_fix(monkeypatch) -
     nodes = _augmented_nodes().drop(columns=["region_id"])
 
     def fail_lookup(self, _nodes, **_kwargs):
-        raise AssertionError(
-            "Allen soma projection must not fall back to depth space"
-        )
+        raise AssertionError("Allen soma projection must not fall back to depth space")
 
     _configure_projection_widget(widget, module, nodes)
     widget._project_from_lookup_files = types.MethodType(fail_lookup, widget)
@@ -2811,9 +2809,7 @@ def test_flat_heatmap_grouped_colors_add_one_layer_per_neuron(monkeypatch) -> No
         f"{module._GROUPED_FLAT_HEATMAP_PREFIX}b.swc",
     ]
     assert all(layer.data.shape == (4, 4) for layer in grouped)
-    assert all(
-        layer.axis_labels == ("Flatmap Y", "Flatmap X") for layer in grouped
-    )
+    assert all(layer.axis_labels == ("Flatmap Y", "Flatmap X") for layer in grouped)
     assert widget.__class__._is_flatmap_render_layer_name(grouped[0].name)
 
 
@@ -2977,7 +2973,9 @@ def test_flat_modes_disable_depth_bin_but_keep_the_depth_minus_one_checkbox(
         assert widget._heatmap_color_mode_combo.enabled is color_combo_enabled
 
 
-def test_flat_modes_disable_cached_region_geometry_controls(monkeypatch) -> None:
+def test_flat_modes_offer_collapsed_labels_and_outlines_but_not_surfaces(
+    monkeypatch,
+) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
     widget._projection_source_combo = types.SimpleNamespace(
@@ -2994,9 +2992,13 @@ def test_flat_modes_disable_cached_region_geometry_controls(monkeypatch) -> None
         )
         widget._update_cached_region_controls()
 
+        # Labels and outlines collapse into one plane; a cached surface is a 3D
+        # voxel shell with no 2D form.
+        assert widget._region_labels_btn.enabled is True
+        assert widget._region_outlines_btn.enabled is True
+        assert widget._clear_region_geometry_btn.enabled is True
         assert widget._region_surfaces_btn.enabled is False
-        assert widget._region_outlines_btn.enabled is False
-        assert widget._region_labels_btn.enabled is False
+        # Only the NRRD recompute path picks its own label atlas.
         assert widget._region_label_atlas_combo.enabled is False
 
     # 3D Points still uses the depth grid, so its geometry stays available.
@@ -3009,15 +3011,80 @@ def test_flat_modes_disable_cached_region_geometry_controls(monkeypatch) -> None
     assert widget._region_outlines_btn.enabled is True
 
 
-def test_region_labels_are_refused_in_flat_modes(monkeypatch) -> None:
+def test_recomputed_region_labels_are_refused_in_flat_modes(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
     widget._render_mode_combo = types.SimpleNamespace(
         currentData=lambda: module._RENDER_FLAT_HEATMAP
     )
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_RECOMPUTE
+    )
 
-    with pytest.raises(RuntimeError, match="not"):
+    with pytest.raises(RuntimeError, match="Recomputed region labels"):
         widget._create_region_labels_from_current_state()
+
+
+def test_flat_mode_labels_route_to_the_cache_instead_of_refusing(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    sentinel = object()
+    widget._create_cached_region_labels = lambda: sentinel
+
+    assert widget._create_region_labels_from_current_state() is sentinel
+
+
+def test_cached_region_control_gating_matches_between_both_enablers(
+    monkeypatch,
+) -> None:
+    """Two call sites apply the same matrix; they must not drift apart."""
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._active_cache_profile = object()
+    names = (
+        "_region_label_atlas_combo",
+        "_region_labels_btn",
+        "_region_surfaces_btn",
+        "_region_outlines_btn",
+        "_clear_region_geometry_btn",
+    )
+    render_modes = (
+        module._RENDER_HEATMAP,
+        module._RENDER_POINTS,
+        module._RENDER_FLAT_HEATMAP,
+        module._RENDER_FLAT_VECTOR,
+        module._RENDER_ALLEN_LAYERS,
+    )
+    sources = (
+        module._PROJECTION_SOURCE_PRECOMPUTED,
+        module._PROJECTION_SOURCE_RECOMPUTE,
+    )
+
+    for render_mode in render_modes:
+        for source in sources:
+            widget._render_mode_combo = types.SimpleNamespace(
+                currentData=lambda mode=render_mode: mode
+            )
+            widget._projection_source_combo = types.SimpleNamespace(
+                currentData=lambda value=source: value
+            )
+            for name in names:
+                setattr(widget, name, _DummyButton())
+            widget._update_cached_region_controls()
+            from_update = {name: getattr(widget, name).enabled for name in names}
+
+            for name in names:
+                setattr(widget, name, _DummyButton())
+            widget._set_region_label_controls_enabled(True)
+            from_setter = {name: getattr(widget, name).enabled for name in names}
+
+            assert from_update == from_setter, (render_mode, source)
 
 
 def test_flat_render_summary_reports_the_collapsed_depth_axis(monkeypatch) -> None:
@@ -3074,8 +3141,9 @@ def test_matching_cache_profile_preserves_a_live_flat_heatmap(monkeypatch) -> No
         "A matching XY grid must not retire the 2D heatmap"
     )
 
-    widget._activate_cache_profile(_CacheProfile("matching-flat-profile"),
-                                   force_transition=True)
+    widget._activate_cache_profile(
+        _CacheProfile("matching-flat-profile"), force_transition=True
+    )
 
     assert widget._viewer.layers == [layer]
     assert widget._last_cache_profile_id == "matching-flat-profile"
@@ -4146,6 +4214,233 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     assert widget._viewer.layers[1].metadata["region_acronym"] == "MOp"
 
 
+def test_cached_flat_region_labels_create_a_two_dimensional_layer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._active_cache_profile = profile
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_HEATMAP
+    )
+    widget._selected_region_ids_provider = lambda: [10, 11]
+    widget._selected_geometry_region_ids_provider = lambda: [315]
+    widget._selected_region_acronyms_provider = lambda: ["Isocortex"]
+    widget._selected_region_source_provider = lambda: "atlas_regions"
+    widget._selected_region_scope_provider = lambda: "whole_parquet"
+    structures = {315: {"id": 315, "acronym": "Isocortex", "rgb_triplet": [1, 2, 3]}}
+    widget._atlas_provider = lambda: types.SimpleNamespace(structures=structures)
+
+    result = types.SimpleNamespace(
+        labels=np.array([[315, 0], [0, 315]], dtype=np.int32),
+        profile_id="profile-1",
+        selected_region_ids=(10, 11),
+        direct_region_ids=(315,),
+        represented_region_ids=(315,),
+        represented_source_region_ids=(10, 11),
+        grid_spec={"label_grouping": "selected_root"},
+        summary=types.SimpleNamespace(
+            labeled_bins=2,
+            represented_region_count=1,
+            to_dict=lambda: {"labeled_bins": 2, "output_shape": [2, 2]},
+        ),
+    )
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    captured = {}
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_flat_region_selection",
+        lambda received_profile, region_ids, **kwargs: (
+            captured.update(
+                profile=received_profile,
+                region_ids=region_ids,
+                kwargs=kwargs,
+                calls=captured.get("calls", 0) + 1,
+            )
+            or result
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collapsed labels must not load NRRDs")
+        ),
+    )
+    widget._focus_projection_view = lambda *args, **kwargs: captured.update(
+        focus_ndisplay=kwargs.get("ndisplay")
+    )
+    widget._set_region_labels_status = lambda message: captured.update(message=message)
+
+    actual = widget._create_cached_region_labels()
+
+    assert actual is result
+    assert captured["calls"] == 1
+    assert captured["profile"] is profile
+    assert captured["kwargs"]["direct_region_ids"] == [315]
+    assert captured["kwargs"]["atlas_structures"] is structures
+    assert captured["kwargs"]["include_outlines"] is False
+    assert captured["focus_ndisplay"] == 2
+
+    layer = widget._region_labels_layer
+    assert layer.name == "Flatmap Region Labels 2D"
+    assert layer.data.shape == (2, 2)
+    assert layer.axis_labels == (
+        module._FLATMAP_AXIS_LABEL_Y,
+        module._FLATMAP_AXIS_LABEL_X,
+    )
+    assert layer.metadata["flatmap_plane_mode"] == module.FLATMAP_PLANE_MODE_FLAT
+    assert layer.metadata["direct_region_ids"] == [315]
+    assert layer.metadata["label_grouping"] == "selected_root"
+    # Overlays must stay pixel-aligned with the anisotropic 2D heatmap.
+    assert "scale" not in layer.init_kwargs
+    assert "translate" not in layer.init_kwargs
+    assert "collapsed region bin(s)" in captured["message"]
+
+
+def test_cached_flat_region_outlines_use_only_materialized_cache_arrays(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._active_cache_profile = profile
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_VECTOR
+    )
+    widget._selected_region_ids_provider = lambda: [10, 11]
+    widget._selected_geometry_region_ids_provider = lambda: [10, 11]
+    widget._selected_region_acronyms_provider = lambda: ["VISp", "MOp"]
+    widget._selected_region_source_provider = lambda: "atlas_regions"
+    widget._selected_region_scope_provider = lambda: "whole_parquet"
+    widget._region_surfaces_layers = []
+    widget._region_outlines_layers = []
+
+    class _AtlasWithoutRuntimeGeometry:
+        structures = {
+            10: {
+                "id": 10,
+                "acronym": "VISp",
+                "name": "Primary visual area",
+                "rgb_triplet": [12, 34, 56],
+            },
+            11: {
+                "id": 11,
+                "acronym": "MOp",
+                "name": "Primary motor area",
+                "rgb_triplet": [78, 90, 123],
+            },
+        }
+
+        @property
+        def annotation(self):
+            raise AssertionError("collapsed outlines must not access atlas.annotation")
+
+        def mesh_from_structure(self, *_args, **_kwargs):
+            raise AssertionError("collapsed outlines must not project atlas meshes")
+
+    widget._atlas_provider = _AtlasWithoutRuntimeGeometry
+    widget._set_region_labels_status = lambda _message: None
+
+    import napari_swc_viewer.flatmap_region_cache as cache_module
+
+    def _outline(region_id):
+        return types.SimpleNamespace(
+            region_id=region_id,
+            vectors=np.asarray([[[0.5, 0.5], [0.0, 1.0]]], dtype=np.float32),
+            union_region_ids=(region_id,),
+            represented_region_ids=(region_id,),
+            planar_bin_count=3,
+        )
+
+    calls = []
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_flat_region_selection",
+        lambda received_profile, region_ids, **kwargs: (
+            calls.append((received_profile, list(region_ids), kwargs))
+            or types.SimpleNamespace(
+                profile_id="profile-1",
+                grid_spec={"label_grouping": "selected_root"},
+                outlines=(_outline(10), _outline(11)),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collapsed outlines must not load NRRDs")
+        ),
+    )
+
+    widget._create_region_outlines()
+
+    # One call for the whole selection, not one per selected region.
+    assert len(calls) == 1
+    assert calls[0][0] is profile
+    assert calls[0][2]["direct_region_ids"] == [10, 11]
+    assert calls[0][2]["include_outlines"] is True
+    assert [layer.name for layer in widget._viewer.layers] == [
+        "Flatmap Region Outlines 2D: VISp (10)",
+        "Flatmap Region Outlines 2D: MOp (11)",
+    ]
+    assert widget._viewer.dims.ndisplay == 2
+    for layer in widget._viewer.layers:
+        assert layer.data.shape[1:] == (2, 2)
+        # napari would otherwise draw an arrowhead on every perimeter segment.
+        assert layer.init_kwargs["vector_style"] == "line"
+        assert layer.axis_labels == (
+            module._FLATMAP_AXIS_LABEL_Y,
+            module._FLATMAP_AXIS_LABEL_X,
+        )
+        assert layer.metadata["flatmap_plane_mode"] == module.FLATMAP_PLANE_MODE_FLAT
+        assert layer.metadata["projection_kind"] == "flatmap_flat_region_outlines"
+        assert layer.metadata["planar_bin_count"] == 3
+        assert "scale" not in layer.init_kwargs
+        assert "translate" not in layer.init_kwargs
+    expected_visp = np.asarray([12, 34, 56, 255], dtype=float) / 255
+    np.testing.assert_allclose(widget._viewer.layers[0].edge_color, expected_visp)
+
+
+def test_flat_region_overlays_are_retired_with_the_grid(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    labels_layer = _DummyLayer(
+        np.zeros((2, 2), dtype=np.int32),
+        name="Flatmap Region Labels 2D",
+    )
+    outline_layer = _DummyLayer(
+        np.zeros((1, 2, 2), dtype=np.float32),
+        name="Flatmap Region Outlines 2D: VISp (10)",
+    )
+    widget._viewer.layers.extend([labels_layer, outline_layer])
+    widget._region_labels_layer = labels_layer
+    widget._region_outlines_layers = [outline_layer]
+    widget._region_surfaces_layers = []
+
+    # Both names keep the depth-grid prefixes, so the prefix-based clear paths
+    # already cover them.
+    assert set(widget._current_cached_region_layers()) == {labels_layer, outline_layer}
+
+    widget._invalidate_flatmap_grid_layers()
+
+    assert labels_layer not in widget._viewer.layers
+    assert outline_layer not in widget._viewer.layers
+    assert widget._region_labels_layer is None
+    assert widget._region_outlines_layers == []
+
+
 def test_empty_custom_geometry_replaces_stale_layer_families(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -4196,6 +4491,19 @@ def test_empty_custom_geometry_replaces_stale_layer_families(monkeypatch) -> Non
     widget._create_region_outlines()
 
     assert stale_outline not in widget._viewer.layers
+    assert widget._region_outlines_layers == []
+
+    # A collapsed 2D outline shares the prefix, so the depth path retires it too.
+    stale_flat_outline = _DummyLayer(
+        np.zeros((1, 2, 2), dtype=np.float32),
+        name="Flatmap Region Outlines 2D: OLD (1)",
+    )
+    widget._viewer.layers.append(stale_flat_outline)
+    widget._region_outlines_layers = [stale_flat_outline]
+
+    widget._create_region_outlines()
+
+    assert stale_flat_outline not in widget._viewer.layers
     assert widget._region_outlines_layers == []
 
 

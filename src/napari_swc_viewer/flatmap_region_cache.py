@@ -282,6 +282,89 @@ class CachedAllenLayerRegionSelection:
     profile_id: str
 
 
+@dataclass(frozen=True)
+class CachedFlatRegionOutlines:
+    """One selected region's depth-collapsed 2D perimeter, derived on read.
+
+    ``vectors`` is a napari Vectors array of shape ``(N, 2, 2)`` holding
+    ``[start(y, x), direction(dy, dx)]`` in flatmap bin-index units.  The cache
+    stores only per-depth-slice perimeters, so this geometry is built at read
+    time from the union of ``union_region_ids`` occupancy.
+    """
+
+    region_id: int
+    vectors: np.ndarray
+    union_region_ids: tuple[int, ...]
+    represented_region_ids: tuple[int, ...]
+    planar_bin_count: int
+    source_voxel_count: int
+
+
+@dataclass(frozen=True)
+class CachedFlatRegionSelectionSummary:
+    """Counts for a region selection collapsed into one flatmap plane."""
+
+    selected_region_count: int
+    direct_region_count: int
+    represented_region_count: int
+    represented_source_region_count: int
+    labeled_bins: int
+    collision_bins: int
+    source_voxel_count: int
+    output_shape: tuple[int, int]
+
+    @property
+    def labeled_voxels(self) -> int:
+        """Compatibility alias for on-demand region-label summaries."""
+        return self.labeled_bins
+
+    @property
+    def collision_voxels(self) -> int:
+        """Compatibility alias for on-demand region-label summaries."""
+        return self.collision_bins
+
+    @property
+    def valid_source_voxels(self) -> int:
+        """Compatibility alias for selected source-voxel counts."""
+        return self.source_voxel_count
+
+    def to_dict(self) -> dict[str, int | list[int]]:
+        return {
+            "selected_region_count": int(self.selected_region_count),
+            "direct_region_count": int(self.direct_region_count),
+            "represented_region_count": int(self.represented_region_count),
+            "represented_source_region_count": int(
+                self.represented_source_region_count
+            ),
+            "labeled_bins": int(self.labeled_bins),
+            "collision_bins": int(self.collision_bins),
+            "source_voxel_count": int(self.source_voxel_count),
+            "output_shape": [int(size) for size in self.output_shape],
+        }
+
+
+@dataclass(frozen=True)
+class CachedFlatRegionSelection:
+    """Cache-backed atlas labels collapsed into one depth-free flatmap plane.
+
+    ``represented_region_ids`` are the label values written into ``labels``,
+    which are the directly selected regions rather than the cached occupancy
+    regions.  ``represented_source_region_ids`` are the occupancy regions that
+    actually contributed counts.
+    """
+
+    labels: np.ndarray
+    selected_region_ids: tuple[int, ...]
+    direct_region_ids: tuple[int, ...]
+    represented_region_ids: tuple[int, ...]
+    represented_source_region_ids: tuple[int, ...]
+    outlines: tuple[CachedFlatRegionOutlines, ...]
+    summary: CachedFlatRegionSelectionSummary
+    grid_spec: Mapping[str, Any]
+    style: str
+    profile_id: str
+
+
 def normalise_atlas_family(atlas_name: str) -> str:
     """Return an atlas identity that is stable across voxel resolutions."""
     return _ATLAS_RESOLUTION_SUFFIX.sub("", str(atlas_name).strip())
@@ -2624,6 +2707,95 @@ def _profile_from_value(
     return open_region_cache(cache_or_profile).profile(profile_id)
 
 
+def _collapsed_occupancy(
+    style_cache: FlatmapRegionStyleCache,
+    region_id: int,
+    plane_size: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return one region's sorted planar bins and depth-summed source counts.
+
+    The cached linear bins index a ``(depth, y, x)`` grid, so the depth plane
+    drops out with one modulo.  Counts for the same ``(y, x)`` column are summed
+    rather than compared, which is what makes a collapsed plane a footprint
+    instead of a contest between a region's own depth bins.
+    """
+    occupancy = style_cache.occupancy_slice(region_id)
+    if occupancy is None:
+        return None
+    depth_linear_bins, source_counts = occupancy
+    if not len(depth_linear_bins):
+        return None
+    planar_bins = np.asarray(depth_linear_bins, dtype=np.int64) % int(plane_size)
+    counts = np.asarray(source_counts, dtype=np.int64)
+    unique_planar_bins, inverse = np.unique(planar_bins, return_inverse=True)
+    collapsed_counts = np.zeros(len(unique_planar_bins), dtype=np.int64)
+    np.add.at(collapsed_counts, inverse, counts)
+    return unique_planar_bins, collapsed_counts
+
+
+def _resolve_flat_region_groups(
+    style_cache: FlatmapRegionStyleCache,
+    *,
+    member_region_ids: Sequence[int],
+    direct_region_ids: Sequence[int],
+    region_descendants: Mapping[int, Iterable[int]] | None = None,
+    atlas_structures: Mapping[object, Mapping[str, Any]] | None = None,
+) -> tuple[dict[int, tuple[int, ...]], str]:
+    """Map each emitted label value to the occupancy regions it aggregates.
+
+    Collapsing depth stacks every cortical layer of an area into one column, so
+    voting between terminal layer regions yields a thickest-layer-wins patchwork
+    rather than an area map.  Grouping each selected region's descendants before
+    the vote is therefore a correctness requirement, not a presentation choice.
+    """
+    occupied = {
+        int(value) for value in style_cache.array("occupancy_region_ids").tolist()
+    }
+    members = tuple(
+        int(region_id) for region_id in member_region_ids if int(region_id) in occupied
+    )
+    roots = tuple(int(region_id) for region_id in direct_region_ids)
+    if not roots:
+        return {region_id: (region_id,) for region_id in members}, "source_region"
+    if len(roots) == 1:
+        # Every include-child-expanded member belongs to the sole selected root
+        # by construction, so no hierarchy is needed for the common case.
+        return {roots[0]: members}, "selected_root"
+    root_set = set(roots)
+    if all(member in root_set for member in members):
+        # Terminal selections (and the identity default) already name their own
+        # label values, so there is nothing left for a hierarchy to decide.
+        return {member: (member,) for member in members}, "selected_root"
+    if region_descendants is None and not atlas_structures:
+        raise ValueError(
+            "Collapsing more than one selected region into flatmap space needs "
+            "region_descendants or atlas_structures to decide which cached "
+            "region belongs to which selection."
+        )
+    descendants = _derive_region_descendants(
+        region_descendants,
+        atlas_structures,
+        members,
+    )
+    # Deepest root first so a nested selection claims its own members before an
+    # ancestor can absorb them.
+    ordered_roots = sorted(
+        roots,
+        key=lambda root: (len(descendants.get(root, (root,))), root),
+    )
+    groups: dict[int, list[int]] = {root: [] for root in roots}
+    for member in members:
+        for root in ordered_roots:
+            if member in descendants.get(root, (root,)):
+                groups[root].append(member)
+                break
+    return {
+        root: tuple(members_for_root)
+        for root, members_for_root in groups.items()
+        if members_for_root
+    }, "selected_root"
+
+
 def materialize_region_selection(
     cache_or_profile: FlatmapRegionCache | FlatmapRegionCacheProfile | str | Path,
     region_ids: Iterable[int],
@@ -2760,24 +2932,16 @@ def materialize_allen_layer_region_selection(
                 f"{layer_index}; expected 0 through {plane_count - 1}."
             )
         mapped.append(region_id)
-        occupancy = style_cache.occupancy_slice(region_id)
-        if occupancy is None:
+        collapsed = _collapsed_occupancy(style_cache, region_id, plane_size)
+        if collapsed is None:
             continue
-        depth_linear_bins, source_counts = occupancy
-        if not len(depth_linear_bins):
-            continue
-
-        planar_bins = np.asarray(depth_linear_bins, dtype=np.int64) % plane_size
-        counts = np.asarray(source_counts, dtype=np.int64)
-        unique_planar_bins, inverse = np.unique(planar_bins, return_inverse=True)
-        collapsed_counts = np.zeros(len(unique_planar_bins), dtype=np.int64)
-        np.add.at(collapsed_counts, inverse, counts)
+        unique_planar_bins, collapsed_counts = collapsed
         output_bins = layer_index * plane_size + unique_planar_bins
 
         pair_bins.append(output_bins)
         pair_counts.append(collapsed_counts)
         pair_ids.append(np.full(len(unique_planar_bins), region_id, dtype=np.int32))
-        source_voxel_count += int(counts.sum())
+        source_voxel_count += int(collapsed_counts.sum())
         represented.append(region_id)
 
     collision_bins = 0
@@ -2826,6 +2990,199 @@ def materialize_allen_layer_region_selection(
         style=style_cache.style,
         profile_id=profile.profile_id,
     )
+
+
+def materialize_flat_region_selection(
+    cache_or_profile: FlatmapRegionCache | FlatmapRegionCacheProfile | str | Path,
+    region_ids: Iterable[int],
+    *,
+    style: str,
+    profile_id: str | None = None,
+    direct_region_ids: Iterable[int] | None = None,
+    region_descendants: Mapping[int, Iterable[int]] | None = None,
+    atlas_structures: Mapping[object, Mapping[str, Any]] | None = None,
+    include_outlines: bool = True,
+) -> CachedFlatRegionSelection:
+    """Collapse cached depth occupancy into one depth-free flatmap plane.
+
+    ``region_ids`` are the cached occupancy regions to read, normally the
+    include-child-expanded selection.  ``direct_region_ids`` are the regions the
+    user actually selected; each one becomes a single label value whose
+    descendants' source-voxel counts are summed before competing regions are
+    resolved by the cache's usual majority rule.
+
+    Outlines are derived here rather than read from the cache: the stored
+    outlines are per-depth-slice perimeters, whose depth-collapsed projection is
+    a strict subset of the true collapsed footprint.
+    """
+    profile = _profile_from_value(cache_or_profile, profile_id)
+    style_cache = profile.style(style)
+    selected = _normalise_region_ids(region_ids)
+    direct = (
+        selected
+        if direct_region_ids is None
+        else _normalise_region_ids(direct_region_ids)
+    )
+    depth_shape = style_cache.output_shape
+    y_bins, x_bins = int(depth_shape[1]), int(depth_shape[2])
+    plane_size = y_bins * x_bins
+    output_shape = (y_bins, x_bins)
+    labels = np.zeros(output_shape, dtype=np.int32)
+
+    groups, grouping = _resolve_flat_region_groups(
+        style_cache,
+        member_region_ids=selected,
+        direct_region_ids=direct,
+        region_descendants=region_descendants,
+        atlas_structures=atlas_structures,
+    )
+
+    represented: list[int] = []
+    represented_sources: set[int] = set()
+    source_voxel_count = 0
+    group_bins: dict[int, np.ndarray] = {}
+    group_source_counts: dict[int, int] = {}
+    group_members: dict[int, tuple[int, ...]] = {}
+    pair_bins: list[np.ndarray] = []
+    pair_counts: list[np.ndarray] = []
+    pair_ids: list[np.ndarray] = []
+    for label_id in direct:
+        members = groups.get(label_id, ())
+        group_members[label_id] = members
+        member_bins: list[np.ndarray] = []
+        member_counts: list[np.ndarray] = []
+        contributing: list[int] = []
+        for member in members:
+            collapsed = _collapsed_occupancy(style_cache, member, plane_size)
+            if collapsed is None:
+                continue
+            member_bins.append(collapsed[0])
+            member_counts.append(collapsed[1])
+            contributing.append(member)
+        if not member_bins:
+            continue
+        # Sum an area's own layers into one footprint instead of letting them
+        # compete; _neighbour_presence also requires ascending unique bins.
+        merged_bins, inverse = np.unique(
+            np.concatenate(member_bins), return_inverse=True
+        )
+        merged_counts = np.zeros(len(merged_bins), dtype=np.int64)
+        np.add.at(merged_counts, inverse, np.concatenate(member_counts))
+        group_bins[label_id] = merged_bins
+        group_source_counts[label_id] = int(merged_counts.sum())
+        group_members[label_id] = tuple(contributing)
+        represented.append(label_id)
+        represented_sources.update(contributing)
+        source_voxel_count += int(merged_counts.sum())
+        pair_bins.append(merged_bins)
+        pair_counts.append(merged_counts)
+        pair_ids.append(np.full(len(merged_bins), label_id, dtype=np.int32))
+
+    collision_bins = 0
+    if pair_bins:
+        bins = np.concatenate(pair_bins)
+        counts = np.concatenate(pair_counts)
+        ids = np.concatenate(pair_ids)
+        order = np.lexsort((ids, -counts, bins))
+        sorted_bins = bins[order]
+        sorted_ids = ids[order]
+        _unique, first, competing = np.unique(
+            sorted_bins,
+            return_index=True,
+            return_counts=True,
+        )
+        labels.reshape(-1)[sorted_bins[first]] = sorted_ids[first]
+        collision_bins = int(np.count_nonzero(competing > 1))
+
+    outlines: list[CachedFlatRegionOutlines] = []
+    if include_outlines:
+        for label_id in direct:
+            merged_bins = group_bins.get(label_id)
+            if merged_bins is None or not len(merged_bins):
+                continue
+            # The stored tracer already emits only in-plane edges, so a single
+            # depth plane reduces it to a 2D perimeter.
+            vectors = _outlines_for_bins(merged_bins, (1, y_bins, x_bins))[:, :, 1:]
+            outlines.append(
+                CachedFlatRegionOutlines(
+                    region_id=int(label_id),
+                    vectors=np.ascontiguousarray(vectors, dtype=np.float32),
+                    union_region_ids=groups.get(label_id, ()),
+                    represented_region_ids=group_members.get(label_id, ()),
+                    planar_bin_count=int(len(merged_bins)),
+                    source_voxel_count=int(group_source_counts.get(label_id, 0)),
+                )
+            )
+
+    summary = CachedFlatRegionSelectionSummary(
+        selected_region_count=len(selected),
+        direct_region_count=len(direct),
+        represented_region_count=len(represented),
+        represented_source_region_count=len(represented_sources),
+        labeled_bins=int(np.count_nonzero(labels)),
+        collision_bins=collision_bins,
+        source_voxel_count=source_voxel_count,
+        output_shape=output_shape,
+    )
+    grid_spec = {
+        "coordinate_order": ["y", "x"],
+        "plane_mode": "flat",
+        "xy_bins": int(style_cache.grid_spec["xy_bins"]),
+        "x_bounds": list(style_cache.grid_spec["x_bounds"]),
+        "y_bounds": list(style_cache.grid_spec["y_bounds"]),
+        "output_shape": [int(size) for size in output_shape],
+        "label_grouping": grouping,
+    }
+    return CachedFlatRegionSelection(
+        labels=labels,
+        selected_region_ids=selected,
+        direct_region_ids=direct,
+        represented_region_ids=tuple(represented),
+        represented_source_region_ids=tuple(sorted(represented_sources)),
+        outlines=tuple(outlines),
+        summary=summary,
+        grid_spec=grid_spec,
+        style=style_cache.style,
+        profile_id=profile.profile_id,
+    )
+
+
+def materialize_flat_region_outlines(
+    cache_or_profile: FlatmapRegionCache | FlatmapRegionCacheProfile | str | Path,
+    region_id: int,
+    *,
+    style: str,
+    profile_id: str | None = None,
+    region_ids: Iterable[int] | None = None,
+    region_descendants: Mapping[int, Iterable[int]] | None = None,
+    atlas_structures: Mapping[object, Mapping[str, Any]] | None = None,
+) -> CachedFlatRegionOutlines | None:
+    """Return one region's depth-collapsed 2D perimeter, or ``None`` when empty.
+
+    ``region_ids`` are the occupancy regions to union; they default to the
+    region itself plus any descendants derivable from the supplied hierarchy.
+    Callers showing several regions should use
+    :func:`materialize_flat_region_selection` instead, which resolves the
+    hierarchy once for the whole selection.
+    """
+    if region_ids is None:
+        descendants = _derive_region_descendants(
+            region_descendants,
+            atlas_structures,
+            (int(region_id),),
+        )
+        region_ids = descendants.get(int(region_id), (int(region_id),))
+    result = materialize_flat_region_selection(
+        cache_or_profile,
+        region_ids,
+        style=style,
+        profile_id=profile_id,
+        direct_region_ids=(int(region_id),),
+        region_descendants=region_descendants,
+        atlas_structures=atlas_structures,
+        include_outlines=True,
+    )
+    return result.outlines[0] if result.outlines else None
 
 
 def materialize_region_surface(

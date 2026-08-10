@@ -243,6 +243,37 @@ def test_flat_vector_layer_keeps_two_axis_labels(widget_class, viewer, host) -> 
     assert viewer.text_overlay.visible is False
 
 
+def test_collapsed_region_overlays_get_two_axes_and_no_plane_caption(
+    widget_class,
+    viewer,
+    host,
+) -> None:
+    """The 2D region overlays occupy one plane, so nothing should caption it."""
+    labels = viewer.add_labels(
+        np.asarray([[315, 0], [0, 315]], dtype=np.int32),
+        name="Flatmap Region Labels 2D",
+        axis_labels=widget_class._flat_axis_labels(),
+        metadata={"flatmap_plane_mode": "flat"},
+    )
+    outlines = viewer.add_vectors(
+        np.asarray([[[0.5, 0.5], [0.0, 1.0]]], dtype=np.float32),
+        name="Flatmap Region Outlines 2D: Isocortex (315)",
+        axis_labels=widget_class._flat_axis_labels(),
+        vector_style="line",
+        metadata={"flatmap_plane_mode": "flat"},
+    )
+    viewer.dims.ndisplay = 2
+
+    for layer in (labels, outlines):
+        host._apply_display_axis_annotations(layer)
+
+        assert host._plane_labels_for_layer(layer) is None
+        assert viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
+        assert viewer.axes.visible is True
+        assert viewer.text_overlay.visible is False
+        assert viewer.text_overlay.text == ""
+
+
 def test_foreign_layer_axis_labels_are_not_copied(viewer, host) -> None:
     points = viewer.add_points(
         np.zeros((2, 3), dtype=float),
