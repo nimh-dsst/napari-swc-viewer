@@ -24,9 +24,13 @@ from .flatmap_heatmap import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class FlatmapRegionLabelsSummary:
-    """Counts and grid settings for one flatmap region-label remap."""
+    """Counts and grid settings for one flatmap region-label remap.
+
+    Keyword-only so the per-axis bin-count split cannot shift positional
+    arguments at a construction site.
+    """
 
     input_voxels: int
     selected_region_count: int
@@ -52,9 +56,7 @@ class FlatmapRegionLabelsSummary:
             "selected_region_count": int(self.selected_region_count),
             "selected_source_voxels": int(self.selected_source_voxels),
             "valid_source_voxels": int(self.valid_source_voxels),
-            "mirrored_depth_source_voxels": int(
-                self.mirrored_depth_source_voxels
-            ),
+            "mirrored_depth_source_voxels": int(self.mirrored_depth_source_voxels),
             "labeled_voxels": int(self.labeled_voxels),
             "collision_voxels": int(self.collision_voxels),
             "xy_bins": int(self.xy_bins),
@@ -288,24 +290,24 @@ def build_flatmap_region_label_volume(
             continue
 
         valid_source_voxels += int(valid.sum())
-        x_bins = _bin_flat_values(
+        x_bin_indices = _bin_flat_values(
             flat_xy[..., 0][valid],
             lookup_stats.x_bounds,
             xy_bins,
         )
-        y_bins = _bin_flat_values(
+        y_bin_indices = _bin_flat_values(
             flat_xy[..., 1][valid],
             lookup_stats.y_bounds,
             xy_bins,
         )
-        depth_bins_for_voxels = np.floor(
+        depth_bin_indices = np.floor(
             (depth_values[valid] - lookup_stats.depth_range_um[0]) / depth_bin_um
         ).astype(np.int64)
-        depth_bins_for_voxels = np.clip(depth_bins_for_voxels, 0, depth_bins - 1)
+        depth_bin_indices = np.clip(depth_bin_indices, 0, depth_bins - 1)
         linear_bins = (
-            (depth_bins_for_voxels * xy_bins * xy_bins)
-            + (y_bins * xy_bins)
-            + x_bins
+            (depth_bin_indices * xy_bins * xy_bins)
+            + (y_bin_indices * xy_bins)
+            + x_bin_indices
         )
         region_ids = annotation_chunk[valid].astype(np.int32, copy=False)
         packed = _pack_pairs(linear_bins, region_ids)

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FLATMAP_XY_BINS = 256
+#: Bin count along the flat map ``y`` axis, which spans ONE hemisphere.  The
+#: ``x`` count is derived from the aspect ratio -- see
+#: :func:`resolve_flatmap_bin_counts` -- so bins stay square.
+DEFAULT_FLATMAP_Y_BINS = 256
+
+#: Retained so a single control cannot exceed the region cache's portable
+#: uint32 key format once ``x`` is derived: the widest style roughly doubles the
+#: ``x`` count, so 2048 keeps the derived count within the old 4096 ceiling.
+MAX_FLATMAP_Y_BINS = 2048
+
+#: Deprecated alias kept while call sites migrate to per-axis counts.
+DEFAULT_FLATMAP_XY_BINS = DEFAULT_FLATMAP_Y_BINS
 DEFAULT_FLATMAP_DEPTH_BIN_UM = 25.0
 MAX_FLATMAP_HEATMAP_VOXELS = 100_000_000
 DEFAULT_LOOKUP_STATS_CHUNK_VOXELS = 10_000_000
@@ -83,9 +95,14 @@ class FlatmapLookupStats:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class FlatmapRenderSummary:
-    """Counts and ranges for a depth-aware flatmap render."""
+    """Counts and ranges for a depth-aware flatmap render.
+
+    Keyword-only so that adding or splitting a field cannot silently shift
+    positional arguments at a construction site -- the per-axis bin-count split
+    is exactly that kind of change.
+    """
 
     total_nodes: int
     flatmap_valid_nodes: int
@@ -167,9 +184,12 @@ class FlatmapSegmentVectors:
     total_segments: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class AllenLayerStackSummary:
-    """Counts and grid provenance for one categorical Allen-layer stack."""
+    """Counts and grid provenance for one categorical Allen-layer stack.
+
+    Keyword-only for the same reason as :class:`FlatmapRenderSummary`.
+    """
 
     total_nodes: int
     flatmap_valid_nodes: int
@@ -278,6 +298,61 @@ def _nondegenerate_bounds(lower: float, upper: float) -> tuple[float, float]:
         return float(lower), float(upper)
     pad = max(abs(float(lower)) * 0.01, 0.5)
     return float(lower - pad), float(upper + pad)
+
+
+class FlatmapBinCounts(NamedTuple):
+    """Per-axis flat map bin counts.
+
+    A named tuple rather than a bare pair because this module mixes ``(row,
+    col)`` and ``(x, y)`` ordering throughout, so a positional pair of bin
+    counts is a silent swap waiting to happen.
+    """
+
+    y_bins: int
+    x_bins: int
+
+
+def resolve_flatmap_bin_counts(
+    *,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    y_bins: int,
+) -> FlatmapBinCounts:
+    """Return per-axis bin counts that make flat map bins square.
+
+    The bilateral flat map lays the two hemispheres side by side along ``x``,
+    so ``x`` spans roughly twice the extent of ``y``.  Giving both axes the same
+    bin count therefore makes every bin about twice as wide as it is tall, which
+    discards ``x`` detail at twice the rate of ``y`` and renders the map
+    horizontally squashed.  Scaling the ``x`` count by the aspect ratio fixes
+    both at once.
+
+    ``y_bins`` is the control: it counts bins across the ``y`` extent, which is
+    one hemisphere tall.  Do **not** think of it as "bins per hemisphere" and do
+    **not** derive ``x`` as ``2 * y_bins`` -- that holds only for
+    ``both_square``.  ``both_shaped`` has an aspect ratio of 1.9162, so doubling
+    would leave 4.2% anisotropy.
+
+    Rounding is pinned to half-up rather than :func:`round`, whose banker's
+    rounding is non-monotone at ties (``round(490.5)`` is 490 but
+    ``round(491.5)`` is 492).  This count is recorded in the region-cache
+    identity digest, so its tie behavior must be stable and explicit.
+    """
+    count = int(y_bins)
+    if count <= 0:
+        raise ValueError(f"y_bins must be positive; got {y_bins!r}.")
+
+    x_lower, x_upper = _nondegenerate_bounds(x_bounds[0], x_bounds[1])
+    y_lower, y_upper = _nondegenerate_bounds(y_bounds[0], y_bounds[1])
+    aspect = (x_upper - x_lower) / (y_upper - y_lower)
+    if not np.isfinite(aspect) or aspect <= 0.0:
+        raise ValueError(
+            f"Flat map bounds give a non-positive aspect ratio; got {aspect!r}."
+        )
+    return FlatmapBinCounts(
+        y_bins=count,
+        x_bins=max(1, math.floor(count * aspect + 0.5)),
+    )
 
 
 def _flatmap_valid_mask(
@@ -535,8 +610,7 @@ def build_flatmap_segment_vectors(
     endpoints = np.asarray(segment_endpoints, dtype=float)
     if endpoints.ndim != 3 or endpoints.shape[1:] != (2, 2):
         raise ValueError(
-            "segment_endpoints must have shape (M, 2, 2); "
-            f"got {endpoints.shape}."
+            f"segment_endpoints must have shape (M, 2, 2); got {endpoints.shape}."
         )
     total_segments = int(endpoints.shape[0])
     resolved_file_ids = tuple(file_ids)
@@ -874,15 +948,15 @@ def build_allen_layer_stack_from_projected_nodes(
         )
     render_valid = flatmap_valid & layer_classified
 
-    x_bins = np.full(len(table), -1, dtype=np.int64)
-    y_bins = np.full(len(table), -1, dtype=np.int64)
+    x_bin_indices = np.full(len(table), -1, dtype=np.int64)
+    y_bin_indices = np.full(len(table), -1, dtype=np.int64)
     if render_valid.any():
-        x_bins[render_valid] = _bin_flat_values(
+        x_bin_indices[render_valid] = _bin_flat_values(
             x_values[render_valid],
             resolved_x_bounds,
             xy_bins,
         )
-        y_bins[render_valid] = _bin_flat_values(
+        y_bin_indices[render_valid] = _bin_flat_values(
             y_values[render_valid],
             resolved_y_bounds,
             xy_bins,
@@ -895,8 +969,8 @@ def build_allen_layer_stack_from_projected_nodes(
             volume,
             (
                 layer_indices[render_indices],
-                y_bins[render_indices],
-                x_bins[render_indices],
+                y_bin_indices[render_indices],
+                x_bin_indices[render_indices],
             ),
             1.0,
         )
@@ -905,8 +979,8 @@ def build_allen_layer_stack_from_projected_nodes(
     for index, label in enumerate(layer_map.layer_labels):
         layer_labels[layer_indices == index] = label
     table.loc[:, "render_valid"] = render_valid
-    table.loc[:, "x_flat_bin"] = x_bins
-    table.loc[:, "y_flat_bin"] = y_bins
+    table.loc[:, "x_flat_bin"] = x_bin_indices
+    table.loc[:, "y_flat_bin"] = y_bin_indices
     table.loc[:, "allen_layer_index"] = layer_indices
     table.loc[:, "allen_layer_label"] = layer_labels
 
@@ -960,9 +1034,13 @@ def _rendered_binned_nodes(
         raise ValueError(f"volume_shape must be 2D or 3D; got {volume_shape}.")
     has_depth_axis = len(volume_shape) == 3
 
-    bin_columns = ("depth_bin", "y_flat_bin", "x_flat_bin") if has_depth_axis else (
-        "y_flat_bin",
-        "x_flat_bin",
+    bin_columns = (
+        ("depth_bin", "y_flat_bin", "x_flat_bin")
+        if has_depth_axis
+        else (
+            "y_flat_bin",
+            "x_flat_bin",
+        )
     )
     required = ("render_valid", *bin_columns, "file_id")
     missing = [column for column in required if column not in projected_nodes.columns]
@@ -1006,9 +1084,7 @@ def rendered_plane_points(
     if missing:
         raise ValueError(f"Projected nodes are missing render column(s): {missing}")
 
-    render_valid = (
-        projected_nodes["render_valid"].fillna(False).astype(bool).to_numpy()
-    )
+    render_valid = projected_nodes["render_valid"].fillna(False).astype(bool).to_numpy()
     columns = [
         pd.to_numeric(projected_nodes[column], errors="coerce").to_numpy(dtype=float)
         for column in bin_columns
@@ -1303,9 +1379,7 @@ def _build_flatmap_render_data_for_bounds(
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
     volume_shape: tuple[int, ...] = (
-        (xy_bins, xy_bins)
-        if collapse_depth
-        else (total_depth_bins, xy_bins, xy_bins)
+        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
     )
     voxel_count = int(np.prod(volume_shape))
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
@@ -1333,19 +1407,19 @@ def _build_flatmap_render_data_for_bounds(
         depth_valid | (include_depth_minus_one & depth_minus_one)
     )
 
-    x_bins = np.full(len(table), -1, dtype=np.int64)
-    y_bins = np.full(len(table), -1, dtype=np.int64)
-    depth_bins = np.full(len(table), -1, dtype=np.int64)
+    x_bin_indices = np.full(len(table), -1, dtype=np.int64)
+    y_bin_indices = np.full(len(table), -1, dtype=np.int64)
+    depth_bin_indices = np.full(len(table), -1, dtype=np.int64)
 
     if render_valid.any():
         x_values = pd.to_numeric(table["x_flat"], errors="coerce").to_numpy(dtype=float)
         y_values = pd.to_numeric(table["y_flat"], errors="coerce").to_numpy(dtype=float)
-        x_bins[render_valid] = _bin_flat_values(
+        x_bin_indices[render_valid] = _bin_flat_values(
             x_values[render_valid],
             x_bounds,
             xy_bins,
         )
-        y_bins[render_valid] = _bin_flat_values(
+        y_bin_indices[render_valid] = _bin_flat_values(
             y_values[render_valid],
             y_bounds,
             xy_bins,
@@ -1354,26 +1428,26 @@ def _build_flatmap_render_data_for_bounds(
         sentinel_nodes = render_valid & depth_minus_one
         valid_depth_nodes = render_valid & depth_valid
         if sentinel_nodes.any():
-            depth_bins[sentinel_nodes] = 0
+            depth_bin_indices[sentinel_nodes] = 0
         if valid_depth_nodes.any():
             raw_depth_bins = np.floor(
                 (depth_values[valid_depth_nodes] - depth_range[0]) / depth_bin_um
             ).astype(np.int64)
             raw_depth_bins = np.clip(raw_depth_bins, 0, valid_depth_bins - 1)
-            depth_bins[valid_depth_nodes] = raw_depth_bins + sentinel_offset
+            depth_bin_indices[valid_depth_nodes] = raw_depth_bins + sentinel_offset
 
     volume = np.zeros(volume_shape, dtype=np.float32)
     render_indices = np.flatnonzero(render_valid)
     if collapse_depth:
         scatter_columns: tuple[np.ndarray, ...] = (
-            y_bins[render_indices],
-            x_bins[render_indices],
+            y_bin_indices[render_indices],
+            x_bin_indices[render_indices],
         )
     else:
         scatter_columns = (
-            depth_bins[render_indices],
-            y_bins[render_indices],
-            x_bins[render_indices],
+            depth_bin_indices[render_indices],
+            y_bin_indices[render_indices],
+            x_bin_indices[render_indices],
         )
     if render_indices.size:
         np.add.at(volume, scatter_columns, 1.0)
@@ -1390,12 +1464,12 @@ def _build_flatmap_render_data_for_bounds(
     )
 
     table.loc[:, "render_valid"] = render_valid
-    table.loc[:, "x_flat_bin"] = x_bins
-    table.loc[:, "y_flat_bin"] = y_bins
+    table.loc[:, "x_flat_bin"] = x_bin_indices
+    table.loc[:, "y_flat_bin"] = y_bin_indices
     if not collapse_depth:
-        table.loc[:, "depth_bin"] = depth_bins
+        table.loc[:, "depth_bin"] = depth_bin_indices
         table.loc[:, "depth_bin_label"] = _depth_labels(
-            depth_bins,
+            depth_bin_indices,
             depth_min_um=depth_range[0],
             depth_bin_um=depth_bin_um,
             sentinel_offset=sentinel_offset,
@@ -1898,9 +1972,7 @@ def build_flatmap_heatmap_volume_result(
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
     volume_shape: tuple[int, ...] = (
-        (xy_bins, xy_bins)
-        if collapse_depth
-        else (total_depth_bins, xy_bins, xy_bins)
+        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
     )
 
     voxel_count = int(np.prod(volume_shape))

@@ -1586,13 +1586,17 @@ def _write_occupancy_runs(
             region_ids = annotation_chunk[valid].astype(np.int64, copy=False)
             if np.any(region_ids > np.iinfo(np.int32).max):
                 raise ValueError("Atlas region IDs must fit in positive int32 values.")
-            x_bins = _bin_flat_values(flat_xy[..., 0][valid], x_bounds, xy_bins)
-            y_bins = _bin_flat_values(flat_xy[..., 1][valid], y_bounds, xy_bins)
-            z_bins = np.floor(
+            x_bin_indices = _bin_flat_values(flat_xy[..., 0][valid], x_bounds, xy_bins)
+            y_bin_indices = _bin_flat_values(flat_xy[..., 1][valid], y_bounds, xy_bins)
+            depth_bin_indices = np.floor(
                 (depth_values[valid] - depth_bounds[0]) / depth_bin_um
             ).astype(np.int64)
-            z_bins = np.clip(z_bins, 0, depth_bins - 1)
-            linear = z_bins * xy_bins * xy_bins + y_bins * xy_bins + x_bins
+            depth_bin_indices = np.clip(depth_bin_indices, 0, depth_bins - 1)
+            linear = (
+                depth_bin_indices * xy_bins * xy_bins
+                + y_bin_indices * xy_bins
+                + x_bin_indices
+            )
             packed = (region_ids.astype(np.uint64) << np.uint64(32)) | linear.astype(
                 np.uint64
             )
