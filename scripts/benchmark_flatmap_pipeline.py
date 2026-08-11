@@ -41,7 +41,7 @@ if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
 from napari_swc_viewer.db import NeuronDatabase
 from napari_swc_viewer.flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
-    DEFAULT_FLATMAP_XY_BINS,
+    DEFAULT_FLATMAP_Y_BINS,
     FlatmapRenderResult,
     build_flatmap_render_data,
     compute_flatmap_lookup_stats,
@@ -360,10 +360,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Number of largest file_id candidates to record when auto-selecting.",
     )
     parser.add_argument(
-        "--xy-bins",
+        "--y-bins",
         type=int,
-        default=DEFAULT_FLATMAP_XY_BINS,
-        help="Number of flatmap heatmap bins along each XY axis.",
+        default=DEFAULT_FLATMAP_Y_BINS,
+        help=(
+            "Number of flatmap heatmap bins along the Y axis. The X count "
+            "is derived from the flat map aspect ratio so bins stay square."
+        ),
     )
     parser.add_argument(
         "--depth-bin-um",
@@ -546,7 +549,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             projection_result.projected_nodes,
             volume_set.flatmap,
             volume_set.depth,
-            xy_bins=args.xy_bins,
+            y_bins=args.y_bins,
             depth_bin_um=args.depth_bin_um,
             include_depth_minus_one=not args.exclude_depth_minus_one,
             invalid_zero_sentinel=args.treat_zero_flatmap_invalid,
@@ -580,7 +583,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "depth": str(args.depth),
             },
             "options": {
-                "xy_bins": int(args.xy_bins),
+                "y_bins": int(args.y_bins),
                 "depth_bin_um": float(args.depth_bin_um),
                 "coordinate_mode": args.coordinate_mode,
                 "resolution_um": float(args.resolution_um),
@@ -628,7 +631,7 @@ def _build_flatmap_render_data_profiled(
     flatmap_volume: np.ndarray,
     depth_volume: np.ndarray,
     *,
-    xy_bins: int,
+    y_bins: int,
     depth_bin_um: float,
     include_depth_minus_one: bool,
     invalid_zero_sentinel: bool,
@@ -651,7 +654,7 @@ def _build_flatmap_render_data_profiled(
             projected_nodes,
             flatmap_volume,
             depth_volume,
-            xy_bins=xy_bins,
+            y_bins=y_bins,
             depth_bin_um=depth_bin_um,
             include_depth_minus_one=include_depth_minus_one,
             invalid_zero_sentinel=invalid_zero_sentinel,
@@ -955,7 +958,7 @@ def print_report(report: dict[str, Any]) -> None:
         "Render: "
         f"{render['rendered_nodes']:,} rendered nodes, "
         f"{render['nonzero_voxels']:,} nonzero voxels, "
-        f"{render['depth_bins']}x{render['xy_bins']}x{render['xy_bins']} volume"
+        f"{render['depth_bins']}x{render['y_bins']}x{render['x_bins']} volume"
     )
     if report.get("rss_limit"):
         limit = report["rss_limit"]

@@ -17,7 +17,8 @@ def _source(projected_nodes: pd.DataFrame) -> FlatmapVoxelCorrelationSource:
         projected_nodes=projected_nodes,
         volume_shape=(2, 2, 2),
         input_file_ids=("a.swc", "b.swc", "c.swc"),
-        xy_bins=2,
+        y_bins=2,
+        x_bins=2,
         depth_bin_um=25.0,
         include_depth_minus_one=False,
     )

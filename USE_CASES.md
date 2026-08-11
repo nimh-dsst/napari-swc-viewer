@@ -318,7 +318,9 @@ projecting meshes, or converting region coordinates while viewing.
   must exactly match the lookup grid; its atlas name and version are recorded
   as cache-profile identity.
 - Ensure there is enough writable disk space for both shaped and square cache
-  profiles. Use the default 256 XY bins and 25 μm depth bins for this test.
+  profiles. Use the default 256 Y bins and 25 μm depth bins for this test. The
+  X bin count is derived per style so bins are square, giving 512 X bins for
+  the square style and 491 for the shaped style.
 - Select at least one parent region with descendants in the **Regions** tab.
 - For the detached-window close check, launch with a dedicated trace:
   `NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari`.
@@ -326,13 +328,13 @@ projecting meshes, or converting region coordinates while viewing.
 **Steps and expected results**
 
 1. **Action:** Open **Flatmap**, choose the lookup directory, click **Build
-   Cache Profile...**, choose a new cache directory, and keep **New profile XY
+   Cache Profile...**, choose a new cache directory, and keep **New profile Y
    bins** at `256` and **Depth bin** at `25 um`.
    **Expected:** The plugin validates the exact atlas/lookup grid match and
    builds one profile containing a shaped/square pair. Progress covers
    annotation scanning, occupancy, surfaces, and outlines. The manifest is
    published only after all referenced arrays are complete.
-2. **Action:** Change **New profile XY bins** to `272`, start a second build,
+2. **Action:** Change **New profile Y bins** to `272`, start a second build,
    and cancel it while it is running.
    **Expected:** Temporary files from that build are removed, the prior profile
    remains listed and usable, and the controls are restored.
@@ -353,8 +355,9 @@ projecting meshes, or converting region coordinates while viewing.
    system crash report, and the plugin does not access atlas annotation or
    region mesh data.
 4. **Action:** Select the new cache profile.
-   **Expected:** XY bins, depth-bin size, canonical bounds, and exclusion of the
-   depth `-1` sentinel plane are set from the profile and locked. If the profile
+   **Expected:** Y bins, depth-bin size, canonical bounds, and exclusion of the
+   depth `-1` sentinel plane are set from the profile and locked. The profile's
+   stored X bin count is used verbatim rather than re-derived. If the profile
    grid differs from an existing heatmap, that heatmap is hidden before being
    removed and the status asks the user to click **Project to Flatmap** again.
 5. **Action:** Select a parent region, enable child regions, then click **Show
@@ -430,9 +433,19 @@ projecting meshes, or converting region coordinates while viewing.
 
 **Manual verification**
 
-- Status: Passed
-- Last verified: 2026-07-22
-- Notes: Verified manually on macOS (macOS 26.5.1 arm64, napari 0.6.6, PyQt6
+- Status: Not run
+- Last verified: 2026-07-22 (against the pre-square-bin cache format)
+- Notes: **Re-run required.** On 2026-08-11 the flat map grid moved to per-axis
+  bin counts: the control is now **Y bins** and the X count is derived from each
+  style's aspect ratio, so one profile holds a 512-wide square grid and a
+  491-wide shaped grid instead of two 256x256 grids. The region-cache manifest
+  went to format version 2 and any cache built before that date is refused with a
+  rebuild message rather than opened. Steps 1, 2, and 4 therefore describe
+  different labels and different profile contents than the last passing run, and
+  step 3's "reopen an existing cache" path must be re-exercised with a cache
+  rebuilt under the new format. The earlier run below still stands for the
+  window-lifecycle behavior (steps 3 and 10), which this change does not touch.
+  Previous result, macOS (macOS 26.5.1 arm64, napari 0.6.6, PyQt6
   6.8.1). Cache build/reopen/parse and shaped/square switching all behave as
   expected. The detached flatmap window now closes completely while the main
   napari window stays open, and the plugin creates the viewer hidden in 3D,
@@ -491,7 +504,7 @@ axes without asserting physical units or anatomical direction.
    choose **Precomputed Parquet + Cache**, select **Both hemispheres, shaped**,
    choose the compatible cache directory/profile, and set **Render** to
    **Allen Layer Heatmap (2D stack)**.
-   **Expected:** **XY bins** remains available unless locked by the active
+   **Expected:** **Y bins** remains available unless locked by the active
    cache profile. **Depth bin** and **Exclude depth -1 nodes** are disabled
    because numeric depth does not assign Allen layers. **Show Region Labels**
    is available for the active cache, while cached surfaces and outlines
@@ -574,7 +587,11 @@ axes without asserting physical units or anatomical direction.
 
 - Status: Not run
 - Last verified: Never
-- Notes: The plane-name and axis-arrow annotations in steps 3, 4, and 10 were
+- Notes: On 2026-08-11 the grid control became **Y bins** and the X bin count
+  is derived from the flat map aspect ratio, so the Allen layer stack is now
+  491 or 512 bins wide rather than square; step 1's control name and the
+  on-screen proportions both changed and are unverified.
+  The plane-name and axis-arrow annotations in steps 3, 4, and 10 were
   added on 2026-08-05 and have not been exercised in napari. Automated tests
   cover them against a viewer double only, which cannot show whether the
   overlays are legible or correctly placed on the canvas. Step 9 was added on
@@ -1186,7 +1203,7 @@ mode uses, so soma points land on the visible render in all five modes.
    drawn at the image origin. The summary panel ends with `Depth: collapsed into
    one flatmap plane`.
 2. **Action:** Inspect the control row.
-   **Expected:** **XY bins** is available unless locked by the cache profile.
+   **Expected:** **Y bins** is available unless locked by the cache profile.
    **Depth bin** is disabled because there are no depth bins to size, while
    **Exclude depth -1 nodes** stays enabled. **Show Region Labels**, cached
    surfaces, and outlines are all disabled because their geometry is depth-based.
@@ -1239,7 +1256,14 @@ mode uses, so soma points land on the visible render in all five modes.
 
 - Status: Not run
 - Last verified: Never
-- Notes: Added on 2026-08-05 and not yet exercised in napari. Automated tests
+- Notes: Added on 2026-08-05 and not yet exercised in napari. On 2026-08-11 the
+  grid gained per-axis bin counts, which makes step 7's vector/heatmap overlay
+  check the most important one here: the vector builder and the heatmap now take
+  two counts, and a single shared count would compress every vector about 2x
+  along X. `tests/test_flatmap_rectangular_grid.py` asserts per-node
+  co-registration on a deliberately non-square grid, but only the canvas shows
+  whether the lines sit on lit pixels. The control is now labelled **Y bins**.
+  Automated tests
   cover the collapse invariant, the pixel-centering math, the segment limit, and
   the per-mode soma coordinate space, and the vector/heatmap alignment was
   confirmed numerically against `AUDpo_left_brainglobe_flatmap.parquet` (interior
@@ -1330,7 +1354,7 @@ there, and it already exists.
    **Coordinate space** to **Flat map + Depth** and **Method** to **Soma
    Location**.
    **Expected:** **Ignore depth (flat map X/Y only)** and **Depth scale** appear.
-   **Depth scale** reads `1.00` and is enabled. **XY bins**, **Depth bin**, and
+   **Depth scale** reads `1.00` and is enabled. **Y bins**, **Depth bin**, and
    **Include depth -1 plane** stay hidden, since binning applies only to voxel
    correlation.
 2. **Action:** Hover over **Depth scale**.
@@ -1374,10 +1398,10 @@ there, and it already exists.
    `flatmap_normalization` entry records the axis divisors, `depth_scale`,
    `include_depth`, `axis_count`, and whether bounds came from `canonical`
    metadata or `observed` data.
-10. **Action:** Set **Method** to **Voxel Correlation** with **XY bins** 128 and
+10. **Action:** Set **Method** to **Voxel Correlation** with **Y bins** 128 and
     **Depth bin** 25 µm, note the reported rendered-node count from a run, then
     check **Ignore depth (flat map X/Y only)** and run again.
-    **Expected:** **Depth bin** greys out while **XY bins** and **Include depth
+    **Expected:** **Depth bin** greys out while **Y bins** and **Include depth
     -1 plane** stay enabled. The rendered-node count is **identical** across the
     two runs — collapsing changes how nodes are grouped, not which are counted —
     while the occupied-voxel count drops sharply as depth planes merge.
@@ -1396,7 +1420,12 @@ there, and it already exists.
 
 - Status: Not run
 - Last verified: Never
-- Notes: Added on 2026-08-06 and not yet exercised in napari. Automated tests in
+- Notes: Added on 2026-08-06 and not yet exercised in napari. On 2026-08-11 the
+  voxel-correlation control became **Y bins** with a derived X count, so step
+  10's grid is rectangular and its occupied-voxel counts differ from any earlier
+  run. The soma-clustering normalization in steps 1-9 is unchanged and still
+  carries a separate 4.2% x/y anisotropy for the shaped style, tracked apart
+  from this change. Automated tests in
   `tests/test_flatmap_depth_normalization.py` cover the divisor math, the
   bilateral-`x` halving trap, depth exclusion versus a zero weight, monotonic
   reweighting, the observed-bounds fallback, and provenance;
@@ -1518,13 +1547,17 @@ layers, and the thickest layer would win in each one.
 14. **Action:** Note the `flatmap-region-cache.json` modification time and the
     profile ID reported in the status line before step 2 and again after step 13.
     **Expected:** Both are unchanged. No profile was rebuilt and no manifest was
-    rewritten — the 2D overlays are read-time derivations of the version-1 arrays.
+    rewritten — the 2D overlays are read-time derivations of the occupancy
+    arrays.
 
 **Manual verification**
 
 - Status: Not run
 - Last verified: Never
-- Notes: Added on 2026-08-10 and not yet exercised in napari. Automated tests in
+- Notes: Added on 2026-08-10 and not yet exercised in napari. On 2026-08-11 the
+  region cache moved to per-axis bin counts and manifest format version 2, so
+  this use case needs a cache rebuilt under the new format; the 2D label image
+  is now `Y bins x X bins` rather than square. Automated tests in
   `tests/test_flatmap_region_cache.py` cover the depth-collapse arithmetic,
   per-selection aggregation (a single selected root reports zero collisions where
   the depth-grid materializer reports one), assignment of members to several roots

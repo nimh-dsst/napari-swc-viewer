@@ -206,7 +206,7 @@ version-3 augmentation in one cancellable, atomic background operation.
 - Flatmap-invalid nodes, non-Isocortex annotations, parent regions,
   unannotated nodes, and non-laminar regions are excluded. Cortical areas
   without layer 4 remain empty on the `L4` plane.
-- **XY bins**, shaped/square style, neuron selection, and heatmap color mode
+- **Y bins**, shaped/square style, neuron selection, and heatmap color mode
   continue to apply. Depth-bin controls and cached surfaces/outlines are
   unavailable while this categorical mode is selected. For a flatmap with no
   plane axis at all, see **Depth-free 2D flatmap modes** below.
@@ -249,7 +249,7 @@ version-3 augmentation in one cancellable, atomic background operation.
   The depth-bin size control is disabled because there are no depth bins to
   size.
 - **2D Heatmap** produces one raw node-count image over the flatmap XY grid.
-  **XY bins**, shaped/square style, neuron selection, and **Heatmap colors** all
+  **Y bins**, shaped/square style, neuron selection, and **Heatmap colors** all
   apply, so Individual and cluster coloring create one tinted 2D image per
   neuron or cluster. With **Precomputed Parquet + Cache** the binning runs in
   DuckDB, matching the 3D heatmap's speed on whole-Parquet renders.
@@ -292,11 +292,18 @@ version-3 augmentation in one cancellable, atomic background operation.
   the lookup grid. It memory-maps the atlas annotation and lookup arrays and
   processes them in bounded chunks.
 - In **Flatmap**, use **Build Cache Profile...** to choose a cache directory and
-  build one shaped/square profile pair. The default fixed grid is 256 XY bins
-  with 25 µm depth bins.
+  build one shaped/square profile pair. The default fixed grid is 256 Y bins
+  with 25 µm depth bins. The X bin count is derived per style from its flat map
+  aspect ratio so bins are square, so the two styles in one profile have
+  different X counts (512 for square, 491 for shaped).
 - The root `flatmap-region-cache.json` manifest can reference multiple profiles.
   Profile identity includes the lookup-set ID, exact atlas provenance, grid
   settings, bounds, output shape, and algorithm versions.
+- The manifest is at format version 2. A cache built before per-axis bin counts
+  were introduced is refused with a message telling you to rebuild it: its
+  arrays were binned on a grid that used one bin count for both flat map axes,
+  so they cannot be reinterpreted on the square-bin grid. Rebuilding is a
+  one-time cost per cache directory.
 - Each style stores sparse region occupancy and source-voxel counts, closed
   voxel-faithful surface triangles, and per-depth XY perimeter vectors. Parent
   region geometry is precomputed as the union of its descendants. Depth-collapsed
@@ -305,8 +312,10 @@ version-3 augmentation in one cancellable, atomic background operation.
 - New arrays are published before the manifest is atomically replaced. A
   cancelled or failed build does not invalidate existing profiles.
 - For viewing, choose **Precomputed Parquet + Cache**, click **Choose Cache
-  Directory...**, and select a compatible profile. Profile selection locks XY
-  bins, depth bins, canonical bounds, and exclusion of the depth `-1` plane.
+  Directory...**, and select a compatible profile. Profile selection locks the
+  Y and X bin counts, depth bins, canonical bounds, and exclusion of the depth
+  `-1` plane. The stored X count is used verbatim rather than re-derived, so a
+  cache-backed render always lands on the profile's own grid.
 - Flatmap region actions follow the active **Query source** and **Search
   scope**. For **Atlas Regions**, **Show Region Labels** uses the
   Include-child-expanded IDs while surfaces and outlines use each directly
@@ -315,15 +324,15 @@ version-3 augmentation in one cancellable, atomic background operation.
   acronym/ID-named, atlas-colored geometry layer per terminal region.
 - In **3D Heatmap** mode, cached labels use the depth grid; recomputed labels
   also accept the active Atlas or Custom selection. In **Allen Layer Heatmap
-  (2D stack)** mode, cached labels collapse the same version-1 occupancy into
-  six synchronized Allen planes. Existing caches do not need to be rebuilt,
-  and surfaces/outlines remain unavailable in the planar mode because their
-  geometry is depth-based.
+  (2D stack)** mode, cached labels collapse the same occupancy arrays into
+  six synchronized Allen planes. The planar mode itself needs no rebuild of a
+  format-version-2 cache, and surfaces/outlines remain unavailable in it
+  because their geometry is depth-based.
 - In **2D Heatmap** and **2D Vector** modes, **Show Region Labels** builds one
-  `XY bins × XY bins` image named **Flatmap Region Labels 2D**, and **Show Region
+  `Y bins × X bins` image named **Flatmap Region Labels 2D**, and **Show Region
   Outlines** builds one **Flatmap Region Outlines 2D** vector layer per directly
-  selected region. Both are derived at read time from the same version-1
-  occupancy arrays; existing caches are reused unchanged and the manifest is not
+  selected region. Both are derived at read time from the same occupancy
+  arrays; a format-version-2 cache is reused unchanged and the manifest is not
   rewritten.
 - Both 2D overlays sum source-voxel counts across depth **per selected region**
   before the majority vote. Selecting `Isocortex` therefore gives one solid

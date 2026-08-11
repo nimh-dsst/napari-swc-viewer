@@ -28,8 +28,20 @@ DEFAULT_FLATMAP_Y_BINS = 256
 #: ``x`` count, so 2048 keeps the derived count within the old 4096 ceiling.
 MAX_FLATMAP_Y_BINS = 2048
 
-#: Deprecated alias kept while call sites migrate to per-axis counts.
-DEFAULT_FLATMAP_XY_BINS = DEFAULT_FLATMAP_Y_BINS
+#: Shared wording for the ``Y bins`` control, so the flat map tab and the analysis
+#: tab explain the derived ``x`` count identically.
+FLATMAP_Y_BINS_TOOLTIP = (
+    "Number of voxel bins across the flat map Y extent.\n\n"
+    "The X count is derived from the flat map aspect ratio so that bins are "
+    "square. X spans BOTH hemispheres while Y spans one, so equal counts "
+    "would make every bin about twice as wide as it is tall.\n\n"
+    "At 256 Y bins the bilateral square style resolves to 512 X bins and the "
+    "bilateral shaped style to 491. The ratio is measured from the data's own "
+    "bounds, so it is not exactly 2 for every style.\n\n"
+    "Flat map X/Y are dimensionless: the projection distorts the cortical "
+    "surface, so a bin width has no reliable conversion to microns."
+)
+
 DEFAULT_FLATMAP_DEPTH_BIN_UM = 25.0
 MAX_FLATMAP_HEATMAP_VOXELS = 100_000_000
 DEFAULT_LOOKUP_STATS_CHUNK_VOXELS = 10_000_000
@@ -112,7 +124,8 @@ class FlatmapRenderSummary:
     excluded_depth_minus_one_nodes: int
     nonzero_voxels: int
     traces_represented: int
-    xy_bins: int
+    y_bins: int
+    x_bins: int
     depth_bins: int
     depth_bin_um: float
     x_flat_min: float
@@ -134,7 +147,8 @@ class FlatmapRenderSummary:
             "excluded_depth_minus_one_nodes": int(self.excluded_depth_minus_one_nodes),
             "nonzero_voxels": int(self.nonzero_voxels),
             "traces_represented": int(self.traces_represented),
-            "xy_bins": int(self.xy_bins),
+            "y_bins": int(self.y_bins),
+            "x_bins": int(self.x_bins),
             "depth_bins": int(self.depth_bins),
             "depth_bin_um": float(self.depth_bin_um),
             "x_flat_min": float(self.x_flat_min),
@@ -198,7 +212,8 @@ class AllenLayerStackSummary:
     excluded_non_layer_nodes: int
     nonzero_voxels: int
     traces_represented: int
-    xy_bins: int
+    y_bins: int
+    x_bins: int
     x_flat_min: float
     x_flat_max: float
     y_flat_min: float
@@ -236,7 +251,8 @@ class AllenLayerStackSummary:
             "excluded_non_layer_nodes": int(self.excluded_non_layer_nodes),
             "nonzero_voxels": int(self.nonzero_voxels),
             "traces_represented": int(self.traces_represented),
-            "xy_bins": int(self.xy_bins),
+            "y_bins": int(self.y_bins),
+            "x_bins": int(self.x_bins),
             "x_flat_min": float(self.x_flat_min),
             "x_flat_max": float(self.x_flat_max),
             "y_flat_min": float(self.y_flat_min),
@@ -281,14 +297,26 @@ class AllenLayerHeatmapVolumeResult:
     volume_shape: tuple[int, int, int]
 
 
-def _validate_resolution(xy_bins: int, depth_bin_um: float) -> tuple[int, float]:
-    xy_bins = int(xy_bins)
+def _validate_resolution(
+    y_bins: int,
+    x_bins: int,
+    depth_bin_um: float,
+) -> tuple[int, int, float]:
+    """Coerce and check a per-axis grid resolution.
+
+    The single coercion funnel for every flat map grid builder, so the two bin
+    counts are validated in one place rather than at each entry point.
+    """
+    y_bins = int(y_bins)
+    x_bins = int(x_bins)
     depth_bin_um = float(depth_bin_um)
-    if xy_bins <= 0:
-        raise ValueError("xy_bins must be positive.")
+    if y_bins <= 0:
+        raise ValueError("y_bins must be positive.")
+    if x_bins <= 0:
+        raise ValueError("x_bins must be positive.")
     if depth_bin_um <= 0.0:
         raise ValueError("depth_bin_um must be positive.")
-    return xy_bins, depth_bin_um
+    return y_bins, x_bins, depth_bin_um
 
 
 def _nondegenerate_bounds(lower: float, upper: float) -> tuple[float, float]:
@@ -353,6 +381,52 @@ def resolve_flatmap_bin_counts(
         y_bins=count,
         x_bins=max(1, math.floor(count * aspect + 0.5)),
     )
+
+
+def _check_bin_count_inputs(
+    y_bins: int,
+    x_bins: int | None,
+    depth_bin_um: float,
+) -> None:
+    """Reject an unusable resolution before any expensive scan runs.
+
+    Deriving ``x`` needs bounds, which for the NRRD paths means scanning the
+    whole lookup volume first.  This positivity check costs nothing and keeps a
+    bad argument from surfacing only after that scan.  It deliberately does not
+    derive anything -- ``_resolve_axis_bin_counts`` remains the one place that
+    does.
+    """
+    _validate_resolution(y_bins, y_bins if x_bins is None else x_bins, depth_bin_um)
+
+
+def _resolve_axis_bin_counts(
+    *,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    y_bins: int,
+    x_bins: int | None,
+    depth_bin_um: float = 1.0,
+) -> tuple[int, int, float]:
+    """Resolve per-axis bin counts, deriving ``x`` only when it is not supplied.
+
+    The single choke point every flat map grid builder goes through, so the
+    square-bin policy cannot be applied in one subsystem and skipped in another.
+
+    A supplied ``x_bins`` is used **verbatim**.  A cache-backed render has to
+    reproduce its profile's stored count exactly -- the widget discards a render
+    whose grid disagrees, and the worker raises on a mask/volume shape mismatch
+    -- and re-deriving from bounds that have been through a JSON float round trip
+    is not guaranteed to return the same integer at a rounding tie.  Never
+    re-derive what was stored.
+    """
+    if x_bins is None:
+        derived = resolve_flatmap_bin_counts(
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            y_bins=y_bins,
+        )
+        y_bins, x_bins = derived.y_bins, derived.x_bins
+    return _validate_resolution(y_bins, x_bins, depth_bin_um)
 
 
 def _flatmap_valid_mask(
@@ -592,7 +666,8 @@ def build_flatmap_segment_vectors(
     *,
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
-    xy_bins: int,
+    y_bins: int,
+    x_bins: int,
     max_segments: int = MAX_FLATMAP_VECTOR_SEGMENTS,
 ) -> FlatmapSegmentVectors:
     """Convert projected parent-child segments into napari vector data.
@@ -602,7 +677,12 @@ def build_flatmap_segment_vectors(
     returns: ``[:, 0]`` is the parent endpoint, ``[:, 1]`` the child endpoint,
     and the last axis is ``(x_flat, y_flat)`` in raw flatmap units.  Output
     coordinates are image pixels in ``(row, col)`` order so the vectors land on
-    the same grid as a flatmap heatmap built with the same bounds and bin count.
+    the same grid as a flatmap heatmap built with the same bounds and bin counts.
+
+    The two counts must be the *same pair* the heatmap was built with.  Scaling
+    both axes by a single count compresses every vector along ``x`` relative to
+    the heatmap it is drawn over -- a whole-dataset misregistration, not a
+    half-pixel offset -- because ``x`` spans two hemispheres and ``y`` one.
 
     Raises ``ValueError`` above ``max_segments`` rather than truncating, because
     a truncated render silently omits whole neurons.
@@ -634,8 +714,8 @@ def build_flatmap_segment_vectors(
             total_segments=0,
         )
 
-    columns = flatmap_pixel_coordinates(endpoints[:, :, 0], x_bounds, xy_bins)
-    rows = flatmap_pixel_coordinates(endpoints[:, :, 1], y_bounds, xy_bins)
+    columns = flatmap_pixel_coordinates(endpoints[:, :, 0], x_bounds, x_bins)
+    rows = flatmap_pixel_coordinates(endpoints[:, :, 1], y_bounds, y_bins)
     # napari image axes are (row, col), so y leads x.
     start = np.column_stack((rows[:, 0], columns[:, 0]))
     end = np.column_stack((rows[:, 1], columns[:, 1]))
@@ -797,7 +877,8 @@ def build_flatmap_render_data(
     flatmap_volume: np.ndarray,
     depth_volume: np.ndarray,
     *,
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
+    x_bins: int | None = None,
     depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
     include_depth_minus_one: bool = True,
     invalid_zero_sentinel: bool = False,
@@ -808,10 +889,14 @@ def build_flatmap_render_data(
 ) -> FlatmapRenderResult:
     """Build a depth-aware flatmap node-count volume and point coordinates.
 
+    ``y_bins`` counts bins across the flat map ``y`` extent; ``x_bins`` defaults
+    to the count that keeps bins square (see :func:`resolve_flatmap_bin_counts`).
+    Pass ``x_bins`` only to reproduce a grid that was recorded elsewhere.
+
     ``collapse_depth`` drops the depth *axis* while keeping depth's say over
     which nodes render; see :func:`_build_flatmap_render_data_for_bounds`.
     """
-    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
+    _check_bin_count_inputs(y_bins, x_bins, depth_bin_um)
     flatmap = _validate_flatmap_volume(flatmap_volume)
     depth = _validate_depth_volume(depth_volume)
     if depth.shape != flatmap.shape[:3]:
@@ -836,12 +921,15 @@ def build_flatmap_render_data(
             invalid_negative_one_sentinel=invalid_negative_one_sentinel,
         )
 
+    # x_bins is derived inside _build_flatmap_render_data_for_bounds, the choke
+    # point where the bounds the aspect ratio needs are already resolved.
     return _build_flatmap_render_data_for_bounds(
         projected_nodes,
         x_bounds=lookup_stats.x_bounds,
         y_bounds=lookup_stats.y_bounds,
         depth_range=lookup_stats.depth_range_um,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
+        x_bins=x_bins,
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include_depth_minus_one,
         collapse_depth=collapse_depth,
@@ -851,7 +939,8 @@ def build_flatmap_render_data(
 def build_flatmap_render_data_from_projected_nodes(
     projected_nodes: pd.DataFrame,
     *,
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
+    x_bins: int | None = None,
     depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
     include_depth_minus_one: bool = True,
     x_bounds: tuple[float, float] | None = None,
@@ -867,7 +956,6 @@ def build_flatmap_render_data_from_projected_nodes(
     to the same output grid.  The subset-derived fallback is retained only for
     legacy version-1/2 Parquets, which did not record canonical bounds.
     """
-    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
     projected = _projected_nodes_with_validity_flags(projected_nodes)
     supplied = (x_bounds, y_bounds, depth_range_um)
     if any(value is not None for value in supplied) and not all(
@@ -893,7 +981,8 @@ def build_flatmap_render_data_from_projected_nodes(
         x_bounds=resolved_x_bounds,
         y_bounds=resolved_y_bounds,
         depth_range=resolved_depth_range,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
+        x_bins=x_bins,
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include_depth_minus_one,
         collapse_depth=collapse_depth,
@@ -904,12 +993,12 @@ def build_allen_layer_stack_from_projected_nodes(
     projected_nodes: pd.DataFrame,
     layer_map: AllenIsocortexLayerMap,
     *,
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
+    x_bins: int | None = None,
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
 ) -> AllenLayerStackResult:
     """Bin projected nodes into six atlas-defined Isocortex layer planes."""
-    xy_bins, _unused_depth_bin = _validate_resolution(xy_bins, 1.0)
     required = ("x_flat", "y_flat", "region_id")
     missing = [column for column in required if column not in projected_nodes.columns]
     if missing:
@@ -917,16 +1006,25 @@ def build_allen_layer_stack_from_projected_nodes(
             f"Projected nodes are missing Allen-layer column(s): {missing}."
         )
 
+    # Bounds first: the derived x count needs them, and the size guard needs the
+    # derived count.
+    resolved_x_bounds = _nondegenerate_bounds(*x_bounds)
+    resolved_y_bounds = _nondegenerate_bounds(*y_bounds)
+    y_bins, x_bins, _unused_depth_bin = _resolve_axis_bin_counts(
+        x_bounds=resolved_x_bounds,
+        y_bounds=resolved_y_bounds,
+        y_bins=y_bins,
+        x_bins=x_bins,
+    )
+
     plane_count = len(layer_map.layer_labels)
-    voxel_count = int(plane_count * xy_bins * xy_bins)
+    voxel_count = int(plane_count * y_bins * x_bins)
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
         raise ValueError(
             "Allen layer heatmap is too large: "
-            f"{plane_count}x{xy_bins}x{xy_bins} voxels. Use fewer XY bins."
+            f"{plane_count}x{y_bins}x{x_bins} voxels. Use fewer Y bins."
         )
 
-    resolved_x_bounds = _nondegenerate_bounds(*x_bounds)
-    resolved_y_bounds = _nondegenerate_bounds(*y_bounds)
     table = projected_nodes.copy()
     x_values = pd.to_numeric(table["x_flat"], errors="coerce").to_numpy(dtype=float)
     y_values = pd.to_numeric(table["y_flat"], errors="coerce").to_numpy(dtype=float)
@@ -954,15 +1052,15 @@ def build_allen_layer_stack_from_projected_nodes(
         x_bin_indices[render_valid] = _bin_flat_values(
             x_values[render_valid],
             resolved_x_bounds,
-            xy_bins,
+            x_bins,
         )
         y_bin_indices[render_valid] = _bin_flat_values(
             y_values[render_valid],
             resolved_y_bounds,
-            xy_bins,
+            y_bins,
         )
 
-    volume = np.zeros((plane_count, xy_bins, xy_bins), dtype=np.float32)
+    volume = np.zeros((plane_count, y_bins, x_bins), dtype=np.float32)
     render_indices = np.flatnonzero(render_valid)
     if render_indices.size:
         np.add.at(
@@ -1003,7 +1101,8 @@ def build_allen_layer_stack_from_projected_nodes(
         excluded_non_layer_nodes=int((flatmap_valid & ~layer_classified).sum()),
         nonzero_voxels=int(np.count_nonzero(volume)),
         traces_represented=traces_represented,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
+        x_bins=x_bins,
         x_flat_min=resolved_x_bounds[0],
         x_flat_max=resolved_x_bounds[1],
         y_flat_min=resolved_y_bounds[0],
@@ -1361,32 +1460,43 @@ def _build_flatmap_render_data_for_bounds(
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
     depth_range: tuple[float, float],
-    xy_bins: int,
+    y_bins: int,
+    x_bins: int | None = None,
     depth_bin_um: float,
     include_depth_minus_one: bool,
     collapse_depth: bool = False,
 ) -> FlatmapRenderResult:
     """Bin projected nodes into a flatmap node-count volume.
 
+    The grid-construction choke point for the pandas render path: ``x_bins`` is
+    derived here, where the bounds the aspect ratio needs are already resolved.
+
     ``collapse_depth`` removes the depth *axis* only: ``render_valid`` is
     computed exactly as for a depth-binned render, so ``include_depth_minus_one``
     still decides whether depth ``-1`` nodes contribute, and the result is the
     depth volume summed over its plane axis.  The volume becomes
-    ``(xy_bins, xy_bins)``, points become ``(N, 2)``, and no ``depth_bin``
+    ``(y_bins, x_bins)``, points become ``(N, 2)``, and no ``depth_bin``
     column is written.
     """
+    y_bins, x_bins, depth_bin_um = _resolve_axis_bin_counts(
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        y_bins=y_bins,
+        x_bins=x_bins,
+        depth_bin_um=depth_bin_um,
+    )
     valid_depth_bins = _depth_bin_count(depth_range, depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
     volume_shape: tuple[int, ...] = (
-        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
+        (y_bins, x_bins) if collapse_depth else (total_depth_bins, y_bins, x_bins)
     )
     voxel_count = int(np.prod(volume_shape))
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
         raise ValueError(
             "Flatmap heatmap is too large: "
             f"{'x'.join(str(size) for size in volume_shape)} voxels. "
-            "Use fewer XY bins or a larger depth bin."
+            "Use fewer Y bins or a larger depth bin."
         )
 
     table = projected_nodes.copy()
@@ -1417,12 +1527,12 @@ def _build_flatmap_render_data_for_bounds(
         x_bin_indices[render_valid] = _bin_flat_values(
             x_values[render_valid],
             x_bounds,
-            xy_bins,
+            x_bins,
         )
         y_bin_indices[render_valid] = _bin_flat_values(
             y_values[render_valid],
             y_bounds,
-            xy_bins,
+            y_bins,
         )
 
         sentinel_nodes = render_valid & depth_minus_one
@@ -1492,7 +1602,8 @@ def _build_flatmap_render_data_for_bounds(
         excluded_depth_minus_one_nodes=excluded_depth_minus_one,
         nonzero_voxels=int(np.count_nonzero(volume)),
         traces_represented=traces_represented,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
+        x_bins=x_bins,
         # A collapsed render has no depth planes and no depth bin size.  Zeros
         # say exactly that: ``depth_plane_labels`` returns an empty tuple for
         # them rather than inventing plane names for an axis that is not there.
@@ -1594,7 +1705,8 @@ def _flatmap_sql_expressions(
     y_upper: float,
     depth_lower: float,
     depth_bin_um: float,
-    xy_bins: int,
+    y_bins: int,
+    x_bins: int,
     valid_depth_bins: int,
     sentinel_offset: int,
     include_depth_minus_one: bool,
@@ -1648,13 +1760,13 @@ def _flatmap_sql_expressions(
     x_bin = (
         f"CASE WHEN isfinite({x_ref}) THEN "
         f"LEAST(GREATEST(CAST(FLOOR(({x_ref} - {_sql_number(x_lower)}) "
-        f"/ {_sql_number(x_span)} * {int(xy_bins)}) AS BIGINT), 0), {int(xy_bins) - 1}) "
+        f"/ {_sql_number(x_span)} * {int(x_bins)}) AS BIGINT), 0), {int(x_bins) - 1}) "
         f"ELSE 0 END"
     )
     y_bin = (
         f"CASE WHEN isfinite({y_ref}) THEN "
         f"LEAST(GREATEST(CAST(FLOOR(({y_ref} - {_sql_number(y_lower)}) "
-        f"/ {_sql_number(y_span)} * {int(xy_bins)}) AS BIGINT), 0), {int(xy_bins) - 1}) "
+        f"/ {_sql_number(y_span)} * {int(y_bins)}) AS BIGINT), 0), {int(y_bins) - 1}) "
         f"ELSE 0 END"
     )
     depth_bin = (
@@ -1914,7 +2026,8 @@ def build_flatmap_heatmap_volume_result(
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
     depth_range_um: tuple[float, float],
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
+    x_bins: int | None = None,
     depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
     include_depth_minus_one: bool = True,
     file_ids: list[object] | None = None,
@@ -1953,26 +2066,31 @@ def build_flatmap_heatmap_volume_result(
         ``file_id -> cluster id`` mapping used only when ``color_mode`` is
         ``cluster``.
     collapse_depth
-        Drop the depth axis, yielding an ``(xy_bins, xy_bins)`` volume equal to
+        Drop the depth axis, yielding a ``(y_bins, x_bins)`` volume equal to
         the depth volume summed over its planes.  Which nodes are counted is
         unchanged -- ``depth_range_um``, ``depth_bin_um``, and
         ``include_depth_minus_one`` still govern the ``WHERE`` clause -- so only
         the grouping keys differ.
     """
     suffix = _style_suffix(style_key)
-    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
-
     x_lower, x_upper = _nondegenerate_bounds(x_bounds[0], x_bounds[1])
     y_lower, y_upper = _nondegenerate_bounds(y_bounds[0], y_bounds[1])
     depth_lower, depth_upper = _nondegenerate_bounds(
         depth_range_um[0], depth_range_um[1]
+    )
+    y_bins, x_bins, depth_bin_um = _resolve_axis_bin_counts(
+        x_bounds=(x_lower, x_upper),
+        y_bounds=(y_lower, y_upper),
+        y_bins=y_bins,
+        x_bins=x_bins,
+        depth_bin_um=depth_bin_um,
     )
 
     valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
     volume_shape: tuple[int, ...] = (
-        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
+        (y_bins, x_bins) if collapse_depth else (total_depth_bins, y_bins, x_bins)
     )
 
     voxel_count = int(np.prod(volume_shape))
@@ -1980,7 +2098,7 @@ def build_flatmap_heatmap_volume_result(
         raise ValueError(
             "Flatmap heatmap is too large: "
             f"{'x'.join(str(size) for size in volume_shape)} voxels. "
-            "Use fewer XY bins or a larger depth bin."
+            "Use fewer Y bins or a larger depth bin."
         )
 
     source_sql = f"read_parquet('{_duckdb_source_path(parquet_path)}')"
@@ -1994,7 +2112,8 @@ def build_flatmap_heatmap_volume_result(
         y_upper=y_upper,
         depth_lower=depth_lower,
         depth_bin_um=depth_bin_um,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
+        x_bins=x_bins,
         valid_depth_bins=valid_depth_bins,
         sentinel_offset=sentinel_offset,
         include_depth_minus_one=include_depth_minus_one,
@@ -2017,7 +2136,8 @@ def build_flatmap_heatmap_volume_result(
             excluded_depth_minus_one_nodes=excluded_depth_minus_one,
             nonzero_voxels=int(nonzero_voxels),
             traces_represented=stats.traces_represented,
-            xy_bins=xy_bins,
+            y_bins=y_bins,
+            x_bins=x_bins,
             # Zeros mark "no depth axis", matching the pandas collapsed render.
             depth_bins=0 if collapse_depth else total_depth_bins,
             depth_bin_um=0.0 if collapse_depth else depth_bin_um,
@@ -2120,7 +2240,8 @@ def _allen_layer_sql_expressions(
     x_upper: float,
     y_lower: float,
     y_upper: float,
-    xy_bins: int,
+    y_bins: int,
+    x_bins: int,
 ) -> dict[str, str]:
     x_column = f"x_flat_{suffix}"
     y_column = f"y_flat_{suffix}"
@@ -2155,13 +2276,13 @@ def _allen_layer_sql_expressions(
     y_span = y_upper - y_lower
     x_bin = (
         f"LEAST(GREATEST(CAST(FLOOR(({x_ref} - {_sql_number(x_lower)}) "
-        f"/ {_sql_number(x_span)} * {int(xy_bins)}) AS BIGINT), 0), "
-        f"{int(xy_bins) - 1})"
+        f"/ {_sql_number(x_span)} * {int(x_bins)}) AS BIGINT), 0), "
+        f"{int(x_bins) - 1})"
     )
     y_bin = (
         f"LEAST(GREATEST(CAST(FLOOR(({y_ref} - {_sql_number(y_lower)}) "
-        f"/ {_sql_number(y_span)} * {int(xy_bins)}) AS BIGINT), 0), "
-        f"{int(xy_bins) - 1})"
+        f"/ {_sql_number(y_span)} * {int(y_bins)}) AS BIGINT), 0), "
+        f"{int(y_bins) - 1})"
     )
     return {
         "flatmap_valid": flatmap_valid,
@@ -2251,7 +2372,8 @@ def build_allen_layer_heatmap_volume_result(
     layer_map: AllenIsocortexLayerMap,
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
+    x_bins: int | None = None,
     file_ids: list[object] | None = None,
     cluster_map: dict[object, int | None] | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
@@ -2259,15 +2381,20 @@ def build_allen_layer_heatmap_volume_result(
 ) -> AllenLayerHeatmapVolumeResult:
     """Build a six-plane Allen Isocortex layer heatmap in DuckDB."""
     suffix = _style_suffix(style_key)
-    xy_bins, _unused_depth_bin = _validate_resolution(xy_bins, 1.0)
     x_lower, x_upper = _nondegenerate_bounds(*x_bounds)
     y_lower, y_upper = _nondegenerate_bounds(*y_bounds)
+    y_bins, x_bins, _unused_depth_bin = _resolve_axis_bin_counts(
+        x_bounds=(x_lower, x_upper),
+        y_bounds=(y_lower, y_upper),
+        y_bins=y_bins,
+        x_bins=x_bins,
+    )
     plane_count = len(layer_map.layer_labels)
-    volume_shape = (plane_count, xy_bins, xy_bins)
+    volume_shape = (plane_count, y_bins, x_bins)
     if int(np.prod(volume_shape)) > MAX_FLATMAP_HEATMAP_VOXELS:
         raise ValueError(
             "Allen layer heatmap is too large: "
-            f"{plane_count}x{xy_bins}x{xy_bins} voxels. Use fewer XY bins."
+            f"{plane_count}x{y_bins}x{x_bins} voxels. Use fewer Y bins."
         )
 
     source_sql = f"read_parquet('{_duckdb_source_path(parquet_path)}')"
@@ -2280,7 +2407,8 @@ def build_allen_layer_heatmap_volume_result(
         x_upper=x_upper,
         y_lower=y_lower,
         y_upper=y_upper,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
+        x_bins=x_bins,
     )
     file_filter = _file_id_filter(file_ids)
 
@@ -2301,7 +2429,8 @@ def build_allen_layer_heatmap_volume_result(
             ),
             nonzero_voxels=int(nonzero_voxels),
             traces_represented=stats.traces_represented,
-            xy_bins=xy_bins,
+            y_bins=y_bins,
+            x_bins=x_bins,
             x_flat_min=x_lower,
             x_flat_max=x_upper,
             y_flat_min=y_lower,

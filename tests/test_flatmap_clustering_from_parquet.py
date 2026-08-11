@@ -139,7 +139,7 @@ def test_compute_flatmap_voxel_correlation_from_parquet(flatmap_parquet) -> None
     result, count_data, provenance = compute_flatmap_voxel_correlation_from_parquet(
         path,
         style="both_shaped",
-        xy_bins=32,
+        y_bins=32,
         depth_bin_um=50.0,
         n_clusters=2,
     )
@@ -149,7 +149,10 @@ def test_compute_flatmap_voxel_correlation_from_parquet(flatmap_parquet) -> None
     assert count_data.count_matrix.shape[1] == len(count_data.voxel_ids)
     assert count_data.rendered_node_count > 0
     assert provenance.style == "both_shaped"
-    assert provenance.xy_bins == 32
+    assert provenance.y_bins == 32
+    # x is derived from the style's own bounds, so it is not 32.
+    assert provenance.x_bins == 41
+    assert provenance.volume_shape[-2:] == (32, 41)
     assert provenance.volume_shape[1] == 32
     assert result.metadata is None  # metadata attached by the worker, not here
 
@@ -237,7 +240,7 @@ def test_collapse_depth_keeps_node_count_and_shrinks_the_grid(
 ) -> None:
     """Collapsing removes the depth axis without changing which nodes count."""
     _frame, path = layered_parquet
-    kwargs = dict(style="both_shaped", xy_bins=8, depth_bin_um=50.0, n_clusters=2)
+    kwargs = dict(style="both_shaped", y_bins=8, depth_bin_um=50.0, n_clusters=2)
 
     _r3, counts_3d, prov_3d = compute_flatmap_voxel_correlation_from_parquet(
         path, **kwargs
@@ -270,7 +273,7 @@ def test_collapse_depth_merges_layers_at_one_flatmap_position(
     )
 
     _frame, path = layered_parquet
-    kwargs = dict(style="both_shaped", xy_bins=8, depth_bin_um=50.0, n_clusters=2)
+    kwargs = dict(style="both_shaped", y_bins=8, depth_bin_um=50.0, n_clusters=2)
 
     _r3, counts_3d, _p3 = compute_flatmap_voxel_correlation_from_parquet(path, **kwargs)
     result_2d, counts_2d, _p2 = compute_flatmap_voxel_correlation_from_parquet(
@@ -301,7 +304,7 @@ def test_collapse_depth_merges_layers_at_one_flatmap_position(
 def test_collapse_depth_preflight_count_matches_the_run(layered_parquet) -> None:
     """The preflight count must not change when the depth axis is collapsed."""
     _frame, path = layered_parquet
-    kwargs = dict(style="both_shaped", xy_bins=8, depth_bin_um=50.0)
+    kwargs = dict(style="both_shaped", y_bins=8, depth_bin_um=50.0)
 
     flat = count_flatmap_voxel_correlation_nodes(path, collapse_depth=True, **kwargs)
     deep = count_flatmap_voxel_correlation_nodes(path, collapse_depth=False, **kwargs)
@@ -364,7 +367,7 @@ def test_compute_flatmap_correlation_respects_file_id_subset(
     result, _count, _prov = compute_flatmap_voxel_correlation_from_parquet(
         path,
         style="both_square",
-        xy_bins=16,
+        y_bins=16,
         depth_bin_um=75.0,
         n_clusters=2,
         file_ids=["neuron_0", "neuron_1", "neuron_2"],
@@ -389,7 +392,7 @@ def test_flatmap_preflight_counts_exact_contributing_nodes(flatmap_parquet) -> N
         count_flatmap_voxel_correlation_nodes(
             path,
             style="both_shaped",
-            xy_bins=32,
+            y_bins=32,
             depth_bin_um=50.0,
             file_ids=["neuron_0", "neuron_1"],
         )
@@ -419,7 +422,7 @@ def test_flatmap_parquet_correlation_worker(flatmap_parquet) -> None:
         parquet_path=path,
         atlas=_fake_atlas(),
         style="both_shaped",
-        xy_bins=32,
+        y_bins=32,
         depth_bin_um=50.0,
         n_clusters=2,
     )
@@ -448,7 +451,7 @@ def test_flatmap_correlation_worker_records_collapse_provenance(
         parquet_path=path,
         atlas=_fake_atlas(),
         style="both_shaped",
-        xy_bins=8,
+        y_bins=8,
         depth_bin_um=50.0,
         n_clusters=2,
         collapse_depth=True,

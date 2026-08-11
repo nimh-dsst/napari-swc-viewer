@@ -88,7 +88,7 @@ def test_benchmark_flatmap_pipeline_writes_json_and_csv(tmp_path: Path) -> None:
             str(depth_path),
             "--file-id",
             "small.swc",
-            "--xy-bins",
+            "--y-bins",
             "8",
             "--depth-bin-um",
             "25",

@@ -9,13 +9,15 @@ import numpy as np
 
 from .flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
-    DEFAULT_FLATMAP_XY_BINS,
+    DEFAULT_FLATMAP_Y_BINS,
     DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
     MAX_FLATMAP_HEATMAP_VOXELS,
     FlatmapLookupStats,
     _bin_flat_values,
+    _check_bin_count_inputs,
     _depth_bin_count,
     _flatmap_valid_mask,
+    _resolve_axis_bin_counts,
     _spatial_chunk_slices,
     _validate_depth_volume,
     _validate_flatmap_volume,
@@ -38,7 +40,8 @@ class FlatmapRegionLabelsSummary:
     valid_source_voxels: int
     labeled_voxels: int
     collision_voxels: int
-    xy_bins: int
+    y_bins: int
+    x_bins: int
     depth_bins: int
     depth_bin_um: float
     x_flat_min: float
@@ -59,7 +62,8 @@ class FlatmapRegionLabelsSummary:
             "mirrored_depth_source_voxels": int(self.mirrored_depth_source_voxels),
             "labeled_voxels": int(self.labeled_voxels),
             "collision_voxels": int(self.collision_voxels),
-            "xy_bins": int(self.xy_bins),
+            "y_bins": int(self.y_bins),
+            "x_bins": int(self.x_bins),
             "depth_bins": int(self.depth_bins),
             "depth_bin_um": float(self.depth_bin_um),
             "x_flat_min": float(self.x_flat_min),
@@ -148,13 +152,13 @@ def _choose_majority_labels(
     return labels, collision_voxels
 
 
-def _validate_label_grid_size(depth_bins: int, xy_bins: int) -> None:
-    voxel_count = int(depth_bins * xy_bins * xy_bins)
+def _validate_label_grid_size(depth_bins: int, y_bins: int, x_bins: int) -> None:
+    voxel_count = int(depth_bins * y_bins * x_bins)
     if voxel_count > MAX_FLATMAP_HEATMAP_VOXELS:
         raise ValueError(
             "Flatmap region labels are too large: "
-            f"{depth_bins}x{xy_bins}x{xy_bins} voxels. "
-            "Use fewer XY bins or a larger depth bin."
+            f"{depth_bins}x{y_bins}x{x_bins} voxels. "
+            "Use fewer Y bins or a larger depth bin."
         )
 
 
@@ -197,7 +201,8 @@ def build_flatmap_region_label_volume(
     depth_volume: np.ndarray,
     *,
     selected_region_ids: Iterable[int],
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
+    x_bins: int | None = None,
     depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
     invalid_zero_sentinel: bool = False,
     invalid_negative_one_sentinel: bool = True,
@@ -206,13 +211,13 @@ def build_flatmap_region_label_volume(
     mirror_depth_fallback: bool = True,
     mirror_coord_axis: int = 2,
 ) -> FlatmapRegionLabelsResult:
-    """Build a depth-aware flatmap labels volume from atlas annotations."""
-    xy_bins = int(xy_bins)
-    depth_bin_um = float(depth_bin_um)
-    if xy_bins <= 0:
-        raise ValueError("xy_bins must be positive.")
-    if depth_bin_um <= 0.0:
-        raise ValueError("depth_bin_um must be positive.")
+    """Build a depth-aware flatmap labels volume from atlas annotations.
+
+    ``x_bins`` defaults to the derived square-bin count.  A caller projecting a
+    region mask onto an existing render must pass that render's stored count, so
+    the mask and the heatmap share one grid.
+    """
+    _check_bin_count_inputs(y_bins, x_bins, depth_bin_um)
     if mirror_coord_axis not in (0, 1, 2):
         raise ValueError("mirror_coord_axis must be 0, 1, or 2.")
 
@@ -248,9 +253,16 @@ def build_flatmap_region_label_volume(
             invalid_negative_one_sentinel=invalid_negative_one_sentinel,
         )
 
+    y_bins, x_bins, depth_bin_um = _resolve_axis_bin_counts(
+        x_bounds=lookup_stats.x_bounds,
+        y_bounds=lookup_stats.y_bounds,
+        y_bins=y_bins,
+        x_bins=x_bins,
+        depth_bin_um=depth_bin_um,
+    )
     depth_bins = _depth_bin_count(lookup_stats.depth_range_um, depth_bin_um)
-    _validate_label_grid_size(depth_bins, xy_bins)
-    output_shape = (depth_bins, xy_bins, xy_bins)
+    _validate_label_grid_size(depth_bins, y_bins, x_bins)
+    output_shape = (depth_bins, y_bins, x_bins)
 
     packed_chunks: list[np.ndarray] = []
     count_chunks: list[np.ndarray] = []
@@ -293,20 +305,20 @@ def build_flatmap_region_label_volume(
         x_bin_indices = _bin_flat_values(
             flat_xy[..., 0][valid],
             lookup_stats.x_bounds,
-            xy_bins,
+            x_bins,
         )
         y_bin_indices = _bin_flat_values(
             flat_xy[..., 1][valid],
             lookup_stats.y_bounds,
-            xy_bins,
+            y_bins,
         )
         depth_bin_indices = np.floor(
             (depth_values[valid] - lookup_stats.depth_range_um[0]) / depth_bin_um
         ).astype(np.int64)
         depth_bin_indices = np.clip(depth_bin_indices, 0, depth_bins - 1)
         linear_bins = (
-            (depth_bin_indices * xy_bins * xy_bins)
-            + (y_bin_indices * xy_bins)
+            (depth_bin_indices * y_bins * x_bins)
+            + (y_bin_indices * x_bins)
             + x_bin_indices
         )
         region_ids = annotation_chunk[valid].astype(np.int32, copy=False)
@@ -332,7 +344,8 @@ def build_flatmap_region_label_volume(
         mirrored_depth_source_voxels=int(mirrored_depth_source_voxels),
         labeled_voxels=int(np.count_nonzero(labels)),
         collision_voxels=int(collision_voxels),
-        xy_bins=int(xy_bins),
+        y_bins=int(y_bins),
+        x_bins=int(x_bins),
         depth_bins=int(depth_bins),
         depth_bin_um=float(depth_bin_um),
         x_flat_min=float(lookup_stats.x_bounds[0]),

@@ -152,8 +152,10 @@ Use **Build Cache Profile...** to project an exactly matching BrainGlobe atlas
 annotation into fixed shaped and square render grids. A cache directory has a
 `flatmap-region-cache.json` manifest and may hold multiple atlas/lookup/grid
 profiles. Each profile stores memory-mappable sparse label occupancy, closed
-voxel-faithful surfaces, and per-depth outlines. The defaults are 256 XY bins
-and 25 µm depth bins.
+voxel-faithful surfaces, and per-depth outlines. The defaults are 256 Y bins
+and 25 µm depth bins; the X bin count is derived from each style's flat map
+aspect ratio so bins are square, giving 512 X bins for the bilateral square
+style and 491 for the bilateral shaped style.
 
 For viewing, select **Precomputed Parquet + Cache**, click **Choose Cache
 Directory...**, and choose a compatible profile. The selected profile fixes and
@@ -166,8 +168,8 @@ colors, but that viewing atlas may have a different voxel resolution.
 The two depth-free renders show cached regions too. In **2D Heatmap** and **2D
 Vector**, **Show Region Labels** builds one depth-collapsed label image and
 **Show Region Outlines** builds 2D perimeter vectors, both derived at read time
-from the same version-1 occupancy arrays — no cache rebuild and no format
-change. Collapsing sums source-voxel counts across depth **per selected
+from the same occupancy arrays — these two overlays need no cache rebuild of
+their own. Collapsing sums source-voxel counts across depth **per selected
 region**, so a 2D overlay is a map of the areas you selected rather than of
 cortical layers; use **Allen Layer Heatmap (2D stack)** for per-layer questions.
 Cached surfaces stay 3D-only, since a voxel shell has no 2D form.

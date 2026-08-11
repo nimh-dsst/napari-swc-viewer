@@ -48,6 +48,54 @@ other 4,871 have every non-soma node typed `0` (undefined). Compartment-filtered
 results must report how many neurons were excluded rather than returning a
 partial answer silently.
 
+## Flat Map X Spans Both Hemispheres, Y Spans One
+
+**Never give the two flat map axes the same bin count.** The bilateral map lays
+the hemispheres side by side along `x`, so `x` covers roughly twice the extent of
+`y`. Equal counts make every bin about twice as wide as it is tall, which throws
+away `x` detail at twice the rate of `y` and draws the map horizontally squashed
+(no `layer.scale` is set on any flat map layer).
+
+Measured from the canonical bounds in
+`isocortex_total_right_brainglobe_flatmap.parquet`:
+
+| style | x span | y span | ratio |
+|---|---|---|---|
+| `both_square` | 2.0000 | 1.0000 | 2.0000 |
+| `both_shaped` | 1.8085 | 0.9434 | 1.9169 |
+
+- The user-facing control is **`y_bins`**. Derive `x` with
+  `resolve_flatmap_bin_counts()` in `flatmap_heatmap.py`, which every grid
+  builder reaches through `_resolve_axis_bin_counts()`. At the default 256 that
+  gives `(256, 512)` for square and `(256, 491)` for shaped.
+- **Do not write `x_bins = 2 * y_bins`.** That is right only for `both_square`;
+  for `both_shaped` it leaves 4.2% anisotropy. `analysis/flatmap_correlation.py`
+  already contains a variant of this trap.
+- Do not call `y_bins` "bins per hemisphere" — at 256 the shaped style gets 245
+  x bins per hemisphere, not 256.
+- Rounding is pinned to `floor(v + 0.5)`, not `round()`: banker's rounding is
+  non-monotone at ties (`round(490.5) == 490` but `round(491.5) == 492`) and this
+  count feeds the region-cache identity digest.
+- **Never re-derive a stored `x_bins`.** Entry points take
+  `y_bins: int, x_bins: int | None = None`; a cache-backed caller passes the
+  profile's recorded value verbatim, because a JSON float round trip could change
+  the derived integer at a tie and the render would then be discarded as a grid
+  mismatch. Cache validators check internal consistency only, never policy
+  conformance.
+- The region-cache profile identity key is `y_bins`, never `x_bins`: one profile
+  builds both styles and they resolve to different `x_bins` (491 vs 512).
+- Because `x_bins == y_bins` used to hold everywhere, any latent `(y, x)` vs
+  `(x, y)` transpose was invisible. Treat surprise failures in this area as
+  probable pre-existing bugs, and verify renders visually rather than only by
+  shape assertions. `tests/test_flatmap_rectangular_grid.py` guards the axis
+  order, the vector/heatmap co-registration, and cross-subsystem agreement.
+
+Still open, deliberately out of scope for the bin fix:
+`resolve_flatmap_depth_normalization` divides `x` by `x_span / 2` and `y` by
+`y_span`, giving `both_shaped` a divisor ratio of 0.9581 — a 4.2% residual x/y
+anisotropy in the soma-clustering metric. Changing it alters existing clustering
+results, so raise it before touching it.
+
 ## Caution: `type` Is Not A Trustworthy Compartment Label
 
 **Some neurons in `isocortex_total_right_brainglobe_flatmap.parquet` have

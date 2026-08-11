@@ -1116,7 +1116,8 @@ def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
         projected_nodes=pd.DataFrame(),
         volume_shape=(2, 2, 2),
         input_file_ids=("n1", "n2"),
-        xy_bins=2,
+        y_bins=2,
+        x_bins=2,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
         flatmap_path="flatmap.nrrd",
@@ -1189,7 +1190,8 @@ def test_flatmap_correlation_worker_uses_cache_without_nrrd_or_annotation(
         projected_nodes=pd.DataFrame(),
         volume_shape=(1, 2, 2),
         input_file_ids=("n1", "n2"),
-        xy_bins=2,
+        y_bins=2,
+        x_bins=2,
         depth_bin_um=25.0,
         include_depth_minus_one=False,
         coordinate_mode="parquet_columns",
@@ -1835,7 +1837,7 @@ def test_flatmap_heatmap_worker_emits_single_volume(tmp_path):
         x_bounds=(0.0, 100.0),
         y_bounds=(0.0, 80.0),
         depth_range_um=(0.0, 700.0),
-        xy_bins=16,
+        y_bins=16,
         depth_bin_um=50.0,
         include_depth_minus_one=False,
     )
@@ -1867,7 +1869,7 @@ def test_flatmap_heatmap_worker_emits_collapsed_volume(tmp_path):
             x_bounds=(0.0, 100.0),
             y_bounds=(0.0, 80.0),
             depth_range_um=(0.0, 700.0),
-            xy_bins=16,
+            y_bins=16,
             depth_bin_um=50.0,
             include_depth_minus_one=False,
             plane_mode=plane_mode,
@@ -1884,8 +1886,9 @@ def test_flatmap_heatmap_worker_emits_collapsed_volume(tmp_path):
     flat = _run("flat")
     depth = _run("depth")
 
-    assert flat.volume.shape == (16, 16)
-    assert flat.volume_shape == (16, 16)
+    # x(0,100)/y(0,80) is ratio 1.25, so 16 y bins derive 20 x bins.
+    assert flat.volume.shape == (16, 20)
+    assert flat.volume_shape == (16, 20)
     assert float(flat.volume.sum()) == 1500.0
     assert flat.render_summary.rendered_nodes == 1500
     assert flat.render_summary.depth_bins == 0
@@ -1905,7 +1908,7 @@ def test_flatmap_heatmap_worker_derives_bounds_when_missing(tmp_path):
         x_bounds=None,
         y_bounds=None,
         depth_range_um=None,
-        xy_bins=16,
+        y_bins=16,
         depth_bin_um=50.0,
         include_depth_minus_one=False,
     )
@@ -1930,7 +1933,7 @@ def test_flatmap_heatmap_worker_reports_error(tmp_path):
         x_bounds=(0.0, 1.0),
         y_bounds=(0.0, 1.0),
         depth_range_um=(0.0, 1.0),
-        xy_bins=8,
+        y_bins=8,
         depth_bin_um=10.0,
         include_depth_minus_one=False,
     )
@@ -1969,7 +1972,7 @@ def test_flatmap_heatmap_worker_emits_allen_layer_stack(tmp_path):
         x_bounds=(0.0, 100.0),
         y_bounds=(0.0, 80.0),
         depth_range_um=None,
-        xy_bins=16,
+        y_bins=16,
         depth_bin_um=50.0,
         include_depth_minus_one=False,
         plane_mode="allen_layers",
@@ -1985,7 +1988,9 @@ def test_flatmap_heatmap_worker_emits_allen_layer_stack(tmp_path):
     assert errors == []
     assert len(finished) == 1
     result = finished[0]
-    assert result.volume.shape == (6, 16, 16)
+    # Six Allen layer planes on the derived rectangular grid.
+    assert result.volume.shape == (6, 16, 20)
+    assert (result.summary.y_bins, result.summary.x_bins) == (16, 20)
     assert result.summary.rendered_nodes == 1500
     assert float(result.volume.sum()) == 1500.0
 

@@ -33,7 +33,9 @@ from ..flatmap_export import export_projected_nodes_csv
 from ..analysis.flatmap_correlation import FlatmapVoxelCorrelationSource
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
-    DEFAULT_FLATMAP_XY_BINS,
+    DEFAULT_FLATMAP_Y_BINS,
+    FLATMAP_Y_BINS_TOOLTIP,
+    MAX_FLATMAP_Y_BINS,
     FLATMAP_PLANE_MODE_ALLEN_LAYERS,
     FLATMAP_PLANE_MODE_DEPTH,
     FLATMAP_PLANE_MODE_FLAT,
@@ -488,12 +490,15 @@ class FlatmapProjectionWidget(QWidget):
         cache_layout.addLayout(cache_profile_row)
 
         cache_grid_row = QHBoxLayout()
-        cache_grid_row.addWidget(QLabel("New profile XY bins:"))
-        self._cache_build_xy_bins_spin = QSpinBox()
-        self._cache_build_xy_bins_spin.setRange(1, 4096)
-        self._cache_build_xy_bins_spin.setSingleStep(16)
-        self._cache_build_xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
-        cache_grid_row.addWidget(self._cache_build_xy_bins_spin)
+        cache_build_y_bins_label = QLabel("New profile Y bins:")
+        cache_build_y_bins_label.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        cache_grid_row.addWidget(cache_build_y_bins_label)
+        self._cache_build_y_bins_spin = QSpinBox()
+        self._cache_build_y_bins_spin.setRange(1, MAX_FLATMAP_Y_BINS)
+        self._cache_build_y_bins_spin.setSingleStep(16)
+        self._cache_build_y_bins_spin.setValue(DEFAULT_FLATMAP_Y_BINS)
+        self._cache_build_y_bins_spin.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        cache_grid_row.addWidget(self._cache_build_y_bins_spin)
         cache_grid_row.addWidget(QLabel("Depth bin:"))
         self._cache_build_depth_bin_spin = QDoubleSpinBox()
         self._cache_build_depth_bin_spin.setRange(0.001, 1000.0)
@@ -576,14 +581,17 @@ class FlatmapProjectionWidget(QWidget):
         render_row.addWidget(self._heatmap_color_mode_combo)
         options_layout.addLayout(render_row)
 
-        xy_bins_row = QHBoxLayout()
-        xy_bins_row.addWidget(QLabel("XY bins:"))
-        self._xy_bins_spin = QSpinBox()
-        self._xy_bins_spin.setRange(1, 4096)
-        self._xy_bins_spin.setSingleStep(16)
-        self._xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
-        xy_bins_row.addWidget(self._xy_bins_spin)
-        options_layout.addLayout(xy_bins_row)
+        y_bins_row = QHBoxLayout()
+        y_bins_label = QLabel("Y bins:")
+        y_bins_label.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        y_bins_row.addWidget(y_bins_label)
+        self._y_bins_spin = QSpinBox()
+        self._y_bins_spin.setRange(1, MAX_FLATMAP_Y_BINS)
+        self._y_bins_spin.setSingleStep(16)
+        self._y_bins_spin.setValue(DEFAULT_FLATMAP_Y_BINS)
+        self._y_bins_spin.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        y_bins_row.addWidget(self._y_bins_spin)
+        options_layout.addLayout(y_bins_row)
 
         depth_bin_row = QHBoxLayout()
         depth_bin_row.addWidget(QLabel("Depth bin:"))
@@ -972,12 +980,14 @@ class FlatmapProjectionWidget(QWidget):
             return False
         try:
             grid = profile.style(self._current_style_key()).grid_spec
-            xy_bins = int(grid["xy_bins"])
+            y_bins = int(grid["y_bins"])
+            x_bins = int(grid["x_bins"])
             x_bounds = tuple(float(value) for value in grid["x_bounds"])
             y_bounds = tuple(float(value) for value in grid["y_bounds"])
         except (KeyError, TypeError, ValueError):
             return False
 
+        bins_match = int(summary.y_bins) == y_bins and int(summary.x_bins) == x_bins
         xy_bounds_match = all(
             np.allclose(cached, rendered, rtol=1e-9, atol=1e-9)
             for cached, rendered in (
@@ -996,8 +1006,8 @@ class FlatmapProjectionWidget(QWidget):
             return bool(
                 layer_labels == tuple(ALLEN_ISOCORTEX_LAYER_LABELS)
                 and tuple(int(value) for value in volume_shape)
-                == (len(layer_labels), xy_bins, xy_bins)
-                and int(summary.xy_bins) == xy_bins
+                == (len(layer_labels), y_bins, x_bins)
+                and bins_match
                 and xy_bounds_match
             )
 
@@ -1005,8 +1015,8 @@ class FlatmapProjectionWidget(QWidget):
             # A collapsed render has no depth axis, so the XY grid alone decides
             # whether the live layer still matches the profile.
             return bool(
-                tuple(int(value) for value in volume_shape) == (xy_bins, xy_bins)
-                and int(summary.xy_bins) == xy_bins
+                tuple(int(value) for value in volume_shape) == (y_bins, x_bins)
+                and bins_match
                 and xy_bounds_match
             )
 
@@ -1025,7 +1035,7 @@ class FlatmapProjectionWidget(QWidget):
         )
         return bool(
             tuple(int(value) for value in volume_shape) == output_shape
-            and int(summary.xy_bins) == xy_bins
+            and bins_match
             and np.isclose(
                 float(summary.depth_bin_um),
                 depth_bin_um,
@@ -1527,7 +1537,8 @@ class FlatmapProjectionWidget(QWidget):
             grid = profile.style(style).grid_spec
             label = (
                 f"{profile.profile_id[:12]} — {cached_atlas_name}, "
-                f"{grid.get('xy_bins')} XY / {grid.get('depth_bin_um')} um"
+                f"{grid.get('x_bins')}x{grid.get('y_bins')} XY / "
+                f"{grid.get('depth_bin_um')} um"
             )
             entries.append((label, profile))
 
@@ -1675,7 +1686,7 @@ class FlatmapProjectionWidget(QWidget):
         self._pending_cache_profile_id = self._cache_profile_id(profile)
         style_cache = profile.style(self._current_style_key())
         grid = style_cache.grid_spec
-        self._xy_bins_spin.setValue(int(grid["xy_bins"]))
+        self._y_bins_spin.setValue(int(grid["y_bins"]))
         self._depth_bin_spin.setValue(float(grid["depth_bin_um"]))
         self._exclude_depth_minus_one_cb.setChecked(True)
         locked = self._current_projection_source() != _PROJECTION_SOURCE_RECOMPUTE
@@ -1856,7 +1867,7 @@ class FlatmapProjectionWidget(QWidget):
             atlas_version=self._atlas_version(atlas, annotation_path),
             atlas_resolution_um=atlas_resolution,
             atlas_structures=getattr(atlas, "structures", None),
-            xy_bins=self._current_cache_build_xy_bins(),
+            y_bins=self._current_cache_build_y_bins(),
             depth_bin_um=self._current_cache_build_depth_bin_um(),
             lookup_resolution_um=(
                 float(raw_lookup_resolution) if raw_lookup_resolution > 0 else None
@@ -2007,7 +2018,7 @@ class FlatmapProjectionWidget(QWidget):
         vector_mode = self._current_render_mode() == _RENDER_FLAT_VECTOR
         cache_locked = bool(getattr(self, "_cache_grid_locked", False))
         control_states = {
-            "_xy_bins_spin": not cache_locked,
+            "_y_bins_spin": not cache_locked,
             # A collapsed render has no depth bins to size, but the depth -1
             # checkbox still selects which nodes it counts.
             "_depth_bin_spin": not cache_locked and not layer_mode and not flat_mode,
@@ -2056,14 +2067,36 @@ class FlatmapProjectionWidget(QWidget):
             return str(mode)
         return _HEATMAP_COLOR_SINGLE
 
-    def _current_xy_bins(self) -> int:
+    def _active_cache_grid_spec(self):
+        """Return the active profile's grid spec, or ``None`` for a live render."""
         profile = getattr(self, "_active_cache_profile", None)
         if (
-            profile is not None
-            and self._current_projection_source() == _PROJECTION_SOURCE_PRECOMPUTED
+            profile is None
+            or self._current_projection_source() != _PROJECTION_SOURCE_PRECOMPUTED
         ):
-            return int(profile.style(self._current_style_key()).grid_spec["xy_bins"])
-        return int(self._xy_bins_spin.value())
+            return None
+        try:
+            return profile.style(self._current_style_key()).grid_spec
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
+    def _current_y_bins(self) -> int:
+        grid = self._active_cache_grid_spec()
+        if grid is not None:
+            return int(grid["y_bins"])
+        return int(self._y_bins_spin.value())
+
+    def _current_x_bins(self) -> int | None:
+        """Return the x count to render with, or ``None`` to derive it.
+
+        A cache-backed render must reproduce the profile's *stored* count
+        exactly; re-deriving it from JSON-round-tripped bounds could differ at a
+        rounding tie, and the render would then be discarded as a mismatch.
+        """
+        grid = self._active_cache_grid_spec()
+        if grid is not None:
+            return int(grid["x_bins"])
+        return None
 
     def _current_depth_bin_um(self) -> float:
         profile = getattr(self, "_active_cache_profile", None)
@@ -2076,10 +2109,10 @@ class FlatmapProjectionWidget(QWidget):
             )
         return float(self._depth_bin_spin.value())
 
-    def _current_cache_build_xy_bins(self) -> int:
-        control = getattr(self, "_cache_build_xy_bins_spin", None)
+    def _current_cache_build_y_bins(self) -> int:
+        control = getattr(self, "_cache_build_y_bins_spin", None)
         if control is None:
-            return self._current_xy_bins()
+            return self._current_y_bins()
         return int(control.value())
 
     def _current_cache_build_depth_bin_um(self) -> float:
@@ -2525,7 +2558,8 @@ class FlatmapProjectionWidget(QWidget):
             x_bounds=bounds.get("x_bounds"),
             y_bounds=bounds.get("y_bounds"),
             depth_range_um=bounds.get("depth_range_um"),
-            xy_bins=self._current_xy_bins(),
+            y_bins=self._current_y_bins(),
+            x_bins=self._current_x_bins(),
             depth_bin_um=self._current_depth_bin_um(),
             include_depth_minus_one=(not self._exclude_depth_minus_one_cb.isChecked()),
             file_ids=list(file_ids),
@@ -3011,7 +3045,8 @@ class FlatmapProjectionWidget(QWidget):
             render_result = build_allen_layer_stack_from_projected_nodes(
                 result.projected_nodes,
                 self._current_allen_layer_map(),
-                xy_bins=self._current_xy_bins(),
+                y_bins=self._current_y_bins(),
+                x_bins=self._current_x_bins(),
                 x_bounds=lookup_stats.x_bounds,
                 y_bounds=lookup_stats.y_bounds,
             )
@@ -3020,7 +3055,8 @@ class FlatmapProjectionWidget(QWidget):
                 result.projected_nodes,
                 volume_set.flatmap,
                 volume_set.depth,
-                xy_bins=self._current_xy_bins(),
+                y_bins=self._current_y_bins(),
+                x_bins=self._current_x_bins(),
                 depth_bin_um=self._current_depth_bin_um(),
                 include_depth_minus_one=(
                     not self._exclude_depth_minus_one_cb.isChecked()
@@ -3075,14 +3111,16 @@ class FlatmapProjectionWidget(QWidget):
             render_result = build_allen_layer_stack_from_projected_nodes(
                 result.projected_nodes,
                 self._current_allen_layer_map(),
-                xy_bins=self._current_xy_bins(),
+                y_bins=self._current_y_bins(),
+                x_bins=self._current_x_bins(),
                 x_bounds=x_bounds,
                 y_bounds=y_bounds,
             )
         else:
             render_result = build_flatmap_render_data_from_projected_nodes(
                 result.projected_nodes,
-                xy_bins=self._current_xy_bins(),
+                y_bins=self._current_y_bins(),
+                x_bins=self._current_x_bins(),
                 depth_bin_um=self._current_depth_bin_um(),
                 include_depth_minus_one=(
                     not self._exclude_depth_minus_one_cb.isChecked()
@@ -3658,7 +3696,8 @@ class FlatmapProjectionWidget(QWidget):
             projected_nodes=projected_nodes,
             volume_shape=tuple(int(size) for size in volume_shape),
             input_file_ids=input_file_ids,
-            xy_bins=int(render_summary.xy_bins),
+            y_bins=int(render_summary.y_bins),
+            x_bins=int(render_summary.x_bins),
             depth_bin_um=float(render_summary.depth_bin_um),
             include_depth_minus_one=bool(render_summary.includes_depth_minus_one_plane),
             flatmap_style=getattr(self, "_last_flatmap_style", None),
@@ -3960,7 +3999,8 @@ class FlatmapProjectionWidget(QWidget):
             volume_set.flatmap,
             volume_set.depth,
             selected_region_ids=selected_region_ids,
-            xy_bins=self._current_xy_bins(),
+            y_bins=self._current_y_bins(),
+            x_bins=self._current_x_bins(),
             depth_bin_um=self._current_depth_bin_um(),
             invalid_zero_sentinel=self._zero_sentinel_cb.isChecked(),
             invalid_negative_one_sentinel=self._negative_one_sentinel_cb.isChecked(),
@@ -5164,7 +5204,10 @@ class FlatmapProjectionWidget(QWidget):
             segments.file_ids,
             x_bounds=(summary.x_flat_min, summary.x_flat_max),
             y_bounds=(summary.y_flat_min, summary.y_flat_max),
-            xy_bins=summary.xy_bins,
+            # Both counts come from the summary of the render these vectors are
+            # drawn over, so the overlay cannot disagree with the heatmap grid.
+            y_bins=summary.y_bins,
+            x_bins=summary.x_bins,
         )
 
     def _create_or_update_flat_vector_layer(

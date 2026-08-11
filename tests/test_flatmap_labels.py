@@ -25,7 +25,7 @@ def test_build_flatmap_region_label_volume_remaps_selected_voxels_to_bins() -> N
         flatmap,
         depth,
         selected_region_ids=[101],
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=25.0,
     )
 
@@ -48,7 +48,7 @@ def test_build_flatmap_region_label_volume_filters_selected_region_ids() -> None
         flatmap,
         depth,
         selected_region_ids=[2, 4],
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=25.0,
     )
 
@@ -67,7 +67,7 @@ def test_build_flatmap_region_label_volume_uses_majority_region_for_collisions()
         flatmap,
         depth,
         selected_region_ids=[7, 9],
-        xy_bins=1,
+        y_bins=1,
         depth_bin_um=25.0,
     )
 
@@ -88,7 +88,7 @@ def test_build_flatmap_region_label_volume_ties_choose_smaller_region_id() -> No
         flatmap,
         depth,
         selected_region_ids=[7, 9],
-        xy_bins=1,
+        y_bins=1,
         depth_bin_um=25.0,
     )
 
@@ -108,7 +108,7 @@ def test_build_flatmap_region_label_volume_leaves_invalid_lookup_voxels_unlabele
         flatmap,
         depth,
         selected_region_ids=[1, 2, 3],
-        xy_bins=1,
+        y_bins=1,
         depth_bin_um=25.0,
     )
 
@@ -132,12 +132,15 @@ def test_build_flatmap_region_labels_uses_mirrored_depth_on_both_panels() -> Non
         flatmap,
         depth,
         selected_region_ids=[315],
-        xy_bins=20,
+        y_bins=20,
         depth_bin_um=25.0,
     )
 
     labeled_x_bins = sorted(np.argwhere(result.labels > 0)[:, 2].tolist())
-    assert labeled_x_bins == [0, 19]
+    # Opposite end bins of the x axis. The x count is derived from the aspect
+    # ratio rather than equal to y_bins, so name the last bin from the grid.
+    assert result.summary.y_bins == 20
+    assert labeled_x_bins == [0, result.summary.x_bins - 1]
     assert result.summary.selected_source_voxels == 2
     assert result.summary.valid_source_voxels == 2
     assert result.summary.mirrored_depth_source_voxels == 1
@@ -149,11 +152,13 @@ def test_build_flatmap_region_labels_uses_mirrored_depth_on_both_panels() -> Non
         flatmap,
         depth,
         selected_region_ids=[315],
-        xy_bins=20,
+        y_bins=20,
         depth_bin_um=25.0,
         mirror_depth_fallback=False,
     )
-    assert np.argwhere(without_fallback.labels > 0)[:, 2].tolist() == [19]
+    assert np.argwhere(without_fallback.labels > 0)[:, 2].tolist() == [
+        without_fallback.summary.x_bins - 1
+    ]
     assert without_fallback.summary.valid_source_voxels == 1
     assert without_fallback.summary.mirrored_depth_source_voxels == 0
 
@@ -173,7 +178,7 @@ def test_build_flatmap_region_labels_prefers_original_depth() -> None:
         flatmap,
         depth,
         selected_region_ids=[315],
-        xy_bins=20,
+        y_bins=20,
         depth_bin_um=25.0,
     )
 
@@ -195,7 +200,7 @@ def test_build_flatmap_region_labels_excludes_depth_invalid_on_both_sides() -> N
         flatmap,
         depth,
         selected_region_ids=[7],
-        xy_bins=3,
+        y_bins=3,
     )
 
     assert result.summary.selected_source_voxels == 2
@@ -214,7 +219,7 @@ def test_build_flatmap_region_labels_mirrors_axis_zero_across_chunks() -> None:
         flatmap,
         depth,
         selected_region_ids=[7],
-        xy_bins=2,
+        y_bins=2,
         mirror_coord_axis=0,
         lookup_stats_chunk_voxels=1,
     )

@@ -1491,7 +1491,7 @@ def test_flatmap_voxel_hides_region_controls_and_shows_binning() -> None:
     assert widget._dilation_label._visible is False
     assert widget._dilation_spin._visible is False
     assert widget._flatmap_style_combo._visible is True
-    assert widget._flatmap_xy_bins_spin._visible is True
+    assert widget._flatmap_y_bins_spin._visible is True
     assert widget._flatmap_depth_bin_spin._visible is True
     assert widget._flatmap_include_depth_minus_one_cb._visible is True
     assert widget._flatmap_coords_status_label._visible is True
@@ -1507,7 +1507,7 @@ def test_flatmap_soma_hides_binning_and_shows_algorithm() -> None:
 
     assert widget._algorithm_combo._visible is True
     assert widget._flatmap_style_combo._visible is True
-    assert widget._flatmap_xy_bins_spin._visible is False
+    assert widget._flatmap_y_bins_spin._visible is False
     assert widget._flatmap_depth_bin_spin._visible is False
     assert widget._flatmap_include_depth_minus_one_cb._visible is False
 
@@ -1556,7 +1556,7 @@ def test_collapsing_depth_disables_the_depth_bin_size() -> None:
     widget._flatmap_ignore_depth_cb.setChecked(True)
     assert widget._flatmap_depth_bin_spin.isEnabled() is False
     assert widget._flatmap_include_depth_minus_one_cb.isEnabled() is True
-    assert widget._flatmap_xy_bins_spin.isEnabled() is True
+    assert widget._flatmap_y_bins_spin.isEnabled() is True
 
     widget._flatmap_ignore_depth_cb.setChecked(False)
     assert widget._flatmap_depth_bin_spin.isEnabled() is True
@@ -1736,7 +1736,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
     widget._clustering_method_combo.setCurrentText("Voxel Correlation")
     widget._method_combo.setCurrentText("complete")
     widget._n_clusters_spin.setValue(7)
-    widget._flatmap_xy_bins_spin.setValue(128)
+    widget._flatmap_y_bins_spin.setValue(128)
     widget._flatmap_depth_bin_spin.setValue(50.0)
     widget._flatmap_include_depth_minus_one_cb.setChecked(False)
     widget._start_background_worker = MagicMock()
@@ -1767,7 +1767,7 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
         "parquet_path": "neurons.parquet",
         "atlas": widget._atlas,
         "style": "both_shaped",
-        "xy_bins": 128,
+        "y_bins": 128,
         "depth_bin_um": 50.0,
         "include_depth_minus_one": False,
         "linkage_method": "complete",

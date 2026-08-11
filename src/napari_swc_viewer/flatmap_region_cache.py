@@ -27,13 +27,14 @@ import numpy as np
 
 from .flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
-    DEFAULT_FLATMAP_XY_BINS,
+    DEFAULT_FLATMAP_Y_BINS,
     DEFAULT_LOOKUP_STATS_CHUNK_VOXELS,
     _bin_flat_values,
     _depth_bin_count,
     _flatmap_valid_mask,
     _spatial_chunk_slices,
     compute_flatmap_lookup_stats,
+    resolve_flatmap_bin_counts,
 )
 from .flatmap_loader import (
     FlatmapLookupLoadCancelledError,
@@ -43,7 +44,12 @@ from .isocortex_layers import AllenIsocortexLayerMap
 
 REGION_CACHE_MANIFEST_FILENAME = "flatmap-region-cache.json"
 REGION_CACHE_FORMAT = "napari_swc_viewer.flatmap_region_cache"
-REGION_CACHE_FORMAT_VERSION = 1
+#: Version 2 replaced the single ``xy_bins`` grid key with per-axis ``x_bins`` /
+#: ``y_bins``, because the flat map ``x`` axis spans both hemispheres and ``y``
+#: only one, so equal counts made every bin twice as wide as it was tall.  A
+#: version-1 cache cannot be reinterpreted -- its arrays were binned on the old
+#: grid -- so it must be rebuilt.
+REGION_CACHE_FORMAT_VERSION = 2
 
 _OCCUPANCY_ALGORITHM = "source-voxel-counts-v1"
 _COLLISION_ALGORITHM = "majority-count-then-smaller-region-id-v1"
@@ -486,10 +492,14 @@ def _validate_root_manifest(value: Mapping[str, Any]) -> None:
         raise RegionCacheValidationError(
             "Not a napari-swc-viewer flatmap region cache: unexpected format."
         )
-    if value.get("format_version") != REGION_CACHE_FORMAT_VERSION:
+    found_version = value.get("format_version")
+    if found_version != REGION_CACHE_FORMAT_VERSION:
         raise RegionCacheValidationError(
-            "Unsupported flatmap region-cache format version: "
-            f"{value.get('format_version')!r}."
+            "This flatmap region cache was built by an older version of the "
+            f"plugin (format version {found_version!r}, this version needs "
+            f"{REGION_CACHE_FORMAT_VERSION}). Its voxel grid used one bin count "
+            "for both flat map axes, which made every bin about twice as wide "
+            "as it was tall. Rebuild the cache to use square bins."
         )
     profiles = value.get("profiles")
     if not isinstance(profiles, Mapping):
@@ -751,19 +761,25 @@ class FlatmapRegionStyleCache:
                 f"Style {self.style} has an unsupported coordinate order."
             )
         try:
-            xy_bins = int(self.grid_spec["xy_bins"])
+            y_bins = int(self.grid_spec["y_bins"])
+            x_bins = int(self.grid_spec["x_bins"])
             depth_bins = int(self.grid_spec["depth_bins"])
             depth_bin_um = float(self.grid_spec["depth_bin_um"])
         except (KeyError, TypeError, ValueError) as exc:
             raise RegionCacheValidationError(
                 f"Style {self.style} has invalid fixed-grid dimensions."
             ) from exc
+        # Internal consistency only -- never a check that x_bins conforms to the
+        # current square-bin policy.  The stored count came from bounds that have
+        # since been through a JSON float round trip, so a policy check could
+        # make a perfectly good cache unopenable at a rounding tie.
         if (
-            xy_bins <= 0
+            y_bins <= 0
+            or x_bins <= 0
             or depth_bins <= 0
             or not np.isfinite(depth_bin_um)
             or depth_bin_um <= 0
-            or shape != (depth_bins, xy_bins, xy_bins)
+            or shape != (depth_bins, y_bins, x_bins)
         ):
             raise RegionCacheValidationError(
                 f"Style {self.style} fixed-grid dimensions do not match its output shape."
@@ -1139,7 +1155,11 @@ class FlatmapRegionCacheProfile:
             canonical_profile = {
                 "lookup_set_id": self.lookup_set_id,
                 "atlas": self.atlas,
-                "xy_bins": int(self._data["xy_bins"]),
+                # ``y_bins`` is the only bin count invariant across styles: one
+                # profile builds both, and shaped/square resolve to DIFFERENT
+                # x counts (491 vs 512 at 256).  The per-style x/y counts are
+                # digested anyway through ``style_grids``.
+                "y_bins": int(self._data["y_bins"]),
                 "depth_bin_um": float(self._data["depth_bin_um"]),
                 "style_grids": {
                     "shaped": dict(self._styles["shaped"].grid_spec),
@@ -1539,16 +1559,20 @@ def _write_occupancy_runs(
     valid_source_voxels = 0
     mirrored_depth_source_voxels = 0
     positive_annotation_voxels = 0
-    xy_bins = int(grid["xy_bins"])
+    y_bins = int(grid["y_bins"])
+    x_bins = int(grid["x_bins"])
     depth_bins = int(grid["depth_bins"])
     x_bounds = tuple(float(value) for value in grid["x_bounds"])
     y_bounds = tuple(float(value) for value in grid["y_bounds"])
     depth_bounds = tuple(float(value) for value in grid["depth_bounds_um"])
     depth_bin_um = float(grid["depth_bin_um"])
-    max_linear_bin = depth_bins * xy_bins * xy_bins
+    max_linear_bin = depth_bins * y_bins * x_bins
     if max_linear_bin > np.iinfo(np.uint32).max:
         raise ValueError(
-            "Region-cache grid contains too many bins for its portable key format."
+            "Region-cache grid is too fine for its portable key format: "
+            f"{depth_bins}x{y_bins}x{x_bins} is {max_linear_bin:,} bins, above "
+            f"the {np.iinfo(np.uint32).max:,} limit. Reduce Y bins or use a "
+            "larger depth bin."
         )
 
     for chunk_index, chunk_slice in enumerate(slices):
@@ -1586,15 +1610,15 @@ def _write_occupancy_runs(
             region_ids = annotation_chunk[valid].astype(np.int64, copy=False)
             if np.any(region_ids > np.iinfo(np.int32).max):
                 raise ValueError("Atlas region IDs must fit in positive int32 values.")
-            x_bin_indices = _bin_flat_values(flat_xy[..., 0][valid], x_bounds, xy_bins)
-            y_bin_indices = _bin_flat_values(flat_xy[..., 1][valid], y_bounds, xy_bins)
+            x_bin_indices = _bin_flat_values(flat_xy[..., 0][valid], x_bounds, x_bins)
+            y_bin_indices = _bin_flat_values(flat_xy[..., 1][valid], y_bounds, y_bins)
             depth_bin_indices = np.floor(
                 (depth_values[valid] - depth_bounds[0]) / depth_bin_um
             ).astype(np.int64)
             depth_bin_indices = np.clip(depth_bin_indices, 0, depth_bins - 1)
             linear = (
-                depth_bin_indices * xy_bins * xy_bins
-                + y_bin_indices * xy_bins
+                depth_bin_indices * y_bins * x_bins
+                + y_bin_indices * x_bins
                 + x_bin_indices
             )
             packed = (region_ids.astype(np.uint64) << np.uint64(32)) | linear.astype(
@@ -2172,7 +2196,7 @@ def _style_grid(
     flatmap: np.ndarray,
     depth: np.ndarray,
     *,
-    xy_bins: int,
+    y_bins: int,
     depth_bin_um: float,
     bounds: Mapping[str, Sequence[float]] | None,
     invalid_zero_sentinel: bool,
@@ -2226,15 +2250,27 @@ def _style_grid(
                 f"{name} must contain finite increasing lower/upper values."
             )
     depth_bins = _depth_bin_count(depth_bounds, depth_bin_um)
+    # Derive here: this is where each style's own bounds are resolved, and the
+    # two styles legitimately resolve to different x counts (491 vs 512 at 256).
+    counts = resolve_flatmap_bin_counts(
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        y_bins=y_bins,
+    )
     grid: dict[str, Any] = {
         "coordinate_order": ["depth", "y", "x"],
-        "xy_bins": int(xy_bins),
+        "y_bins": int(counts.y_bins),
+        "x_bins": int(counts.x_bins),
         "depth_bins": int(depth_bins),
         "depth_bin_um": float(depth_bin_um),
         "x_bounds": list(x_bounds),
         "y_bounds": list(y_bounds),
         "depth_bounds_um": list(depth_bounds),
-        "output_shape": [int(depth_bins), int(xy_bins), int(xy_bins)],
+        "output_shape": [
+            int(depth_bins),
+            int(counts.y_bins),
+            int(counts.x_bins),
+        ],
         "includes_depth_minus_one_plane": False,
     }
     if stats is not None:
@@ -2355,7 +2391,7 @@ def build_region_cache_profile(
     atlas_structures: Mapping[object, Mapping[str, Any]] | None = None,
     atlas_structure_catalog_id: str | None = None,
     region_descendants: Mapping[int, Iterable[int]] | None = None,
-    xy_bins: int = DEFAULT_FLATMAP_XY_BINS,
+    y_bins: int = DEFAULT_FLATMAP_Y_BINS,
     depth_bin_um: float = DEFAULT_FLATMAP_DEPTH_BIN_UM,
     bounds_by_style: Mapping[str, Mapping[str, Sequence[float]]] | None = None,
     invalid_zero_sentinel: bool = False,
@@ -2375,8 +2411,8 @@ def build_region_cache_profile(
     new files have been published and the root manifest is atomically replaced.
     """
     root = Path(cache_dir)
-    if int(xy_bins) <= 0:
-        raise ValueError("xy_bins must be positive.")
+    if int(y_bins) <= 0:
+        raise ValueError("y_bins must be positive.")
     if not np.isfinite(depth_bin_um) or float(depth_bin_um) <= 0:
         raise ValueError("depth_bin_um must be finite and positive.")
     if int(chunk_voxels) <= 0:
@@ -2490,7 +2526,7 @@ def build_region_cache_profile(
     shaped_grid = _style_grid(
         shaped,
         depth_array,
-        xy_bins=int(xy_bins),
+        y_bins=int(y_bins),
         depth_bin_um=float(depth_bin_um),
         bounds=style_bounds.get("shaped"),
         invalid_zero_sentinel=invalid_zero_sentinel,
@@ -2502,7 +2538,7 @@ def build_region_cache_profile(
     square_grid = _style_grid(
         square,
         depth_array,
-        xy_bins=int(xy_bins),
+        y_bins=int(y_bins),
         depth_bin_um=float(depth_bin_um),
         bounds=style_bounds.get("square"),
         invalid_zero_sentinel=invalid_zero_sentinel,
@@ -2536,7 +2572,7 @@ def build_region_cache_profile(
             "annotation_shape": [int(size) for size in annotation_array.shape],
             "structure_catalog_id": resolved_catalog_id,
         },
-        "xy_bins": int(xy_bins),
+        "y_bins": int(y_bins),
         "depth_bin_um": float(depth_bin_um),
         "style_grids": {"shaped": shaped_grid, "square": square_grid},
         "algorithms": {
@@ -2614,7 +2650,7 @@ def build_region_cache_profile(
             "directory": relative_directory,
             "lookup_set_id": str(lookup_set_id),
             "atlas": canonical_profile["atlas"],
-            "xy_bins": int(xy_bins),
+            "y_bins": int(y_bins),
             "depth_bin_um": float(depth_bin_um),
             "algorithms": canonical_profile["algorithms"],
             "validity": canonical_profile["validity"],
@@ -2978,7 +3014,8 @@ def materialize_allen_layer_region_selection(
         "coordinate_order": ["allen_layer", "y", "x"],
         "plane_mode": "allen_layers",
         "layer_labels": list(layer_labels),
-        "xy_bins": int(style_cache.grid_spec["xy_bins"]),
+        "y_bins": int(style_cache.grid_spec["y_bins"]),
+        "x_bins": int(style_cache.grid_spec["x_bins"]),
         "x_bounds": list(style_cache.grid_spec["x_bounds"]),
         "y_bounds": list(style_cache.grid_spec["y_bounds"]),
         "output_shape": [int(size) for size in output_shape],
@@ -3131,7 +3168,8 @@ def materialize_flat_region_selection(
     grid_spec = {
         "coordinate_order": ["y", "x"],
         "plane_mode": "flat",
-        "xy_bins": int(style_cache.grid_spec["xy_bins"]),
+        "y_bins": int(style_cache.grid_spec["y_bins"]),
+        "x_bins": int(style_cache.grid_spec["x_bins"]),
         "x_bounds": list(style_cache.grid_spec["x_bounds"]),
         "y_bounds": list(style_cache.grid_spec["y_bounds"]),
         "output_shape": [int(size) for size in output_shape],

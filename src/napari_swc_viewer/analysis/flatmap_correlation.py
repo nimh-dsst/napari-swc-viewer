@@ -31,7 +31,8 @@ class FlatmapVoxelCorrelationSource:
     projected_nodes: pd.DataFrame
     volume_shape: tuple[int, int, int]
     input_file_ids: tuple[str, ...]
-    xy_bins: int
+    y_bins: int
+    x_bins: int | None
     depth_bin_um: float
     include_depth_minus_one: bool
     flatmap_style: str | None = None
@@ -272,7 +273,8 @@ def query_flatmap_soma_coordinates_and_count(
             y_upper=1.0,
             depth_lower=0.0,
             depth_bin_um=1.0,
-            xy_bins=1,
+            y_bins=1,
+            x_bins=1,
             valid_depth_bins=1,
             sentinel_offset=0,
             include_depth_minus_one=False,
@@ -497,7 +499,8 @@ class FlatmapParquetCorrelationProvenance:
     """Binning provenance for a parquet-driven flatmap correlation run."""
 
     style: str
-    xy_bins: int
+    y_bins: int
+    x_bins: int
     depth_bin_um: float
     include_depth_minus_one: bool
     volume_shape: tuple[int, ...]
@@ -640,7 +643,8 @@ def count_flatmap_voxel_correlation_nodes(
     parquet_path: str,
     *,
     style: str,
-    xy_bins: int,
+    y_bins: int,
+    x_bins: int | None = None,
     depth_bin_um: float,
     include_depth_minus_one: bool = True,
     file_ids: list[str] | None = None,
@@ -663,29 +667,35 @@ def count_flatmap_voxel_correlation_nodes(
         _file_id_filter,
         _flatmap_sql_expressions,
         _nondegenerate_bounds,
+        _resolve_axis_bin_counts,
         _style_suffix,
-        _validate_resolution,
     )
 
     suffix = _style_suffix(style)
-    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
     x_bounds, y_bounds, depth_range = _resolve_flatmap_render_bounds(
         parquet_path, style, suffix
     )
     x_lower, x_upper = _nondegenerate_bounds(*x_bounds)
     y_lower, y_upper = _nondegenerate_bounds(*y_bounds)
     depth_lower, depth_upper = _nondegenerate_bounds(*depth_range)
+    y_bins, x_bins, depth_bin_um = _resolve_axis_bin_counts(
+        x_bounds=(x_lower, x_upper),
+        y_bounds=(y_lower, y_upper),
+        y_bins=y_bins,
+        x_bins=x_bins,
+        depth_bin_um=depth_bin_um,
+    )
     valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
     grid_shape: tuple[int, ...] = (
-        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
+        (y_bins, x_bins) if collapse_depth else (total_depth_bins, y_bins, x_bins)
     )
     if int(np.prod(grid_shape)) > MAX_FLATMAP_HEATMAP_VOXELS:
         shape_text = "x".join(str(int(size)) for size in grid_shape)
         raise ValueError(
             f"Flatmap voxel grid is too large: {shape_text} voxels. "
-            "Use fewer XY bins or a larger depth bin."
+            "Use fewer Y bins or a larger depth bin."
         )
 
     file_filter = _file_id_filter(file_ids)
@@ -705,7 +715,8 @@ def count_flatmap_voxel_correlation_nodes(
             y_upper=y_upper,
             depth_lower=depth_lower,
             depth_bin_um=depth_bin_um,
-            xy_bins=xy_bins,
+            y_bins=y_bins,
+            x_bins=x_bins,
             valid_depth_bins=valid_depth_bins,
             sentinel_offset=sentinel_offset,
             include_depth_minus_one=include_depth_minus_one,
@@ -726,7 +737,8 @@ def compute_flatmap_voxel_correlation_from_parquet(
     parquet_path: str,
     *,
     style: str,
-    xy_bins: int,
+    y_bins: int,
+    x_bins: int | None = None,
     depth_bin_um: float,
     include_depth_minus_one: bool = True,
     method: str = "average",
@@ -761,25 +773,30 @@ def compute_flatmap_voxel_correlation_from_parquet(
         _flatmap_sql_expressions,
         _nondegenerate_bounds,
         _query_flatmap_bin_counts,
+        _resolve_axis_bin_counts,
         _style_suffix,
-        _validate_resolution,
     )
 
     suffix = _style_suffix(style)
-    xy_bins, depth_bin_um = _validate_resolution(xy_bins, depth_bin_um)
-
     x_bounds, y_bounds, depth_range = _resolve_flatmap_render_bounds(
         parquet_path, style, suffix
     )
     x_lower, x_upper = _nondegenerate_bounds(x_bounds[0], x_bounds[1])
     y_lower, y_upper = _nondegenerate_bounds(y_bounds[0], y_bounds[1])
     depth_lower, depth_upper = _nondegenerate_bounds(depth_range[0], depth_range[1])
+    y_bins, x_bins, depth_bin_um = _resolve_axis_bin_counts(
+        x_bounds=(x_lower, x_upper),
+        y_bounds=(y_lower, y_upper),
+        y_bins=y_bins,
+        x_bins=x_bins,
+        depth_bin_um=depth_bin_um,
+    )
 
     valid_depth_bins = _depth_bin_count((depth_lower, depth_upper), depth_bin_um)
     sentinel_offset = 1 if include_depth_minus_one else 0
     total_depth_bins = valid_depth_bins + sentinel_offset
     volume_shape: tuple[int, ...] = (
-        (xy_bins, xy_bins) if collapse_depth else (total_depth_bins, xy_bins, xy_bins)
+        (y_bins, x_bins) if collapse_depth else (total_depth_bins, y_bins, x_bins)
     )
 
     voxel_count = int(np.prod(volume_shape))
@@ -787,7 +804,7 @@ def compute_flatmap_voxel_correlation_from_parquet(
         shape_text = "x".join(str(int(size)) for size in volume_shape)
         raise ValueError(
             f"Flatmap voxel grid is too large: {shape_text} voxels. "
-            "Use fewer XY bins or a larger depth bin."
+            "Use fewer Y bins or a larger depth bin."
         )
 
     file_filter = _file_id_filter(file_ids)
@@ -811,7 +828,8 @@ def compute_flatmap_voxel_correlation_from_parquet(
             y_upper=y_upper,
             depth_lower=depth_lower,
             depth_bin_um=depth_bin_um,
-            xy_bins=xy_bins,
+            y_bins=y_bins,
+            x_bins=x_bins,
             valid_depth_bins=valid_depth_bins,
             sentinel_offset=sentinel_offset,
             include_depth_minus_one=include_depth_minus_one,
@@ -859,7 +877,8 @@ def compute_flatmap_voxel_correlation_from_parquet(
     result.unassigned_neuron_ids = list(count_data.unassigned_neuron_ids)
     provenance = FlatmapParquetCorrelationProvenance(
         style=style,
-        xy_bins=int(xy_bins),
+        y_bins=int(y_bins),
+        x_bins=int(x_bins),
         depth_bin_um=float(depth_bin_um),
         include_depth_minus_one=bool(include_depth_minus_one),
         volume_shape=volume_shape,

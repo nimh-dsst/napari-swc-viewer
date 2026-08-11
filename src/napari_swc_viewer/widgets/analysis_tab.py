@@ -46,7 +46,9 @@ from ..analysis.flatmap_correlation import (
 )
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
-    DEFAULT_FLATMAP_XY_BINS,
+    DEFAULT_FLATMAP_Y_BINS,
+    FLATMAP_Y_BINS_TOOLTIP,
+    MAX_FLATMAP_Y_BINS,
 )
 from .collapsible_section import CollapsibleSection
 from .node_type_selector import NodeTypeSelectorComboBox
@@ -135,7 +137,7 @@ class _ClusteringRequest:
     eps: float
     min_samples: int
     flatmap_style: str | None
-    flatmap_xy_bins: int
+    flatmap_y_bins: int
     flatmap_depth_bin_um: float
     flatmap_include_depth_minus_one: bool
     flatmap_depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE
@@ -792,14 +794,16 @@ class AnalysisTabWidget(QWidget):
         self._flatmap_depth_scale_row.addWidget(self._flatmap_depth_scale_spin)
         corr_layout.addLayout(self._flatmap_depth_scale_row)
 
-        self._flatmap_xy_bins_row = QHBoxLayout()
-        self._flatmap_xy_bins_label = QLabel("XY bins:")
-        self._flatmap_xy_bins_row.addWidget(self._flatmap_xy_bins_label)
-        self._flatmap_xy_bins_spin = QSpinBox()
-        self._flatmap_xy_bins_spin.setRange(2, 4096)
-        self._flatmap_xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
-        self._flatmap_xy_bins_row.addWidget(self._flatmap_xy_bins_spin)
-        corr_layout.addLayout(self._flatmap_xy_bins_row)
+        self._flatmap_y_bins_row = QHBoxLayout()
+        self._flatmap_y_bins_label = QLabel("Y bins:")
+        self._flatmap_y_bins_row.addWidget(self._flatmap_y_bins_label)
+        self._flatmap_y_bins_spin = QSpinBox()
+        self._flatmap_y_bins_spin.setRange(2, MAX_FLATMAP_Y_BINS)
+        self._flatmap_y_bins_spin.setValue(DEFAULT_FLATMAP_Y_BINS)
+        self._flatmap_y_bins_spin.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        self._flatmap_y_bins_label.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        self._flatmap_y_bins_row.addWidget(self._flatmap_y_bins_spin)
+        corr_layout.addLayout(self._flatmap_y_bins_row)
 
         self._flatmap_depth_bin_row = QHBoxLayout()
         self._flatmap_depth_bin_label = QLabel("Depth bin (μm):")
@@ -1538,8 +1542,8 @@ class AnalysisTabWidget(QWidget):
         # Flatmap binning controls only matter for voxel correlation.
         flatmap_voxel = is_flatmap and not is_soma
         for widget in (
-            getattr(self, "_flatmap_xy_bins_label", None),
-            getattr(self, "_flatmap_xy_bins_spin", None),
+            getattr(self, "_flatmap_y_bins_label", None),
+            getattr(self, "_flatmap_y_bins_spin", None),
             getattr(self, "_flatmap_depth_bin_label", None),
             getattr(self, "_flatmap_depth_bin_spin", None),
             getattr(self, "_flatmap_include_depth_minus_one_cb", None),
@@ -1740,7 +1744,7 @@ class AnalysisTabWidget(QWidget):
             eps=float(self._eps_spin.value()),
             min_samples=int(self._min_samples_spin.value()),
             flatmap_style=flatmap_style,
-            flatmap_xy_bins=int(self._flatmap_xy_bins_spin.value()),
+            flatmap_y_bins=int(self._flatmap_y_bins_spin.value()),
             flatmap_depth_bin_um=float(self._flatmap_depth_bin_spin.value()),
             flatmap_include_depth_minus_one=(
                 self._flatmap_include_depth_minus_one_cb.isChecked()
@@ -1771,7 +1775,7 @@ class AnalysisTabWidget(QWidget):
             dilation_fraction=request.dilation_fraction,
             file_ids=(None if request.file_ids is None else list(request.file_ids)),
             flatmap_style=request.flatmap_style,
-            flatmap_xy_bins=request.flatmap_xy_bins,
+            flatmap_y_bins=request.flatmap_y_bins,
             flatmap_depth_bin_um=request.flatmap_depth_bin_um,
             flatmap_include_depth_minus_one=(request.flatmap_include_depth_minus_one),
             flatmap_collapse_depth=not request.flatmap_include_depth,
@@ -1883,7 +1887,7 @@ class AnalysisTabWidget(QWidget):
                 worker = FlatmapParquetCorrelationWorker(
                     **common,
                     style=request.flatmap_style,
-                    xy_bins=request.flatmap_xy_bins,
+                    y_bins=request.flatmap_y_bins,
                     depth_bin_um=request.flatmap_depth_bin_um,
                     include_depth_minus_one=(request.flatmap_include_depth_minus_one),
                     linkage_method=request.linkage_method,
