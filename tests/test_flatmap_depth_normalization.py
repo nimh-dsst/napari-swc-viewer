@@ -5,8 +5,13 @@ spanning the bilateral flat map while ``depth_um`` is raw microns spanning the
 cortical thickness.  Clustering them together unweighted lets depth supply
 >99.99% of the Euclidean variance, collapsing the result to a laminar partition.
 These tests guard the normalization that fixes that, plus the two traps it is
-easy to reintroduce: halving the bilateral ``x`` span, and treating "ignore
-depth" as a zero weight rather than a dropped axis.
+easy to reintroduce: giving the flat map axes separate divisors, which distorts
+flat map space, and treating "ignore depth" as a zero weight rather than a
+dropped axis.
+
+Both flat map axes share one divisor taken from the ``y`` span, matching how the
+voxel grid derives its bin counts. ``tests/test_flatmap_bin_counts.py`` covers
+the grid side of that same policy.
 """
 
 from __future__ import annotations
@@ -174,45 +179,114 @@ def legacy_parquet(tmp_path):
     return _write_parquet(tmp_path, with_metadata=False)
 
 
-def test_square_hemisphere_is_a_unit_cube(canonical_parquet) -> None:
-    """The square style's x divisor must halve the bilateral span."""
+def test_square_style_divides_by_the_hemisphere_height(canonical_parquet) -> None:
+    """The shared divisor is the y span, which is one hemisphere tall."""
     _frame, path = canonical_parquet
     norm = resolve_flatmap_depth_normalization(path, style="both_square")
 
     assert norm.bounds_source == "canonical"
-    # x spans two hemispheres, so one hemisphere is half of it.
-    assert norm.x_divisor == pytest.approx(1.0)
-    assert norm.y_divisor == pytest.approx(1.0)
+    assert norm.flatmap_divisor == pytest.approx(1.0)
     assert norm.depth_divisor_um == pytest.approx(1856.49658203125)
 
 
-def test_square_x_divisor_is_not_the_full_bilateral_span(canonical_parquet) -> None:
-    """Guard the trap that silently gives y twice x's weight.
+def test_square_style_is_unchanged_by_the_shared_divisor(canonical_parquet) -> None:
+    """``both_square`` is an exact 2:1 map, so sharing a divisor changes nothing.
 
-    Dividing x by the full canonical span (2.0) squeezes each hemisphere to
-    half width, so tangential distance along x counts for half as much as the
-    same distance along y.
+    Its old per-axis divisors were ``x_span / 2 == 1.0`` and ``y_span == 1.0``,
+    already equal.  Pinning that here separates "the fix" from "a regression":
+    any change in square-style clustering results is a bug, not the intended
+    effect.
     """
     _frame, path = canonical_parquet
     norm = resolve_flatmap_depth_normalization(path, style="both_square")
 
-    full_span = SQUARE_X_BOUNDS[1] - SQUARE_X_BOUNDS[0]
-    assert norm.x_divisor != pytest.approx(full_span)
-    assert norm.x_divisor / norm.y_divisor == pytest.approx(1.0)
+    legacy_x_divisor = (SQUARE_X_BOUNDS[1] - SQUARE_X_BOUNDS[0]) / 2.0
+    legacy_y_divisor = SQUARE_Y_BOUNDS[1] - SQUARE_Y_BOUNDS[0]
+    assert legacy_x_divisor == pytest.approx(legacy_y_divisor)
+    assert norm.flatmap_divisor == pytest.approx(legacy_x_divisor)
 
 
-def test_shaped_style_corrects_its_aspect_ratio(canonical_parquet) -> None:
-    """The shaped map's hemisphere is not square and must be corrected."""
+@pytest.mark.parametrize("style", ["both_square", "both_shaped"])
+def test_flat_map_space_is_isotropic(canonical_parquet, style: str) -> None:
+    """Equal flat map separations must give equal distances on both axes.
+
+    This is the test the old normalization lacked. It divided each axis by its
+    own span, forcing every style's hemisphere into a square bounding box; for
+    ``both_shaped`` that stretched x by 4.2% relative to y. Asserting on a
+    *distance* rather than on divisor values is what makes it style-agnostic.
+    """
+    _frame, path = canonical_parquet
+    norm = resolve_flatmap_depth_normalization(
+        path,
+        style=style,
+        include_depth=False,
+    )
+
+    step = 0.01
+    origin = (0.5, 0.5, 0.0)
+    moved_x = (0.5 + step, 0.5, 0.0)
+    moved_y = (0.5, 0.5 + step, 0.0)
+    scaled = normalize_flatmap_soma_coordinates(
+        np.asarray([origin, moved_x, moved_y], dtype=float),
+        norm,
+    )
+    x_distance = float(np.linalg.norm(scaled[1] - scaled[0]))
+    y_distance = float(np.linalg.norm(scaled[2] - scaled[0]))
+
+    assert x_distance == pytest.approx(y_distance)
+    # Under the old per-axis divisors the shaped style failed this by 4.2%.
+    assert x_distance > 0.0
+
+
+def test_shaped_style_no_longer_stretches_x(canonical_parquet) -> None:
+    """Pin the removed distortion, so the regression cannot come back quietly.
+
+    The old shaped divisors were ``x_span / 2`` (0.9042) for x and ``y_span``
+    (0.9434) for y, a ratio of 0.9581 — x differences were inflated ~4.4%. The
+    shared divisor must be the y span, not the old halved x span.
+    """
     _frame, path = canonical_parquet
     norm = resolve_flatmap_depth_normalization(path, style="both_shaped")
 
-    expected_x = (SHAPED_X_BOUNDS[1] - SHAPED_X_BOUNDS[0]) / 2.0
-    expected_y = SHAPED_Y_BOUNDS[1] - SHAPED_Y_BOUNDS[0]
-    assert norm.x_divisor == pytest.approx(expected_x)
-    assert norm.y_divisor == pytest.approx(expected_y)
-    # The raw shaped hemisphere is ~4% off square, which is why it needs its
-    # own divisors rather than reusing the square style's.
-    assert expected_x / expected_y == pytest.approx(0.958, abs=0.01)
+    y_span = SHAPED_Y_BOUNDS[1] - SHAPED_Y_BOUNDS[0]
+    legacy_x_divisor = (SHAPED_X_BOUNDS[1] - SHAPED_X_BOUNDS[0]) / 2.0
+
+    assert norm.flatmap_divisor == pytest.approx(y_span)
+    assert norm.flatmap_divisor != pytest.approx(legacy_x_divisor)
+    # The anisotropy that used to be present, quantified.
+    assert legacy_x_divisor / y_span == pytest.approx(0.958, abs=0.01)
+
+
+def test_both_styles_share_the_binning_reference_axis(canonical_parquet) -> None:
+    """The normalization and the voxel grid must agree on what sets the unit.
+
+    Both take ``y`` as the reference axis: the grid's bin width is
+    ``y_span / y_bins`` on both axes, and the metric's unit is the ``y`` span.
+    A change to either that broke this pairing would silently put soma
+    clustering and the heatmap on differently-proportioned spaces.
+    """
+    from napari_swc_viewer.flatmap_heatmap import resolve_flatmap_bin_counts
+
+    _frame, path = canonical_parquet
+    for style, x_bounds, y_bounds in (
+        ("both_square", SQUARE_X_BOUNDS, SQUARE_Y_BOUNDS),
+        ("both_shaped", SHAPED_X_BOUNDS, SHAPED_Y_BOUNDS),
+    ):
+        norm = resolve_flatmap_depth_normalization(path, style=style)
+        y_bins = 256
+        counts = resolve_flatmap_bin_counts(
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            y_bins=y_bins,
+        )
+        # The grid's bin width and the metric's unit differ only by y_bins.
+        bin_width = (y_bounds[1] - y_bounds[0]) / counts.y_bins
+        assert norm.flatmap_divisor / y_bins == pytest.approx(bin_width)
+        # And an x step of one metric unit spans exactly x_bins/y_bins bins.
+        assert counts.x_bins / counts.y_bins == pytest.approx(
+            (x_bounds[1] - x_bounds[0]) / norm.flatmap_divisor,
+            rel=1e-3,
+        )
 
 
 def test_normalization_puts_axes_on_a_comparable_scale(canonical_parquet) -> None:
@@ -300,24 +374,25 @@ def test_negative_depth_scale_is_rejected(canonical_parquet) -> None:
 
 
 def test_legacy_parquet_falls_back_to_observed_bounds(legacy_parquet) -> None:
-    """Without canonical bounds the observed span is used unhalved.
+    """Without canonical bounds the observed y span sets the unit.
 
-    Observed bounds already cover only the hemispheres present in the data, so
-    applying the bilateral halving here would stretch the x axis.
+    The old code needed a branch here: canonical x spans two hemispheres and
+    was halved, while observed x might span one and was not. Taking the unit
+    from y removes that guess -- y spans one hemisphere either way -- so this
+    path no longer special-cases anything.
     """
     _frame, path = legacy_parquet
     norm = resolve_flatmap_depth_normalization(path, style="both_square")
 
     assert norm.bounds_source == "observed"
-    observed_x_span = 1.93 - 1.05
-    assert norm.x_divisor == pytest.approx(observed_x_span, abs=1e-4)
+    observed_y_span = 0.93 - 0.10
+    assert norm.flatmap_divisor == pytest.approx(observed_y_span, abs=1e-4)
 
 
 def test_normalization_rejects_wrongly_shaped_coordinates() -> None:
     norm = FlatmapDepthNormalization(
         style="both_square",
-        x_divisor=1.0,
-        y_divisor=1.0,
+        flatmap_divisor=1.0,
         depth_divisor_um=1856.5,
     )
     with pytest.raises(ValueError, match=r"\(N, 3\) array"):
@@ -339,7 +414,10 @@ def test_normalization_metadata_round_trips(canonical_parquet) -> None:
     assert payload["include_depth"] is True
     assert payload["bounds_source"] == "canonical"
     assert payload["axis_count"] == 3
-    assert payload["x_divisor"] == pytest.approx(1.0)
+    assert payload["flatmap_divisor"] == pytest.approx(1.0)
+    # One divisor, not two that must be kept equal.
+    assert "x_divisor" not in payload
+    assert "y_divisor" not in payload
     # Must be JSON-serializable for workbook/parquet exports.
     assert json.loads(json.dumps(payload)) == payload
 
@@ -378,9 +456,7 @@ def test_worker_records_normalization_provenance(canonical_parquet) -> None:
     result = _run_worker(path, depth_scale=2.0)
 
     assert result.metadata is not None
-    assert result.metadata.distance_metric == (
-        "euclidean_flatmap_depth_unit_hemisphere"
-    )
+    assert result.metadata.distance_metric == ("euclidean_flatmap_isotropic_plus_depth")
     recorded = result.metadata.extra_metadata["flatmap_normalization"]
     assert recorded["depth_scale"] == pytest.approx(2.0)
     assert recorded["include_depth"] is True
@@ -400,7 +476,7 @@ def test_worker_can_cluster_on_flatmap_position_only(canonical_parquet) -> None:
     result = _run_worker(path, include_depth=False)
 
     assert result.metadata is not None
-    assert result.metadata.distance_metric == "euclidean_flatmap_xy_unit_hemisphere"
+    assert result.metadata.distance_metric == "euclidean_flatmap_isotropic"
     recorded = result.metadata.extra_metadata["flatmap_normalization"]
     assert recorded["include_depth"] is False
     assert recorded["axis_count"] == 2

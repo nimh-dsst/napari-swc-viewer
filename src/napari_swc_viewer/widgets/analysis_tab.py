@@ -46,7 +46,9 @@ from ..analysis.flatmap_correlation import (
 )
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
-    DEFAULT_FLATMAP_XY_BINS,
+    DEFAULT_FLATMAP_Y_BINS,
+    FLATMAP_Y_BINS_TOOLTIP,
+    MAX_FLATMAP_Y_BINS,
 )
 from .collapsible_section import CollapsibleSection
 from .node_type_selector import NodeTypeSelectorComboBox
@@ -79,18 +81,24 @@ _FLATMAP_COORDS_INFO_TEXT = (
 )
 _DEPTH_SCALE_TOOLTIP = (
     "Weight of cortical depth relative to flat map position.\n\n"
-    "Soma coordinates are normalized so one hemisphere spans 1.0 along each "
-    "flat map axis and one full cortical thickness spans 1.0 in depth.\n\n"
+    "Both flat map axes are divided by the same number, so flat map space is "
+    "scaled but never distorted: 1.0 is one hemisphere height in any "
+    "direction. One full cortical thickness spans 1.0 in depth.\n\n"
     "Higher values weight depth MORE, pulling clusters toward cortical layers "
     "(laminar grouping).\n"
     "Lower values weight depth LESS, pulling clusters toward flat map "
     "position (areal grouping).\n\n"
     "1.0 treats a full cortical thickness of depth separation as equivalent "
-    "to one hemisphere width of tangential separation.\n\n"
+    "to one hemisphere height of tangential separation.\n\n"
     "These are fractions of each axis, not physical distances. The flat map "
     "projection distorts the cortical surface, so flat map X/Y have no "
     "reliable conversion to microns and this weight cannot be read as a "
     "physical ratio."
+)
+_FLATMAP_EPS_TOOLTIP = (
+    "DBSCAN neighbourhood radius in normalized flat map units, where 1.0 is "
+    "one hemisphere height. The radius is circular: both flat map axes share "
+    "one divisor, so the same value means the same distance in any direction."
 )
 _IGNORE_DEPTH_TOOLTIP = (
     "Cluster on flat map X/Y only, dropping the depth axis entirely.\n\n"
@@ -135,7 +143,7 @@ class _ClusteringRequest:
     eps: float
     min_samples: int
     flatmap_style: str | None
-    flatmap_xy_bins: int
+    flatmap_y_bins: int
     flatmap_depth_bin_um: float
     flatmap_include_depth_minus_one: bool
     flatmap_depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE
@@ -772,7 +780,7 @@ class AnalysisTabWidget(QWidget):
 
         # Flat map soma clustering: depth weighting.  Raw Parquet coordinates
         # mix normalized flat map units with microns, so soma coordinates are
-        # normalized to a unit hemisphere cube and depth is then weighted here.
+        # scaled by one shared flat map divisor and depth is then weighted here.
         self._flatmap_ignore_depth_cb = QCheckBox("Ignore depth (flat map X/Y only)")
         self._flatmap_ignore_depth_cb.setChecked(False)
         self._flatmap_ignore_depth_cb.setToolTip(_IGNORE_DEPTH_TOOLTIP)
@@ -792,14 +800,16 @@ class AnalysisTabWidget(QWidget):
         self._flatmap_depth_scale_row.addWidget(self._flatmap_depth_scale_spin)
         corr_layout.addLayout(self._flatmap_depth_scale_row)
 
-        self._flatmap_xy_bins_row = QHBoxLayout()
-        self._flatmap_xy_bins_label = QLabel("XY bins:")
-        self._flatmap_xy_bins_row.addWidget(self._flatmap_xy_bins_label)
-        self._flatmap_xy_bins_spin = QSpinBox()
-        self._flatmap_xy_bins_spin.setRange(2, 4096)
-        self._flatmap_xy_bins_spin.setValue(DEFAULT_FLATMAP_XY_BINS)
-        self._flatmap_xy_bins_row.addWidget(self._flatmap_xy_bins_spin)
-        corr_layout.addLayout(self._flatmap_xy_bins_row)
+        self._flatmap_y_bins_row = QHBoxLayout()
+        self._flatmap_y_bins_label = QLabel("Y bins:")
+        self._flatmap_y_bins_row.addWidget(self._flatmap_y_bins_label)
+        self._flatmap_y_bins_spin = QSpinBox()
+        self._flatmap_y_bins_spin.setRange(2, MAX_FLATMAP_Y_BINS)
+        self._flatmap_y_bins_spin.setValue(DEFAULT_FLATMAP_Y_BINS)
+        self._flatmap_y_bins_spin.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        self._flatmap_y_bins_label.setToolTip(FLATMAP_Y_BINS_TOOLTIP)
+        self._flatmap_y_bins_row.addWidget(self._flatmap_y_bins_spin)
+        corr_layout.addLayout(self._flatmap_y_bins_row)
 
         self._flatmap_depth_bin_row = QHBoxLayout()
         self._flatmap_depth_bin_label = QLabel("Depth bin (μm):")
@@ -1538,8 +1548,8 @@ class AnalysisTabWidget(QWidget):
         # Flatmap binning controls only matter for voxel correlation.
         flatmap_voxel = is_flatmap and not is_soma
         for widget in (
-            getattr(self, "_flatmap_xy_bins_label", None),
-            getattr(self, "_flatmap_xy_bins_spin", None),
+            getattr(self, "_flatmap_y_bins_label", None),
+            getattr(self, "_flatmap_y_bins_spin", None),
             getattr(self, "_flatmap_depth_bin_label", None),
             getattr(self, "_flatmap_depth_bin_spin", None),
             getattr(self, "_flatmap_include_depth_minus_one_cb", None),
@@ -1607,8 +1617,8 @@ class AnalysisTabWidget(QWidget):
     def _apply_eps_units(self, normalized_space: bool) -> None:
         """Retarget the DBSCAN eps control at the active coordinate space.
 
-        Flat map soma clustering measures distance in normalized hemisphere-cube
-        units, where a whole hemisphere spans 1.0 — the micron range the CCFv3
+        Flat map soma clustering measures distance in normalized flat map units,
+        where one hemisphere height is 1.0 — the micron range the CCFv3
         clustering needs would collapse every soma into a single cluster.  Each
         space keeps its own remembered value so switching back and forth does
         not destroy the user's setting.
@@ -1638,14 +1648,8 @@ class AnalysisTabWidget(QWidget):
             spin.setSuffix("")
             if label is not None:
                 label.setText("Eps (hemisphere fraction):")
-                label.setToolTip(
-                    "DBSCAN neighbourhood radius in normalized units, where "
-                    "1.0 is one hemisphere width."
-                )
-            spin.setToolTip(
-                "DBSCAN neighbourhood radius in normalized units, where 1.0 is "
-                "one hemisphere width."
-            )
+                label.setToolTip(_FLATMAP_EPS_TOOLTIP)
+            spin.setToolTip(_FLATMAP_EPS_TOOLTIP)
         else:
             restored = getattr(self, "_eps_value_um", 100.0)
             spin.setDecimals(1)
@@ -1740,7 +1744,7 @@ class AnalysisTabWidget(QWidget):
             eps=float(self._eps_spin.value()),
             min_samples=int(self._min_samples_spin.value()),
             flatmap_style=flatmap_style,
-            flatmap_xy_bins=int(self._flatmap_xy_bins_spin.value()),
+            flatmap_y_bins=int(self._flatmap_y_bins_spin.value()),
             flatmap_depth_bin_um=float(self._flatmap_depth_bin_spin.value()),
             flatmap_include_depth_minus_one=(
                 self._flatmap_include_depth_minus_one_cb.isChecked()
@@ -1771,7 +1775,7 @@ class AnalysisTabWidget(QWidget):
             dilation_fraction=request.dilation_fraction,
             file_ids=(None if request.file_ids is None else list(request.file_ids)),
             flatmap_style=request.flatmap_style,
-            flatmap_xy_bins=request.flatmap_xy_bins,
+            flatmap_y_bins=request.flatmap_y_bins,
             flatmap_depth_bin_um=request.flatmap_depth_bin_um,
             flatmap_include_depth_minus_one=(request.flatmap_include_depth_minus_one),
             flatmap_collapse_depth=not request.flatmap_include_depth,
@@ -1883,7 +1887,7 @@ class AnalysisTabWidget(QWidget):
                 worker = FlatmapParquetCorrelationWorker(
                     **common,
                     style=request.flatmap_style,
-                    xy_bins=request.flatmap_xy_bins,
+                    y_bins=request.flatmap_y_bins,
                     depth_bin_um=request.flatmap_depth_bin_um,
                     include_depth_minus_one=(request.flatmap_include_depth_minus_one),
                     linkage_method=request.linkage_method,

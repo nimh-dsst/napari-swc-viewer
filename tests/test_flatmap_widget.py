@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+import dataclasses
 import types
 
 import numpy as np
@@ -608,11 +609,12 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
             self.enabled = bool(enabled)
 
     class _Profile:
-        def __init__(self, profile_id: str, xy_bins: int) -> None:
+        def __init__(self, profile_id: str, y_bins: int) -> None:
             self.profile_id = profile_id
             self.atlas = {"name": "allen_mouse_25um"}
             self._grid = {
-                "xy_bins": xy_bins,
+                "y_bins": y_bins,
+                "x_bins": y_bins,
                 "depth_bin_um": 25.0,
             }
             self.compatibility_calls: list[dict[str, object]] = []
@@ -656,7 +658,7 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     )
     widget._current_source_parquet_path = lambda: Path("neurons.parquet")
     widget._invalidate_flatmap_grid_layers = lambda: None
-    widget._xy_bins_spin = _ValueControl()
+    widget._y_bins_spin = _ValueControl()
     widget._depth_bin_spin = _ValueControl()
     widget._exclude_depth_minus_one_cb = _ValueControl()
     widget._negative_one_sentinel_cb = _ValueControl()
@@ -699,7 +701,7 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     assert widget._active_cache_profile is saved
     assert widget._cache_profile_combo.currentData() is saved
     assert widget._pending_cache_profile_id == saved.profile_id
-    assert widget._xy_bins_spin.value == 256
+    assert widget._y_bins_spin.value == 256
     assert widget._depth_bin_spin.value == 25.0
     assert saved.compatibility_calls[-1]["atlas_version"] == "1.2"
 
@@ -784,7 +786,8 @@ class _CacheProfile:
         self.atlas = {"name": "allen_mouse_25um"}
         self.grid = {
             "output_shape": list(output_shape),
-            "xy_bins": 4,
+            "y_bins": 4,
+            "x_bins": 4,
             "depth_bins": 1,
             "depth_bin_um": 25.0,
             "x_bounds": [0.0, 1.0],
@@ -816,7 +819,7 @@ def _configure_cache_activation_widget(widget, module) -> _DummyLayer:
     widget._projection_source_combo = types.SimpleNamespace(
         currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
     )
-    widget._xy_bins_spin = _DummyValueControl(4)
+    widget._y_bins_spin = _DummyValueControl(4)
     widget._depth_bin_spin = _DummyValueControl(25.0)
     widget._exclude_depth_minus_one_cb = _DummyValueControl(checked=False)
     widget._negative_one_sentinel_cb = _DummyValueControl(checked=True)
@@ -1108,7 +1111,8 @@ def _label_result(region_id: int = 7) -> FlatmapRegionLabelsResult:
         valid_source_voxels=1,
         labeled_voxels=1,
         collision_voxels=0,
-        xy_bins=1,
+        y_bins=1,
+        x_bins=1,
         depth_bins=1,
         depth_bin_um=25.0,
         x_flat_min=0.0,
@@ -1131,7 +1135,7 @@ def _configure_region_label_creation_widget(widget) -> None:
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
     widget._zero_sentinel_cb = types.SimpleNamespace(isChecked=lambda: False)
     widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
-    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 1)
+    widget._y_bins_spin = types.SimpleNamespace(value=lambda: 1)
     widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
     widget._focus_projection_view = lambda *_args, **_kwargs: None
     widget._lookup_stats_for_volume_set = lambda *_args, **_kwargs: object()
@@ -1445,7 +1449,7 @@ def _configure_projection_widget(widget, module, nodes: pd.DataFrame) -> None:
     widget._table_file_ids_provider = lambda: ["a.swc", "b.swc"]
     widget._selected_file_ids_provider = lambda: []
     widget._source_combo = types.SimpleNamespace(currentData=lambda: module._SOURCE_ALL)
-    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 4)
+    widget._y_bins_spin = types.SimpleNamespace(value=lambda: 4)
     widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
     widget._exclude_depth_minus_one_cb = types.SimpleNamespace(isChecked=lambda: False)
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
@@ -1618,7 +1622,7 @@ def test_add_soma_uses_duckdb_soma_query_not_full_node_scan(monkeypatch) -> None
     widget._table_file_ids_provider = lambda: ["a.swc", "b.swc"]
     widget._selected_file_ids_provider = lambda: []
     widget._source_combo = types.SimpleNamespace(currentData=lambda: module._SOURCE_ALL)
-    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 4)
+    widget._y_bins_spin = types.SimpleNamespace(value=lambda: 4)
     widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 25)
     widget._exclude_depth_minus_one_cb = types.SimpleNamespace(isChecked=lambda: False)
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
@@ -2008,16 +2012,18 @@ def test_precomputed_cache_grid_values_are_used_without_ui_rounding(
     )
     widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
     style_cache = types.SimpleNamespace(
-        grid_spec={"xy_bins": 3, "depth_bin_um": 12.3456}
+        grid_spec={"y_bins": 3, "x_bins": 5, "depth_bin_um": 12.3456}
     )
     widget._active_cache_profile = types.SimpleNamespace(
         style=lambda _style: style_cache
     )
     # The UI controls cannot represent this small/fractional profile exactly.
-    widget._xy_bins_spin = types.SimpleNamespace(value=lambda: 16)
+    widget._y_bins_spin = types.SimpleNamespace(value=lambda: 16)
     widget._depth_bin_spin = types.SimpleNamespace(value=lambda: 12.346)
 
-    assert widget._current_xy_bins() == 3
+    # Both counts come from the profile verbatim, never re-derived from bounds.
+    assert widget._current_y_bins() == 3
+    assert widget._current_x_bins() == 5
     assert widget._current_depth_bin_um() == 12.3456
 
 
@@ -2125,7 +2131,8 @@ def test_latest_flatmap_correlation_source_requires_heatmap_render(monkeypatch) 
         excluded_depth_minus_one_nodes=0,
         nonzero_voxels=2,
         traces_represented=2,
-        xy_bins=4,
+        y_bins=4,
+        x_bins=4,
         depth_bins=2,
         depth_bin_um=25.0,
         x_flat_min=0.0,
@@ -2180,7 +2187,8 @@ def test_latest_flatmap_correlation_source_requires_heatmap_render(monkeypatch) 
     assert source is not None
     assert source.volume_shape == (2, 4, 4)
     assert source.input_file_ids == ("a.swc", "b.swc")
-    assert source.xy_bins == 4
+    assert source.y_bins == 4
+    assert source.x_bins == 4
     assert source.depth_bin_um == 25.0
     assert source.mirror_depth_fallback is True
     assert source.mirror_coord_axis == 2
@@ -2210,24 +2218,25 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
     volume[0, 1, 2] = 1.0
     volume[1, 3, 0] = 2.0
     render_summary = module.FlatmapRenderSummary(
-        3,
-        3,
-        2,
-        1,
-        3,
-        0,
-        2,
-        2,
-        4,
-        2,
-        25.0,
-        0.0,
-        1.0,
-        0.0,
-        1.0,
-        0.0,
-        25.0,
-        True,
+        total_nodes=3,
+        flatmap_valid_nodes=3,
+        depth_valid_nodes=2,
+        depth_minus_one_nodes=1,
+        rendered_nodes=3,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=2,
+        traces_represented=2,
+        y_bins=4,
+        x_bins=4,
+        depth_bins=2,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+        includes_depth_minus_one_plane=True,
     )
     render_result = module.FlatmapRenderResult(
         projected_nodes=projected,
@@ -2524,24 +2533,25 @@ def _simple_render_summary(
     includes_depth_minus_one_plane: bool = True,
 ):
     return module.FlatmapRenderSummary(
-        total_nodes,
-        total_nodes,
-        total_nodes,
-        0,
-        total_nodes,
-        0,
-        total_nodes,
-        1,
-        4,
-        1,
-        25.0,
-        0.0,
-        1.0,
-        0.0,
-        1.0,
-        0.0,
-        25.0,
-        includes_depth_minus_one_plane,
+        total_nodes=total_nodes,
+        flatmap_valid_nodes=total_nodes,
+        depth_valid_nodes=total_nodes,
+        depth_minus_one_nodes=0,
+        rendered_nodes=total_nodes,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=total_nodes,
+        traces_represented=1,
+        y_bins=4,
+        x_bins=4,
+        depth_bins=1,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+        includes_depth_minus_one_plane=includes_depth_minus_one_plane,
     )
 
 
@@ -2554,7 +2564,8 @@ def _simple_allen_layer_summary(module, total_nodes: int = 2):
         excluded_non_layer_nodes=0,
         nonzero_voxels=2,
         traces_represented=1,
-        xy_bins=4,
+        y_bins=4,
+        x_bins=4,
         x_flat_min=0.0,
         x_flat_max=1.0,
         y_flat_min=0.0,
@@ -2661,29 +2672,31 @@ def _flat_render_summary(
     module,
     total_nodes: int = 2,
     *,
-    xy_bins: int = 4,
+    y_bins: int = 4,
+    x_bins: int | None = None,
     bounds: tuple[float, float] = (0.0, 1.0),
 ):
     """A depth-collapsed summary: real depth counts, no depth axis."""
     return module.FlatmapRenderSummary(
-        total_nodes,
-        total_nodes,
-        total_nodes,
-        0,
-        total_nodes,
-        0,
-        total_nodes,
-        1,
-        xy_bins,
-        0,  # depth_bins
-        0.0,  # depth_bin_um
-        bounds[0],
-        bounds[1],
-        bounds[0],
-        bounds[1],
-        0.0,
-        25.0,
-        True,
+        total_nodes=total_nodes,
+        flatmap_valid_nodes=total_nodes,
+        depth_valid_nodes=total_nodes,
+        depth_minus_one_nodes=0,
+        rendered_nodes=total_nodes,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=total_nodes,
+        traces_represented=1,
+        y_bins=y_bins,
+        x_bins=y_bins if x_bins is None else x_bins,
+        depth_bins=0,
+        depth_bin_um=0.0,
+        x_flat_min=bounds[0],
+        x_flat_max=bounds[1],
+        y_flat_min=bounds[0],
+        y_flat_max=bounds[1],
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+        includes_depth_minus_one_plane=True,
     )
 
 
@@ -2949,7 +2962,7 @@ def test_flat_modes_disable_depth_bin_but_keep_the_depth_minus_one_checkbox(
 ) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
-    widget._xy_bins_spin = _DummyButton()
+    widget._y_bins_spin = _DummyButton()
     widget._depth_bin_spin = _DummyButton()
     widget._exclude_depth_minus_one_cb = _DummyButton()
     widget._negative_one_sentinel_cb = _DummyButton()
@@ -2966,7 +2979,7 @@ def test_flat_modes_disable_depth_bin_but_keep_the_depth_minus_one_checkbox(
         )
         widget._update_render_mode_controls()
 
-        assert widget._xy_bins_spin.enabled is True
+        assert widget._y_bins_spin.enabled is True
         # No depth bins to size, but the checkbox still selects nodes.
         assert widget._depth_bin_spin.enabled is False
         assert widget._exclude_depth_minus_one_cb.enabled is True
@@ -3262,24 +3275,25 @@ def test_depth_heatmap_plane_label_reports_the_depth_range(monkeypatch) -> None:
     volume = np.zeros((3, 4, 4), dtype=np.float32)
     volume[1, 1, 2] = 1.0
     render_summary = module.FlatmapRenderSummary(
-        1,
-        1,
-        1,
-        0,
-        1,
-        0,
-        1,
-        1,
-        4,
-        3,
-        25.0,
-        0.0,
-        1.0,
-        0.0,
-        1.0,
-        0.0,
-        75.0,
-        False,
+        total_nodes=1,
+        flatmap_valid_nodes=1,
+        depth_valid_nodes=1,
+        depth_minus_one_nodes=0,
+        rendered_nodes=1,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=1,
+        traces_represented=1,
+        y_bins=4,
+        x_bins=4,
+        depth_bins=3,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=75.0,
+        includes_depth_minus_one_plane=False,
     )
     render_result = module.FlatmapRenderResult(
         projected_nodes=projected,
@@ -3390,7 +3404,7 @@ def test_allen_layer_mode_enables_cached_labels_but_disables_depth_and_geometry(
         currentData=lambda: module._RENDER_ALLEN_LAYERS
     )
     widget._cache_grid_locked = False
-    widget._xy_bins_spin = _DummyValueControl()
+    widget._y_bins_spin = _DummyValueControl()
     widget._depth_bin_spin = _DummyValueControl()
     widget._exclude_depth_minus_one_cb = _DummyValueControl()
     widget._negative_one_sentinel_cb = _DummyValueControl()
@@ -3408,7 +3422,7 @@ def test_allen_layer_mode_enables_cached_labels_but_disables_depth_and_geometry(
     widget._update_render_mode_controls()
     widget._update_cached_region_controls()
 
-    assert widget._xy_bins_spin.enabled is True
+    assert widget._y_bins_spin.enabled is True
     assert widget._depth_bin_spin.enabled is False
     assert widget._exclude_depth_minus_one_cb.enabled is False
     assert widget._negative_one_sentinel_cb.enabled is True
@@ -3707,7 +3721,8 @@ def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None
         valid_source_voxels=2,
         labeled_voxels=1,
         collision_voxels=1,
-        xy_bins=2,
+        y_bins=2,
+        x_bins=2,
         depth_bins=1,
         depth_bin_um=25.0,
         x_flat_min=0.0,
@@ -3766,7 +3781,8 @@ def test_region_labels_layer_uses_display_viewer_provider(monkeypatch) -> None:
         valid_source_voxels=2,
         labeled_voxels=1,
         collision_voxels=0,
-        xy_bins=2,
+        y_bins=2,
+        x_bins=2,
         depth_bins=1,
         depth_bin_um=25.0,
         x_flat_min=0.0,
@@ -4629,24 +4645,25 @@ def test_create_points_layer_uses_table_colors(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
     render_summary = module.FlatmapRenderSummary(
-        2,
-        2,
-        1,
-        1,
-        2,
-        0,
-        2,
-        2,
-        8,
-        2,
-        25.0,
-        0.0,
-        1.0,
-        0.0,
-        1.0,
-        0.0,
-        25.0,
-        True,
+        total_nodes=2,
+        flatmap_valid_nodes=2,
+        depth_valid_nodes=1,
+        depth_minus_one_nodes=1,
+        rendered_nodes=2,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=2,
+        traces_represented=2,
+        y_bins=8,
+        x_bins=8,
+        depth_bins=2,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+        includes_depth_minus_one_plane=True,
     )
     render_result = module.FlatmapRenderResult(
         projected_nodes=pd.DataFrame({"file_id": ["a.swc", "b.swc"]}),
@@ -4980,7 +4997,8 @@ def test_apply_precomputed_allen_layer_result_rejects_no_mapped_nodes(
         excluded_non_layer_nodes=1,
         nonzero_voxels=0,
         traces_represented=0,
-        xy_bins=4,
+        y_bins=4,
+        x_bins=4,
         x_flat_min=0.0,
         x_flat_max=1.0,
         y_flat_min=0.0,
@@ -5002,3 +5020,115 @@ def test_apply_precomputed_allen_layer_result_rejects_no_mapped_nodes(
         widget._apply_precomputed_allen_layer_result(result)
 
     assert widget._viewer.layers == []
+
+
+class _RectangularCacheProfile:
+    """A profile whose grid is 3 tall by 7 wide, as a derived grid really is."""
+
+    def __init__(self, profile_id: str = "rectangular-profile") -> None:
+        self.profile_id = profile_id
+        self.atlas = {"name": "allen_mouse_25um"}
+        self.grid = {
+            "output_shape": [1, 3, 7],
+            "y_bins": 3,
+            "x_bins": 7,
+            "depth_bins": 1,
+            "depth_bin_um": 25.0,
+            "x_bounds": [0.0, 1.0],
+            "y_bounds": [0.0, 1.0],
+            "depth_bounds_um": [0.0, 25.0],
+            "includes_depth_minus_one_plane": False,
+        }
+
+    def style(self, style: str):
+        assert style == "both_shaped"
+        return types.SimpleNamespace(grid_spec=self.grid)
+
+
+def _rectangular_match_widget(module, monkeypatch):
+    widget = _widget(module)
+    _configure_cache_activation_widget(widget, module)
+    widget._last_render_summary = module.FlatmapRenderSummary(
+        total_nodes=1,
+        flatmap_valid_nodes=1,
+        depth_valid_nodes=1,
+        depth_minus_one_nodes=0,
+        rendered_nodes=1,
+        excluded_depth_minus_one_nodes=0,
+        nonzero_voxels=1,
+        traces_represented=1,
+        y_bins=3,
+        x_bins=7,
+        depth_bins=1,
+        depth_bin_um=25.0,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        depth_min_um=0.0,
+        depth_max_um=25.0,
+        includes_depth_minus_one_plane=False,
+    )
+    widget._last_volume_shape = (1, 3, 7)
+    return widget
+
+
+def test_render_matches_a_rectangular_cache_profile(monkeypatch) -> None:
+    """A render on the profile's own 3x7 grid must be recognized as matching."""
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _rectangular_match_widget(module, monkeypatch)
+
+    assert widget._render_matches_cache_profile(_RectangularCacheProfile()) is True
+
+
+def test_render_with_swapped_axes_does_not_match_a_rectangular_profile(
+    monkeypatch,
+) -> None:
+    """A 7x3 render must not pass as a 3x7 profile.
+
+    With a square profile this transpose is invisible, so the comparison has to
+    check each axis against its own stored count.
+    """
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _rectangular_match_widget(module, monkeypatch)
+    summary = widget._last_render_summary
+    widget._last_render_summary = dataclasses.replace(summary, y_bins=7, x_bins=3)
+    widget._last_volume_shape = (1, 7, 3)
+
+    assert widget._render_matches_cache_profile(_RectangularCacheProfile()) is False
+
+
+def test_render_with_a_re_derived_x_count_does_not_match(monkeypatch) -> None:
+    """A render that ignored the stored x count must be discarded, not kept.
+
+    This is why cache-backed renders pass the profile's ``x_bins`` verbatim: a
+    silently re-derived count would put the heatmap on a different grid than the
+    cached region mask, which the worker later rejects outright.
+    """
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _rectangular_match_widget(module, monkeypatch)
+    summary = widget._last_render_summary
+    widget._last_render_summary = dataclasses.replace(summary, x_bins=6)
+    widget._last_volume_shape = (1, 3, 6)
+
+    assert widget._render_matches_cache_profile(_RectangularCacheProfile()) is False
+
+
+def test_current_bins_read_a_rectangular_profile_verbatim(monkeypatch) -> None:
+    """The render path must take both counts from the active profile."""
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._projection_source_combo = types.SimpleNamespace(
+        currentData=lambda: module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._style_combo = types.SimpleNamespace(currentData=lambda: "both_shaped")
+    widget._active_cache_profile = _RectangularCacheProfile()
+    widget._y_bins_spin = types.SimpleNamespace(value=lambda: 256)
+
+    assert widget._current_y_bins() == 3
+    assert widget._current_x_bins() == 7
+
+    # With no cache profile the x count is left for the builder to derive.
+    widget._active_cache_profile = None
+    assert widget._current_y_bins() == 256
+    assert widget._current_x_bins() is None

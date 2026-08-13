@@ -48,6 +48,98 @@ other 4,871 have every non-soma node typed `0` (undefined). Compartment-filtered
 results must report how many neurons were excluded rather than returning a
 partial answer silently.
 
+## Flat Map X Spans Both Hemispheres, Y Spans One
+
+**Never give the two flat map axes the same bin count.** The bilateral map lays
+the hemispheres side by side along `x`, so `x` covers roughly twice the extent of
+`y`. Equal counts make every bin about twice as wide as it is tall, which throws
+away `x` detail at twice the rate of `y` and draws the map horizontally squashed
+(no `layer.scale` is set on any flat map layer).
+
+Measured from the canonical bounds in
+`isocortex_total_right_brainglobe_flatmap.parquet`:
+
+| style | x span | y span | ratio |
+|---|---|---|---|
+| `both_square` | 2.0000 | 1.0000 | 2.0000 |
+| `both_shaped` | 1.8085 | 0.9434 | 1.9169 |
+
+- The user-facing control is **`y_bins`**. Derive `x` with
+  `resolve_flatmap_bin_counts()` in `flatmap_heatmap.py`, which every grid
+  builder reaches through `_resolve_axis_bin_counts()`. At the default 256 that
+  gives `(256, 512)` for square and `(256, 491)` for shaped.
+- **Do not write `x_bins = 2 * y_bins`.** That is right only for `both_square`;
+  for `both_shaped` it leaves 4.2% anisotropy. `analysis/flatmap_correlation.py`
+  already contains a variant of this trap.
+- Do not call `y_bins` "bins per hemisphere" — at 256 the shaped style gets 245
+  x bins per hemisphere, not 256.
+- Rounding is pinned to `floor(v + 0.5)`, not `round()`: banker's rounding is
+  non-monotone at ties (`round(490.5) == 490` but `round(491.5) == 492`) and this
+  count feeds the region-cache identity digest.
+- **Never re-derive a stored `x_bins`.** Entry points take
+  `y_bins: int, x_bins: int | None = None`; a cache-backed caller passes the
+  profile's recorded value verbatim, because a JSON float round trip could change
+  the derived integer at a tie and the render would then be discarded as a grid
+  mismatch. Cache validators check internal consistency only, never policy
+  conformance.
+- The region-cache profile identity key is `y_bins`, never `x_bins`: one profile
+  builds both styles and they resolve to different `x_bins` (491 vs 512).
+- Because `x_bins == y_bins` used to hold everywhere, any latent `(y, x)` vs
+  `(x, y)` transpose was invisible. Treat surprise failures in this area as
+  probable pre-existing bugs, and verify renders visually rather than only by
+  shape assertions. `tests/test_flatmap_rectangular_grid.py` guards the axis
+  order, the vector/heatmap co-registration, and cross-subsystem agreement.
+
+**The soma-clustering metric follows the same policy.**
+`resolve_flatmap_depth_normalization` divides *both* flat map axes by the `y`
+span, so flat map space is scaled without being distorted. It used to divide `x`
+by `x_span / 2` and `y` by `y_span`, which gave `both_shaped` a divisor ratio of
+0.9581 — a 4.2% anisotropy. Both subsystems now take `y` as the reference axis:
+
+- The grid's bin width is `y_span / y_bins` on both axes.
+- The metric's unit is the `y` span, i.e. one hemisphere *height*.
+
+`FlatmapDepthNormalization` carries **one** `flatmap_divisor`, not one per axis,
+so the anisotropy cannot return by editing a single number. Do not reintroduce
+per-axis divisors, and do not scale `x` by `x_span / 2` — the `x` extent is not a
+per-hemisphere quantity. `depth_um` keeps its own divisor because it is a
+different physical quantity; `depth_scale` weights it.
+
+Fixing this changed `both_shaped` soma-clustering results. Measured on all
+18,518 somas in `isocortex_total_right_brainglobe_flatmap.parquet` with
+hierarchical/ward at `depth_scale=1.0`, versus the old anisotropic metric:
+
+| style | k=5 | k=10 |
+|---|---|---|
+| `both_shaped` | 37.5% moved (ARI 0.44) | 38.7% moved (ARI 0.47) |
+| `both_square` | 0.0% (ARI 1.00) | 0.0% (ARI 1.00) |
+
+**Always quote the algorithm and the neuron count with a change rate.** These
+figures are ward at full scale and nothing else reproduces them: seeded k-means
+over the same 18,518 somas moves 1.4% at k=5, and ward over an 833-soma subset
+moves 1.9%. Ward is agglomerative, so a small metric perturbation flips
+near-tied merges and the reordering cascades, and more somas means more
+near-ties. A rate from a partial table therefore does **not** bound the
+full-dataset rate — the two differ ~20x here. Do not read a small number from a
+subset as evidence the metric barely moved.
+
+`both_square` is an exact 2:1 map whose old divisors were already equal
+(`x_span / 2 == 1.0`, `y_span == 1.0`), so it is bit-identical — any change
+there is a bug, not the fix. That makes a square-style pair the sharpest
+available regression control, because it exercises the same code path the fix
+changed. The `distance_metric` recorded in exports was renamed to
+`euclidean_flatmap_isotropic[_plus_depth]` so results from before the change
+cannot be silently compared as if they matched.
+
+`scripts/compare_clustering_exports.py` measures all of this from paired
+pre/post workbook exports (`--dir anisotropy_fix_data`, which is gitignored —
+this project keeps no data files in version control, so the workbooks must be
+regenerated locally). It gates every pair on comparability before
+reporting a number, and it matches cluster labels optimally first, because
+cluster ids are arbitrary — a raw label diff reports 99.6% for the shaped k=10
+pair whose true movement is 38.7%. `ANISOTROPY_FIX_RESULTS.MD` records the full
+validation, including the two controls that held.
+
 ## Caution: `type` Is Not A Trustworthy Compartment Label
 
 **Some neurons in `isocortex_total_right_brainglobe_flatmap.parquet` have

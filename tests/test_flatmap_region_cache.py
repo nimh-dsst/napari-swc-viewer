@@ -24,6 +24,7 @@ from napari_swc_viewer.flatmap_region_cache import (
     open_region_cache,
     structure_catalog_id,
 )
+from napari_swc_viewer.flatmap_heatmap import resolve_flatmap_bin_counts
 from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
 
 
@@ -36,7 +37,11 @@ def _lookup_arrays():
             shaped[first, second, :, 0] = first
             shaped[first, second, :, 1] = second
             square[first, second, :, 0] = first * 2
-            square[first, second, :, 1] = second * 3
+            # Kept proportional to x so the square style's stats-derived bounds
+            # stay ratio 1.0 and the derived x count is 2, not 1.  With 2 bins,
+            # value 2 under bounds (0,2) clips to bin 1 exactly as value 3 under
+            # (0,3) did, so no bin index changes -- only the recorded bounds.
+            square[first, second, :, 1] = second * 2
     depth = np.zeros(shape, dtype=np.float32)
     depth[:, :, 1] = 10.0
     # Region 3 at this voxel recovers depth zero from the opposite hemisphere.
@@ -73,7 +78,7 @@ def _build(cache_dir: Path, **kwargs):
             4: {4},
             5: {5},
         },
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=10,
         chunk_voxels=2,
         **kwargs,
@@ -124,7 +129,7 @@ def _build_planar_cache(cache_dir: Path):
         lookup_set_id="planar-lookup-set",
         atlas_name="test_mouse",
         atlas_resolution_um=10,
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=10,
         bounds_by_style=bounds,
         chunk_voxels=2,
@@ -548,7 +553,7 @@ def test_multiple_profiles_duplicate_rejection_and_relocation(tmp_path):
         atlas_version="1.2",
         atlas_resolution_um=10,
         region_descendants={1: {2, 3}},
-        xy_bins=3,
+        y_bins=3,
         depth_bin_um=10,
         chunk_voxels=2,
     )
@@ -636,7 +641,7 @@ def test_structure_catalog_and_atlas_family_are_resolution_independent(tmp_path)
         atlas_version="1.2",
         atlas_resolution_um=10,
         atlas_structures=structures,
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=10,
         chunk_voxels=2,
     )
@@ -785,7 +790,7 @@ def test_cancelled_build_keeps_existing_manifest_and_cleans_temporary_profile(tm
             atlas_name="test_mouse",
             atlas_version="1.2",
             atlas_resolution_um=10,
-            xy_bins=3,
+            y_bins=3,
             depth_bin_um=10,
             chunk_voxels=2,
             cancel_callback=cancel,
@@ -816,7 +821,7 @@ def test_build_closes_all_temporary_memmaps_before_cleanup_and_publication(
         # Both directly selectable regions deliberately share one footprint,
         # exercising the footprint comparison mapping from the reported bug.
         region_descendants={1: {2}, 2: {2}},
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=10,
         chunk_voxels=2,
     )
@@ -889,7 +894,7 @@ def test_failed_build_preserves_original_error_when_temp_cleanup_is_locked(
             atlas_name="test_mouse",
             atlas_version="1.2",
             atlas_resolution_um=10,
-            xy_bins=2,
+            y_bins=2,
             depth_bin_um=10,
             chunk_voxels=2,
         )
@@ -944,7 +949,7 @@ def test_build_rejects_annotation_lookup_shape_mismatch(tmp_path):
             lookup_set_id="lookup",
             atlas_name="test_mouse",
             atlas_resolution_um=10,
-            xy_bins=2,
+            y_bins=2,
             depth_bin_um=10,
         )
 
@@ -981,7 +986,9 @@ def test_build_uses_lookup_set_grid_contract_and_requires_exact_resolution(
         lookup_resolution_um=(10.0, 10.0, 10.0),
         spatial_shape=(2, 2, 2),
         shaped_grid=grid("both_shaped", 1.0, 1.0),
-        square_grid=grid("both_square", 2.0, 3.0),
+        # Ratio 1.0 so the derived x count is 2, matching the (2, 2, 2) shape
+        # this test asserts.
+        square_grid=grid("both_square", 2.0, 2.0),
     )
     profile = build_region_cache_profile(
         tmp_path / "cache",
@@ -992,7 +999,7 @@ def test_build_uses_lookup_set_grid_contract_and_requires_exact_resolution(
         depth=depth,
         atlas_name="test_mouse_10um",
         atlas_resolution_um=10,
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=10,
         chunk_voxels=2,
     )
@@ -1010,7 +1017,7 @@ def test_build_uses_lookup_set_grid_contract_and_requires_exact_resolution(
             depth=depth,
             atlas_name="test_mouse_25um",
             atlas_resolution_um=25,
-            xy_bins=2,
+            y_bins=2,
             depth_bin_um=10,
         )
 
@@ -1027,7 +1034,7 @@ def test_empty_annotation_regions_round_trip(tmp_path):
         atlas_name="test_mouse",
         atlas_resolution_um=10,
         region_descendants={1: {1}},
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=10,
         chunk_voxels=2,
     )
@@ -1041,3 +1048,209 @@ def test_empty_annotation_regions_round_trip(tmp_path):
     assert result.summary.labeled_bins == 0
     assert result.surfaces[0].vertices.shape == (0, 3)
     assert result.outlines[0].vectors.shape == (0, 2, 3)
+
+
+def _rectangular_lookup_arrays():
+    """A lookup whose valid x extent is twice its y extent.
+
+    ``y_bins=2`` therefore derives ``x_bins=4``, so every encode/decode step is
+    exercised on a grid where a ``(y, x)`` transpose cannot go unnoticed.
+    """
+    shape = (2, 2, 2)
+    flat = np.empty((*shape, 2), dtype=np.float32)
+    for first in range(shape[0]):
+        for second in range(shape[1]):
+            for third in range(shape[2]):
+                # x spans 0..2 while y spans 0..1, an aspect ratio of exactly 2.
+                flat[first, second, third, 0] = first * 2.0
+                flat[first, second, third, 1] = float(second)
+    depth = np.zeros(shape, dtype=np.float32)
+    depth[:, :, 1] = 10.0
+    annotation = np.full(shape, 7, dtype=np.int32)
+    return annotation, flat, depth
+
+
+def _build_rectangular(cache_dir: Path):
+    annotation, flat, depth = _rectangular_lookup_arrays()
+    return build_region_cache_profile(
+        cache_dir,
+        annotation=annotation,
+        shaped_flatmap=flat,
+        square_flatmap=flat.copy(),
+        depth=depth,
+        lookup_set_id="rectangular-lookup-set",
+        atlas_name="test_mouse",
+        atlas_resolution_um=10,
+        region_descendants={7: {7}},
+        y_bins=2,
+        depth_bin_um=10,
+        chunk_voxels=2,
+    )
+
+
+def test_rectangular_profile_records_per_axis_counts(tmp_path):
+    """The grid spec must carry both counts and a matching output shape."""
+    profile = _build_rectangular(tmp_path / "cache")
+    grid = profile.style("shaped").grid_spec
+    assert grid["y_bins"] == 2
+    # x spans 0..2 and y spans 0..1, a ratio of 2, so x gets twice the bins.
+    assert grid["x_bins"] == 4
+    assert grid["coordinate_order"] == ["depth", "y", "x"]
+    assert grid["output_shape"] == [profile.style("shaped").output_shape[0], 2, 4]
+    assert profile.style("shaped").output_shape[1:] == (2, 4)
+    # The single-count key is gone, so a stale reader fails loudly.
+    assert "xy_bins" not in grid
+
+
+def test_rectangular_region_cache_round_trips_the_linear_encoding(tmp_path):
+    """Decoded labels must match an independent ``z*y*x + y*x + x`` recompute.
+
+    The encode side packs ``region_id << 32 | linear``; if the linear stride used
+    ``y_bins`` where it needed ``x_bins`` the labels would scatter, which only a
+    non-square grid can reveal.
+    """
+    profile = _build_rectangular(tmp_path / "cache")
+    depth_bins, y_bins, x_bins = profile.style("shaped").output_shape
+    assert (y_bins, x_bins) == (2, 4)
+
+    result = materialize_region_selection(
+        profile,
+        [7],
+        style="shaped",
+        direct_region_ids=[7],
+    )
+    assert result.labels.shape == (depth_bins, y_bins, x_bins)
+
+    annotation, flat, depth = _rectangular_lookup_arrays()
+    grid = profile.style("shaped").grid_spec
+    x_bounds = tuple(float(value) for value in grid["x_bounds"])
+    y_bounds = tuple(float(value) for value in grid["y_bounds"])
+    depth_bounds = tuple(float(value) for value in grid["depth_bounds_um"])
+    depth_bin_um = float(grid["depth_bin_um"])
+
+    expected = np.zeros(depth_bins * y_bins * x_bins, dtype=np.int32)
+    for index in np.ndindex(annotation.shape):
+        x_value = float(flat[index][0])
+        y_value = float(flat[index][1])
+        depth_value = float(depth[index])
+        x_bin = min(
+            x_bins - 1,
+            int(
+                np.floor(
+                    (x_value - x_bounds[0]) / (x_bounds[1] - x_bounds[0]) * x_bins
+                )
+            ),
+        )
+        y_bin = min(
+            y_bins - 1,
+            int(
+                np.floor(
+                    (y_value - y_bounds[0]) / (y_bounds[1] - y_bounds[0]) * y_bins
+                )
+            ),
+        )
+        depth_bin = min(
+            depth_bins - 1,
+            int(np.floor((depth_value - depth_bounds[0]) / depth_bin_um)),
+        )
+        linear = depth_bin * y_bins * x_bins + y_bin * x_bins + x_bin
+        expected[linear] = 7
+
+    np.testing.assert_array_equal(
+        result.labels.reshape(-1),
+        expected,
+    )
+    # A real rectangle, so the stride above is not the square special case.
+    assert y_bins != x_bins
+
+
+def test_rectangular_flat_and_allen_materializers_keep_the_x_axis(tmp_path):
+    """Collapsing depth must not collapse the rectangle."""
+    profile = _build_rectangular(tmp_path / "cache")
+    flat = materialize_flat_region_selection(
+        profile,
+        [7],
+        style="shaped",
+        direct_region_ids=[7],
+    )
+    assert flat.labels.shape == (2, 4)
+
+    outlines = materialize_flat_region_outlines(profile, 7, style="shaped")
+    assert outlines.vectors.shape[1:] == (2, 2)
+
+    allen = materialize_allen_layer_region_selection(
+        profile,
+        [7],
+        style="shaped",
+        layer_map=AllenIsocortexLayerMap(
+            atlas_name="test_mouse",
+            isocortex_region_id=1,
+            region_to_layer_index={7: 0},
+            region_ids_by_layer=((7,), (), (), (), (), ()),
+        ),
+    )
+    assert allen.labels.shape == (6, 2, 4)
+    assert allen.grid_spec["y_bins"] == 2
+    assert allen.grid_spec["x_bins"] == 4
+
+
+def test_version_one_manifest_is_rejected_with_a_rebuild_message(tmp_path):
+    """An old cache must say "rebuild", not fail on a missing grid key.
+
+    Version 1 stored a single ``xy_bins`` and binned its arrays on that grid, so
+    it cannot be reinterpreted -- only rebuilt.  Without the version bump the
+    first failure would be a ``KeyError`` surfacing as "invalid fixed-grid
+    dimensions", which points at corruption rather than at an outdated cache.
+    """
+    root = tmp_path / "cache"
+    _build(root)
+    manifest_path = root / REGION_CACHE_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["format_version"] == 2
+    manifest["format_version"] = 1
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RegionCacheValidationError, match="[Rr]ebuild") as excinfo:
+        open_region_cache(root)
+    message = str(excinfo.value)
+    assert "older version" in message
+    assert "format version 1" in message
+    assert "invalid fixed-grid dimensions" not in message
+
+
+def test_uint32_key_guard_names_the_control_to_reduce(tmp_path, monkeypatch):
+    """The portable-key guard must be actionable on a rectangular grid.
+
+    ``region_id << 32 | linear`` needs ``linear`` under 2**32.  Deriving x makes
+    the grid wider than the old square one, so the ceiling arrives sooner and the
+    message has to name a control the user actually has.
+    """
+    annotation, flat, depth = _rectangular_lookup_arrays()
+    with pytest.raises(ValueError) as excinfo:
+        build_region_cache_profile(
+            tmp_path / "cache",
+            annotation=annotation,
+            shaped_flatmap=flat,
+            square_flatmap=flat.copy(),
+            depth=depth,
+            lookup_set_id="too-fine",
+            atlas_name="test_mouse",
+            atlas_resolution_um=10,
+            region_descendants={7: {7}},
+            # Ratio 2, so 60000 y bins derive 120000 x bins: with 2 depth bins
+            # that is 1.44e10 linear bins, far over the 2**32 ceiling.
+            y_bins=60000,
+            depth_bin_um=10,
+            chunk_voxels=2,
+        )
+    message = str(excinfo.value)
+    assert "portable key format" in message
+    assert "Reduce Y bins" in message
+    # The offending grid is reported so the user can see how far over it is.
+    derived = resolve_flatmap_bin_counts(
+        x_bounds=(0.0, 2.0),
+        y_bounds=(0.0, 1.0),
+        y_bins=60000,
+    )
+    assert str(derived.x_bins) in message
+    assert str(derived.y_bins) in message

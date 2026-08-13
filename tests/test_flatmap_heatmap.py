@@ -136,7 +136,7 @@ def test_flatmap_heatmap_includes_depth_minus_one_in_sentinel_plane() -> None:
         _projected_nodes(),
         flatmap,
         depth,
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
     )
@@ -173,7 +173,7 @@ def test_flatmap_heatmap_excludes_depth_minus_one_when_requested() -> None:
         _projected_nodes(),
         flatmap,
         depth,
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=False,
     )
@@ -199,7 +199,7 @@ def test_flatmap_heatmap_reuses_precomputed_lookup_stats() -> None:
         _projected_nodes(),
         flatmap,
         depth,
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
     )
@@ -207,7 +207,7 @@ def test_flatmap_heatmap_reuses_precomputed_lookup_stats() -> None:
         _projected_nodes(),
         flatmap,
         depth,
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
         lookup_stats=stats,
@@ -223,7 +223,7 @@ def test_flatmap_heatmap_reuses_precomputed_lookup_stats() -> None:
 def test_flatmap_heatmap_from_projected_nodes_uses_projected_bounds() -> None:
     result = build_flatmap_render_data_from_projected_nodes(
         _projected_nodes(),
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
     )
@@ -260,7 +260,7 @@ def test_flatmap_heatmap_from_projected_nodes_infers_validity_flags() -> None:
 
     result = build_flatmap_render_data_from_projected_nodes(
         projected,
-        xy_bins=2,
+        y_bins=2,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
     )
@@ -291,14 +291,14 @@ def test_precomputed_subset_uses_canonical_bounds_for_cache_alignment() -> None:
     }
     complete = build_flatmap_render_data_from_projected_nodes(
         full,
-        xy_bins=10,
+        y_bins=10,
         depth_bin_um=10.0,
         include_depth_minus_one=False,
         **canonical,
     )
     subset = build_flatmap_render_data_from_projected_nodes(
         full.iloc[[1]],
-        xy_bins=10,
+        y_bins=10,
         depth_bin_um=10.0,
         include_depth_minus_one=False,
         **canonical,
@@ -384,7 +384,7 @@ def _flat_binned_projected_nodes() -> pd.DataFrame:
 @pytest.mark.parametrize("include", [False, True])
 def test_collapsed_render_equals_depth_render_summed_over_planes(include) -> None:
     kwargs = dict(
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=include,
         x_bounds=(0.0, 6.0),
@@ -414,7 +414,7 @@ def test_collapsed_render_equals_depth_render_summed_over_planes(include) -> Non
 def test_collapsed_render_reports_no_depth_binning() -> None:
     flat = build_flatmap_render_data_from_projected_nodes(
         _projected_nodes(),
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         collapse_depth=True,
         x_bounds=(0.0, 6.0),
@@ -434,7 +434,7 @@ def test_collapsed_render_reports_no_depth_binning() -> None:
 def test_collapsed_render_excludes_depth_minus_one_when_requested() -> None:
     included = build_flatmap_render_data_from_projected_nodes(
         _projected_nodes(),
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=True,
         collapse_depth=True,
@@ -444,7 +444,7 @@ def test_collapsed_render_excludes_depth_minus_one_when_requested() -> None:
     )
     excluded = build_flatmap_render_data_from_projected_nodes(
         _projected_nodes(),
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         include_depth_minus_one=False,
         collapse_depth=True,
@@ -460,7 +460,7 @@ def test_collapsed_render_excludes_depth_minus_one_when_requested() -> None:
 
 def test_collapsed_lookup_render_matches_summed_depth_volume() -> None:
     flatmap, depth_volume = _lookup_volumes()
-    kwargs = dict(xy_bins=4, depth_bin_um=25.0)
+    kwargs = dict(y_bins=4, depth_bin_um=25.0)
     depth = build_flatmap_render_data(
         _projected_nodes(), flatmap, depth_volume, **kwargs
     )
@@ -523,7 +523,8 @@ def test_build_flatmap_segment_vectors_uses_row_col_start_direction() -> None:
         file_ids,
         x_bounds=bounds,
         y_bounds=bounds,
-        xy_bins=bins,
+        y_bins=bins,
+        x_bins=bins,
     )
 
     assert vectors.data.shape == (2, 2, 2)
@@ -561,7 +562,8 @@ def test_build_flatmap_segment_vectors_refuses_above_the_limit() -> None:
             file_ids,
             x_bounds=(0.0, 40.0),
             y_bounds=(0.0, 40.0),
-            xy_bins=8,
+            y_bins=8,
+            x_bins=8,
             max_segments=1,
         )
 
@@ -572,7 +574,8 @@ def test_build_flatmap_segment_vectors_handles_an_empty_selection() -> None:
         [],
         x_bounds=(0.0, 40.0),
         y_bounds=(0.0, 40.0),
-        xy_bins=8,
+        y_bins=8,
+        x_bins=8,
     )
 
     assert vectors.data.shape == (0, 2, 2)
@@ -640,7 +643,7 @@ def test_rendered_plane_points_returns_two_columns_without_a_plane() -> None:
 def test_rendered_plane_points_match_a_depth_render_points_array() -> None:
     render = build_flatmap_render_data_from_projected_nodes(
         _projected_nodes(),
-        xy_bins=4,
+        y_bins=4,
         depth_bin_um=25.0,
         x_bounds=(0.0, 6.0),
         y_bounds=(0.0, 6.0),
@@ -693,7 +696,7 @@ def test_build_allen_layer_stack_counts_and_excludes_nodes() -> None:
     result = build_allen_layer_stack_from_projected_nodes(
         _allen_layer_nodes(),
         _allen_layer_map(),
-        xy_bins=10,
+        y_bins=10,
         x_bounds=(0.0, 10.0),
         y_bounds=(0.0, 10.0),
     )
@@ -728,7 +731,7 @@ def test_allen_layer_grouped_volumes_preserve_counts() -> None:
     result = build_allen_layer_stack_from_projected_nodes(
         _allen_layer_nodes(),
         _allen_layer_map(),
-        xy_bins=10,
+        y_bins=10,
         x_bounds=(0.0, 10.0),
         y_bounds=(0.0, 10.0),
     )
@@ -752,7 +755,7 @@ def test_allen_layer_grouped_volumes_preserve_counts() -> None:
     assert sum(float(group.volume.sum()) for group in clusters) == 6.0
 
 
-def test_allen_layer_stack_clips_xy_bins_to_canonical_bounds() -> None:
+def test_allen_layer_stack_clips_bins_to_canonical_bounds() -> None:
     nodes = pd.DataFrame(
         {
             "file_id": ["low.swc", "high.swc"],
@@ -766,7 +769,7 @@ def test_allen_layer_stack_clips_xy_bins_to_canonical_bounds() -> None:
     result = build_allen_layer_stack_from_projected_nodes(
         nodes,
         _allen_layer_map(),
-        xy_bins=4,
+        y_bins=4,
         x_bounds=(0.0, 10.0),
         y_bounds=(0.0, 10.0),
     )
@@ -811,7 +814,7 @@ def _pandas_reference_volume(
     frame: pd.DataFrame,
     *,
     suffix: str,
-    xy_bins: int,
+    y_bins: int,
     depth_bin_um: float,
     include: bool,
     x_bounds,
@@ -831,7 +834,7 @@ def _pandas_reference_volume(
     )
     return build_flatmap_render_data_from_projected_nodes(
         projected,
-        xy_bins=xy_bins,
+        y_bins=y_bins,
         depth_bin_um=depth_bin_um,
         include_depth_minus_one=include,
         x_bounds=x_bounds,
@@ -861,7 +864,7 @@ def test_duckdb_single_volume_matches_pandas(
     reference = _pandas_reference_volume(
         _frame,
         suffix=suffix,
-        xy_bins=32,
+        y_bins=32,
         depth_bin_um=50.0,
         include=include,
         x_bounds=x_bounds,
@@ -878,7 +881,7 @@ def test_duckdb_single_volume_matches_pandas(
             x_bounds=x_bounds,
             y_bounds=y_bounds,
             depth_range_um=depth_range,
-            xy_bins=32,
+            y_bins=32,
             depth_bin_um=50.0,
             include_depth_minus_one=include,
         )
@@ -910,7 +913,7 @@ def test_duckdb_collapsed_volume_matches_pandas(
     reference = _pandas_reference_volume(
         _frame,
         suffix=suffix,
-        xy_bins=32,
+        y_bins=32,
         depth_bin_um=50.0,
         include=include,
         x_bounds=x_bounds,
@@ -928,7 +931,7 @@ def test_duckdb_collapsed_volume_matches_pandas(
             x_bounds=x_bounds,
             y_bounds=y_bounds,
             depth_range_um=depth_range,
-            xy_bins=32,
+            y_bins=32,
             depth_bin_um=50.0,
             include_depth_minus_one=include,
             collapse_depth=True,
@@ -936,8 +939,15 @@ def test_duckdb_collapsed_volume_matches_pandas(
     finally:
         conn.close()
 
-    assert result.volume.shape == (32, 32)
-    assert result.volume_shape == (32, 32)
+    # Not square: the x count is derived from the bounds' aspect ratio, so the
+    # DuckDB grid must match the pandas grid on both axes, not just on y.
+    expected_shape = (
+        reference.summary.y_bins,
+        reference.summary.x_bins,
+    )
+    assert expected_shape[0] != expected_shape[1]
+    assert result.volume.shape == expected_shape
+    assert result.volume_shape == expected_shape
     np.testing.assert_array_equal(result.volume, reference.volume)
     assert result.render_summary.rendered_nodes == reference.summary.rendered_nodes
     assert result.render_summary.depth_bins == 0
@@ -954,7 +964,7 @@ def test_duckdb_collapsed_volume_equals_summed_depth_volume(_flatmap_parquet, in
         x_bounds=x_bounds,
         y_bounds=y_bounds,
         depth_range_um=depth_range,
-        xy_bins=24,
+        y_bins=24,
         depth_bin_um=75.0,
         include_depth_minus_one=include,
     )
@@ -979,7 +989,7 @@ def test_duckdb_collapsed_grouped_volumes_sum_to_single(_flatmap_parquet):
         x_bounds=x_bounds,
         y_bounds=y_bounds,
         depth_range_um=depth_range,
-        xy_bins=24,
+        y_bins=24,
         depth_bin_um=75.0,
         collapse_depth=True,
     )
@@ -996,8 +1006,15 @@ def test_duckdb_collapsed_grouped_volumes_sum_to_single(_flatmap_parquet):
 
     assert individual.volume is None
     assert individual.grouped_volumes
+    # Every group volume must use the same derived rectangular grid as the
+    # single-colour volume, or summing the groups would not reproduce it.
+    collapsed_shape = (
+        single.render_summary.y_bins,
+        single.render_summary.x_bins,
+    )
+    assert collapsed_shape[0] != collapsed_shape[1]
     assert all(
-        group.volume.shape == (24, 24) for group in individual.grouped_volumes
+        group.volume.shape == collapsed_shape for group in individual.grouped_volumes
     )
     combined = sum(group.volume for group in individual.grouped_volumes)
     np.testing.assert_array_equal(combined, single.volume)
@@ -1010,7 +1027,7 @@ def test_duckdb_grouped_volumes_sum_to_single(_flatmap_parquet, include):
     reference = _pandas_reference_volume(
         _frame,
         suffix="shaped",
-        xy_bins=24,
+        y_bins=24,
         depth_bin_um=75.0,
         include=include,
         x_bounds=x_bounds,
@@ -1027,7 +1044,7 @@ def test_duckdb_grouped_volumes_sum_to_single(_flatmap_parquet, include):
             x_bounds=x_bounds,
             y_bounds=y_bounds,
             depth_range_um=depth_range,
-            xy_bins=24,
+            y_bins=24,
             depth_bin_um=75.0,
             include_depth_minus_one=include,
         )
@@ -1040,7 +1057,7 @@ def test_duckdb_grouped_volumes_sum_to_single(_flatmap_parquet, include):
             x_bounds=x_bounds,
             y_bounds=y_bounds,
             depth_range_um=depth_range,
-            xy_bins=24,
+            y_bins=24,
             depth_bin_um=75.0,
             include_depth_minus_one=include,
             cluster_map=cluster_map,
@@ -1077,7 +1094,7 @@ def test_duckdb_file_id_subset_and_empty_selection(_flatmap_parquet):
             path,
             style_key="both_shaped",
             color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
-            xy_bins=16,
+            y_bins=16,
             depth_bin_um=100.0,
             include_depth_minus_one=False,
             file_ids=["neuron_0", "neuron_1"],
@@ -1088,7 +1105,7 @@ def test_duckdb_file_id_subset_and_empty_selection(_flatmap_parquet):
             path,
             style_key="both_shaped",
             color_mode=FLATMAP_HEATMAP_COLOR_SINGLE,
-            xy_bins=16,
+            y_bins=16,
             depth_bin_um=100.0,
             include_depth_minus_one=False,
             file_ids=[],
@@ -1130,7 +1147,7 @@ def test_duckdb_voxel_guard_rejects_oversized_grid(_flatmap_parquet):
                 x_bounds=(0.0, 118.0),
                 y_bounds=(0.0, 88.0),
                 depth_range_um=(0.0, 890.0),
-                xy_bins=int(MAX_FLATMAP_HEATMAP_VOXELS**0.5) + 1000,
+                y_bins=int(MAX_FLATMAP_HEATMAP_VOXELS**0.5) + 1000,
                 depth_bin_um=1.0,
                 include_depth_minus_one=False,
             )
@@ -1157,7 +1174,7 @@ def test_duckdb_allen_layer_stack_matches_pandas(tmp_path) -> None:
     reference = build_allen_layer_stack_from_projected_nodes(
         projected,
         layer_map,
-        xy_bins=20,
+        y_bins=20,
         x_bounds=(0.0, 118.0),
         y_bounds=(0.0, 88.0),
     )
@@ -1172,7 +1189,7 @@ def test_duckdb_allen_layer_stack_matches_pandas(tmp_path) -> None:
             layer_map=layer_map,
             x_bounds=(0.0, 118.0),
             y_bounds=(0.0, 88.0),
-            xy_bins=20,
+            y_bins=20,
         )
         individual = build_allen_layer_heatmap_volume_result(
             conn,
@@ -1182,7 +1199,7 @@ def test_duckdb_allen_layer_stack_matches_pandas(tmp_path) -> None:
             layer_map=layer_map,
             x_bounds=(0.0, 118.0),
             y_bounds=(0.0, 88.0),
-            xy_bins=20,
+            y_bins=20,
         )
         cluster = build_allen_layer_heatmap_volume_result(
             conn,
@@ -1192,7 +1209,7 @@ def test_duckdb_allen_layer_stack_matches_pandas(tmp_path) -> None:
             layer_map=layer_map,
             x_bounds=(0.0, 118.0),
             y_bounds=(0.0, 88.0),
-            xy_bins=20,
+            y_bins=20,
             cluster_map={f"neuron_{index}": index % 2 for index in range(6)},
         )
     finally:
@@ -1225,7 +1242,7 @@ def test_duckdb_allen_layer_stack_requires_region_id(
                 layer_map=_allen_layer_map(),
                 x_bounds=(0.0, 118.0),
                 y_bounds=(0.0, 88.0),
-                xy_bins=20,
+                y_bins=20,
             )
     finally:
         conn.close()
@@ -1257,7 +1274,7 @@ def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
     reference = build_allen_layer_stack_from_projected_nodes(
         reference_nodes,
         _allen_layer_map(),
-        xy_bins=12,
+        y_bins=12,
         x_bounds=(0.0, 118.0),
         y_bounds=(0.0, 88.0),
     )
@@ -1272,7 +1289,7 @@ def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
             layer_map=_allen_layer_map(),
             x_bounds=(0.0, 118.0),
             y_bounds=(0.0, 88.0),
-            xy_bins=12,
+            y_bins=12,
             file_ids=selected_ids,
         )
         empty = build_allen_layer_heatmap_volume_result(
@@ -1283,7 +1300,7 @@ def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
             layer_map=_allen_layer_map(),
             x_bounds=(0.0, 118.0),
             y_bounds=(0.0, 88.0),
-            xy_bins=12,
+            y_bins=12,
             file_ids=[],
         )
     finally:
@@ -1291,7 +1308,10 @@ def test_duckdb_allen_layer_stack_selected_files_and_empty_selection(
 
     np.testing.assert_array_equal(selected.volume, reference.volume)
     assert selected.summary.traces_represented <= 2
-    assert empty.volume.shape == (6, 12, 12)
+    # An empty selection still reports the derived rectangular grid, so a caller
+    # sizing a layer from it cannot disagree with a populated render.
+    assert empty.volume.shape == (6, selected.summary.y_bins, selected.summary.x_bins)
+    assert empty.volume.shape == (6, 12, 16)
     assert float(empty.volume.sum()) == 0.0
     assert empty.summary.rendered_nodes == 0
 

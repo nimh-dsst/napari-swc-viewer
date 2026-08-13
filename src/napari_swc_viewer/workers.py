@@ -325,7 +325,7 @@ class ClusteringPreflightWorker(QObject):
         dilation_fraction: float = 0.0,
         file_ids: list[str] | None = None,
         flatmap_style: str | None = None,
-        flatmap_xy_bins: int = 0,
+        flatmap_y_bins: int = 0,
         flatmap_depth_bin_um: float = 0.0,
         flatmap_include_depth_minus_one: bool = True,
         flatmap_collapse_depth: bool = False,
@@ -341,7 +341,7 @@ class ClusteringPreflightWorker(QObject):
             None if file_ids is None else [str(file_id) for file_id in file_ids]
         )
         self._flatmap_style = flatmap_style
-        self._flatmap_xy_bins = int(flatmap_xy_bins)
+        self._flatmap_y_bins = int(flatmap_y_bins)
         self._flatmap_depth_bin_um = float(flatmap_depth_bin_um)
         self._flatmap_include_depth_minus_one = bool(flatmap_include_depth_minus_one)
         # Collapsing does not change the node count, but it shrinks the voxel
@@ -402,7 +402,7 @@ class ClusteringPreflightWorker(QObject):
                 node_count = count_flatmap_voxel_correlation_nodes(
                     self._parquet_path,
                     style=self._flatmap_style,
-                    xy_bins=self._flatmap_xy_bins,
+                    y_bins=self._flatmap_y_bins,
                     depth_bin_um=self._flatmap_depth_bin_um,
                     include_depth_minus_one=(self._flatmap_include_depth_minus_one),
                     file_ids=self._file_ids,
@@ -816,7 +816,7 @@ class RegionCacheBuildWorker(QObject):
         atlas_version: str | None,
         atlas_resolution_um,
         atlas_structures,
-        xy_bins: int,
+        y_bins: int,
         depth_bin_um: float,
         lookup_resolution_um: float | None = None,
     ) -> None:
@@ -828,7 +828,7 @@ class RegionCacheBuildWorker(QObject):
         self._atlas_version = atlas_version
         self._atlas_resolution_um = atlas_resolution_um
         self._atlas_structures = atlas_structures
-        self._xy_bins = int(xy_bins)
+        self._y_bins = int(y_bins)
         self._depth_bin_um = float(depth_bin_um)
         self._lookup_resolution_um = lookup_resolution_um
         self._cancel_requested = False
@@ -873,7 +873,7 @@ class RegionCacheBuildWorker(QObject):
                 atlas_version=self._atlas_version,
                 atlas_resolution_um=self._atlas_resolution_um,
                 atlas_structures=self._atlas_structures,
-                xy_bins=self._xy_bins,
+                y_bins=self._y_bins,
                 depth_bin_um=self._depth_bin_um,
                 bounds_by_style=bounds_by_style,
                 cancel_callback=lambda: self._cancel_requested,
@@ -1210,7 +1210,10 @@ class FlatmapCorrelationWorker(QObject):
             volume_set.flatmap,
             volume_set.depth,
             selected_region_ids=mask_region_ids,
-            xy_bins=source.xy_bins,
+            # Both counts come from the render this mask is projected onto, so
+            # the mask cannot end up on a different grid than the heatmap.
+            y_bins=source.y_bins,
+            x_bins=source.x_bins,
             depth_bin_um=source.depth_bin_um,
             invalid_zero_sentinel=source.invalid_zero_sentinel,
             invalid_negative_one_sentinel=source.invalid_negative_one_sentinel,
@@ -1342,7 +1345,10 @@ class FlatmapCorrelationWorker(QObject):
             extra_metadata = {
                 "flatmap_style": source.flatmap_style,
                 "flatmap_coordinate_mode": source.coordinate_mode,
-                "flatmap_xy_bins": int(source.xy_bins),
+                "flatmap_y_bins": int(source.y_bins),
+                "flatmap_x_bins": (
+                    None if source.x_bins is None else int(source.x_bins)
+                ),
                 "flatmap_depth_bin_um": float(source.depth_bin_um),
                 "flatmap_include_depth_minus_one": bool(source.include_depth_minus_one),
                 "flatmap_path": source.flatmap_path,
@@ -1407,7 +1413,7 @@ class FlatmapParquetCorrelationWorker(QObject):
         parquet_path: str,
         atlas: BrainGlobeAtlas,
         style: str,
-        xy_bins: int,
+        y_bins: int,
         depth_bin_um: float,
         include_depth_minus_one: bool = True,
         linkage_method: str = "average",
@@ -1419,7 +1425,7 @@ class FlatmapParquetCorrelationWorker(QObject):
         self._parquet_path = parquet_path
         self._atlas = atlas
         self._style = style
-        self._xy_bins = int(xy_bins)
+        self._y_bins = int(y_bins)
         self._depth_bin_um = float(depth_bin_um)
         self._include_depth_minus_one = bool(include_depth_minus_one)
         self._linkage_method = linkage_method
@@ -1442,7 +1448,7 @@ class FlatmapParquetCorrelationWorker(QObject):
                 compute_flatmap_voxel_correlation_from_parquet(
                     self._parquet_path,
                     style=self._style,
-                    xy_bins=self._xy_bins,
+                    y_bins=self._y_bins,
                     depth_bin_um=self._depth_bin_um,
                     include_depth_minus_one=self._include_depth_minus_one,
                     method=self._linkage_method,
@@ -1456,7 +1462,8 @@ class FlatmapParquetCorrelationWorker(QObject):
             extra_metadata = {
                 "flatmap_style": provenance.style,
                 "flatmap_coordinate_mode": "parquet_columns",
-                "flatmap_xy_bins": int(provenance.xy_bins),
+                "flatmap_y_bins": int(provenance.y_bins),
+                "flatmap_x_bins": int(provenance.x_bins),
                 "flatmap_depth_bin_um": float(provenance.depth_bin_um),
                 "flatmap_include_depth_minus_one": bool(
                     provenance.include_depth_minus_one
@@ -1509,10 +1516,13 @@ class FlatmapSomaClusterWorker(QObject):
     is handled separately for flatmap space.
 
     The raw columns mix units — ``x_flat``/``y_flat`` are normalized floats
-    while ``depth_um`` is microns — so coordinates are normalized to a unit
-    hemisphere cube before any distance is computed.  ``depth_scale`` weights
-    the depth axis relative to the flat map, and ``include_depth=False`` drops
-    depth entirely for a purely tangential clustering.
+    while ``depth_um`` is microns — so coordinates are rescaled before any
+    distance is computed.  Both flat map axes are divided by one shared
+    divisor, the ``y`` span, so the flat map plane is scaled without being
+    distorted; ``depth_um`` gets its own divisor because it is a different
+    physical quantity.  ``depth_scale`` then weights the depth axis relative to
+    the flat map, and ``include_depth=False`` drops depth entirely for a purely
+    tangential clustering.
     """
 
     progress = Signal(str, int, int)
@@ -1638,10 +1648,14 @@ class FlatmapSomaClusterWorker(QObject):
                 region_selection=None,
                 analysis_method="flatmap_soma_location",
                 clustering_algorithm=self._algorithm,
+                # Renamed away from "unit_hemisphere" when the two flat map axes
+                # started sharing one divisor: a hemisphere is 1.0 tall but no
+                # longer forced to 1.0 wide, and the rename keeps results from
+                # before that change from being compared as if they matched.
                 distance_metric=(
-                    "euclidean_flatmap_depth_unit_hemisphere"
+                    "euclidean_flatmap_isotropic_plus_depth"
                     if normalization.include_depth
-                    else "euclidean_flatmap_xy_unit_hemisphere"
+                    else "euclidean_flatmap_isotropic"
                 ),
                 clustering_linkage=clustering_linkage,
                 dendrogram_linkage=dendrogram_linkage,
@@ -1654,7 +1668,7 @@ class FlatmapSomaClusterWorker(QObject):
                 extra_metadata={
                     "flatmap_style": self._style,
                     "flatmap_normalization": normalization.to_dict(),
-                    # eps is in normalized hemisphere-cube units here, not the
+                    # eps is in normalized flat map units here, not the
                     # microns the CCF soma clustering uses.
                     "dbscan_eps_units": (
                         "normalized_hemisphere" if self._algorithm == "dbscan" else None
@@ -1976,7 +1990,8 @@ class FlatmapHeatmapWorker(QObject):
         x_bounds: tuple[float, float] | None,
         y_bounds: tuple[float, float] | None,
         depth_range_um: tuple[float, float] | None,
-        xy_bins: int,
+        y_bins: int,
+        x_bins: int | None = None,
         depth_bin_um: float,
         include_depth_minus_one: bool,
         file_ids: list[object] | None = None,
@@ -1991,7 +2006,11 @@ class FlatmapHeatmapWorker(QObject):
         self._x_bounds = x_bounds
         self._y_bounds = y_bounds
         self._depth_range_um = depth_range_um
-        self._xy_bins = int(xy_bins)
+        self._y_bins = int(y_bins)
+        # ``None`` lets the builder derive the square-bin x count.  A cache-backed
+        # render passes the profile's stored count so the render grid matches the
+        # cached mask exactly.
+        self._x_bins = None if x_bins is None else int(x_bins)
         self._depth_bin_um = float(depth_bin_um)
         self._include_depth_minus_one = bool(include_depth_minus_one)
         self._file_ids = file_ids
@@ -2049,7 +2068,8 @@ class FlatmapHeatmapWorker(QObject):
                         layer_map=self._allen_layer_map,
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,
-                        xy_bins=self._xy_bins,
+                        y_bins=self._y_bins,
+                        x_bins=self._x_bins,
                         file_ids=self._file_ids,
                         cluster_map=self._cluster_map,
                         progress_callback=self.progress.emit,
@@ -2067,7 +2087,8 @@ class FlatmapHeatmapWorker(QObject):
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,
                         depth_range_um=depth_range_um,
-                        xy_bins=self._xy_bins,
+                        y_bins=self._y_bins,
+                        x_bins=self._x_bins,
                         depth_bin_um=self._depth_bin_um,
                         include_depth_minus_one=self._include_depth_minus_one,
                         file_ids=self._file_ids,

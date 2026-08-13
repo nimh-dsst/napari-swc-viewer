@@ -442,11 +442,18 @@ def test_project_bilateral_nodes_preserve_distinct_flatmap_panels(
         projected,
         flatmap,
         depth,
-        xy_bins=20,
+        y_bins=20,
         depth_bin_um=25.0,
         include_depth_minus_one=False,
     )
-    assert render.projected_nodes["x_flat_bin"].tolist() == [0, 19]
+    # The two hemispheres must stay in opposite end bins of the x axis.  The x
+    # count is derived from the aspect ratio rather than equal to y_bins, so the
+    # last bin is named from the render's own grid instead of hardcoded.
+    assert render.summary.y_bins == 20
+    assert render.projected_nodes["x_flat_bin"].tolist() == [
+        0,
+        render.summary.x_bins - 1,
+    ]
     assert render.summary.rendered_nodes == 2
     assert render.summary.nonzero_voxels == 2
 
