@@ -1516,10 +1516,13 @@ class FlatmapSomaClusterWorker(QObject):
     is handled separately for flatmap space.
 
     The raw columns mix units — ``x_flat``/``y_flat`` are normalized floats
-    while ``depth_um`` is microns — so coordinates are normalized to a unit
-    hemisphere cube before any distance is computed.  ``depth_scale`` weights
-    the depth axis relative to the flat map, and ``include_depth=False`` drops
-    depth entirely for a purely tangential clustering.
+    while ``depth_um`` is microns — so coordinates are rescaled before any
+    distance is computed.  Both flat map axes are divided by one shared
+    divisor, the ``y`` span, so the flat map plane is scaled without being
+    distorted; ``depth_um`` gets its own divisor because it is a different
+    physical quantity.  ``depth_scale`` then weights the depth axis relative to
+    the flat map, and ``include_depth=False`` drops depth entirely for a purely
+    tangential clustering.
     """
 
     progress = Signal(str, int, int)
@@ -1645,10 +1648,14 @@ class FlatmapSomaClusterWorker(QObject):
                 region_selection=None,
                 analysis_method="flatmap_soma_location",
                 clustering_algorithm=self._algorithm,
+                # Renamed away from "unit_hemisphere" when the two flat map axes
+                # started sharing one divisor: a hemisphere is 1.0 tall but no
+                # longer forced to 1.0 wide, and the rename keeps results from
+                # before that change from being compared as if they matched.
                 distance_metric=(
-                    "euclidean_flatmap_depth_unit_hemisphere"
+                    "euclidean_flatmap_isotropic_plus_depth"
                     if normalization.include_depth
-                    else "euclidean_flatmap_xy_unit_hemisphere"
+                    else "euclidean_flatmap_isotropic"
                 ),
                 clustering_linkage=clustering_linkage,
                 dendrogram_linkage=dendrogram_linkage,
@@ -1661,7 +1668,7 @@ class FlatmapSomaClusterWorker(QObject):
                 extra_metadata={
                     "flatmap_style": self._style,
                     "flatmap_normalization": normalization.to_dict(),
-                    # eps is in normalized hemisphere-cube units here, not the
+                    # eps is in normalized flat map units here, not the
                     # microns the CCF soma clustering uses.
                     "dbscan_eps_units": (
                         "normalized_hemisphere" if self._algorithm == "dbscan" else None

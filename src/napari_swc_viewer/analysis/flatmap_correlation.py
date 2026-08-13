@@ -14,13 +14,16 @@ from ..flatmap_heatmap import FlatmapLookupStats
 logger = logging.getLogger(__name__)
 
 #: Depth axis weight that makes one full cortical thickness count for exactly
-#: one hemisphere width of tangential flat map distance.
+#: one hemisphere *height* of tangential flat map distance.  Height, not width:
+#: both flat map axes are divided by the ``y`` span, which is the axis that
+#: spans one hemisphere.
 DEFAULT_FLATMAP_DEPTH_SCALE = 1.0
 
-#: DBSCAN neighbourhood radius for flat map soma clustering, in normalized
-#: hemisphere-cube units rather than microns.  A hemisphere spans 1.0 per axis,
-#: so this is 5% of the hemisphere width.  The CCF soma clustering keeps its own
-#: micron-valued default; the two spaces are not interchangeable.
+#: DBSCAN neighbourhood radius for flat map soma clustering, in normalized flat
+#: map units rather than microns.  One unit is one hemisphere height, so this is
+#: 5% of that in any direction -- the radius is circular because both flat map
+#: axes share one divisor.  The CCF soma clustering keeps its own micron-valued
+#: default; the two spaces are not interchangeable.
 DEFAULT_FLATMAP_SOMA_DBSCAN_EPS = 0.05
 
 
@@ -334,7 +337,7 @@ def query_flatmap_soma_coordinates(
 
 @dataclass(frozen=True)
 class FlatmapDepthNormalization:
-    """Axis divisors that put flatmap + depth coordinates on a common scale.
+    """Divisors that put flatmap + depth coordinates on a common scale.
 
     The raw Parquet columns mix units: ``x_flat``/``y_flat`` are normalized
     floats spanning the *bilateral* flat map while ``depth_um`` is raw microns
@@ -342,21 +345,30 @@ class FlatmapDepthNormalization:
     unweighted Euclidean metric lets depth contribute >99.99% of the variance,
     which reduces the result to a 1-D laminar partition.
 
-    Dividing each axis by its own span makes one hemisphere a unit cube, so a
-    full cortical thickness of depth separation counts for the same distance as
-    one hemisphere width of tangential separation.
+    **The two flat map axes share one divisor**, so flat map space stays
+    isotropic: equal distances in the metric mean equal distances on the flat
+    map, whichever direction they run.  This is the same policy the voxel grid
+    uses -- :func:`napari_swc_viewer.flatmap_heatmap.resolve_flatmap_bin_counts`
+    derives the ``x`` bin count from the aspect ratio so a bin is as wide as it
+    is tall, which is exactly one shared unit per axis.  Both take ``y`` as the
+    reference axis, since ``y`` spans one hemisphere while ``x`` spans two.
 
-    ``x_divisor`` is **half** the canonical ``x`` span because the bilateral
-    flat map lays the two hemispheres side by side along ``x``.  Dividing by the
-    full span instead would squeeze each hemisphere to half width and silently
-    give ``y`` twice the weight of ``x``.  No offset is subtracted: Euclidean
-    distance is translation invariant, and leaving the origin alone keeps the
-    two hemispheres adjacent rather than superimposed.
+    Giving each axis its own span instead would force every style's hemisphere
+    into a square bounding box, stretching whichever axis is shorter.  For
+    ``both_shaped`` that put 4.2% anisotropy into the metric; ``both_square`` is
+    an exact 2:1 map, so it was and remains unaffected.  Since the projection's
+    true surface geometry is unknowable (flat map x/y have no reliable micron
+    conversion), the conservative choice is to add no distortion at all.
+
+    ``depth_um`` keeps its own divisor because it is a genuinely different
+    quantity in different units; ``depth_scale`` weights it against flat map
+    distance.  No offset is subtracted: Euclidean distance is translation
+    invariant, and leaving the origin alone keeps the two hemispheres adjacent
+    rather than superimposed.
     """
 
     style: str
-    x_divisor: float
-    y_divisor: float
+    flatmap_divisor: float
     depth_divisor_um: float
     depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE
     include_depth: bool = True
@@ -371,8 +383,9 @@ class FlatmapDepthNormalization:
         """Return a JSON-safe mapping for export metadata."""
         return {
             "style": self.style,
-            "x_divisor": float(self.x_divisor),
-            "y_divisor": float(self.y_divisor),
+            # One divisor, not one per axis: recording two numbers that must
+            # always be equal is how the old anisotropy hid in plain sight.
+            "flatmap_divisor": float(self.flatmap_divisor),
             "depth_divisor_um": float(self.depth_divisor_um),
             "depth_scale": float(self.depth_scale),
             "include_depth": bool(self.include_depth),
@@ -388,7 +401,17 @@ def resolve_flatmap_depth_normalization(
     depth_scale: float = DEFAULT_FLATMAP_DEPTH_SCALE,
     include_depth: bool = True,
 ) -> FlatmapDepthNormalization:
-    """Return per-hemisphere axis divisors for one flat map style.
+    """Return the shared flat map divisor and depth divisor for one style.
+
+    Both flat map axes are divided by the ``y`` span, which keeps flat map space
+    isotropic and matches how the voxel grid derives its bin counts.  ``y`` is
+    the reference axis because it spans one hemisphere while ``x`` spans two, so
+    the ``x`` extent is not a per-hemisphere quantity and must not set the unit.
+
+    Because ``x`` no longer sets a divisor, the bilateral halving this function
+    used to apply to canonical bounds -- and the matching exception for observed
+    bounds -- are both gone.  ``y`` spans one hemisphere either way, so there is
+    nothing left to special-case.
 
     Prefers the canonical bounds recorded in version-3 Parquet metadata so the
     metric does not depend on which neurons happen to be in scope.  Falls back
@@ -404,10 +427,8 @@ def resolve_flatmap_depth_normalization(
     grid = _flatmap_canonical_grid_spec(parquet_path, style)
     if grid is not None:
         bounds_source = "canonical"
-        x_bounds = grid.x_bounds
         y_bounds = grid.y_bounds
         depth_bounds = grid.depth_bounds_um
-        x_divisor = float(x_bounds[1] - x_bounds[0]) / 2.0
     else:
         bounds_source = "observed"
         logger.warning(
@@ -417,21 +438,16 @@ def resolve_flatmap_depth_normalization(
             parquet_path,
             style,
         )
-        x_bounds, y_bounds, depth_bounds = _resolve_flatmap_render_bounds(
+        _x_bounds, y_bounds, depth_bounds = _resolve_flatmap_render_bounds(
             parquet_path,
             style,
             _style_suffix(style),
         )
-        # Observed bounds already cover only the hemispheres present in the
-        # data, so the bilateral halving that canonical bounds require would
-        # wrongly stretch the x axis here.
-        x_divisor = float(x_bounds[1] - x_bounds[0])
-    y_divisor = float(y_bounds[1] - y_bounds[0])
+    flatmap_divisor = float(y_bounds[1] - y_bounds[0])
     depth_divisor = float(depth_bounds[1] - depth_bounds[0])
 
     for name, value in (
-        ("x", x_divisor),
-        ("y", y_divisor),
+        ("y", flatmap_divisor),
         ("depth_um", depth_divisor),
     ):
         if not np.isfinite(value) or value <= 0.0:
@@ -442,8 +458,7 @@ def resolve_flatmap_depth_normalization(
 
     return FlatmapDepthNormalization(
         style=style,
-        x_divisor=x_divisor,
-        y_divisor=y_divisor,
+        flatmap_divisor=flatmap_divisor,
         depth_divisor_um=depth_divisor,
         depth_scale=float(depth_scale),
         include_depth=bool(include_depth),
@@ -466,7 +481,10 @@ def normalize_flatmap_soma_coordinates(
     coords: np.ndarray,
     normalization: FlatmapDepthNormalization,
 ) -> np.ndarray:
-    """Scale raw ``(x_flat, y_flat, depth_um)`` rows onto the unit hemisphere cube.
+    """Scale raw ``(x_flat, y_flat, depth_um)`` rows onto a common scale.
+
+    Both flat map axes are divided by the same number, so the flat map plane is
+    scaled without being distorted; only depth is weighted separately.
 
     Returns an ``(N, 3)`` array when ``normalization.include_depth`` is set and
     an ``(N, 2)`` array otherwise, so excluding depth genuinely clusters on flat
@@ -479,12 +497,7 @@ def normalize_flatmap_soma_coordinates(
             f"got shape {raw.shape}."
         )
 
-    scaled_xy = np.column_stack(
-        [
-            raw[:, 0] / normalization.x_divisor,
-            raw[:, 1] / normalization.y_divisor,
-        ]
-    )
+    scaled_xy = raw[:, :2] / normalization.flatmap_divisor
     if not normalization.include_depth:
         return scaled_xy
 

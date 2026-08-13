@@ -1289,12 +1289,13 @@ k=10 spanned essentially the whole hemisphere tangentially while carving depth
 into contiguous bands, and the labels matched a depth-only clustering at
 ARI 0.85.
 
-Soma coordinates are now divided by their own per-hemisphere span before any
-distance is computed, making one hemisphere a unit cube. **Depth scale** then
-weights the depth axis:
+Soma coordinates are now scaled before any distance is computed: **both flat
+map axes are divided by the same number** (the `y` span, which is one
+hemisphere tall), so flat map space is scaled without being distorted.
+**Depth scale** then weights the depth axis:
 
 - `1.0` (default) treats a full cortical thickness of depth separation as
-  equivalent to one hemisphere width of tangential separation.
+  equivalent to one hemisphere height of tangential separation.
 - Higher values weight depth **more**, pulling clusters toward cortical layers.
 - Lower values weight depth **less**, pulling clusters toward flat map position.
 - **Ignore depth (flat map X/Y only)** drops the depth axis outright, clustering
@@ -1308,17 +1309,36 @@ coordinates gives values that vary by roughly 2x across the map and drift
 systematically with the separation being measured, which is the distortion
 showing through. Do not convert flat map `x`/`y` to microns, and do not describe
 a depth scale as equivalent to some number of microns of tangential distance.
-Normalizing each axis by its own span is what keeps the metric well defined
-without making that claim.
+Scaling both flat map axes by one shared divisor is what keeps the metric well
+defined without making that claim.
 
-The `x` divisor is **half** the canonical `x` span, because the bilateral flat
-map lays the two hemispheres side by side along `x`. For the bilateral square
-style that leaves `x` and `y` untouched; the bilateral shaped style is about 4%
-off square and gets its own divisors.
+One divisor serves both flat map axes, so equal distances in the metric mean
+equal distances on the flat map whichever direction they run. This is the same
+policy the voxel grid uses, where the derived `x` bin count makes a bin as wide
+as it is tall; both take `y` as the reference axis because `y` spans one
+hemisphere while `x` spans two.
+
+Earlier versions divided each axis by its own span, which forced every style's
+hemisphere into a square bounding box. The bilateral square style is an exact
+2:1 map, so its divisors were already equal and its results are unchanged. The
+bilateral shaped style is about 4% off square, so it carried a 4.2% anisotropy.
+Removing it moves about 38% of shaped somas to a different cluster, measured on
+all 18,518 somas in `isocortex_total_right_brainglobe_flatmap.parquet` with
+hierarchical/ward at **Depth scale** `1.0` — about 37% at k=5 and about 39% at
+k=10. Results from before the change are not comparable, and `distance_metric`
+was renamed so they cannot be mistaken for each other.
+
+Quote the algorithm and the neuron count whenever you cite one of those rates,
+because nothing else reproduces them: k-means over the same somas moves about
+1% at k=5, and ward over an 833-soma subset moves about 2%. Ward is
+agglomerative, so removing a small distortion flips near-tied merges and the
+reordering cascades; a larger table has more near-ties available to flip. A
+rate measured on a partial table does not bound the full-dataset rate.
 
 DBSCAN's **Eps** changes units with the coordinate space: microns in **CCFv3
-Coordinates**, normalized hemisphere fractions in **Flat map + Depth**, where
-1.0 is one hemisphere width. Each space remembers its own value.
+Coordinates**, normalized flat map units in **Flat map + Depth**, where
+1.0 is one hemisphere height. The radius is circular because both flat map
+axes share one divisor. Each space remembers its own value.
 
 **Ignore depth in Voxel Correlation** collapses the voxel grid's depth planes,
 so nodes at one flat map position share a voxel whatever their depth. Two
@@ -1360,7 +1380,9 @@ there, and it already exists.
 2. **Action:** Hover over **Depth scale**.
    **Expected:** The tooltip states that higher values weight depth MORE
    (laminar grouping) and lower values weight depth LESS (areal grouping), and
-   explains that 1.0 equates one cortical thickness with one hemisphere width.
+   explains that 1.0 equates one cortical thickness with one hemisphere height,
+   and states that both flat map axes share one divisor so the space is scaled
+   without distortion.
 3. **Action:** Set **Method** to **Voxel Correlation**, then back to **Soma
    Location**.
    **Expected:** **Depth scale** hides for voxel correlation and reappears for
@@ -1389,13 +1411,14 @@ there, and it already exists.
    that other value intact.
 8. **Action:** Run DBSCAN in flat map space at **Eps** `0.050`, then at `1.000`.
    **Expected:** `0.050` produces multiple clusters plus noise. `1.000` — one
-   whole hemisphere width — collapses nearly everything into a single cluster,
+   whole hemisphere height — collapses nearly everything into a single cluster,
    confirming the control now spans a useful range rather than saturating.
 9. **Action:** Export the clustering result and inspect the run metadata.
    **Expected:** `distance_metric` reads
-   `euclidean_flatmap_depth_unit_hemisphere`, or
-   `euclidean_flatmap_xy_unit_hemisphere` when depth was ignored. A
-   `flatmap_normalization` entry records the axis divisors, `depth_scale`,
+   `euclidean_flatmap_isotropic_plus_depth`, or
+   `euclidean_flatmap_isotropic` when depth was ignored. A
+   `flatmap_normalization` entry records the single `flatmap_divisor` shared by
+   both flat map axes, the `depth_divisor_um`, `depth_scale`,
    `include_depth`, `axis_count`, and whether bounds came from `canonical`
    metadata or `observed` data.
 10. **Action:** Set **Method** to **Voxel Correlation** with **Y bins** 128 and
@@ -1418,16 +1441,40 @@ there, and it already exists.
 
 **Manual verification**
 
-- Status: Not run
-- Last verified: Never
-- Notes: Added on 2026-08-06 and not yet exercised in napari. On 2026-08-11 the
-  voxel-correlation control became **Y bins** with a derived X count, so step
-  10's grid is rectangular and its occupied-voxel counts differ from any earlier
-  run. The soma-clustering normalization in steps 1-9 is unchanged and still
-  carries a separate 4.2% x/y anisotropy for the shaped style, tracked apart
-  from this change. Automated tests in
-  `tests/test_flatmap_depth_normalization.py` cover the divisor math, the
-  bilateral-`x` halving trap, depth exclusion versus a zero weight, monotonic
+- Status: Partially run — step 9 (export metadata) and the isotropy change
+  verified in napari on 2026-08-13; steps 1-8 and 10-12 not run
+- Last verified: 2026-08-13 (step 9 and the metric change only)
+- Notes: Added on 2026-08-06 and not yet fully exercised in napari. On
+  2026-08-11 the voxel-correlation control became **Y bins** with a derived X
+  count, so step 10's grid is rectangular and its occupied-voxel counts differ
+  from any earlier run. The same date also made the soma-clustering metric
+  isotropic: both flat map axes now share one divisor, which removed the shaped
+  style's 4.2% anisotropy. Steps 1-8 therefore still need re-running for the
+  shaped style, and the **Depth scale** and **Eps** tooltips now say
+  "hemisphere height" rather than "width".
+
+  On 2026-08-13 the metric change itself was verified in napari by exporting
+  paired clustering runs before and after the fix and comparing them with
+  `scripts/compare_clustering_exports.py` (run it with
+  `--dir anisotropy_fix_data`; that directory is gitignored, so the workbooks
+  are local-only and must be regenerated to repeat this). Step 9's metadata was
+  confirmed
+  directly: `distance_metric` reads `euclidean_flatmap_isotropic_plus_depth`,
+  and `flatmap_normalization` carries a single `flatmap_divisor` with no
+  `x_divisor`/`y_divisor`, plus `bounds_source: canonical` and `axis_count: 3`.
+  Twelve exports in six pairs were compared. Over all 18,518 somas with
+  hierarchical/ward at
+  **Depth scale** `1.00`, the shaped style moved 37.5% of somas at k=5 and 38.7%
+  at k=10 (ARI 0.44 and 0.47). Two controls held exactly: the square style moved
+  0.0% (ARI 1.000000, all ten cluster sizes identical) because its old divisors
+  were already equal, and a voxel-correlation pair moved 0.0% because it never
+  reaches the soma normalization. The square control is the stronger of the two,
+  since it runs the same code path the fix changed under the most
+  perturbation-sensitive settings available. `ANISOTROPY_FIX_RESULTS.MD` records
+  the full analysis. Automated tests in
+  `tests/test_flatmap_depth_normalization.py` cover the shared-divisor math,
+  isotropy as a distance property on both styles, agreement with the voxel
+  grid's reference axis, depth exclusion versus a zero weight, monotonic
   reweighting, the observed-bounds fallback, and provenance;
   `tests/test_flatmap_clustering_from_parquet.py` covers the collapsed
   correlation, including that collapsing preserves the node count while shrinking

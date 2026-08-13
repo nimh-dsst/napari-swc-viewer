@@ -81,18 +81,24 @@ _FLATMAP_COORDS_INFO_TEXT = (
 )
 _DEPTH_SCALE_TOOLTIP = (
     "Weight of cortical depth relative to flat map position.\n\n"
-    "Soma coordinates are normalized so one hemisphere spans 1.0 along each "
-    "flat map axis and one full cortical thickness spans 1.0 in depth.\n\n"
+    "Both flat map axes are divided by the same number, so flat map space is "
+    "scaled but never distorted: 1.0 is one hemisphere height in any "
+    "direction. One full cortical thickness spans 1.0 in depth.\n\n"
     "Higher values weight depth MORE, pulling clusters toward cortical layers "
     "(laminar grouping).\n"
     "Lower values weight depth LESS, pulling clusters toward flat map "
     "position (areal grouping).\n\n"
     "1.0 treats a full cortical thickness of depth separation as equivalent "
-    "to one hemisphere width of tangential separation.\n\n"
+    "to one hemisphere height of tangential separation.\n\n"
     "These are fractions of each axis, not physical distances. The flat map "
     "projection distorts the cortical surface, so flat map X/Y have no "
     "reliable conversion to microns and this weight cannot be read as a "
     "physical ratio."
+)
+_FLATMAP_EPS_TOOLTIP = (
+    "DBSCAN neighbourhood radius in normalized flat map units, where 1.0 is "
+    "one hemisphere height. The radius is circular: both flat map axes share "
+    "one divisor, so the same value means the same distance in any direction."
 )
 _IGNORE_DEPTH_TOOLTIP = (
     "Cluster on flat map X/Y only, dropping the depth axis entirely.\n\n"
@@ -774,7 +780,7 @@ class AnalysisTabWidget(QWidget):
 
         # Flat map soma clustering: depth weighting.  Raw Parquet coordinates
         # mix normalized flat map units with microns, so soma coordinates are
-        # normalized to a unit hemisphere cube and depth is then weighted here.
+        # scaled by one shared flat map divisor and depth is then weighted here.
         self._flatmap_ignore_depth_cb = QCheckBox("Ignore depth (flat map X/Y only)")
         self._flatmap_ignore_depth_cb.setChecked(False)
         self._flatmap_ignore_depth_cb.setToolTip(_IGNORE_DEPTH_TOOLTIP)
@@ -1611,8 +1617,8 @@ class AnalysisTabWidget(QWidget):
     def _apply_eps_units(self, normalized_space: bool) -> None:
         """Retarget the DBSCAN eps control at the active coordinate space.
 
-        Flat map soma clustering measures distance in normalized hemisphere-cube
-        units, where a whole hemisphere spans 1.0 — the micron range the CCFv3
+        Flat map soma clustering measures distance in normalized flat map units,
+        where one hemisphere height is 1.0 — the micron range the CCFv3
         clustering needs would collapse every soma into a single cluster.  Each
         space keeps its own remembered value so switching back and forth does
         not destroy the user's setting.
@@ -1642,14 +1648,8 @@ class AnalysisTabWidget(QWidget):
             spin.setSuffix("")
             if label is not None:
                 label.setText("Eps (hemisphere fraction):")
-                label.setToolTip(
-                    "DBSCAN neighbourhood radius in normalized units, where "
-                    "1.0 is one hemisphere width."
-                )
-            spin.setToolTip(
-                "DBSCAN neighbourhood radius in normalized units, where 1.0 is "
-                "one hemisphere width."
-            )
+                label.setToolTip(_FLATMAP_EPS_TOOLTIP)
+            spin.setToolTip(_FLATMAP_EPS_TOOLTIP)
         else:
             restored = getattr(self, "_eps_value_um", 100.0)
             spin.setDecimals(1)

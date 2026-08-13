@@ -240,3 +240,8 @@ example_data_aligned/
 .DS_Store
 
 *.npy
+
+# Clustering export workbooks backing ANISOTROPY_FIX_RESULTS.MD. The report
+# records the findings; the raw data stays local.
+anisotropy_fix_data/
+*.xlsx
