@@ -310,6 +310,12 @@ _REFERENCE_ACTION_TEMPLATE = "template"
 _REFERENCE_ACTION_OUTLINE = "outline"
 _REFERENCE_ACTION_MESHES = "meshes"
 _REFERENCE_ACTION_SEGMENTATION = "segmentation"
+_ATLAS_OPTIONS = (
+    "allen_mouse_10um",
+    "allen_mouse_25um",
+    "allen_mouse_50um",
+    "allen_mouse_100um",
+)
 _ATLAS_REFERENCE_PROMPT = (
     "Atlas loaded. Go to the Reference tab to show the template, outline, "
     "or selected region meshes."
@@ -2786,13 +2792,7 @@ class NeuronViewerWidget(QWidget):
 
         atlas_row.addWidget(QLabel("Atlas:"))
         self._atlas_combo = QComboBox()
-        self._atlas_combo.addItems(
-            [
-                "allen_mouse_10um",
-                "allen_mouse_25um",
-                "allen_mouse_50um",
-            ]
-        )
+        self._atlas_combo.addItems(_ATLAS_OPTIONS)
         self._atlas_combo.setCurrentText("allen_mouse_25um")
         atlas_row.addWidget(self._atlas_combo)
 

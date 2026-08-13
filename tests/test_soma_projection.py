@@ -2451,10 +2451,22 @@ def test_reference_template_checkbox_defaults_to_lazy_load(
     assert "on demand" in widget._show_template_cb.tooltip
 
 
+def test_data_tab_offers_all_supported_atlas_resolutions() -> None:
+    """The Data-tab atlas selector should include the 100 um atlas."""
+    atlas_options = NeuronViewerWidget._setup_data_tab.__globals__["_ATLAS_OPTIONS"]
+
+    assert atlas_options == (
+        "allen_mouse_10um",
+        "allen_mouse_25um",
+        "allen_mouse_50um",
+        "allen_mouse_100um",
+    )
+
+
 def test_load_atlas_starts_background_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit atlas loads should start a background worker and busy UI."""
+    """A 100 um atlas load should start a background worker and busy UI."""
     workers = []
     threads = []
 
@@ -2508,7 +2520,7 @@ def test_load_atlas_starts_background_worker(
     )
 
     widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._atlas_combo = _DummyComboBox("allen_mouse_25um")
+    widget._atlas_combo = _DummyComboBox("allen_mouse_100um")
     widget._load_atlas_btn = _DummyButton("Load Atlas")
     widget._atlas_status_label = _DummyStatusLabel()
     widget._atlas_progress = _DummyProgressBar()
@@ -2520,7 +2532,7 @@ def test_load_atlas_starts_background_worker(
     NeuronViewerWidget._load_atlas(widget)
 
     assert len(workers) == 1
-    assert workers[0].atlas_name == "allen_mouse_25um"
+    assert workers[0].atlas_name == "allen_mouse_100um"
     assert workers[0].thread is threads[0]
     assert threads[0].started_called is True
     assert widget._atlas_load_worker is workers[0]
@@ -2531,7 +2543,7 @@ def test_load_atlas_starts_background_worker(
     assert widget._atlas_progress.range == (0, 0)
     assert (
         widget._atlas_status_label.text
-        == "Atlas: Preparing to load allen_mouse_25um..."
+        == "Atlas: Preparing to load allen_mouse_100um..."
     )
 
 

@@ -44,7 +44,8 @@ Unless a use case says otherwise:
 
 The user can download the Allen Adult Mouse Brain Atlas at the resolution
 needed for their data. The plugin supports the BrainGlobe atlas identifiers
-`allen_mouse_10um`, `allen_mouse_25um`, and `allen_mouse_50um`.
+`allen_mouse_10um`, `allen_mouse_25um`, `allen_mouse_50um`, and
+`allen_mouse_100um`.
 
 The underlying atlas is the Allen Institute's Adult Mouse Brain Atlas, which
 provides the commonly used CCFv3 coordinate space. The plugin obtains it
@@ -72,16 +73,17 @@ configuration; see BrainGlobe's
 - The computer has an internet connection and enough free disk space for the
   selected atlas.
 - The user can write to the BrainGlobe cache directory.
-- At least one of `allen_mouse_10um`, `allen_mouse_25um`, or
-  `allen_mouse_50um` is not already present in the configured BrainGlobe cache.
+- At least one of `allen_mouse_10um`, `allen_mouse_25um`,
+  `allen_mouse_50um`, or `allen_mouse_100um` is not already present in the
+  configured BrainGlobe cache.
 - Start from a clean napari session with the **SWC Viewer** plugin open.
 
 **Steps and expected results**
 
 1. **Action:** Open the **Data** tab and expand **Atlas**.
    **Expected:** The atlas selector offers `allen_mouse_10um`,
-   `allen_mouse_25um`, and `allen_mouse_50um`, with a **Load Atlas** button and
-   an atlas status area.
+   `allen_mouse_25um`, `allen_mouse_50um`, and `allen_mouse_100um`, with a
+   **Load Atlas** button and an atlas status area.
 2. **Action:** Select an Allen mouse atlas that is not in the local BrainGlobe
    cache, then click **Load Atlas**.
    **Expected:** The plugin checks the cache, displays a text warning that the
