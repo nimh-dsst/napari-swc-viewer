@@ -3245,15 +3245,6 @@ class NeuronViewerWidget(QWidget):
 
         layout.addWidget(self._region_query_stack)
 
-        appearance_group = QGroupBox("Region Appearance")
-        appearance_layout = QVBoxLayout(appearance_group)
-        self._region_appearance_editor = RegionAppearanceEditor()
-        self._region_appearance_editor.appearance_applied.connect(
-            self._on_region_appearance_applied
-        )
-        appearance_layout.addWidget(self._region_appearance_editor)
-        layout.addWidget(appearance_group)
-
         query_btn_row = QHBoxLayout()
         self._region_query_find_btn = QPushButton("Find Neurons")
         self._region_query_find_btn.clicked.connect(
@@ -3273,6 +3264,19 @@ class NeuronViewerWidget(QWidget):
         self._regions_status_label = QLabel("")
         self._regions_status_label.setWordWrap(True)
         layout.addWidget(self._regions_status_label)
+
+        self._region_appearance_section = CollapsibleSection(
+            "Region Appearance",
+            expanded=False,
+        )
+        appearance_layout = self._region_appearance_section.content_layout()
+        self._region_appearance_editor = RegionAppearanceEditor()
+        self._region_appearance_editor.appearance_applied.connect(
+            self._on_region_appearance_applied
+        )
+        appearance_layout.addWidget(self._region_appearance_editor)
+        layout.addWidget(self._region_appearance_section)
+
         layout.addStretch()
         self._on_region_query_source_changed(
             self._region_query_source_combo.currentText()
@@ -3674,6 +3678,14 @@ class NeuronViewerWidget(QWidget):
         self._show_region_meshes_cb.setChecked(False)
         self._show_region_meshes_cb.stateChanged.connect(self._toggle_region_meshes)
         mesh_layout.addWidget(self._show_region_meshes_cb)
+
+        self._region_mesh_scope_label = QLabel(
+            "Only directly selected top-level parent regions are shown as meshes. "
+            "Child-region meshes are omitted because loading and rendering them "
+            "would incur a higher computational cost."
+        )
+        self._region_mesh_scope_label.setWordWrap(True)
+        mesh_layout.addWidget(self._region_mesh_scope_label)
 
         mesh_opacity_row = QHBoxLayout()
         mesh_opacity_row.addWidget(QLabel("Opacity:"))

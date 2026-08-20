@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import gc
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -2429,11 +2430,19 @@ def test_reference_template_checkbox_defaults_to_lazy_load(
         def setValue(self, *_args) -> None:
             return None
 
+    class _LabelStub:
+        def __init__(self, text: str = "") -> None:
+            self.text = text
+            self.word_wrap = False
+
+        def setWordWrap(self, enabled: bool) -> None:
+            self.word_wrap = bool(enabled)
+
     globals_dict = NeuronViewerWidget._setup_reference_tab.__globals__
     monkeypatch.setitem(globals_dict, "QVBoxLayout", _Layout)
     monkeypatch.setitem(globals_dict, "QHBoxLayout", _Layout)
     monkeypatch.setitem(globals_dict, "QGroupBox", _FakeWidget)
-    monkeypatch.setitem(globals_dict, "QLabel", _FakeWidget)
+    monkeypatch.setitem(globals_dict, "QLabel", _LabelStub)
     monkeypatch.setitem(globals_dict, "QCheckBox", _CheckBoxStub)
     monkeypatch.setitem(globals_dict, "QSlider", _SliderStub)
 
@@ -2449,6 +2458,22 @@ def test_reference_template_checkbox_defaults_to_lazy_load(
 
     assert widget._show_template_cb.isChecked() is False
     assert "on demand" in widget._show_template_cb.tooltip
+    assert "top-level parent regions" in widget._region_mesh_scope_label.text
+    assert "higher computational cost" in widget._region_mesh_scope_label.text
+    assert widget._region_mesh_scope_label.word_wrap is True
+
+
+def test_region_appearance_is_a_collapsed_bottom_section() -> None:
+    source = inspect.getsource(NeuronViewerWidget._setup_regions_tab)
+
+    assert 'CollapsibleSection(\n            "Region Appearance"' in source
+    assert "expanded=False" in source
+    status_position = source.index("layout.addWidget(self._regions_status_label)")
+    appearance_position = source.index(
+        "layout.addWidget(self._region_appearance_section)"
+    )
+    stretch_position = source.rindex("layout.addStretch()")
+    assert status_position < appearance_position < stretch_position
 
 
 def test_data_tab_offers_all_supported_atlas_resolutions() -> None:

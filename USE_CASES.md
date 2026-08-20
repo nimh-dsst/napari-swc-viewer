@@ -1663,9 +1663,11 @@ settings affect flatmap outlines only.
 **Steps and expected results**
 
 1. **Action:** Load the atlas and Parquet, open **Regions**, set **Query source**
-   to **Atlas Regions**, and select `MOp` and `SSp`.
-   **Expected:** **Region Appearance** shows a searchable tree containing the
-   selected regions and their descendants. Each row shows a color swatch,
+   to **Atlas Regions**, select `MOp` and `SSp`, then expand **Region
+   Appearance** at the bottom of the tab.
+   **Expected:** The query buttons and status text remain above the collapsed
+   section. Expanding **Region Appearance** shows a searchable tree containing
+   the selected regions and their descendants. Each row shows a color swatch,
    **Fill**, **Fill %**, **Outline**, **Outline %**, and the setting source.
    Regions without overrides display their own atlas colors.
 2. **Action:** From **Reference**, enable **Show selected region segmentation**
@@ -1673,7 +1675,11 @@ settings affect flatmap outlines only.
    labels, surfaces, and outlines in render modes that support each overlay.
    **Expected:** The initial CCFv3 and flatmap fills and flatmap outlines agree
    on each region's atlas color. Filled regions share combined Labels layers;
-   the plugin does not create one full annotation volume per region.
+   the plugin does not create one full annotation volume per region. The
+   **Region Meshes** message explains that only directly selected top-level
+   parents receive meshes; descendant meshes are omitted because of their
+   higher loading and rendering cost, even though descendant IDs remain visible
+   in segmentation.
 3. **Action:** Select the `MOp` and `SSp` rows in **Region Appearance** and click
    **Assign Distinct Colors**.
    **Expected:** The two swatches change to deterministic colors suitable for
