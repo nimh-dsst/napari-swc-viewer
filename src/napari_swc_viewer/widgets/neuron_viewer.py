@@ -85,6 +85,7 @@ from ..point_import import (
     summarize_standard_point_parquet_groups,
     validate_point_metadata_against_atlas,
 )
+from ..region_appearance import RegionAppearanceStore
 from ..project_io import (
     ProjectBundle,
     export_enhanced_neuron_parquet,
@@ -2590,6 +2591,7 @@ class NeuronViewerWidget(QWidget):
                 selected_region_source_provider=(self._active_flatmap_region_source),
                 selected_region_scope_provider=self._active_flatmap_region_scope,
                 selected_region_error_provider=self._active_flatmap_region_error,
+                region_appearance_provider=self._region_appearance_store,
                 display_viewer_provider=self._get_or_create_flatmap_viewer,
                 display_viewer_ready_callback=(self._on_flatmap_display_viewer_ready),
                 display_viewer_failed_callback=(self._on_flatmap_display_viewer_failed),
@@ -3098,6 +3100,8 @@ class NeuronViewerWidget(QWidget):
 
     def _setup_regions_tab(self, parent: QWidget) -> None:
         """Set up the region selection tab."""
+        from .region_appearance import RegionAppearanceEditor
+
         parent_layout = QVBoxLayout(parent)
 
         scroll_area = QScrollArea()
@@ -3260,6 +3264,19 @@ class NeuronViewerWidget(QWidget):
         self._regions_status_label = QLabel("")
         self._regions_status_label.setWordWrap(True)
         layout.addWidget(self._regions_status_label)
+
+        self._region_appearance_section = CollapsibleSection(
+            "Region Appearance",
+            expanded=False,
+        )
+        appearance_layout = self._region_appearance_section.content_layout()
+        self._region_appearance_editor = RegionAppearanceEditor()
+        self._region_appearance_editor.appearance_applied.connect(
+            self._on_region_appearance_applied
+        )
+        appearance_layout.addWidget(self._region_appearance_editor)
+        layout.addWidget(self._region_appearance_section)
+
         layout.addStretch()
         self._on_region_query_source_changed(
             self._region_query_source_combo.currentText()
@@ -3662,11 +3679,20 @@ class NeuronViewerWidget(QWidget):
         self._show_region_meshes_cb.stateChanged.connect(self._toggle_region_meshes)
         mesh_layout.addWidget(self._show_region_meshes_cb)
 
+        self._region_mesh_scope_label = QLabel(
+            "Only directly selected top-level parent regions are shown as meshes. "
+            "Child-region meshes are omitted because loading and rendering them "
+            "would incur a higher computational cost."
+        )
+        self._region_mesh_scope_label.setWordWrap(True)
+        mesh_layout.addWidget(self._region_mesh_scope_label)
+
         mesh_opacity_row = QHBoxLayout()
         mesh_opacity_row.addWidget(QLabel("Opacity:"))
         self._mesh_opacity_slider = QSlider(Qt.Horizontal)
         self._mesh_opacity_slider.setRange(0, 100)
         self._mesh_opacity_slider.setValue(30)
+        self._mesh_opacity_slider.valueChanged.connect(self._update_mesh_opacity)
         mesh_opacity_row.addWidget(self._mesh_opacity_slider)
         mesh_layout.addLayout(mesh_opacity_row)
 
@@ -4020,6 +4046,12 @@ class NeuronViewerWidget(QWidget):
             self._regions_status_label.setText(message)
             show_warning(message)
             return
+        appearance_editor = getattr(self, "_region_appearance_editor", None)
+        if (
+            appearance_editor is not None
+            and not appearance_editor.resolve_unapplied_before_save()
+        ):
+            return
 
         self._set_project_save_in_progress(True)
         self._project_progress.setVisible(True)
@@ -4039,6 +4071,12 @@ class NeuronViewerWidget(QWidget):
             QApplication.processEvents()
 
         try:
+            appearance_getter = getattr(self, "_region_appearance_store", None)
+            appearance_store = (
+                appearance_getter()
+                if callable(appearance_getter)
+                else RegionAppearanceStore()
+            )
             saved = save_project_bundle(
                 bundle_path,
                 source_parquet_path=self._db.parquet_path,
@@ -4046,6 +4084,7 @@ class NeuronViewerWidget(QWidget):
                 layers=self._iter_viewer_layers(),
                 atlas_name=self._current_atlas_name(),
                 analysis_metadata=self._analysis_project_metadata(),
+                region_appearance=appearance_store.to_palette_dict(),
                 flatmap_cache_reference=(self._flatmap_tab.active_cache_reference()),
                 progress_callback=_on_save_progress,
                 overwrite=overwrite,
@@ -4139,6 +4178,20 @@ class NeuronViewerWidget(QWidget):
         """Restore a loaded project bundle into the current widget/viewer."""
         self._load_parquet_path(bundle.source_parquet_path)
         self._saved_table_state = dict(bundle.table_state)
+        if bundle.region_appearance:
+            try:
+                appearance_store = RegionAppearanceStore.from_palette_dict(
+                    bundle.region_appearance
+                )
+                appearance_editor = getattr(
+                    self,
+                    "_region_appearance_editor",
+                    None,
+                )
+                if appearance_editor is not None:
+                    appearance_editor.load_applied_store(appearance_store)
+            except Exception as exc:
+                logger.warning("Could not restore region appearance: %s", exc)
         cache_reference = getattr(bundle, "flatmap_cache_reference", None)
         if cache_reference:
             try:
@@ -4160,6 +4213,8 @@ class NeuronViewerWidget(QWidget):
         self._apply_active_cluster_assignment()
 
         self._restore_project_layers(bundle)
+        if bundle.region_appearance:
+            self._on_region_appearance_applied(self._region_appearance_store())
         self._sync_neuron_table_heatmap_membership()
         self._refresh_manual_heatmap_combo()
         self._refresh_heatmap_layer_list()
@@ -4549,6 +4604,13 @@ class NeuronViewerWidget(QWidget):
                 set_atlas(atlas)
                 selector_timing.set(items=len(getattr(selector, "_items_by_id", {})))
         self._set_custom_region_hierarchy_for_atlas(atlas)
+        appearance_editor = getattr(self, "_region_appearance_editor", None)
+        if appearance_editor is not None:
+            appearance_editor.set_atlas(atlas)
+            self._refresh_region_appearance_selection()
+            apply_appearance = getattr(self, "_on_region_appearance_applied", None)
+            if callable(apply_appearance):
+                apply_appearance(appearance_editor.applied_store)
         self._atlas_status_label.setText(
             f"Atlas: {atlas_name} ({len(atlas.structures)} structures)"
         )
@@ -7154,6 +7216,9 @@ class NeuronViewerWidget(QWidget):
             _REGION_QUERY_SOURCE_CUSTOM,
         }:
             self._sync_active_region_reference_layers()
+        refresh_appearance = getattr(self, "_refresh_region_appearance_selection", None)
+        if callable(refresh_appearance):
+            refresh_appearance()
 
     def _on_region_query_scope_changed(self, _text: str) -> None:
         """Track the current region-query scope selection."""
@@ -7170,6 +7235,9 @@ class NeuronViewerWidget(QWidget):
             _REGION_QUERY_SOURCE_CUSTOM,
         }:
             self._sync_active_region_reference_layers()
+        refresh_appearance = getattr(self, "_refresh_region_appearance_selection", None)
+        if callable(refresh_appearance):
+            refresh_appearance()
 
     def _selected_region_query_scope(self) -> str:
         """Return the active search scope for region and mask queries."""
@@ -7463,6 +7531,41 @@ class NeuronViewerWidget(QWidget):
             return "Custom Isocortex Layers are unavailable for the loaded atlas."
         return None
 
+    def _region_appearance_store(self) -> RegionAppearanceStore:
+        """Return a copy of the currently applied atlas appearance state."""
+        editor = getattr(self, "_region_appearance_editor", None)
+        if editor is not None:
+            return editor.applied_store
+        return RegionAppearanceStore(atlas_name=self._current_atlas_name() or "")
+
+    def _refresh_region_appearance_selection(self) -> None:
+        """Show the active Atlas/Custom selection subtree in the editor."""
+        editor = getattr(self, "_region_appearance_editor", None)
+        if editor is None:
+            return
+        source = getattr(
+            self,
+            "_region_query_source",
+            _REGION_QUERY_SOURCE_ATLAS,
+        )
+        root_ids = (
+            self._active_flatmap_parent_region_ids()
+            if source in {_REGION_QUERY_SOURCE_ATLAS, _REGION_QUERY_SOURCE_CUSTOM}
+            else []
+        )
+        editor.set_selection(root_ids)
+
+    def _on_region_appearance_applied(
+        self,
+        _store: RegionAppearanceStore,
+    ) -> None:
+        """Restyle existing region overlays after an explicit Apply."""
+        self._restyle_reference_region_layers()
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        restyle_flatmap = getattr(flatmap_tab, "apply_region_appearance", None)
+        if callable(restyle_flatmap):
+            restyle_flatmap()
+
     def _sync_region_query_scope_selector(self) -> None:
         """Show the atlas and custom selectors matching the query scope."""
         index = (
@@ -7656,6 +7759,9 @@ class NeuronViewerWidget(QWidget):
     def _on_regions_selected(self, acronyms: list[str]) -> None:
         """Handle region selection changes."""
         _ = acronyms
+        refresh_appearance = getattr(self, "_refresh_region_appearance_selection", None)
+        if callable(refresh_appearance):
+            refresh_appearance()
         if (
             getattr(
                 self,
@@ -7677,6 +7783,9 @@ class NeuronViewerWidget(QWidget):
 
     def _on_custom_regions_selected(self, _region_ids: list[int]) -> None:
         """Refresh reference previews for an active custom selection."""
+        refresh_appearance = getattr(self, "_refresh_region_appearance_selection", None)
+        if callable(refresh_appearance):
+            refresh_appearance()
         if hasattr(self, "_regions_status_label"):
             self._regions_status_label.setText("")
         if (
@@ -9628,8 +9737,21 @@ class NeuronViewerWidget(QWidget):
 
         # Add new meshes
         opacity = self._mesh_opacity_slider.value() / 100.0
+        appearance_getter = getattr(self, "_region_appearance_store", None)
+        appearance_store = appearance_getter() if callable(appearance_getter) else None
+        appearance_kwargs = (
+            {"appearance_store": appearance_store}
+            if appearance_store is not None
+            else {}
+        )
         for acronym in acronyms:
-            add_region_mesh(self.viewer, self._atlas, acronym, opacity=opacity)
+            add_region_mesh(
+                self.viewer,
+                self._atlas,
+                acronym,
+                opacity=opacity,
+                **appearance_kwargs,
+            )
 
     def _update_custom_region_meshes(
         self,
@@ -9652,6 +9774,13 @@ class NeuronViewerWidget(QWidget):
             show_info("Switched to 3D view for mesh display")
 
         opacity = self._mesh_opacity_slider.value() / 100.0
+        appearance_getter = getattr(self, "_region_appearance_store", None)
+        appearance_store = appearance_getter() if callable(appearance_getter) else None
+        appearance_kwargs = (
+            {"appearance_store": appearance_store}
+            if appearance_store is not None
+            else {}
+        )
         created_count = 0
         missing_acronyms: list[str] = []
         for group in groups:
@@ -9660,6 +9789,7 @@ class NeuronViewerWidget(QWidget):
                 self._atlas,
                 group,
                 opacity=opacity,
+                **appearance_kwargs,
             )
             if layer is not None:
                 created_count += 1
@@ -9705,7 +9835,20 @@ class NeuronViewerWidget(QWidget):
             return
 
         opacity = self._seg_opacity_slider.value() / 100.0
-        add_region_segmentation(self.viewer, self._atlas, acronyms, opacity=opacity)
+        appearance_getter = getattr(self, "_region_appearance_store", None)
+        appearance_store = appearance_getter() if callable(appearance_getter) else None
+        appearance_kwargs = (
+            {"appearance_store": appearance_store}
+            if appearance_store is not None
+            else {}
+        )
+        add_region_segmentation(
+            self.viewer,
+            self._atlas,
+            acronyms,
+            opacity=opacity,
+            **appearance_kwargs,
+        )
 
     def _update_custom_region_segmentation(
         self,
@@ -9730,12 +9873,36 @@ class NeuronViewerWidget(QWidget):
             return
 
         opacity = self._seg_opacity_slider.value() / 100.0
+        appearance_getter = getattr(self, "_region_appearance_store", None)
+        appearance_store = appearance_getter() if callable(appearance_getter) else None
+        appearance_kwargs = (
+            {"appearance_store": appearance_store}
+            if appearance_store is not None
+            else {}
+        )
         add_region_id_segmentation(
             self.viewer,
             self._atlas,
             region_ids,
             opacity=opacity,
+            **appearance_kwargs,
         )
+
+    def _restyle_reference_region_layers(self) -> None:
+        """Apply committed region styles to current CCF layers in place."""
+        if self._atlas is None:
+            return
+        from .reference_layers import apply_region_appearance_to_layer
+
+        store = self._region_appearance_store()
+        for layer in list(self.viewer.layers):
+            try:
+                apply_region_appearance_to_layer(layer, self._atlas, store)
+            except Exception:
+                logger.exception(
+                    "Failed to apply region appearance to layer %s",
+                    getattr(layer, "name", "<unnamed>"),
+                )
 
     def _update_seg_opacity(self, value: int) -> None:
         """Update the region segmentation layer opacity."""
@@ -9744,6 +9911,26 @@ class NeuronViewerWidget(QWidget):
             if layer.name == "Region Segmentation":
                 layer.opacity = opacity
                 break
+
+    def _update_mesh_opacity(self, value: int) -> None:
+        """Update the global CCF mesh opacity beneath region styling."""
+        base_opacity = value / 100.0
+        store = self._region_appearance_store()
+        for layer in self.viewer.layers:
+            metadata = getattr(layer, "metadata", None)
+            if not isinstance(metadata, dict):
+                continue
+            kind = str(metadata.get("region_layer_kind", "") or "")
+            if kind not in {"mesh", "mesh_group"}:
+                continue
+            setattr(layer, "_napari_swc_region_base_opacity", base_opacity)
+            if kind == "mesh":
+                region_id = int(metadata.get("region_id", 0) or 0)
+                if region_id > 0 and self._atlas is not None:
+                    effective = store.resolve(region_id, self._atlas.structures)
+                    layer.opacity = base_opacity * effective.fill_opacity
+            else:
+                layer.opacity = base_opacity
 
     def _on_ndisplay_changed(self, event) -> None:
         """Auto-hide neuron line/point layers in 2D to keep slice scrubbing fast."""

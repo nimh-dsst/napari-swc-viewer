@@ -10,6 +10,11 @@ import types
 
 import numpy as np
 
+from napari_swc_viewer.region_appearance import (
+    RegionAppearanceOverride,
+    RegionAppearanceStore,
+)
+
 from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
 
 
@@ -224,9 +229,114 @@ def test_add_region_id_segmentation_keeps_exact_ids_and_atlas_colors(
         np.asarray([[[101, 102, 0, 0]]], dtype=np.int32),
     )
     assert layer.metadata == {
+        "region_layer_kind": "segmentation",
         "region_selection_source": "custom",
         "selected_region_ids": [101, 102],
+        "represented_region_ids": [101, 102],
         "exact_region_ids": True,
     }
     np.testing.assert_allclose(layer.colormap.color_dict[101], [1, 0, 0, 1])
     np.testing.assert_allclose(layer.colormap.color_dict[102], [0, 1, 0, 1])
+
+
+def test_region_segmentation_appearance_updates_colormap_without_rebuilding_data(
+    monkeypatch,
+) -> None:
+    module = _import_reference_layers_module()
+    viewer = _FakeReferenceViewer()
+    atlas = _FakeReferenceAtlas()
+
+    class _DirectLabelColormap:
+        def __init__(self, *, color_dict) -> None:
+            self.color_dict = color_dict
+
+    fake_napari_utils = types.ModuleType("napari.utils")
+    fake_napari_utils.DirectLabelColormap = _DirectLabelColormap
+    monkeypatch.setitem(sys.modules, "napari.utils", fake_napari_utils)
+    initial_store = RegionAppearanceStore(
+        overrides={
+            101: RegionAppearanceOverride(
+                color_mode="custom",
+                color_rgb=(0.25, 0.5, 0.75),
+            ),
+            102: RegionAppearanceOverride(fill_visible=False),
+        }
+    )
+    layer = module.add_region_id_segmentation(
+        viewer,
+        atlas,
+        [101, 102],
+        appearance_store=initial_store,
+    )
+    original_data = layer.data
+
+    np.testing.assert_allclose(layer.colormap.color_dict[101], [0.25, 0.5, 0.75, 1.0])
+    np.testing.assert_allclose(layer.colormap.color_dict[102], [0.0, 1.0, 0.0, 0.0])
+
+    updated_store = RegionAppearanceStore(
+        overrides={101: RegionAppearanceOverride(fill_opacity=0.4)}
+    )
+    assert module.apply_region_appearance_to_layer(
+        layer,
+        atlas,
+        updated_store,
+    )
+    assert layer.data is original_data
+    np.testing.assert_allclose(layer.colormap.color_dict[101], [1.0, 0.0, 0.0, 0.4])
+    np.testing.assert_allclose(layer.colormap.color_dict[102], [0.0, 1.0, 0.0, 1.0])
+
+
+def test_custom_mesh_group_uses_per_region_fill_visibility() -> None:
+    module = _import_reference_layers_module()
+    viewer = _FakeReferenceViewer()
+    atlas = _FakeReferenceAtlas()
+    group = CustomRegionSelectionGroup(
+        label="L1",
+        region_ids=(101, 102),
+        acronyms=("AAA1", "BBB1"),
+    )
+    store = RegionAppearanceStore(
+        overrides={
+            101: RegionAppearanceOverride(
+                color_mode="custom",
+                color_rgb=(0.25, 0.5, 0.75),
+            ),
+            102: RegionAppearanceOverride(fill_visible=False),
+        }
+    )
+
+    layer, missing = module.add_region_mesh_group(
+        viewer,
+        atlas,
+        group,
+        appearance_store=store,
+    )
+
+    assert missing == ()
+    np.testing.assert_allclose(
+        layer.vertex_colors[:3],
+        np.asarray([[0.25, 0.5, 0.75, 1.0]] * 3),
+    )
+    np.testing.assert_allclose(
+        layer.vertex_colors[3:],
+        np.asarray([[0.0, 1.0, 0.0, 0.0]] * 3),
+    )
+
+
+def test_region_mesh_restyle_preserves_manual_layer_visibility() -> None:
+    module = _import_reference_layers_module()
+    viewer = _FakeReferenceViewer()
+    atlas = _FakeReferenceAtlas()
+    layer = module.add_region_mesh(viewer, atlas, "AAA1")
+    assert layer is not None
+
+    layer.visible = False
+    module.apply_region_appearance_to_layer(
+        layer,
+        atlas,
+        RegionAppearanceStore(
+            overrides={101: RegionAppearanceOverride(fill_visible=True)}
+        ),
+    )
+
+    assert layer.visible is False

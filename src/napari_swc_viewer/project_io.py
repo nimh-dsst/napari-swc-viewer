@@ -64,6 +64,7 @@ class ProjectBundle:
     table_state: dict[str, Any]
     layers: tuple[ProjectLayer, ...]
     flatmap_cache_reference: dict[str, Any] | None = None
+    region_appearance: dict[str, Any] | None = None
 
 
 def _json_safe(value: Any) -> Any:
@@ -1141,6 +1142,7 @@ def _write_project_bundle_contents(
     app_layers: Sequence[Any],
     atlas_name: str | None,
     analysis_metadata: Mapping[str, Any] | None,
+    region_appearance: Mapping[str, Any] | None,
     flatmap_cache_reference: Mapping[str, Any] | None,
     progress_callback: _ProgressCallback | None,
     total_steps: int,
@@ -1248,6 +1250,8 @@ def _write_project_bundle_contents(
         "analysis_metadata": dict(analysis_metadata or {}),
         "layers": manifest_layers,
     }
+    if region_appearance:
+        manifest["region_appearance"] = dict(region_appearance)
     if flatmap_cache_reference:
         # Keep the potentially large region cache external to the project.
         # The reference is informational and may be relocated by the user.
@@ -1263,6 +1267,7 @@ def save_project_bundle(
     layers: Iterable[Any] = (),
     atlas_name: str | None = None,
     analysis_metadata: Mapping[str, Any] | None = None,
+    region_appearance: Mapping[str, Any] | None = None,
     flatmap_cache_reference: Mapping[str, Any] | None = None,
     progress_callback: _ProgressCallback | None = None,
     overwrite: bool = False,
@@ -1293,6 +1298,7 @@ def save_project_bundle(
             app_layers=app_layers,
             atlas_name=atlas_name,
             analysis_metadata=analysis_metadata,
+            region_appearance=region_appearance,
             flatmap_cache_reference=flatmap_cache_reference,
             progress_callback=progress_callback,
             total_steps=total_steps,
@@ -1353,6 +1359,11 @@ def load_project_bundle(bundle_path: str | Path) -> ProjectBundle:
         flatmap_cache_reference=(
             dict(manifest["flatmap_cache"])
             if isinstance(manifest.get("flatmap_cache"), Mapping)
+            else None
+        ),
+        region_appearance=(
+            dict(manifest["region_appearance"])
+            if isinstance(manifest.get("region_appearance"), Mapping)
             else None
         ),
     )

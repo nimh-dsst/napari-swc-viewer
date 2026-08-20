@@ -335,7 +335,7 @@ def test_flat_region_selection_collapses_depth_into_one_plane(tmp_path, style):
     assert result.style == style
 
 
-def test_flat_region_selection_sums_one_root_across_its_descendants(tmp_path):
+def test_flat_region_selection_retains_descendants_beneath_one_root(tmp_path):
     profile = _build(tmp_path / "cache")
 
     result = materialize_flat_region_selection(
@@ -345,16 +345,16 @@ def test_flat_region_selection_sums_one_root_across_its_descendants(tmp_path):
         direct_region_ids=[1],
     )
 
-    # The depth-grid materialiser reports one collision here because regions 2
-    # and 3 compete for a shared bin. Aggregating them under the selected root
-    # sums their counts instead, which is what makes a collapsed plane an area
-    # map rather than a thickest-descendant-wins patchwork.
-    assert result.summary.collision_bins == 0
+    # Descendant IDs remain in the label plane so the colormap can restyle them
+    # independently. Regions 2 and 3 compete in their shared flatmap column;
+    # their counts tie, so the smaller region ID wins that bin.
+    assert result.summary.collision_bins == 1
     assert result.represented_region_ids == (1,)
     assert result.represented_source_region_ids == (2, 3)
-    assert result.grid_spec["label_grouping"] == "selected_root"
-    assert sorted(set(np.unique(result.labels).tolist())) == [0, 1]
-    assert np.array_equal(result.labels, np.array([[1, 1], [1, 0]], dtype=np.int32))
+    assert result.grid_spec["label_grouping"] == "source_region"
+    assert result.grid_spec["geometry_grouping"] == "selected_root"
+    assert sorted(set(np.unique(result.labels).tolist())) == [0, 2, 3]
+    assert np.array_equal(result.labels, np.array([[2, 3], [2, 0]], dtype=np.int32))
     assert result.summary.labeled_bins == 3
     assert result.summary.source_voxel_count == 4
 
@@ -377,9 +377,12 @@ def test_flat_region_selection_assigns_members_to_several_roots(tmp_path, hierar
     )
 
     assert result.represented_region_ids == (6, 7)
-    assert np.array_equal(result.labels, np.array([[6, 7], [6, 0]], dtype=np.int32))
-    # The one shared bin is a genuine boundary between two selections.
+    assert result.represented_source_region_ids == (2, 3)
+    assert np.array_equal(result.labels, np.array([[2, 3], [2, 0]], dtype=np.int32))
+    # The one shared bin is resolved from source occupancy across depth.
     assert result.summary.collision_bins == 1
+    assert result.grid_spec["label_grouping"] == "source_region"
+    assert result.grid_spec["geometry_grouping"] == "selected_root"
     assert [outline.region_id for outline in result.outlines] == [6, 7]
     assert result.outlines[0].represented_region_ids == (2,)
     assert result.outlines[1].represented_region_ids == (3,)
@@ -1136,17 +1139,13 @@ def test_rectangular_region_cache_round_trips_the_linear_encoding(tmp_path):
         x_bin = min(
             x_bins - 1,
             int(
-                np.floor(
-                    (x_value - x_bounds[0]) / (x_bounds[1] - x_bounds[0]) * x_bins
-                )
+                np.floor((x_value - x_bounds[0]) / (x_bounds[1] - x_bounds[0]) * x_bins)
             ),
         )
         y_bin = min(
             y_bins - 1,
             int(
-                np.floor(
-                    (y_value - y_bounds[0]) / (y_bounds[1] - y_bounds[0]) * y_bins
-                )
+                np.floor((y_value - y_bounds[0]) / (y_bounds[1] - y_bounds[0]) * y_bins)
             ),
         )
         depth_bin = min(

@@ -15,6 +15,10 @@ from napari_swc_viewer.flatmap_labels import (
     FlatmapRegionLabelsResult,
     FlatmapRegionLabelsSummary,
 )
+from napari_swc_viewer.region_appearance import (
+    RegionAppearanceOverride,
+    RegionAppearanceStore,
+)
 
 
 class _FakeWidget:
@@ -194,7 +198,7 @@ class _DummyLayer:
         )
         self._keep_auto_contrast = False
         self._slice_input = types.SimpleNamespace(ndisplay=2)
-        self.visible = True
+        self.visible = kwargs.get("visible", True)
         self.refresh_count = 0
         self.thumbnail_updates = 0
         self.slice_updates: list[object] = []
@@ -4230,6 +4234,178 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     assert widget._viewer.layers[1].metadata["region_acronym"] == "MOp"
 
 
+def test_apply_region_appearance_restyles_layers_without_materializing_cache(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    structures = {
+        10: {
+            "id": 10,
+            "acronym": "VISp",
+            "rgb_triplet": [12, 34, 56],
+            "structure_id_path": [10],
+        }
+    }
+    widget._atlas_provider = lambda: types.SimpleNamespace(structures=structures)
+    store = RegionAppearanceStore(
+        overrides={
+            10: RegionAppearanceOverride(
+                color_mode="custom",
+                color_rgb=(0.25, 0.5, 0.75),
+                fill_opacity=0.4,
+                outline_visible=False,
+            )
+        }
+    )
+    widget._region_appearance_provider = lambda: store
+
+    class _DirectLabelColormap:
+        def __init__(self, *, color_dict) -> None:
+            self.color_dict = color_dict
+
+    fake_utils = sys.modules["napari.utils"]
+    fake_utils.DirectLabelColormap = _DirectLabelColormap
+    fake_colormaps = types.ModuleType("napari.utils.colormaps")
+    fake_colormaps.Colormap = lambda colors: np.asarray(colors)
+    monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restyling must not load NRRDs")
+        ),
+    )
+
+    label_data = np.asarray([[10, 0], [0, 10]], dtype=np.int32)
+    labels = _DummyLayer(
+        label_data,
+        name="Flatmap Region Labels 2D",
+        opacity=0.35,
+        metadata={
+            "region_layer_kind": "flatmap_labels",
+            "represented_region_ids": [10],
+        },
+    )
+    surface = _DummyLayer(
+        np.zeros((3, 3), dtype=np.float32),
+        name="Flatmap Region Surfaces: VISp (10)",
+        opacity=0.45,
+        metadata={"region_layer_kind": "flatmap_surface", "region_id": 10},
+    )
+    setattr(surface, "_napari_swc_region_base_opacity", 0.45)
+    outline = _DummyLayer(
+        np.zeros((1, 2, 3), dtype=np.float32),
+        name="Flatmap Region Outlines: VISp (10)",
+        edge_color=[1.0, 0.0, 0.0, 1.0],
+        opacity=0.9,
+        metadata={"region_layer_kind": "flatmap_outline", "region_id": 10},
+    )
+    setattr(outline, "_napari_swc_region_base_opacity", 0.9)
+    widget._viewer.layers.extend([labels, surface, outline])
+
+    widget.apply_region_appearance()
+
+    assert labels.data is label_data
+    np.testing.assert_allclose(
+        labels.colormap.color_dict[10],
+        [0.25, 0.5, 0.75, 0.4],
+    )
+    np.testing.assert_allclose(surface.colormap[0], [0.25, 0.5, 0.75, 1.0])
+    assert surface.opacity == pytest.approx(0.18)
+    np.testing.assert_allclose(outline.edge_color, [0.25, 0.5, 0.75, 1.0])
+    assert outline.visible is False
+
+    # A direct napari layer toggle remains the global gate, while removing a
+    # per-region hide can re-enable a layer that was hidden only by the style.
+    surface.visible = False
+    store = RegionAppearanceStore()
+    widget.apply_region_appearance()
+    assert surface.visible is False
+    assert outline.visible is True
+
+
+def test_apply_region_appearance_restyles_flat_labels_by_descendant_id(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    structures = {
+        1: {
+            "id": 1,
+            "acronym": "ROOT",
+            "rgb_triplet": [128, 128, 128],
+            "structure_id_path": [1],
+        },
+        2: {
+            "id": 2,
+            "acronym": "C2",
+            "rgb_triplet": [12, 34, 56],
+            "structure_id_path": [1, 2],
+        },
+        3: {
+            "id": 3,
+            "acronym": "C3",
+            "rgb_triplet": [78, 90, 123],
+            "structure_id_path": [1, 3],
+        },
+    }
+    widget._atlas_provider = lambda: types.SimpleNamespace(structures=structures)
+    widget._region_appearance_provider = lambda: RegionAppearanceStore(
+        overrides={
+            1: RegionAppearanceOverride(
+                color_mode="custom",
+                color_rgb=(1.0, 0.0, 0.0),
+                fill_opacity=0.6,
+            ),
+            2: RegionAppearanceOverride(
+                color_mode="custom",
+                color_rgb=(0.0, 0.0, 1.0),
+            ),
+        }
+    )
+
+    class _DirectLabelColormap:
+        def __init__(self, *, color_dict) -> None:
+            self.color_dict = color_dict
+
+    sys.modules["napari.utils"].DirectLabelColormap = _DirectLabelColormap
+    label_data = np.asarray([[2, 3], [2, 0]], dtype=np.int32)
+    labels = _DummyLayer(
+        label_data,
+        name="Flatmap Region Labels 2D",
+        opacity=0.35,
+        metadata={
+            "region_layer_kind": "flatmap_labels",
+            "flatmap_plane_mode": module.FLATMAP_PLANE_MODE_FLAT,
+            "represented_region_ids": [1],
+            "represented_source_region_ids": [2, 3],
+        },
+    )
+    setattr(
+        labels,
+        "_napari_swc_flatmap_region_labels_result",
+        types.SimpleNamespace(
+            represented_region_ids=(1,),
+            represented_source_region_ids=(2, 3),
+        ),
+    )
+    widget._viewer.layers.append(labels)
+
+    widget.apply_region_appearance()
+
+    assert labels.data is label_data
+    assert 1 not in labels.colormap.color_dict
+    np.testing.assert_allclose(
+        labels.colormap.color_dict[2],
+        [0.0, 0.0, 1.0, 0.6],
+    )
+    np.testing.assert_allclose(
+        labels.colormap.color_dict[3],
+        [1.0, 0.0, 0.0, 0.6],
+    )
+
+
 def test_cached_flat_region_labels_create_a_two_dimensional_layer(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -4248,17 +4424,34 @@ def test_cached_flat_region_labels_create_a_two_dimensional_layer(monkeypatch) -
     widget._selected_region_acronyms_provider = lambda: ["Isocortex"]
     widget._selected_region_source_provider = lambda: "atlas_regions"
     widget._selected_region_scope_provider = lambda: "whole_parquet"
-    structures = {315: {"id": 315, "acronym": "Isocortex", "rgb_triplet": [1, 2, 3]}}
+    structures = {
+        315: {"id": 315, "acronym": "Isocortex", "rgb_triplet": [1, 2, 3]},
+        10: {
+            "id": 10,
+            "acronym": "C10",
+            "rgb_triplet": [4, 5, 6],
+            "structure_id_path": [315, 10],
+        },
+        11: {
+            "id": 11,
+            "acronym": "C11",
+            "rgb_triplet": [7, 8, 9],
+            "structure_id_path": [315, 11],
+        },
+    }
     widget._atlas_provider = lambda: types.SimpleNamespace(structures=structures)
 
     result = types.SimpleNamespace(
-        labels=np.array([[315, 0], [0, 315]], dtype=np.int32),
+        labels=np.array([[10, 0], [0, 11]], dtype=np.int32),
         profile_id="profile-1",
         selected_region_ids=(10, 11),
         direct_region_ids=(315,),
         represented_region_ids=(315,),
         represented_source_region_ids=(10, 11),
-        grid_spec={"label_grouping": "selected_root"},
+        grid_spec={
+            "label_grouping": "source_region",
+            "geometry_grouping": "selected_root",
+        },
         summary=types.SimpleNamespace(
             labeled_bins=2,
             represented_region_count=1,
@@ -4312,7 +4505,9 @@ def test_cached_flat_region_labels_create_a_two_dimensional_layer(monkeypatch) -
     )
     assert layer.metadata["flatmap_plane_mode"] == module.FLATMAP_PLANE_MODE_FLAT
     assert layer.metadata["direct_region_ids"] == [315]
-    assert layer.metadata["label_grouping"] == "selected_root"
+    assert layer.metadata["label_grouping"] == "source_region"
+    assert layer.metadata["geometry_grouping"] == "selected_root"
+    assert sorted(np.unique(layer.data).tolist()) == [0, 10, 11]
     # Overlays must stay pixel-aligned with the anisotropic 2D heatmap.
     assert "scale" not in layer.init_kwargs
     assert "translate" not in layer.init_kwargs
@@ -4387,7 +4582,10 @@ def test_cached_flat_region_outlines_use_only_materialized_cache_arrays(
             calls.append((received_profile, list(region_ids), kwargs))
             or types.SimpleNamespace(
                 profile_id="profile-1",
-                grid_spec={"label_grouping": "selected_root"},
+                grid_spec={
+                    "label_grouping": "source_region",
+                    "geometry_grouping": "selected_root",
+                },
                 outlines=(_outline(10), _outline(11)),
             )
         ),
@@ -4423,6 +4621,7 @@ def test_cached_flat_region_outlines_use_only_materialized_cache_arrays(
         assert layer.metadata["flatmap_plane_mode"] == module.FLATMAP_PLANE_MODE_FLAT
         assert layer.metadata["projection_kind"] == "flatmap_flat_region_outlines"
         assert layer.metadata["planar_bin_count"] == 3
+        assert layer.metadata["geometry_grouping"] == "selected_root"
         assert "scale" not in layer.init_kwargs
         assert "translate" not in layer.init_kwargs
     expected_visp = np.asarray([12, 34, 56, 255], dtype=float) / 255

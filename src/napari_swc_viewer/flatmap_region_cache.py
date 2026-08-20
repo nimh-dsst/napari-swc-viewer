@@ -353,10 +353,11 @@ class CachedFlatRegionSelectionSummary:
 class CachedFlatRegionSelection:
     """Cache-backed atlas labels collapsed into one depth-free flatmap plane.
 
-    ``represented_region_ids`` are the label values written into ``labels``,
-    which are the directly selected regions rather than the cached occupancy
-    regions.  ``represented_source_region_ids`` are the occupancy regions that
-    actually contributed counts.
+    ``represented_region_ids`` are the directly selected regions whose groups
+    contributed occupancy.  ``represented_source_region_ids`` are both the
+    cached occupancy regions that contributed counts and the label values
+    written into ``labels``.  Retaining those source IDs lets a 2D Labels
+    colormap apply descendant appearance overrides after depth is collapsed.
     """
 
     labels: np.ndarray
@@ -2781,12 +2782,12 @@ def _resolve_flat_region_groups(
     region_descendants: Mapping[int, Iterable[int]] | None = None,
     atlas_structures: Mapping[object, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[int, tuple[int, ...]], str]:
-    """Map each emitted label value to the occupancy regions it aggregates.
+    """Map each selected geometry root to the occupancy regions it aggregates.
 
-    Collapsing depth stacks every cortical layer of an area into one column, so
-    voting between terminal layer regions yields a thickest-layer-wins patchwork
-    rather than an area map.  Grouping each selected region's descendants before
-    the vote is therefore a correctness requirement, not a presentation choice.
+    Labels retain source region IDs so descendant appearance overrides remain
+    addressable after depth is collapsed.  These groups are still required for
+    direct-selection summaries and for union outlines, which follow the selected
+    parent footprint rather than the winning source label in each planar bin.
     """
     occupied = {
         int(value) for value in style_cache.array("occupancy_region_ids").tolist()
@@ -3048,9 +3049,12 @@ def materialize_flat_region_selection(
 
     ``region_ids`` are the cached occupancy regions to read, normally the
     include-child-expanded selection.  ``direct_region_ids`` are the regions the
-    user actually selected; each one becomes a single label value whose
-    descendants' source-voxel counts are summed before competing regions are
-    resolved by the cache's usual majority rule.
+    user actually selected and define the union footprints used for outlines.
+    The 2D label values remain the source occupancy region IDs so the displayed
+    colormap can resolve parent inheritance and descendant appearance overrides.
+    When multiple source regions occupy the same flatmap column, their counts
+    are summed through depth and the cache's majority rule selects the visible
+    source ID; the smaller ID wins an equal-count tie.
 
     Outlines are derived here rather than read from the cache: the stored
     outlines are per-depth-slice perimeters, whose depth-collapsed projection is
@@ -3100,10 +3104,13 @@ def materialize_flat_region_selection(
             member_bins.append(collapsed[0])
             member_counts.append(collapsed[1])
             contributing.append(member)
+            pair_bins.append(collapsed[0])
+            pair_counts.append(collapsed[1])
+            pair_ids.append(np.full(len(collapsed[0]), member, dtype=np.int32))
         if not member_bins:
             continue
-        # Sum an area's own layers into one footprint instead of letting them
-        # compete; _neighbour_presence also requires ascending unique bins.
+        # Build the selected root's union footprint for its outline; source IDs
+        # still compete independently in the Labels layer above.
         merged_bins, inverse = np.unique(
             np.concatenate(member_bins), return_inverse=True
         )
@@ -3115,9 +3122,6 @@ def materialize_flat_region_selection(
         represented.append(label_id)
         represented_sources.update(contributing)
         source_voxel_count += int(merged_counts.sum())
-        pair_bins.append(merged_bins)
-        pair_counts.append(merged_counts)
-        pair_ids.append(np.full(len(merged_bins), label_id, dtype=np.int32))
 
     collision_bins = 0
     if pair_bins:
@@ -3173,7 +3177,8 @@ def materialize_flat_region_selection(
         "x_bounds": list(style_cache.grid_spec["x_bounds"]),
         "y_bounds": list(style_cache.grid_spec["y_bounds"]),
         "output_shape": [int(size) for size in output_shape],
-        "label_grouping": grouping,
+        "label_grouping": "source_region",
+        "geometry_grouping": grouping,
     }
     return CachedFlatRegionSelection(
         labels=labels,
