@@ -15,6 +15,10 @@ from napari_swc_viewer.flatmap_labels import (
     FlatmapRegionLabelsResult,
     FlatmapRegionLabelsSummary,
 )
+from napari_swc_viewer.region_appearance import (
+    RegionAppearanceOverride,
+    RegionAppearanceStore,
+)
 
 
 class _FakeWidget:
@@ -194,7 +198,7 @@ class _DummyLayer:
         )
         self._keep_auto_contrast = False
         self._slice_input = types.SimpleNamespace(ndisplay=2)
-        self.visible = True
+        self.visible = kwargs.get("visible", True)
         self.refresh_count = 0
         self.thumbnail_updates = 0
         self.slice_updates: list[object] = []
@@ -4228,6 +4232,97 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
         assert layer.metadata["selected_region_acronyms"] == ["VISp", "MOp"]
     assert widget._viewer.layers[0].metadata["region_name"] == "Primary visual area"
     assert widget._viewer.layers[1].metadata["region_acronym"] == "MOp"
+
+
+def test_apply_region_appearance_restyles_layers_without_materializing_cache(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    structures = {
+        10: {
+            "id": 10,
+            "acronym": "VISp",
+            "rgb_triplet": [12, 34, 56],
+            "structure_id_path": [10],
+        }
+    }
+    widget._atlas_provider = lambda: types.SimpleNamespace(structures=structures)
+    store = RegionAppearanceStore(
+        overrides={
+            10: RegionAppearanceOverride(
+                color_mode="custom",
+                color_rgb=(0.25, 0.5, 0.75),
+                fill_opacity=0.4,
+                outline_visible=False,
+            )
+        }
+    )
+    widget._region_appearance_provider = lambda: store
+
+    class _DirectLabelColormap:
+        def __init__(self, *, color_dict) -> None:
+            self.color_dict = color_dict
+
+    fake_utils = sys.modules["napari.utils"]
+    fake_utils.DirectLabelColormap = _DirectLabelColormap
+    fake_colormaps = types.ModuleType("napari.utils.colormaps")
+    fake_colormaps.Colormap = lambda colors: np.asarray(colors)
+    monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
+    monkeypatch.setattr(
+        module,
+        "load_flatmap_volume_set",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restyling must not load NRRDs")
+        ),
+    )
+
+    label_data = np.asarray([[10, 0], [0, 10]], dtype=np.int32)
+    labels = _DummyLayer(
+        label_data,
+        name="Flatmap Region Labels 2D",
+        opacity=0.35,
+        metadata={
+            "region_layer_kind": "flatmap_labels",
+            "represented_region_ids": [10],
+        },
+    )
+    surface = _DummyLayer(
+        np.zeros((3, 3), dtype=np.float32),
+        name="Flatmap Region Surfaces: VISp (10)",
+        opacity=0.45,
+        metadata={"region_layer_kind": "flatmap_surface", "region_id": 10},
+    )
+    setattr(surface, "_napari_swc_region_base_opacity", 0.45)
+    outline = _DummyLayer(
+        np.zeros((1, 2, 3), dtype=np.float32),
+        name="Flatmap Region Outlines: VISp (10)",
+        edge_color=[1.0, 0.0, 0.0, 1.0],
+        opacity=0.9,
+        metadata={"region_layer_kind": "flatmap_outline", "region_id": 10},
+    )
+    setattr(outline, "_napari_swc_region_base_opacity", 0.9)
+    widget._viewer.layers.extend([labels, surface, outline])
+
+    widget.apply_region_appearance()
+
+    assert labels.data is label_data
+    np.testing.assert_allclose(
+        labels.colormap.color_dict[10],
+        [0.25, 0.5, 0.75, 0.4],
+    )
+    np.testing.assert_allclose(surface.colormap[0], [0.25, 0.5, 0.75, 1.0])
+    assert surface.opacity == pytest.approx(0.18)
+    np.testing.assert_allclose(outline.edge_color, [0.25, 0.5, 0.75, 1.0])
+    assert outline.visible is False
+
+    # A direct napari layer toggle remains the global gate, while removing a
+    # per-region hide can re-enable a layer that was hidden only by the style.
+    surface.visible = False
+    store = RegionAppearanceStore()
+    widget.apply_region_appearance()
+    assert surface.visible is False
+    assert outline.visible is True
 
 
 def test_cached_flat_region_labels_create_a_two_dimensional_layer(monkeypatch) -> None:

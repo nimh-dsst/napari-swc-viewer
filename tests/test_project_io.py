@@ -790,6 +790,36 @@ def test_project_bundle_references_external_flatmap_cache_without_copying_it(
     assert not (bundle_path / "flatmap-region-cache.json").exists()
 
 
+def test_project_bundle_round_trips_region_appearance(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "saved.swcv"
+    _write_three_neuron_source_parquet(source)
+    appearance = {
+        "format": "napari_swc_viewer.region_palette",
+        "version": 1,
+        "atlas": {"name": "allen_mouse_25um", "version": "1.2"},
+        "overrides": {
+            "101": {
+                "color_mode": "custom",
+                "color_rgb": [0.1, 0.2, 0.3],
+                "fill_visible": False,
+            }
+        },
+    }
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_subset_table_state(),
+        layers=[],
+        region_appearance=appearance,
+    )
+
+    bundle = load_project_bundle(bundle_path)
+    assert bundle.manifest["region_appearance"] == appearance
+    assert bundle.region_appearance == appearance
+
+
 def test_save_project_bundle_rejects_empty_table(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     bundle_path = tmp_path / "empty.swcv"

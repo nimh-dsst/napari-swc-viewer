@@ -37,6 +37,9 @@ Unless a use case says otherwise:
 | [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
 | [UC-010](#uc-010-identify-axon-termini-and-prune-neurons-lacking-them) | Locate termini as childless axon-typed nodes, then select and remove the neurons that have none (see the annotation caution) | Partially run |
 | [UC-011](#uc-011-view-a-depth-free-2d-flatmap-and-per-neuron-vector-traces) | View a plain flatmap with no depth axis as a 2D heatmap or per-neuron vector traces, and place somas in the current render's space | Not run |
+| [UC-012](#uc-012-balance-cortical-depth-against-flat-map-position-when-clustering-somas) | Cluster somas with an isotropic flatmap metric and an explicit cortical-depth weight | Partially run |
+| [UC-013](#uc-013-overlay-cached-brain-regions-on-a-2d-flat-map) | Overlay cached region fills and outlines on depth-free flatmap renders | Not run |
+| [UC-014](#uc-014-control-and-share-region-appearance-across-ccfv3-and-flatmap-views) | Assign, stage, share, save, and restore region colors and visibility across CCFv3 and flatmap overlays | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -1627,6 +1630,118 @@ layers, and the thickest layer would win in each one.
   labels with 247 of 16,816 columns contested, all at genuine area boundaries.
   None of that shows whether the overlays read correctly on the canvas, so
   steps 3, 4, 6, and 8 still need eyes.
+
+### UC-014: Control and Share Region Appearance Across CCFv3 and Flatmap Views
+
+**Capability**
+
+The user can give atlas subregions a consistent visual identity across CCFv3
+segmentation and mesh layers and flatmap label, surface, and outline layers.
+The **Region Appearance** panel edits one atlas-scoped palette without changing
+which region IDs are selected for neuron queries. Edits remain staged until
+**Apply** is clicked, so several colors, fill/outline visibility settings, and
+opacity values can be reviewed as one change.
+
+Each region uses its own atlas color when no override exists. An explicit
+parent setting is inherited by descendants; a child can override individual
+properties, select **Use Atlas Color** to break inherited color, or select
+**Inherit** to remove all of its explicit settings. Filled labels stay in one
+combined napari Labels layer: hidden IDs become transparent colormap entries
+rather than separate volumes. CCFv3 has no per-region contour layer, so outline
+settings affect flatmap outlines only.
+
+**Prerequisites**
+
+- A loaded Allen Mouse Brain Atlas. Use `allen_mouse_25um` v1.2 when following
+  UC-003 and UC-004 with their example data and cache.
+- A neuron Parquet with atlas `region_id` data, plus at least two selected atlas
+  areas or custom terminal regions. `MOp` and `SSp` make a useful pair.
+- To check both coordinate spaces, complete UC-003 and UC-004 and open the
+  compatible flatmap region cache.
+- Start from a clean napari session with the **SWC Viewer** plugin open.
+
+**Steps and expected results**
+
+1. **Action:** Load the atlas and Parquet, open **Regions**, set **Query source**
+   to **Atlas Regions**, and select `MOp` and `SSp`.
+   **Expected:** **Region Appearance** shows a searchable tree containing the
+   selected regions and their descendants. Each row shows a color swatch,
+   **Fill**, **Fill %**, **Outline**, **Outline %**, and the setting source.
+   Regions without overrides display their own atlas colors.
+2. **Action:** From **Reference**, enable **Show selected region segmentation**
+   and **Show selected region meshes**. In **Flatmap**, create cached region
+   labels, surfaces, and outlines in render modes that support each overlay.
+   **Expected:** The initial CCFv3 and flatmap fills and flatmap outlines agree
+   on each region's atlas color. Filled regions share combined Labels layers;
+   the plugin does not create one full annotation volume per region.
+3. **Action:** Select the `MOp` and `SSp` rows in **Region Appearance** and click
+   **Assign Distinct Colors**.
+   **Expected:** The two swatches change to deterministic colors suitable for
+   napari's dark canvas, and the status reports unapplied changes. Existing
+   overlays do not change yet, and the selected query regions and query results
+   are unchanged.
+4. **Action:** Choose a child row, click its swatch to set a custom color, set
+   **Fill** to **Hide**, and give another row partial **Fill %** and **Outline
+   %** values. Select a child of a custom-colored parent and click **Use Atlas
+   Color**.
+   **Expected:** The source indicators distinguish custom, inherited, and
+   explicit atlas color. The atlas-color child keeps its own atlas color even
+   though its parent has a custom color. All changes remain staged.
+5. **Action:** Click **Apply**.
+   **Expected:** Existing CCFv3 segmentation/mesh fills and flatmap
+   label/surface fills update to the shared colors, fill visibility, and fill
+   opacity. Existing flatmap outlines update to the same colors and their
+   outline visibility/opacity. Hidden combined-label entries are transparent;
+   visible IDs remain available as label values. No CCF contour layer appears.
+   No atlas volume, NRRD, flatmap projection, mesh geometry, or region cache is
+   rebuilt.
+6. **Action:** Change a Reference opacity slider and toggle a styled napari
+   layer's eye icon, then apply another region edit.
+   **Expected:** The family opacity remains the global value and each per-region
+   opacity remains a multiplier beneath it. A layer hidden with napari's eye
+   icon stays globally hidden after **Apply**. Region visibility still does not
+   alter query selection.
+7. **Action:** Stage a different color or visibility value and click **Revert**.
+   **Expected:** The staged controls return to the applied palette and every
+   rendered layer remains unchanged.
+8. **Action:** Click **Export Applied Palette...**, save the JSON file, clear or
+   change several overrides with **Inherit** and **Apply**, then click **Import
+   Palette...** and choose the exported file. Try **Merge**, repeat the import,
+   and try **Replace**; click **Apply** after each accepted import.
+   **Expected:** Import first summarizes matching overrides and offers
+   **Merge**, **Replace**, and **Cancel**. **Merge** preserves unrelated staged
+   overrides; **Replace** removes them. The imported palette remains staged
+   until **Apply**, after which the two coordinate spaces again agree.
+9. **Action:** Attempt to import a palette whose atlas name differs, then one
+   with the same name but a different version, and one containing an unknown
+   numeric region ID.
+   **Expected:** An atlas-name mismatch is rejected. A version mismatch requires
+   confirmation before matching IDs are imported. Unknown IDs are skipped and
+   their count is reported.
+10. **Action:** Stage an unapplied edit and click **Save Project As...**. Test
+    **Cancel**, then repeat and test **Discard**, and finally repeat with an edit
+    and test **Apply**.
+    **Expected:** **Cancel** stops the save. **Discard** saves the previously
+    applied palette and removes the draft. **Apply** first updates the overlays
+    and saves that newly applied palette, so the project never silently records
+    an ambiguous draft.
+11. **Action:** Close the project, click **Load Project...**, and reopen the
+    saved bundle. Also open a project bundle created before Region Appearance
+    was added.
+    **Expected:** The new project restores its applied palette and newly created
+    overlays use it. The older project opens normally with an empty palette and
+    atlas-color defaults.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: Added on 2026-08-20. Automated tests cover ancestry resolution,
+  explicit atlas-color breaks, transparent combined-label entries, per-region
+  mesh and flatmap styling, in-place restyling without cache/NRRD work, palette
+  JSON and project round trips, import filtering, and old-project compatibility.
+  Qt-dependent interaction and visual co-registration still require this manual
+  napari run.
 
 ## Use-Case Template
 

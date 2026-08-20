@@ -91,9 +91,27 @@ from ..isocortex_layers import (
     AllenIsocortexLayerMap,
     layer_map_from_atlas,
 )
+from ..region_appearance import RegionAppearanceStore, structure_catalog
 from ..swc import NodeType
 
 logger = logging.getLogger(__name__)
+
+
+def _region_layer_base_visible(layer) -> bool:
+    """Return the current napari layer visibility before region styling."""
+    current = bool(getattr(layer, "visible", True))
+    base = bool(getattr(layer, "_napari_swc_region_base_visible", True))
+    previous = getattr(layer, "_napari_swc_region_applied_visible", None)
+    if previous is not None and current != bool(previous):
+        base = current
+        setattr(layer, "_napari_swc_region_base_visible", base)
+    return base
+
+
+def _set_region_layer_visible(layer, visible: bool) -> None:
+    layer.visible = bool(visible)
+    setattr(layer, "_napari_swc_region_applied_visible", bool(visible))
+
 
 _SOURCE_SELECTED = "selected"
 _SOURCE_ALL = "all"
@@ -198,6 +216,7 @@ class FlatmapProjectionWidget(QWidget):
         selected_region_source_provider: Callable[[], str] | None = None,
         selected_region_scope_provider: Callable[[], str] | None = None,
         selected_region_error_provider: Callable[[], str | None] | None = None,
+        region_appearance_provider: Callable[[], RegionAppearanceStore] | None = None,
         display_viewer_provider: Callable[..., object | None] | None = None,
         display_viewer_ready_callback: Callable[[object, object], None] | None = None,
         display_viewer_failed_callback: Callable[[object, str], None] | None = None,
@@ -239,6 +258,9 @@ class FlatmapProjectionWidget(QWidget):
         )
         self._selected_region_error_provider = selected_region_error_provider or (
             lambda: None
+        )
+        self._region_appearance_provider = region_appearance_provider or (
+            lambda: RegionAppearanceStore()
         )
 
         self._flatmap_path: Path | None = None
@@ -4175,6 +4197,8 @@ class FlatmapProjectionWidget(QWidget):
         axis_labels: tuple[str, ...] | None = None,
         layer_name: str = _REGION_LABELS_LAYER_NAME,
     ):
+        metadata = dict(metadata)
+        metadata["region_layer_kind"] = "flatmap_labels"
         viewer = self._display_viewer()
         layer = self._region_labels_layer
         if not self._layer_is_in_viewer(layer, viewer=viewer):
@@ -4225,6 +4249,7 @@ class FlatmapProjectionWidget(QWidget):
                 refresh()
 
         setattr(layer, "_napari_swc_flatmap_region_labels_result", result)
+        setattr(layer, "_napari_swc_region_base_opacity", 0.35)
         return layer
 
     @staticmethod
@@ -4254,8 +4279,16 @@ class FlatmapProjectionWidget(QWidget):
         except (KeyError, TypeError):
             return None
 
-    @classmethod
-    def _region_label_colormap(cls, atlas, region_ids: list[int]):
+    def _region_appearance_store(self) -> RegionAppearanceStore:
+        provider = getattr(self, "_region_appearance_provider", None)
+        store = provider() if callable(provider) else None
+        return (
+            store
+            if isinstance(store, RegionAppearanceStore)
+            else RegionAppearanceStore()
+        )
+
+    def _region_label_colormap(self, atlas, region_ids: list[int]):
         if atlas is None:
             return None
         try:
@@ -4267,22 +4300,14 @@ class FlatmapProjectionWidget(QWidget):
             None: np.array([0, 0, 0, 0], dtype=np.float32),
             0: np.array([0, 0, 0, 0], dtype=np.float32),
         }
+        appearance_store = self._region_appearance_store()
+        catalog = structure_catalog(getattr(atlas, "structures", None))
         for region_id in region_ids:
-            structure = cls._atlas_structure_for_region_id(atlas, int(region_id))
-            if structure is None:
-                rgb = [128, 128, 128]
-            else:
-                rgb = structure.get("rgb_triplet", [128, 128, 128])
-            rgba = np.asarray(
-                [
-                    float(rgb[0]) / 255.0,
-                    float(rgb[1]) / 255.0,
-                    float(rgb[2]) / 255.0,
-                    1.0,
-                ],
-                dtype=np.float32,
+            effective = appearance_store.resolve(
+                int(region_id),
+                catalog,
             )
-            color_dict[int(region_id)] = rgba
+            color_dict[int(region_id)] = effective.fill_rgba
         return DirectLabelColormap(color_dict=color_dict)
 
     def _clear_region_labels(self) -> None:
@@ -4317,6 +4342,12 @@ class FlatmapProjectionWidget(QWidget):
         return np.asarray(
             [float(rgb[0]) / 255, float(rgb[1]) / 255, float(rgb[2]) / 255, 1],
             dtype=np.float32,
+        )
+
+    def _effective_region_appearance(self, atlas, region_id: int):
+        return self._region_appearance_store().resolve(
+            int(region_id),
+            getattr(atlas, "structures", None),
         )
 
     @classmethod
@@ -4414,7 +4445,8 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 if surface is None or not len(surface.faces):
                     continue
-                rgba = self._atlas_region_rgba(atlas, region_id)
+                effective = self._effective_region_appearance(atlas, region_id)
+                rgba = np.asarray(effective.color_rgba, dtype=np.float32)
                 name = self._cached_geometry_layer_name(
                     _REGION_SURFACES_LAYER_NAME,
                     atlas,
@@ -4429,6 +4461,7 @@ class FlatmapProjectionWidget(QWidget):
                     selected_region_ids=geometry_ids,
                 )
                 metadata["component_count"] = int(surface.component_count)
+                metadata["region_layer_kind"] = "flatmap_surface"
                 layer = viewer.add_surface(
                     (
                         np.array(surface.vertices, dtype=np.float32, copy=True),
@@ -4438,8 +4471,16 @@ class FlatmapProjectionWidget(QWidget):
                     name=name,
                     colormap=Colormap(np.vstack([rgba, rgba])),
                     contrast_limits=(0.0, 1.0),
-                    opacity=0.45,
+                    opacity=0.45 * effective.fill_opacity,
+                    visible=effective.fill_visible,
                     metadata=metadata,
+                )
+                setattr(layer, "_napari_swc_region_base_opacity", 0.45)
+                setattr(layer, "_napari_swc_region_base_visible", True)
+                setattr(
+                    layer,
+                    "_napari_swc_region_applied_visible",
+                    bool(layer.visible),
                 )
                 created.append(layer)
             self._region_surfaces_layers = created
@@ -4515,6 +4556,8 @@ class FlatmapProjectionWidget(QWidget):
                         "label_grouping": str(result.grid_spec["label_grouping"]),
                     }
                 )
+                effective = self._effective_region_appearance(atlas, region_id)
+                metadata["region_layer_kind"] = "flatmap_outline"
                 layer = viewer.add_vectors(
                     np.array(outlines.vectors, dtype=np.float32, copy=True),
                     name=self._cached_geometry_layer_name(
@@ -4523,15 +4566,23 @@ class FlatmapProjectionWidget(QWidget):
                         region_id,
                         selection_count=len(geometry_ids),
                     ),
-                    edge_color=self._atlas_region_rgba(atlas, region_id),
+                    edge_color=np.asarray(effective.color_rgba, dtype=np.float32),
                     edge_width=_FLAT_REGION_OUTLINE_EDGE_WIDTH,
-                    opacity=0.9,
+                    opacity=0.9 * effective.outline_opacity,
+                    visible=effective.outline_visible,
                     # napari draws an arrowhead per segment by default, which
                     # reads as a field of arrows rather than a boundary.
                     vector_style="line",
                     blending="translucent",
                     axis_labels=self._flat_axis_labels(),
                     metadata=metadata,
+                )
+                setattr(layer, "_napari_swc_region_base_opacity", 0.9)
+                setattr(layer, "_napari_swc_region_base_visible", True)
+                setattr(
+                    layer,
+                    "_napari_swc_region_applied_visible",
+                    bool(layer.visible),
                 )
                 created.append(layer)
             self._region_outlines_layers = created
@@ -4584,29 +4635,40 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 if outlines is None or not len(outlines.vectors):
                     continue
-                rgba = self._atlas_region_rgba(atlas, region_id)
+                effective = self._effective_region_appearance(atlas, region_id)
+                rgba = np.asarray(effective.color_rgba, dtype=np.float32)
                 name = self._cached_geometry_layer_name(
                     _REGION_OUTLINES_LAYER_NAME,
                     atlas,
                     region_id,
                     selection_count=len(geometry_ids),
                 )
+                metadata = self._cached_geometry_metadata(
+                    projection_kind="flatmap_region_outlines",
+                    profile=profile,
+                    atlas=atlas,
+                    region_id=region_id,
+                    selected_region_ids=geometry_ids,
+                )
+                metadata["region_layer_kind"] = "flatmap_outline"
                 layer = viewer.add_vectors(
                     np.array(outlines.vectors, dtype=np.float32, copy=True),
                     name=name,
                     edge_color=rgba,
                     edge_width=1.5,
-                    opacity=0.9,
+                    opacity=0.9 * effective.outline_opacity,
+                    visible=effective.outline_visible,
                     # Perimeter segments are boundaries, not directed vectors;
                     # napari's default style would put an arrowhead on each one.
                     vector_style="line",
-                    metadata=self._cached_geometry_metadata(
-                        projection_kind="flatmap_region_outlines",
-                        profile=profile,
-                        atlas=atlas,
-                        region_id=region_id,
-                        selected_region_ids=geometry_ids,
-                    ),
+                    metadata=metadata,
+                )
+                setattr(layer, "_napari_swc_region_base_opacity", 0.9)
+                setattr(layer, "_napari_swc_region_base_visible", True)
+                setattr(
+                    layer,
+                    "_napari_swc_region_applied_visible",
+                    bool(layer.visible),
                 )
                 created.append(layer)
             self._region_outlines_layers = created
@@ -4648,6 +4710,84 @@ class FlatmapProjectionWidget(QWidget):
         self._clear_region_surface_layers()
         self._clear_region_outline_layers()
         self._set_region_labels_status("Cleared cached flatmap region geometry.")
+
+    def apply_region_appearance(self) -> None:
+        """Restyle current flatmap region layers without materializing data."""
+        layers = self._display_layers(create=False)
+        atlas = self._atlas_provider()
+        if layers is None or atlas is None:
+            return
+        appearance_store = self._region_appearance_store()
+        try:
+            from napari.utils.colormaps import Colormap
+        except Exception:
+            Colormap = None  # type: ignore[assignment,misc]
+
+        for layer in list(layers):
+            metadata = getattr(layer, "metadata", None)
+            if not isinstance(metadata, Mapping):
+                continue
+            kind = str(metadata.get("region_layer_kind", "") or "")
+            if kind == "flatmap_labels":
+                result = getattr(
+                    layer,
+                    "_napari_swc_flatmap_region_labels_result",
+                    None,
+                )
+                region_ids = (
+                    getattr(result, "represented_region_ids", None)
+                    if result is not None
+                    else None
+                ) or metadata.get("represented_region_ids", ())
+                colormap = self._region_label_colormap(
+                    atlas,
+                    [int(value) for value in region_ids],
+                )
+                if colormap is not None:
+                    layer.colormap = colormap
+            elif kind == "flatmap_surface":
+                region_id = int(metadata.get("region_id", 0) or 0)
+                if region_id <= 0 or Colormap is None:
+                    continue
+                effective = appearance_store.resolve(
+                    region_id,
+                    getattr(atlas, "structures", None),
+                )
+                rgba = np.asarray(effective.color_rgba, dtype=np.float32)
+                layer.colormap = Colormap(np.vstack([rgba, rgba]))
+                base_opacity = float(
+                    getattr(layer, "_napari_swc_region_base_opacity", 0.45)
+                )
+                layer.opacity = base_opacity * effective.fill_opacity
+                _set_region_layer_visible(
+                    layer,
+                    _region_layer_base_visible(layer) and effective.fill_visible,
+                )
+            elif kind == "flatmap_outline":
+                region_id = int(metadata.get("region_id", 0) or 0)
+                if region_id <= 0:
+                    continue
+                effective = appearance_store.resolve(
+                    region_id,
+                    getattr(atlas, "structures", None),
+                )
+                layer.edge_color = np.asarray(
+                    effective.color_rgba,
+                    dtype=np.float32,
+                )
+                base_opacity = float(
+                    getattr(layer, "_napari_swc_region_base_opacity", 0.9)
+                )
+                layer.opacity = base_opacity * effective.outline_opacity
+                _set_region_layer_visible(
+                    layer,
+                    _region_layer_base_visible(layer) and effective.outline_visible,
+                )
+            else:
+                continue
+            refresh = getattr(layer, "refresh", None)
+            if callable(refresh):
+                refresh()
 
     def _color_for_file_id(
         self,
