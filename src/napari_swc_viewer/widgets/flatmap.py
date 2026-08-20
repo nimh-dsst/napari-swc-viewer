@@ -3947,6 +3947,12 @@ class FlatmapProjectionWidget(QWidget):
                         for value in flat_result.represented_source_region_ids
                     ],
                     "label_grouping": str(flat_result.grid_spec["label_grouping"]),
+                    "geometry_grouping": str(
+                        flat_result.grid_spec.get(
+                            "geometry_grouping",
+                            flat_result.grid_spec["label_grouping"],
+                        )
+                    ),
                 }
             )
         layer = self._create_or_update_region_labels_layer(
@@ -4211,7 +4217,10 @@ class FlatmapProjectionWidget(QWidget):
             layer_name,
             viewer=viewer,
         )
-        colormap = self._region_label_colormap(atlas, result.represented_region_ids)
+        colormap = self._region_label_colormap(
+            atlas,
+            self._region_label_ids(result=result),
+        )
         kwargs: dict[str, object] = {
             "name": layer_name,
             "opacity": 0.35,
@@ -4287,6 +4296,27 @@ class FlatmapProjectionWidget(QWidget):
             if isinstance(store, RegionAppearanceStore)
             else RegionAppearanceStore()
         )
+
+    @staticmethod
+    def _region_label_ids(
+        *,
+        result=None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> list[int]:
+        """Return the atlas IDs stored as values in a region Labels layer."""
+        if result is not None:
+            source_ids = getattr(result, "represented_source_region_ids", None)
+            if source_ids is not None:
+                return [int(value) for value in source_ids]
+            represented_ids = getattr(result, "represented_region_ids", ())
+            return [int(value) for value in represented_ids]
+        if metadata is not None:
+            source_ids = metadata.get("represented_source_region_ids")
+            if source_ids is not None:
+                return [int(value) for value in source_ids]  # type: ignore[union-attr]
+            represented_ids = metadata.get("represented_region_ids", ())
+            return [int(value) for value in represented_ids]  # type: ignore[union-attr]
+        return []
 
     def _region_label_colormap(self, atlas, region_ids: list[int]):
         if atlas is None:
@@ -4554,6 +4584,12 @@ class FlatmapProjectionWidget(QWidget):
                         ],
                         "planar_bin_count": int(outlines.planar_bin_count),
                         "label_grouping": str(result.grid_spec["label_grouping"]),
+                        "geometry_grouping": str(
+                            result.grid_spec.get(
+                                "geometry_grouping",
+                                result.grid_spec["label_grouping"],
+                            )
+                        ),
                     }
                 )
                 effective = self._effective_region_appearance(atlas, region_id)
@@ -4734,14 +4770,9 @@ class FlatmapProjectionWidget(QWidget):
                     "_napari_swc_flatmap_region_labels_result",
                     None,
                 )
-                region_ids = (
-                    getattr(result, "represented_region_ids", None)
-                    if result is not None
-                    else None
-                ) or metadata.get("represented_region_ids", ())
                 colormap = self._region_label_colormap(
                     atlas,
-                    [int(value) for value in region_ids],
+                    self._region_label_ids(result=result, metadata=metadata),
                 )
                 if colormap is not None:
                     layer.colormap = colormap

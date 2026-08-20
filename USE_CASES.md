@@ -1507,11 +1507,19 @@ time from an existing flatmap region cache, without rebuilding it and without
 loading NRRDs, `atlas.annotation`, or BrainGlobe meshes. Before this, a 2D flat
 map had no anatomical frame of reference at all.
 
-Both overlays combine cortical depth **per selected region**, so selecting
-`Isocortex` produces one footprint and selecting several areas produces an area
-map. This is the whole point of the workflow: collapsing the terminal *layer*
-regions instead would make every cortical column a contest between its own
-layers, and the thickest layer would win in each one.
+The filled Labels overlay preserves descendant region identity after depth is
+collapsed. Each source region's counts are first summed through depth; when
+several descendants occupy the same flatmap column, the region with the largest
+count supplies that pixel's label ID, with the smaller ID winning a tie. This
+lets **Region Appearance** recolor a child independently while unchanged
+children still inherit an overridden parent color. A 2D pixel can represent
+only one of its depth-overlapping descendants, so this majority rule is an
+explicit part of the view rather than a biological partition of the column.
+
+Outlines keep different semantics: they union all selected descendants under
+each directly selected parent. Selecting `Isocortex` therefore produces one
+outer Isocortex perimeter even though its filled overlay retains the winning
+descendant ID in each pixel.
 
 **Prerequisites**
 
@@ -1539,11 +1547,13 @@ layers, and the thickest layer would win in each one.
 2. **Action:** In **Regions**, set **Query source** to **Atlas Regions**, enable
    **Include child regions**, check only `Isocortex`, and click **Show Region
    Labels**.
-   **Expected:** A layer named **Flatmap Region Labels 2D** draws one solid
-   Isocortex-colored footprint. There is no plane slider and no plane caption,
-   and the **Flatmap X** / **Flatmap Y** axis captions are shown. The status line
-   reports the collapsed bin count, the number of selected regions represented,
-   and the profile ID.
+   **Expected:** A layer named **Flatmap Region Labels 2D** draws the Isocortex
+   footprint with descendant source-region IDs retained. Each pixel shows the
+   descendant with the largest depth-summed occupancy in that flatmap column;
+   equal counts choose the smaller ID. There is no plane slider or plane
+   caption, and the **Flatmap X** / **Flatmap Y** axis captions are shown. The
+   status line reports the collapsed bin count, the number of directly selected
+   regions represented, and the profile ID.
 3. **Action:** Zoom into a boundary between lit heatmap pixels and unlabeled
    background.
    **Expected:** The label edge sits exactly on heatmap pixel boundaries, with no
@@ -1557,13 +1567,15 @@ layers, and the thickest layer would win in each one.
    camera stays where it was rather than re-centring.
 5. **Action:** Uncheck `Isocortex`, check `MOp` and `SSp`, then click **Show
    Region Labels** followed by **Show Region Outlines**.
-   **Expected:** The label image shows two differently colored areas meeting on a
-   shared boundary, not a patchwork of cortical layers. Two outline layers appear,
-   named `Flatmap Region Outlines 2D: MOp (985)` and
+   **Expected:** Every nonzero label ID belongs to the selected `MOp` or `SSp`
+   descendant sets, with overlaps resolved by depth-summed occupancy. Two
+   parent-union outline layers appear, named
+   `Flatmap Region Outlines 2D: MOp (985)` and
    `Flatmap Region Outlines 2D: SSp (322)`.
 6. **Action:** Hover the cursor over a labeled pixel.
-   **Expected:** napari's status bar reports the ID of the area you selected
-   (`985` or `322`), not a terminal layer region such as `MOp5`.
+   **Expected:** napari's status bar reports the winning descendant/source ID
+   stored in that pixel, such as `MOp5`, rather than rewriting every pixel to
+   the directly selected parent ID (`985` or `322`).
 7. **Action:** Switch **Query source** to **Custom Regions**, check two terminal
    layer regions, and click **Show Region Outlines**.
    **Expected:** One acronym/ID-named, atlas-colored outline layer appears per
@@ -1611,25 +1623,24 @@ layers, and the thickest layer would win in each one.
   this use case needs a cache rebuilt under the new format; the 2D label image
   is now `Y bins x X bins` rather than square. Automated tests in
   `tests/test_flatmap_region_cache.py` cover the depth-collapse arithmetic,
-  per-selection aggregation (a single selected root reports zero collisions where
-  the depth-grid materializer reports one), assignment of members to several roots
-  from either an explicit descendant map or a structure catalog, the refusal when
-  neither is available, reuse of the stored depth-free perimeter tracer, agreement
-  between the flat and Allen-layer collapses, and that neither new materializer
-  changes `profile_id` or the manifest. `tests/test_flatmap_widget.py` covers the
+  source-ID retention beneath a single selected root, majority and tie
+  resolution, assignment of members to several outline roots from either an
+  explicit descendant map or a structure catalog, the refusal when neither is
+  available, reuse of the stored depth-free perimeter tracer, agreement between
+  the flat and Allen-layer footprints, and that neither materializer changes
+  `profile_id` or the manifest. `tests/test_flatmap_widget.py` covers the
   button-enable matrix in both flat modes, agreement between the two gating call
-  sites across five render modes and two sources, the 2D layer names, axis
-  captions, plane-mode metadata, `ndisplay`, absence of `scale`/`translate`, a
-  single materializer call for a multi-region outline request, and overlay
-  retirement. Verified numerically against
+  sites across five render modes and two sources, the 2D layer names, descendant
+  colormap IDs, axis captions, plane-mode metadata, `ndisplay`, absence of
+  `scale`/`translate`, a single materializer call for a multi-region outline
+  request, and overlay retirement. Verified numerically against
   `/Users/lawrimorejg/Downloads/flatmap_cache_25` (shaped, 240 leaf regions):
-  `Isocortex` collapses to 43,967 bins with **0** collisions and a 1,506-segment
-  perimeter in 0.105 s, while collapsing the same selection at leaf level leaves
-  43,863 of 43,967 columns contested (L5 winning 53%, L2/3 33%) — the patchwork
-  the per-selection rule exists to prevent. `MOp`+`SSp`+`VISp`+`AUD` gives four
-  labels with 247 of 16,816 columns contested, all at genuine area boundaries.
-  None of that shows whether the overlays read correctly on the canvas, so
-  steps 3, 4, 6, and 8 still need eyes.
+  the `Isocortex` union occupies 43,967 bins with a 1,506-segment perimeter in
+  0.105 s; 43,863 columns contain competing descendant sources (L5 wins 53% and
+  L2/3 33% under the majority rule measured before this UI change). Those
+  existing measurements need to be rerun against the retained-ID Labels layer.
+  None of this shows whether the overlays or child recoloring read correctly on
+  the canvas, so steps 2-6 and 8 still need eyes.
 
 ### UC-014: Control and Share Region Appearance Across CCFv3 and Flatmap Views
 
@@ -1649,6 +1660,12 @@ properties, select **Use Atlas Color** to break inherited color, or select
 combined napari Labels layer: hidden IDs become transparent colormap entries
 rather than separate volumes. CCFv3 has no per-region contour layer, so outline
 settings affect flatmap outlines only.
+
+The depth-free 2D flatmap retains descendant/source IDs in that combined Labels
+layer. Where descendants overlap in one XY column, depth-summed occupancy picks
+one displayed ID by majority, with the smaller ID breaking a tie. Child colors
+therefore remain independently addressable, but only the winning descendant is
+visible at a given 2D pixel; the 3D layer continues to preserve depth planes.
 
 **Prerequisites**
 
@@ -1697,10 +1714,12 @@ settings affect flatmap outlines only.
    **Expected:** Existing CCFv3 segmentation/mesh fills and flatmap
    label/surface fills update to the shared colors, fill visibility, and fill
    opacity. Existing flatmap outlines update to the same colors and their
-   outline visibility/opacity. Hidden combined-label entries are transparent;
-   visible IDs remain available as label values. No CCF contour layer appears.
-   No atlas volume, NRRD, flatmap projection, mesh geometry, or region cache is
-   rebuilt.
+   outline visibility/opacity. In the depth-free **Flatmap Region Labels 2D**
+   layer, a child override recolors pixels whose retained label value is that
+   child ID, while sibling IDs without an override inherit the parent setting.
+   Hidden combined-label entries are transparent; visible IDs remain available
+   as label values. No CCF contour layer appears. No atlas volume, NRRD,
+   flatmap projection, mesh geometry, or region cache is rebuilt.
 6. **Action:** Change a Reference opacity slider and toggle a styled napari
    layer's eye icon, then apply another region edit.
    **Expected:** The family opacity remains the global value and each per-region
@@ -1744,10 +1763,11 @@ settings affect flatmap outlines only.
 - Last verified: Never
 - Notes: Added on 2026-08-20. Automated tests cover ancestry resolution,
   explicit atlas-color breaks, transparent combined-label entries, per-region
-  mesh and flatmap styling, in-place restyling without cache/NRRD work, palette
-  JSON and project round trips, import filtering, and old-project compatibility.
-  Qt-dependent interaction and visual co-registration still require this manual
-  napari run.
+  mesh and flatmap styling, retained descendant IDs and inherited/overridden
+  colors in a 2D Labels layer, in-place restyling without cache/NRRD work,
+  palette JSON and project round trips, import filtering, and old-project
+  compatibility. Qt-dependent interaction and visual co-registration still
+  require this manual napari run.
 
 ## Use-Case Template
 
