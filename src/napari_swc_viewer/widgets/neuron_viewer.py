@@ -2909,6 +2909,17 @@ class NeuronViewerWidget(QWidget):
         state_changed = getattr(self._neuron_table, "state_changed", None)
         if state_changed is not None:
             state_changed.connect(self._refresh_neuron_table_summary)
+
+        self._adaptive_table_height_cb = QCheckBox("Adaptive table height")
+        self._adaptive_table_height_cb.setChecked(True)
+        self._adaptive_table_height_cb.setToolTip(
+            "Grow the table with its visible rows (up to 20). Uncheck to use "
+            "a fixed eight-row viewport."
+        )
+        self._adaptive_table_height_cb.toggled.connect(
+            self._neuron_table.set_adaptive_height_enabled
+        )
+        neurons_layout.addWidget(self._adaptive_table_height_cb)
         neurons_layout.addWidget(self._neuron_table)
 
         assignment_row = QHBoxLayout()

@@ -207,12 +207,47 @@ def _make_widget(module, entries_by_file_id: dict[object, object]):
     )
     widget.selection_changed = _DummySignal()
     widget.state_changed = _DummySignal()
+    widget.preferred_height_row_counts = []
+
+    def _refresh_preferred_height(*, visible_row_count=None) -> None:
+        widget.preferred_height_row_counts.append(visible_row_count)
+
+    widget._refresh_preferred_height = _refresh_preferred_height
 
     def _populate_row(row: int, entry) -> None:
         widget._table.set_file_id(row, entry.file_id)
 
     widget._populate_row = _populate_row
     return widget
+
+
+def test_preferred_visible_row_count_grows_and_caps() -> None:
+    module = _import_neuron_table_module()
+
+    assert module._preferred_visible_row_count(0) == 4
+    assert module._preferred_visible_row_count(3) == 4
+    assert module._preferred_visible_row_count(12) == 12
+    assert module._preferred_visible_row_count(20) == 20
+    assert module._preferred_visible_row_count(200) == 20
+
+
+def test_preferred_visible_row_count_is_stable_in_fixed_mode() -> None:
+    module = _import_neuron_table_module()
+
+    assert module._preferred_visible_row_count(0, adaptive=False) == 8
+    assert module._preferred_visible_row_count(200, adaptive=False) == 8
+
+
+def test_set_adaptive_height_enabled_refreshes_the_viewport() -> None:
+    module = _import_neuron_table_module()
+    widget = module.NeuronTableWidget.__new__(module.NeuronTableWidget)
+    refresh_calls = []
+    widget._refresh_preferred_height = lambda: refresh_calls.append(True)
+
+    widget.set_adaptive_height_enabled(False)
+
+    assert widget._adaptive_height_enabled is False
+    assert refresh_calls == [True]
 
 
 def test_neuron_table_retain_file_ids_preserves_survivor_state() -> None:
@@ -464,6 +499,7 @@ def test_neuron_table_apply_filters_intersects_cluster_and_heatmap_filters() -> 
         1: False,
         2: True,
     }
+    assert widget.preferred_height_row_counts == [1]
 
 
 def test_neuron_table_apply_filters_manual_heatmap_uses_string_fallback() -> None:
@@ -482,6 +518,7 @@ def test_neuron_table_apply_filters_manual_heatmap_uses_string_fallback() -> Non
         0: False,
         1: True,
     }
+    assert widget.preferred_height_row_counts == [1]
 
 
 def test_neuron_table_select_file_ids_selects_multiple_visible_rows_once() -> None:

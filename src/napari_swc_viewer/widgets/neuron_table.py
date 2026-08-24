@@ -81,6 +81,27 @@ _EDITABLE_METADATA_COLUMNS = {
     COL_NOTES: "notes",
 }
 
+# Keep a useful empty-state viewport, then grow with the result set until the
+# table is tall enough for routine multi-neuron work.  Larger result sets keep
+# using the table's own scrollbar so the controls below it remain reachable.
+_MIN_PREFERRED_VISIBLE_ROWS = 4
+_MAX_PREFERRED_VISIBLE_ROWS = 20
+_FIXED_VISIBLE_ROWS = 8
+
+
+def _preferred_visible_row_count(
+    visible_row_count: int,
+    *,
+    adaptive: bool = True,
+) -> int:
+    """Return the bounded number of rows the table should make visible."""
+    if not adaptive:
+        return _FIXED_VISIBLE_ROWS
+    return min(
+        max(int(visible_row_count), _MIN_PREFERRED_VISIBLE_ROWS),
+        _MAX_PREFERRED_VISIBLE_ROWS,
+    )
+
 
 class _NumericSortItem(QTableWidgetItem):
     """Table item that sorts by numeric key stored in ``Qt.UserRole``."""
@@ -225,6 +246,8 @@ class NeuronTableWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._table = QTableWidget(0, 11)
+        self._adaptive_height_enabled = True
+        self._table_maximum_height = self._table.maximumHeight()
         self._configure_cluster_columns()
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -248,6 +271,63 @@ class NeuronTableWidget(QWidget):
         self._table.setSortingEnabled(True)
 
         layout.addWidget(self._table)
+        self._refresh_preferred_height(visible_row_count=0)
+
+    def _refresh_preferred_height(
+        self,
+        *,
+        visible_row_count: int | None = None,
+    ) -> None:
+        """Grow the table with its visible rows, up to the viewport row cap."""
+        adaptive = bool(self.__dict__.get("_adaptive_height_enabled", True))
+        if visible_row_count is None:
+            visible_row_count = (
+                sum(
+                    not self._table.isRowHidden(row)
+                    for row in range(self._table.rowCount())
+                )
+                if adaptive
+                else 0
+            )
+
+        preferred_rows = _preferred_visible_row_count(
+            visible_row_count,
+            adaptive=adaptive,
+        )
+        horizontal_header = self._table.horizontalHeader()
+        header_height = max(
+            horizontal_header.height(),
+            horizontal_header.sizeHint().height(),
+        )
+        row_height = self._table.verticalHeader().defaultSectionSize()
+        scrollbar_height = self._table.horizontalScrollBar().sizeHint().height()
+        frame_height = 2 * self._table.frameWidth()
+        preferred_height = (
+            header_height
+            + preferred_rows * row_height
+            + scrollbar_height
+            + frame_height
+        )
+
+        if adaptive:
+            # Reset the maximum left behind by ``setFixedHeight`` before
+            # lowering or raising the adaptive minimum.
+            self._table.setMaximumHeight(
+                self.__dict__.get(
+                    "_table_maximum_height",
+                    self._table.maximumHeight(),
+                )
+            )
+            self._table.setMinimumHeight(preferred_height)
+        else:
+            self._table.setFixedHeight(preferred_height)
+        self._table.updateGeometry()
+        self.updateGeometry()
+
+    def set_adaptive_height_enabled(self, enabled: bool) -> None:
+        """Switch between a fixed viewport and row-aware table height."""
+        self._adaptive_height_enabled = bool(enabled)
+        self._refresh_preferred_height()
 
     def _assignment_sets(self):
         """Return saved assignment sets, tolerating legacy test widgets."""
@@ -344,6 +424,7 @@ class NeuronTableWidget(QWidget):
             self._populate_row(row, entry)
 
         self._table.setSortingEnabled(sorting_enabled)
+        self._refresh_preferred_height(visible_row_count=n)
         self.state_changed.emit()
 
     def _populate_row(self, row: int, entry: NeuronEntry) -> None:
@@ -649,6 +730,7 @@ class NeuronTableWidget(QWidget):
             self._table.setSortingEnabled(sorting_enabled)
             self._table.blockSignals(signals_blocked)
 
+        self._refresh_preferred_height(visible_row_count=len(entries))
         self.selection_changed.emit([])
         self.state_changed.emit()
 
@@ -882,6 +964,7 @@ class NeuronTableWidget(QWidget):
             self._table.setSortingEnabled(sorting_enabled)
             self._table.blockSignals(signals_blocked)
 
+        self._refresh_preferred_height(visible_row_count=0)
         self.state_changed.emit()
 
     def retain_file_ids(
@@ -1013,12 +1096,15 @@ class NeuronTableWidget(QWidget):
         else:
             heatmap_matches = added_flags(self._entries.keys(), heatmap_file_ids)
 
+        visible_row_count = 0
         for row, file_id in self._iter_rows_with_file_ids():
             visible = cluster_matches.get(file_id, True) and heatmap_matches.get(
                 file_id,
                 False,
             )
             self._table.setRowHidden(row, not visible)
+            visible_row_count += int(visible)
+        self._refresh_preferred_height(visible_row_count=visible_row_count)
 
     def hide_all_not_in_cluster(
         self,
