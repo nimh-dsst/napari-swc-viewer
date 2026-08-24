@@ -2909,6 +2909,17 @@ class NeuronViewerWidget(QWidget):
         state_changed = getattr(self._neuron_table, "state_changed", None)
         if state_changed is not None:
             state_changed.connect(self._refresh_neuron_table_summary)
+
+        self._adaptive_table_height_cb = QCheckBox("Adaptive table height")
+        self._adaptive_table_height_cb.setChecked(True)
+        self._adaptive_table_height_cb.setToolTip(
+            "Grow the table with its visible rows (up to 20). Uncheck to use "
+            "a fixed eight-row viewport."
+        )
+        self._adaptive_table_height_cb.toggled.connect(
+            self._neuron_table.set_adaptive_height_enabled
+        )
+        neurons_layout.addWidget(self._adaptive_table_height_cb)
         neurons_layout.addWidget(self._neuron_table)
 
         assignment_row = QHBoxLayout()
@@ -8116,8 +8127,7 @@ class NeuronViewerWidget(QWidget):
             matched_file_ids = result["file_id"].tolist()
             self._neuron_table.retain_file_ids(matched_file_ids)
         else:
-            neurons = [(row["file_id"], row["subject"]) for _, row in result.iterrows()]
-            self._neuron_table.populate(neurons)
+            self._neuron_table.populate(result["file_id"].tolist())
 
         saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
         if callable(saved_state_applier):

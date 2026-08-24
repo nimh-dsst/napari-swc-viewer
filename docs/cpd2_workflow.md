@@ -182,10 +182,12 @@ region metadata for 25 um region queries.
 
 The **Selected Neurons** table is a holding area for neurons that can be
 visualized, analyzed, colored, filtered, or exported. Rows in this table are not
-automatically rendered in the napari scene. The table lets you select rows,
-toggle `Vis`, inspect `Added`, `Heatmap`, `Neuron ID`, `Subject`, editable
-`Label`/`Group`/`Tags`/`Notes`, saved cluster-assignment columns, and `Color`,
-and then decide which rows to render or use for heatmaps.
+automatically rendered in the napari scene. Use **Table view** to switch among
+focused **Default**, **Notes**, **Visibility**, **Label**, and **Full** column
+sets. Together the views let you select rows, toggle `Vis`, inspect `Added`,
+`Heatmap`, `Neuron Name`, editable `Label`/`Group`/`Tags`/`Notes`, saved
+cluster-assignment columns, and `Color`, and then decide which rows to render or
+use for heatmaps.
 
 ## Add soma markers for all 77 neurons
 

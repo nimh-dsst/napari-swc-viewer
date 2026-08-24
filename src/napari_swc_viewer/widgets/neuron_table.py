@@ -3,7 +3,8 @@
 Provides an interactive table for viewing and controlling neurons:
 - Toggle neuron visibility on/off
 - Track whether a neuron is currently added to the scene
-- View neuron ID, subject, and cluster assignment
+- Switch between focused column views
+- View neuron name and cluster assignments
 - Edit neuron colors via color picker
 """
 
@@ -21,8 +22,10 @@ from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QColorDialog,
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -56,19 +59,17 @@ COL_VISIBLE = 0
 COL_ADDED = 1
 COL_HEATMAP = 2
 COL_NEURON_ID = 3
-COL_SUBJECT = 4
-COL_LABEL = 5
-COL_GROUP = 6
-COL_TAGS = 7
-COL_NOTES = 8
-COL_CLUSTER = 9
-COL_COLOR = 10
+COL_LABEL = 4
+COL_GROUP = 5
+COL_TAGS = 6
+COL_NOTES = 7
+COL_CLUSTER = 8
+COL_COLOR = 9
 _BASE_HEADERS = [
     "Vis",
     "Added",
     "Heatmap",
-    "Neuron ID",
-    "Subject",
+    "Neuron Name",
     "Label",
     "Group",
     "Tags",
@@ -80,6 +81,56 @@ _EDITABLE_METADATA_COLUMNS = {
     COL_TAGS: "tags",
     COL_NOTES: "notes",
 }
+
+_DEFAULT_TABLE_VIEW = "default"
+_TABLE_VIEW_DEFINITIONS = {
+    "default": (
+        "Default",
+        frozenset({COL_NEURON_ID}),
+        True,
+    ),
+    "notes": (
+        "Notes",
+        frozenset({COL_NEURON_ID, COL_NOTES}),
+        True,
+    ),
+    "visibility": (
+        "Visibility",
+        frozenset({COL_VISIBLE, COL_ADDED, COL_HEATMAP, COL_NEURON_ID}),
+        False,
+    ),
+    "label": (
+        "Label",
+        frozenset({COL_NEURON_ID, COL_LABEL, COL_GROUP, COL_TAGS}),
+        True,
+    ),
+    "full": (
+        "Full",
+        frozenset(range(COL_CLUSTER)),
+        True,
+    ),
+}
+
+# Keep a useful empty-state viewport, then grow with the result set until the
+# table is tall enough for routine multi-neuron work.  Larger result sets keep
+# using the table's own scrollbar so the controls below it remain reachable.
+_MIN_PREFERRED_VISIBLE_ROWS = 4
+_MAX_PREFERRED_VISIBLE_ROWS = 20
+_FIXED_VISIBLE_ROWS = 8
+
+
+def _preferred_visible_row_count(
+    visible_row_count: int,
+    *,
+    adaptive: bool = True,
+) -> int:
+    """Return the bounded number of rows the table should make visible."""
+    if not adaptive:
+        return _FIXED_VISIBLE_ROWS
+    return min(
+        max(int(visible_row_count), _MIN_PREFERRED_VISIBLE_ROWS),
+        _MAX_PREFERRED_VISIBLE_ROWS,
+    )
 
 
 class _NumericSortItem(QTableWidgetItem):
@@ -98,7 +149,6 @@ class NeuronEntry:
     """Per-neuron state tracked by the neuron selection table."""
 
     file_id: object
-    subject: str
     color: list[float] = field(default_factory=lambda: list(GRAY_RGBA))
     cluster_id: int | None = None
     visible: bool = True
@@ -113,7 +163,6 @@ class NeuronEntry:
         """Return a JSON-safe representation of this row."""
         return {
             "file_id": self.file_id,
-            "subject": self.subject,
             "color": list(self.color),
             "cluster_id": self.cluster_id,
             "visible": self.visible,
@@ -170,7 +219,6 @@ class NeuronEntry:
                 normalized_heatmaps = ()
         return cls(
             file_id="" if file_id is None else file_id,
-            subject=str(state.get("subject") or ""),
             color=color_values[:4],
             cluster_id=cluster_id,
             visible=bool(state.get("visible", True)),
@@ -218,29 +266,35 @@ class NeuronTableWidget(QWidget):
             else ClusterAssignmentStore()
         )
         self._cluster_column_by_id: dict[str, int] = {}
+        self._current_table_view = _DEFAULT_TABLE_VIEW
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 11)
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("Table view:"))
+        self._table_view_combo = QComboBox()
+        for view_key, (
+            label,
+            _columns,
+            _show_clusters,
+        ) in _TABLE_VIEW_DEFINITIONS.items():
+            self._table_view_combo.addItem(label, view_key)
+        self._table_view_combo.currentIndexChanged.connect(self._on_table_view_changed)
+        view_row.addWidget(self._table_view_combo, 1)
+        layout.addLayout(view_row)
+
+        self._table = QTableWidget(0, COL_COLOR + 1)
+        self._adaptive_height_enabled = True
+        self._table_maximum_height = self._table.maximumHeight()
         self._configure_cluster_columns()
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
-        # Column sizing
-        header = self._table.horizontalHeader()
-        header.setSectionResizeMode(COL_VISIBLE, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_ADDED, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_HEATMAP, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_NEURON_ID, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_SUBJECT, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_LABEL, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_GROUP, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_TAGS, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_NOTES, QHeaderView.Stretch)
         self._configure_header_resize_modes()
+        self._apply_table_view()
 
         self._table.verticalHeader().setVisible(False)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
@@ -248,6 +302,63 @@ class NeuronTableWidget(QWidget):
         self._table.setSortingEnabled(True)
 
         layout.addWidget(self._table)
+        self._refresh_preferred_height(visible_row_count=0)
+
+    def _refresh_preferred_height(
+        self,
+        *,
+        visible_row_count: int | None = None,
+    ) -> None:
+        """Grow the table with its visible rows, up to the viewport row cap."""
+        adaptive = bool(self.__dict__.get("_adaptive_height_enabled", True))
+        if visible_row_count is None:
+            visible_row_count = (
+                sum(
+                    not self._table.isRowHidden(row)
+                    for row in range(self._table.rowCount())
+                )
+                if adaptive
+                else 0
+            )
+
+        preferred_rows = _preferred_visible_row_count(
+            visible_row_count,
+            adaptive=adaptive,
+        )
+        horizontal_header = self._table.horizontalHeader()
+        header_height = max(
+            horizontal_header.height(),
+            horizontal_header.sizeHint().height(),
+        )
+        row_height = self._table.verticalHeader().defaultSectionSize()
+        scrollbar_height = self._table.horizontalScrollBar().sizeHint().height()
+        frame_height = 2 * self._table.frameWidth()
+        preferred_height = (
+            header_height
+            + preferred_rows * row_height
+            + scrollbar_height
+            + frame_height
+        )
+
+        if adaptive:
+            # Reset the maximum left behind by ``setFixedHeight`` before
+            # lowering or raising the adaptive minimum.
+            self._table.setMaximumHeight(
+                self.__dict__.get(
+                    "_table_maximum_height",
+                    self._table.maximumHeight(),
+                )
+            )
+            self._table.setMinimumHeight(preferred_height)
+        else:
+            self._table.setFixedHeight(preferred_height)
+        self._table.updateGeometry()
+        self.updateGeometry()
+
+    def set_adaptive_height_enabled(self, enabled: bool) -> None:
+        """Switch between a fixed viewport and row-aware table height."""
+        self._adaptive_height_enabled = bool(enabled)
+        self._refresh_preferred_height()
 
     def _assignment_sets(self):
         """Return saved assignment sets, tolerating legacy test widgets."""
@@ -293,6 +404,7 @@ class NeuronTableWidget(QWidget):
             return
         set_column_count(len(headers))
         set_headers(headers)
+        self._apply_table_view()
 
     def _configure_header_resize_modes(self) -> None:
         """Apply resize policies after dynamic column changes."""
@@ -304,7 +416,6 @@ class NeuronTableWidget(QWidget):
         header.setSectionResizeMode(COL_ADDED, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_HEATMAP, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_NEURON_ID, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_SUBJECT, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_LABEL, QHeaderView.Stretch)
         header.setSectionResizeMode(COL_GROUP, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_TAGS, QHeaderView.Stretch)
@@ -313,13 +424,46 @@ class NeuronTableWidget(QWidget):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self._color_column(), QHeaderView.ResizeToContents)
 
-    def populate(self, neurons: list[tuple[str, str]]) -> None:
+    def _on_table_view_changed(self, _index: int) -> None:
+        """Apply the focused table view selected by the user."""
+        view_key = self._table_view_combo.currentData()
+        if view_key not in _TABLE_VIEW_DEFINITIONS:
+            return
+        self._current_table_view = str(view_key)
+        self._apply_table_view()
+
+    def _apply_table_view(self) -> None:
+        """Show only the columns included in the current focused view."""
+        set_column_hidden = getattr(self._table, "setColumnHidden", None)
+        if not callable(set_column_hidden):
+            return
+
+        view_key = self.__dict__.get(
+            "_current_table_view",
+            _DEFAULT_TABLE_VIEW,
+        )
+        definition = _TABLE_VIEW_DEFINITIONS.get(
+            view_key,
+            _TABLE_VIEW_DEFINITIONS[_DEFAULT_TABLE_VIEW],
+        )
+        _label, base_columns, show_clusters = definition
+        color_column = self._color_column()
+        for column in range(self._table.columnCount()):
+            is_cluster_column = COL_CLUSTER <= column < color_column
+            visible = (
+                column in base_columns
+                or column == color_column
+                or (show_clusters and is_cluster_column)
+            )
+            set_column_hidden(column, not visible)
+
+    def populate(self, file_ids: list[object]) -> None:
         """Fill the table with neurons from a query result.
 
         Parameters
         ----------
-        neurons : list[tuple[str, str]]
-            List of (file_id, subject) tuples.
+        file_ids : list[object]
+            Per-neuron ``file_id`` values to show as neuron names.
         """
         sorting_enabled = self._table.isSortingEnabled()
         self._table.setSortingEnabled(False)
@@ -332,18 +476,19 @@ class NeuronTableWidget(QWidget):
         self._configure_cluster_columns()
         self._configure_header_resize_modes()
 
-        n = len(neurons)
+        n = len(file_ids)
         colors = neuron_palette(n)
 
         self._table.setRowCount(n)
 
-        for row, (file_id, subject) in enumerate(neurons):
+        for row, file_id in enumerate(file_ids):
             color = colors[row] if row < len(colors) else list(GRAY_RGBA)
-            entry = NeuronEntry(file_id=file_id, subject=subject, color=color)
+            entry = NeuronEntry(file_id=file_id, color=color)
             self._entries[file_id] = entry
             self._populate_row(row, entry)
 
         self._table.setSortingEnabled(sorting_enabled)
+        self._refresh_preferred_height(visible_row_count=n)
         self.state_changed.emit()
 
     def _populate_row(self, row: int, entry: NeuronEntry) -> None:
@@ -365,16 +510,11 @@ class NeuronTableWidget(QWidget):
         # Heatmap state
         self._set_heatmap_cell(row, entry.heatmap_layer_names)
 
-        # Neuron ID
+        # Neuron name (the unique file_id key)
         id_item = QTableWidgetItem(str(entry.file_id))
         id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
         id_item.setData(Qt.UserRole, entry.file_id)
         self._table.setItem(row, COL_NEURON_ID, id_item)
-
-        # Subject
-        subj_item = QTableWidgetItem(entry.subject)
-        subj_item.setFlags(subj_item.flags() & ~Qt.ItemIsEditable)
-        self._table.setItem(row, COL_SUBJECT, subj_item)
 
         self._set_text_cell(row, COL_LABEL, entry.label, editable=True)
         self._set_text_cell(row, COL_GROUP, entry.group, editable=True)
@@ -649,6 +789,7 @@ class NeuronTableWidget(QWidget):
             self._table.setSortingEnabled(sorting_enabled)
             self._table.blockSignals(signals_blocked)
 
+        self._refresh_preferred_height(visible_row_count=len(entries))
         self.selection_changed.emit([])
         self.state_changed.emit()
 
@@ -882,6 +1023,7 @@ class NeuronTableWidget(QWidget):
             self._table.setSortingEnabled(sorting_enabled)
             self._table.blockSignals(signals_blocked)
 
+        self._refresh_preferred_height(visible_row_count=0)
         self.state_changed.emit()
 
     def retain_file_ids(
@@ -1013,12 +1155,15 @@ class NeuronTableWidget(QWidget):
         else:
             heatmap_matches = added_flags(self._entries.keys(), heatmap_file_ids)
 
+        visible_row_count = 0
         for row, file_id in self._iter_rows_with_file_ids():
             visible = cluster_matches.get(file_id, True) and heatmap_matches.get(
                 file_id,
                 False,
             )
             self._table.setRowHidden(row, not visible)
+            visible_row_count += int(visible)
+        self._refresh_preferred_height(visible_row_count=visible_row_count)
 
     def hide_all_not_in_cluster(
         self,
