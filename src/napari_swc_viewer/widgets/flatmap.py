@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from napari.utils.notifications import show_info, show_warning
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -21,6 +22,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -124,6 +126,8 @@ _RENDER_FLAT_VECTOR = "flat_vector"
 _HEATMAP_COLOR_SINGLE = "single"
 _HEATMAP_COLOR_INDIVIDUAL = "individual"
 _HEATMAP_COLOR_CLUSTER = "cluster"
+_FINE_PROJECTION_GAMMA = 0.2
+_DEFAULT_HEATMAP_GAMMA = 1.0
 # One neuron's heatmap is dominated by a few dense bins -- the soma and tight
 # local arbor -- while its long-range projections leave one or two nodes per
 # bin.  Against the full range those projections are nearly black, so a
@@ -229,6 +233,11 @@ class FlatmapProjectionWidget(QWidget):
         self._display_viewer_failed_callback = display_viewer_failed_callback
         self._last_display_viewer = None
         self._display_axis_annotation_state: dict | None = None
+        self._flatmap_display_layer_event_viewer = None
+        self._flatmap_display_layer_event_connections: list[tuple[object, object]] = []
+        self._flatmap_heatmap_name_event_connections: dict[
+            int, tuple[object, object, object]
+        ] = {}
         self._database_provider = database_provider
         self._selected_file_ids_provider = selected_file_ids_provider
         self._table_file_ids_provider = table_file_ids_provider
@@ -337,6 +346,7 @@ class FlatmapProjectionWidget(QWidget):
                         else "none",
                         str(bool(create)).lower(),
                     )
+                    self._connect_flatmap_display_layer_events(viewer)
             return viewer
         return getattr(self, "_viewer", None)
 
@@ -352,12 +362,14 @@ class FlatmapProjectionWidget(QWidget):
             return False
 
         self._clear_display_axis_annotations(viewer)
+        self._disconnect_flatmap_display_layer_events(viewer)
         self._last_display_viewer = None
         self._projection_layer = None
         self._soma_layer = None
         self._region_labels_layer = None
         self._region_surfaces_layers = []
         self._region_outlines_layers = []
+        self._refresh_flatmap_heatmap_layer_list()
         return True
 
     def _notify_display_viewer_ready(self, layer) -> None:
@@ -365,6 +377,8 @@ class FlatmapProjectionWidget(QWidget):
         viewer = self._current_display_viewer()
         if viewer is None or not self._layer_is_in_viewer(layer, viewer=viewer):
             return
+        self._connect_flatmap_display_layer_events(viewer)
+        self._refresh_flatmap_heatmap_layer_list()
         callback = getattr(self, "_display_viewer_ready_callback", None)
         if not callable(callback):
             return
@@ -397,6 +411,275 @@ class FlatmapProjectionWidget(QWidget):
         if viewer is None:
             return None
         return getattr(viewer, "layers", None)
+
+    @staticmethod
+    def _is_flatmap_heatmap_layer(layer) -> bool:
+        """Return whether a layer is a gamma-adjustable flatmap heatmap."""
+        metadata = getattr(layer, "metadata", {}) or {}
+        return bool(
+            hasattr(layer, "gamma")
+            and metadata.get("flatmap_render_mode")
+            in {_RENDER_HEATMAP, _RENDER_FLAT_HEATMAP, _RENDER_ALLEN_LAYERS}
+        )
+
+    def _flatmap_heatmap_layers(self) -> list[object]:
+        """Return rendered flatmap heatmap layers from the display viewer."""
+        layers = self._display_layers(create=False) or ()
+        return [layer for layer in layers if self._is_flatmap_heatmap_layer(layer)]
+
+    def _selected_flatmap_heatmap_layers(self) -> list[object]:
+        """Return flatmap heatmaps highlighted in the appearance section."""
+        layer_list = getattr(self, "_flatmap_heatmap_layer_list", None)
+        if layer_list is None:
+            return []
+        selected_names = {item.text() for item in layer_list.selectedItems()}
+        if not selected_names:
+            return []
+        return [
+            layer
+            for layer in self._flatmap_heatmap_layers()
+            if str(getattr(layer, "name", "")) in selected_names
+        ]
+
+    def _refresh_flatmap_heatmap_layer_list(self) -> None:
+        """Refresh the Flatmap-tab list of gamma-adjustable heatmaps."""
+        layer_list = getattr(self, "_flatmap_heatmap_layer_list", None)
+        if layer_list is None:
+            return
+
+        previous = {item.text() for item in layer_list.selectedItems()}
+        layers = self._flatmap_heatmap_layers()
+        layer_list.clear()
+        for layer in layers:
+            layer_list.addItem(str(getattr(layer, "name", "<unnamed>")))
+        for index in range(layer_list.count()):
+            item = layer_list.item(index)
+            if item.text() in previous:
+                item.setSelected(True)
+
+        self._sync_flatmap_heatmap_name_event_connections(layers)
+        status = getattr(self, "_flatmap_heatmap_gamma_status_label", None)
+        if status is not None:
+            if layers:
+                status.setText(
+                    f"{len(layers)} flatmap heatmap layer(s) available."
+                )
+            else:
+                status.setText("No rendered flatmap heatmaps are available.")
+        self._update_flatmap_heatmap_gamma_controls()
+
+    def _update_flatmap_heatmap_gamma_controls(self, *_args) -> None:
+        """Enable flatmap gamma actions only when heatmaps are selected."""
+        ready = bool(self._selected_flatmap_heatmap_layers())
+        for attribute in (
+            "_flatmap_enhance_fine_projections_btn",
+            "_flatmap_reset_gamma_btn",
+        ):
+            button = getattr(self, attribute, None)
+            if button is not None:
+                button.setEnabled(ready)
+
+    def _set_selected_flatmap_heatmap_gamma(
+        self,
+        gamma: float,
+        *,
+        action: str,
+    ) -> None:
+        """Set gamma on all heatmaps selected in the Flatmap tab."""
+        selected_layers = self._selected_flatmap_heatmap_layers()
+        status = getattr(self, "_flatmap_heatmap_gamma_status_label", None)
+        if not selected_layers:
+            if status is not None:
+                status.setText("Select at least one flatmap heatmap layer.")
+            return
+
+        updated = 0
+        failed_names: list[str] = []
+        for layer in selected_layers:
+            try:
+                layer.gamma = float(gamma)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                failed_names.append(str(getattr(layer, "name", "<unnamed>")))
+                logger.warning(
+                    "Could not set gamma on flatmap heatmap layer '%s'.",
+                    getattr(layer, "name", "<unnamed>"),
+                    exc_info=True,
+                )
+            else:
+                updated += 1
+
+        message = (
+            f"{action} on {updated} flatmap heatmap layer(s) "
+            f"(gamma {float(gamma):.2f})."
+        )
+        if failed_names:
+            message += " Could not update: " + ", ".join(failed_names[:3])
+            if len(failed_names) > 3:
+                message += f" and {len(failed_names) - 3} more"
+            message += "."
+        if status is not None:
+            status.setText(message)
+
+    def _enhance_selected_flatmap_heatmap_projections(self) -> None:
+        """Brighten fine projections in selected flatmap heatmaps."""
+        self._set_selected_flatmap_heatmap_gamma(
+            _FINE_PROJECTION_GAMMA,
+            action="Enhanced fine projections",
+        )
+
+    def _reset_selected_flatmap_heatmap_gamma(self) -> None:
+        """Restore default gamma on selected flatmap heatmaps."""
+        self._set_selected_flatmap_heatmap_gamma(
+            _DEFAULT_HEATMAP_GAMMA,
+            action="Reset gamma",
+        )
+
+    def _on_flatmap_heatmap_section_expanded(self, expanded: bool) -> None:
+        """Refresh the heatmap list whenever its section is opened."""
+        if expanded:
+            self._refresh_flatmap_heatmap_layer_list()
+
+    def _on_flatmap_display_layers_changed(self, _event=None) -> None:
+        """Refresh flatmap gamma controls after display-layer changes."""
+        self._refresh_flatmap_heatmap_layer_list()
+
+    def _connect_flatmap_display_layer_events(self, viewer) -> None:
+        """Follow additions, removals, and renames in the display viewer."""
+        if getattr(self, "_flatmap_display_layer_event_viewer", None) is viewer:
+            self._sync_flatmap_heatmap_name_event_connections(
+                self._flatmap_heatmap_layers()
+            )
+            return
+
+        self._disconnect_flatmap_display_layer_events()
+        self._flatmap_display_layer_event_viewer = viewer
+        connections: list[tuple[object, object]] = []
+        events = getattr(getattr(viewer, "layers", None), "events", None)
+        if events is not None:
+            callback = self._on_flatmap_display_layers_changed
+            for event_name in ("inserted", "removed", "reordered"):
+                signal = getattr(events, event_name, None)
+                connect = getattr(signal, "connect", None)
+                if not callable(connect):
+                    continue
+                try:
+                    connect(callback)
+                except Exception:
+                    logger.debug(
+                        "Could not follow flatmap display-layer changes.",
+                        exc_info=True,
+                    )
+                else:
+                    connections.append((signal, callback))
+        self._flatmap_display_layer_event_connections = connections
+        self._sync_flatmap_heatmap_name_event_connections(
+            self._flatmap_heatmap_layers()
+        )
+
+    def _sync_flatmap_heatmap_name_event_connections(
+        self,
+        layers: list[object],
+    ) -> None:
+        """Track heatmap renames so the selector never keeps stale names."""
+        connections = getattr(
+            self,
+            "_flatmap_heatmap_name_event_connections",
+            None,
+        )
+        if connections is None:
+            connections = {}
+            self._flatmap_heatmap_name_event_connections = connections
+
+        active_ids = {id(layer) for layer in layers}
+        for layer_id, connection in list(connections.items()):
+            if layer_id not in active_ids:
+                self._disconnect_flatmap_heatmap_name_event_connection(
+                    layer_id,
+                    connection,
+                )
+
+        for layer in layers:
+            layer_id = id(layer)
+            existing = connections.get(layer_id)
+            if existing is not None and existing[0] is layer:
+                continue
+            if existing is not None:
+                self._disconnect_flatmap_heatmap_name_event_connection(
+                    layer_id,
+                    existing,
+                )
+            signal = getattr(getattr(layer, "events", None), "name", None)
+            connect = getattr(signal, "connect", None)
+            if not callable(connect):
+                continue
+            callback = self._on_flatmap_display_layers_changed
+            try:
+                connect(callback)
+            except Exception:
+                logger.debug(
+                    "Could not follow flatmap heatmap layer rename.",
+                    exc_info=True,
+                )
+            else:
+                connections[layer_id] = (layer, signal, callback)
+
+    def _disconnect_flatmap_heatmap_name_event_connection(
+        self,
+        layer_id: int,
+        connection: tuple[object, object, object],
+    ) -> None:
+        """Disconnect one tracked flatmap heatmap name signal."""
+        _layer, signal, callback = connection
+        disconnect = getattr(signal, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect(callback)
+            except Exception:
+                logger.debug(
+                    "Could not disconnect flatmap heatmap name event.",
+                    exc_info=True,
+                )
+        connections = getattr(
+            self,
+            "_flatmap_heatmap_name_event_connections",
+            None,
+        )
+        if connections is not None:
+            connections.pop(layer_id, None)
+
+    def _disconnect_flatmap_display_layer_events(self, viewer=None) -> None:
+        """Stop following a detached flatmap viewer being replaced or closed."""
+        tracked_viewer = getattr(self, "_flatmap_display_layer_event_viewer", None)
+        if viewer is not None and tracked_viewer is not viewer:
+            return
+
+        for signal, callback in getattr(
+            self,
+            "_flatmap_display_layer_event_connections",
+            (),
+        ):
+            disconnect = getattr(signal, "disconnect", None)
+            if callable(disconnect):
+                try:
+                    disconnect(callback)
+                except Exception:
+                    logger.debug(
+                        "Could not disconnect flatmap display-layer event.",
+                        exc_info=True,
+                    )
+        self._flatmap_display_layer_event_connections = []
+
+        name_connections = getattr(
+            self,
+            "_flatmap_heatmap_name_event_connections",
+            {},
+        )
+        for layer_id, connection in list(name_connections.items()):
+            self._disconnect_flatmap_heatmap_name_event_connection(
+                layer_id,
+                connection,
+            )
+        self._flatmap_display_layer_event_viewer = None
 
     def _setup_ui(self) -> None:
         """Build the tab UI."""
@@ -666,6 +949,59 @@ class FlatmapProjectionWidget(QWidget):
         self._projection_progress_bar.setVisible(False)
         layout.addWidget(self._projection_progress_bar)
 
+        self._flatmap_heatmap_appearance_section = CollapsibleSection(
+            "Heatmap Appearance",
+            expanded=False,
+        )
+        appearance_layout = self._flatmap_heatmap_appearance_section.content_layout()
+        appearance_hint = QLabel(
+            "Select one or more rendered flatmap heatmaps to adjust together."
+        )
+        appearance_hint.setWordWrap(True)
+        appearance_layout.addWidget(appearance_hint)
+
+        self._flatmap_heatmap_layer_list = QListWidget()
+        self._flatmap_heatmap_layer_list.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+        )
+        self._flatmap_heatmap_layer_list.itemSelectionChanged.connect(
+            self._update_flatmap_heatmap_gamma_controls
+        )
+        appearance_layout.addWidget(self._flatmap_heatmap_layer_list)
+
+        gamma_actions = QHBoxLayout()
+        self._flatmap_enhance_fine_projections_btn = QPushButton(
+            "Enhance Fine Projections"
+        )
+        self._flatmap_enhance_fine_projections_btn.setToolTip(
+            "Set gamma to 0.20 on each selected flatmap heatmap to brighten "
+            "low-intensity projections."
+        )
+        self._flatmap_enhance_fine_projections_btn.clicked.connect(
+            self._enhance_selected_flatmap_heatmap_projections
+        )
+        gamma_actions.addWidget(self._flatmap_enhance_fine_projections_btn)
+
+        self._flatmap_reset_gamma_btn = QPushButton("Reset Gamma")
+        self._flatmap_reset_gamma_btn.setToolTip(
+            "Restore gamma to 1.00 on each selected flatmap heatmap."
+        )
+        self._flatmap_reset_gamma_btn.clicked.connect(
+            self._reset_selected_flatmap_heatmap_gamma
+        )
+        gamma_actions.addWidget(self._flatmap_reset_gamma_btn)
+        appearance_layout.addLayout(gamma_actions)
+
+        self._flatmap_heatmap_gamma_status_label = QLabel(
+            "No rendered flatmap heatmaps are available."
+        )
+        self._flatmap_heatmap_gamma_status_label.setWordWrap(True)
+        appearance_layout.addWidget(self._flatmap_heatmap_gamma_status_label)
+        self._flatmap_heatmap_appearance_section.expanded_changed.connect(
+            self._on_flatmap_heatmap_section_expanded
+        )
+        layout.addWidget(self._flatmap_heatmap_appearance_section)
+
         labels_group = QGroupBox("Cached Regions")
         labels_layout = QVBoxLayout(labels_group)
         atlas_row = QHBoxLayout()
@@ -724,6 +1060,10 @@ class FlatmapProjectionWidget(QWidget):
         self._update_render_mode_controls()
         self._update_cached_region_controls()
         self._update_lookup_files_section()
+        viewer = self._current_display_viewer()
+        if viewer is not None:
+            self._connect_flatmap_display_layer_events(viewer)
+        self._refresh_flatmap_heatmap_layer_list()
 
     def set_flatmap_path(self, path: str | Path | None) -> None:
         """Set the flatmap path, primarily for tests and scripted use."""

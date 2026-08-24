@@ -1012,6 +1012,7 @@ def _layer_display_metadata(layer: Any) -> dict[str, Any]:
         "translate",
         "blending",
         "rendering",
+        "gamma",
         "contrast_limits",
         "contrast_limits_range",
     ):

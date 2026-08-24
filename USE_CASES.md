@@ -33,7 +33,7 @@ Unless a use case says otherwise:
 | [UC-005](#uc-005-view-an-allen-isocortex-layer-flatmap-stack) | View flatmap node counts as six Allen Isocortex layer images | Not run |
 | [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
 | [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
-| [UC-008](#uc-008-create-combined-and-individual-neuron-heatmaps) | Create one combined heatmap or color-matched heatmaps for individual neurons | Not run |
+| [UC-008](#uc-008-create-combined-individual-and-enhanced-neuron-heatmaps) | Create combined or individual heatmaps and enhance fine projections in selected layers | Not run |
 | [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
 | [UC-010](#uc-010-identify-axon-termini-and-prune-neurons-lacking-them) | Locate termini as childless axon-typed nodes, then select and remove the neurons that have none (see the annotation caution) | Partially run |
 | [UC-011](#uc-011-view-a-depth-free-2d-flatmap-and-per-neuron-vector-traces) | View a plain flatmap with no depth axis as a 2D heatmap or per-neuron vector traces, and place somas in the current render's space | Not run |
@@ -844,7 +844,7 @@ Enhanced Parquet exports preserve every assignment and its run provenance.
 - Last verified: Never
 - Notes: None
 
-### UC-008: Create Combined and Individual Neuron Heatmaps
+### UC-008: Create Combined, Individual, and Enhanced Neuron Heatmaps
 
 **Capability**
 
@@ -853,7 +853,9 @@ combined node-count heatmap or one color-matched heatmap per neuron. Individual
 layers preserve the selected cohort captured when the run starts and make it
 possible to compare neuron occupancy independently. A monochrome cohort is
 automatically assigned distinct palette colors so its rendered neurons, table
-swatches, and heatmaps remain visually associated.
+swatches, and heatmaps remain visually associated. One or more heatmaps can be
+selected in **Tools** and given the minimum supported gamma to make faint,
+fine projections easier to see without changing the underlying voxel data.
 
 **Prerequisites**
 
@@ -924,6 +926,22 @@ swatches, and heatmaps remain visually associated.
    **Expected:** Layer membership and names stay synchronized. Deleting a layer
    removes its membership; renaming it updates the affected row and selector
    without changing the recorded source neuron.
+9. **Action:** Open **Tools** > **Heatmap Sources**. With no source highlighted,
+   inspect **Enhance Fine Projections** and **Reset Gamma**. Select one heatmap
+   and click **Enhance Fine Projections**.
+   **Expected:** Both buttons are disabled with no selection and enabled when a
+   heatmap is selected. The selected layer's gamma becomes `0.20`, faint
+   low-intensity projections brighten, other heatmaps do not change, and the
+   status reports the number of layers updated. The heatmap voxel data and
+   contrast limits are unchanged.
+10. **Action:** Use Ctrl-click (Windows/Linux) or Command-click (macOS) to
+    select multiple entries under **Heatmap Sources**, then click **Enhance Fine
+    Projections**. Leave at least one heatmap unselected as a control. Click
+    **Reset Gamma** with the same entries selected.
+    **Expected:** Enhancement applies gamma `0.20` to every selected heatmap and
+    does not affect the unselected control. Reset restores gamma `1.00` on every
+    selected heatmap. If the project is saved and reopened, each saved
+    heatmap's current gamma is restored.
 
 **Manual verification**
 
@@ -1187,6 +1205,11 @@ incomplete subset of neurons.
 **Add Soma** places somas in whichever coordinate space the current **Render**
 mode uses, so soma points land on the visible render in all five modes.
 
+The collapsed **Heatmap Appearance** section lists rendered flatmap heatmap
+layers from the detached flatmap window. It can apply the minimum supported
+gamma to one or several selected 3D, 2D, or Allen-layer heatmaps so faint
+projections remain visible without changing their node-count data.
+
 **Prerequisites**
 
 - Load a neuron Parquet with valid flatmap coordinates. For **Precomputed
@@ -1256,6 +1279,21 @@ mode uses, so soma points land on the visible render in all five modes.
     **Expected:** The action reports that `region_id` is required and names both
     remedies (regenerate the Parquet, or switch to a depth or 2D mode). No soma
     layer is added and no somas are silently placed on depth bins.
+12. **Action:** Before rendering a heatmap, expand **Heatmap Appearance** in the
+    **Flatmap** tab. Then render a **2D Heatmap** and inspect the section again.
+    **Expected:** Initially the section reports that no rendered flatmap
+    heatmaps are available and both gamma buttons are disabled. After rendering,
+    **Isocortex Flatmap 2D Heatmap** appears in the section's layer list. Points,
+    vectors, region labels, surfaces, and outlines never appear in this list.
+13. **Action:** Render at least three heatmaps with **Heatmap colors** set to
+    **Individual neurons**. Select two entries in **Heatmap Appearance** with
+    Ctrl-click (Windows/Linux) or Command-click (macOS), leaving the third as a
+    control. Click **Enhance Fine Projections**, then **Reset Gamma**.
+    **Expected:** Enhancement applies gamma `0.20` to the two selected flatmap
+    heatmaps, brightening their faint projections without changing their data,
+    contrast limits, or the unselected control. Reset restores gamma `1.00` on
+    both selected layers. Renaming or removing a heatmap in the detached viewer
+    refreshes the list, and closing that viewer clears it.
 
 **Manual verification**
 

@@ -349,6 +349,7 @@ class _DummyImageLayer:
         self.data = np.asarray(data, dtype=float)
         self.name = kwargs["name"]
         self.metadata = kwargs.get("metadata", {})
+        self.gamma = kwargs.get("gamma", 1.0)
         self.opacity = kwargs.get("opacity", 1.0)
         self.colormap = kwargs.get("colormap")
         self.blending = kwargs.get("blending")
@@ -6348,6 +6349,74 @@ def test_region_isolation_region_ids_follow_include_children_state() -> None:
 
     selector._include_children = False
     assert NeuronViewerWidget._selected_region_isolation_region_ids(widget) == [1]
+
+
+def test_heatmap_gamma_actions_apply_to_all_selected_layers() -> None:
+    source_a = types.SimpleNamespace(name="Source A", gamma=1.0)
+    source_b = types.SimpleNamespace(name="Source B", gamma=0.8)
+    status = _DummyLabel()
+    widget = types.SimpleNamespace(
+        _selected_heatmap_layers=lambda: [source_a, source_b],
+        _tools_status_label=status,
+    )
+    widget._set_selected_heatmap_gamma = types.MethodType(
+        NeuronViewerWidget._set_selected_heatmap_gamma,
+        widget,
+    )
+
+    NeuronViewerWidget._enhance_selected_heatmap_projections(widget)
+
+    assert source_a.gamma == pytest.approx(0.2)
+    assert source_b.gamma == pytest.approx(0.2)
+    assert status.text == (
+        "Enhanced fine projections on 2 heatmap layer(s) (gamma 0.20)."
+    )
+
+    NeuronViewerWidget._reset_selected_heatmap_gamma(widget)
+
+    assert source_a.gamma == pytest.approx(1.0)
+    assert source_b.gamma == pytest.approx(1.0)
+    assert status.text == "Reset gamma on 2 heatmap layer(s) (gamma 1.00)."
+
+
+def test_heatmap_gamma_action_requires_a_selected_layer() -> None:
+    status = _DummyLabel()
+    widget = types.SimpleNamespace(
+        _selected_heatmap_layers=lambda: [],
+        _tools_status_label=status,
+    )
+
+    NeuronViewerWidget._set_selected_heatmap_gamma(
+        widget,
+        0.2,
+        action="Enhanced fine projections",
+    )
+
+    assert status.text == "Select at least one eligible heatmap layer."
+
+
+def test_tools_selection_enables_gamma_actions() -> None:
+    enhance_button = _DummyButton()
+    reset_button = _DummyButton()
+    selected_layers = [types.SimpleNamespace(name="Source A")]
+    widget = types.SimpleNamespace(
+        _atlas=object(),
+        _heatmap_layer_list=object(),
+        _selected_heatmap_layers=lambda: selected_layers,
+        _enhance_fine_projections_btn=enhance_button,
+        _reset_heatmap_gamma_btn=reset_button,
+    )
+
+    NeuronViewerWidget._update_tools_controls(widget)
+
+    assert enhance_button.enabled is True
+    assert reset_button.enabled is True
+
+    selected_layers.clear()
+    NeuronViewerWidget._update_tools_controls(widget)
+
+    assert enhance_button.enabled is False
+    assert reset_button.enabled is False
 
 
 def test_create_region_isolated_heatmaps_separate_layers_sets_metadata(

@@ -330,6 +330,8 @@ _SELECTED_HEATMAP_MODE_SINGLE = "single"
 _SELECTED_HEATMAP_MODE_INDIVIDUAL = "individual"
 _INDIVIDUAL_HEATMAP_MEMORY_WARNING_BYTES = 1024**3
 _INDIVIDUAL_HEATMAP_CONTRAST_FRACTION = 0.2
+_FINE_PROJECTION_GAMMA = 0.2
+_DEFAULT_HEATMAP_GAMMA = 1.0
 _GREEK_HEATMAP_IDENTIFIERS = (
     "alpha",
     "beta",
@@ -3315,6 +3317,30 @@ class NeuronViewerWidget(QWidget):
             self._update_tools_controls
         )
         sources_layout.addWidget(self._heatmap_layer_list)
+
+        gamma_btn_row = QHBoxLayout()
+        self._enhance_fine_projections_btn = QPushButton(
+            "Enhance Fine Projections"
+        )
+        self._enhance_fine_projections_btn.setToolTip(
+            "Set gamma to 0.20 on each selected heatmap to brighten "
+            "low-intensity projections."
+        )
+        self._enhance_fine_projections_btn.clicked.connect(
+            self._enhance_selected_heatmap_projections
+        )
+        gamma_btn_row.addWidget(self._enhance_fine_projections_btn)
+
+        self._reset_heatmap_gamma_btn = QPushButton("Reset Gamma")
+        self._reset_heatmap_gamma_btn.setToolTip(
+            "Restore gamma to 1.00 on each selected heatmap."
+        )
+        self._reset_heatmap_gamma_btn.clicked.connect(
+            self._reset_selected_heatmap_gamma
+        )
+        gamma_btn_row.addWidget(self._reset_heatmap_gamma_btn)
+        sources_layout.addLayout(gamma_btn_row)
+
         self._tools_hint_label = QLabel("")
         self._tools_hint_label.setWordWrap(True)
         sources_layout.addWidget(self._tools_hint_label)
@@ -4325,7 +4351,7 @@ class NeuronViewerWidget(QWidget):
         layer_metadata: dict[str, object],
     ) -> None:
         """Restore one saved image layer with app metadata and display options."""
-        for attr_name in ("blending", "rendering"):
+        for attr_name in ("blending", "rendering", "gamma"):
             if attr_name in display and display[attr_name] is not None:
                 kwargs[attr_name] = display[attr_name]
         limits = display.get("contrast_limits")
@@ -6398,11 +6424,64 @@ class NeuronViewerWidget(QWidget):
 
         selected_layers = self._selected_heatmap_layers()
         ready = self._atlas is not None and bool(selected_layers)
+        if hasattr(self, "_enhance_fine_projections_btn"):
+            self._enhance_fine_projections_btn.setEnabled(ready)
+        if hasattr(self, "_reset_heatmap_gamma_btn"):
+            self._reset_heatmap_gamma_btn.setEnabled(ready)
         if hasattr(self, "_create_blur_btn"):
             self._create_blur_btn.setEnabled(ready)
         if hasattr(self, "_create_region_isolated_heatmap_btn"):
             has_regions = bool(self._selected_region_isolation_region_ids())
             self._create_region_isolated_heatmap_btn.setEnabled(ready and has_regions)
+
+    def _set_selected_heatmap_gamma(self, gamma: float, *, action: str) -> None:
+        """Set gamma on every heatmap selected in the Tools source list."""
+        selected_layers = self._selected_heatmap_layers()
+        if not selected_layers:
+            self._tools_status_label.setText(
+                "Select at least one eligible heatmap layer."
+            )
+            return
+
+        updated_names: list[str] = []
+        failed_names: list[str] = []
+        for layer in selected_layers:
+            try:
+                layer.gamma = float(gamma)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                failed_names.append(str(getattr(layer, "name", "<unnamed>")))
+                logger.warning(
+                    "Could not set gamma on heatmap layer '%s'.",
+                    getattr(layer, "name", "<unnamed>"),
+                    exc_info=True,
+                )
+            else:
+                updated_names.append(str(getattr(layer, "name", "<unnamed>")))
+
+        message = (
+            f"{action} on {len(updated_names)} heatmap layer(s) "
+            f"(gamma {float(gamma):.2f})."
+        )
+        if failed_names:
+            message += " Could not update: " + ", ".join(failed_names[:3])
+            if len(failed_names) > 3:
+                message += f" and {len(failed_names) - 3} more"
+            message += "."
+        self._tools_status_label.setText(message)
+
+    def _enhance_selected_heatmap_projections(self) -> None:
+        """Brighten low-intensity projections in selected heatmap layers."""
+        self._set_selected_heatmap_gamma(
+            _FINE_PROJECTION_GAMMA,
+            action="Enhanced fine projections",
+        )
+
+    def _reset_selected_heatmap_gamma(self) -> None:
+        """Restore the default gamma on selected heatmap layers."""
+        self._set_selected_heatmap_gamma(
+            _DEFAULT_HEATMAP_GAMMA,
+            action="Reset gamma",
+        )
 
     def _update_histogram_controls(self) -> None:
         """Enable or disable Histogram actions based on current selection."""
