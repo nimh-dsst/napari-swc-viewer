@@ -5427,6 +5427,34 @@ def test_populate_neuron_table_preserves_rendered_color_when_subset_filter_remov
     widget._update_layer_colors.assert_called_once_with({"n1": [0.2, 0.3, 0.4, 1.0]})
 
 
+def test_populate_neuron_table_does_not_require_subject_column() -> None:
+    populated_file_ids: list[object] = []
+    table = types.SimpleNamespace(_entries={})
+    table.populate = MagicMock(side_effect=populated_file_ids.extend)
+    table.set_added_file_ids = MagicMock()
+    table.get_selected_file_ids = MagicMock(return_value=[])
+    table.file_ids = lambda: list(populated_file_ids)
+
+    widget = types.SimpleNamespace(
+        _neuron_table=table,
+        _scene_render_modes={},
+        _scene_display_state={},
+        _current_neuron_layers=[],
+        _highlighted_file_ids=None,
+        _last_soma_selection=set(),
+        _refresh_cluster_filter_controls=MagicMock(),
+        _refresh_neuron_table_summary=MagicMock(),
+        _update_layer_colors=MagicMock(),
+    )
+    _bind_table_membership_helpers(widget)
+
+    result = pd.DataFrame({"file_id": ["n1", "n2"]})
+
+    NeuronViewerWidget._populate_neuron_table(widget, result)
+
+    table.populate.assert_called_once_with(["n1", "n2"])
+
+
 def test_add_heatmap_menu_exposes_single_and_individual_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

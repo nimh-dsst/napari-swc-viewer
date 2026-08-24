@@ -8127,8 +8127,7 @@ class NeuronViewerWidget(QWidget):
             matched_file_ids = result["file_id"].tolist()
             self._neuron_table.retain_file_ids(matched_file_ids)
         else:
-            neurons = [(row["file_id"], row["subject"]) for _, row in result.iterrows()]
-            self._neuron_table.populate(neurons)
+            self._neuron_table.populate(result["file_id"].tolist())
 
         saved_state_applier = getattr(self, "_apply_saved_table_state_to_table", None)
         if callable(saved_state_applier):

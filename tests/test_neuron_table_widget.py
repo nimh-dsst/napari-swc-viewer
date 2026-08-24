@@ -118,6 +118,7 @@ class _DummyTable:
         self._column_count = 7
         self.headers: list[str] = []
         self.resize_calls: list[tuple[int, object]] = []
+        self.hidden_columns: dict[int, bool] = {}
 
     def rowCount(self) -> int:
         return len(self._file_ids)
@@ -136,6 +137,9 @@ class _DummyTable:
 
     def setSectionResizeMode(self, column: int, mode) -> None:
         self.resize_calls.append((int(column), mode))
+
+    def setColumnHidden(self, column: int, hidden: bool) -> None:
+        self.hidden_columns[int(column)] = bool(hidden)
 
     def model(self) -> _DummyModel:
         return _DummyModel()
@@ -250,21 +254,110 @@ def test_set_adaptive_height_enabled_refreshes_the_viewport() -> None:
     assert refresh_calls == [True]
 
 
+def test_neuron_table_populate_uses_file_ids_without_subject_values() -> None:
+    module = _import_neuron_table_module()
+    widget = _make_widget(module, {})
+
+    widget.populate([1, "n2"])
+
+    assert widget.file_ids() == [1, "n2"]
+    assert list(widget._entries) == [1, "n2"]
+    assert all(not hasattr(entry, "subject") for entry in widget._entries.values())
+
+
+def test_neuron_table_focused_views_show_the_requested_columns() -> None:
+    module = _import_neuron_table_module()
+    store = ClusterAssignmentStore()
+    store.add(
+        name="Soma Location 1",
+        assignments={"n1": 1},
+        input_file_ids=["n1"],
+    )
+    store.add(
+        name="Voxel Correlation 1",
+        assignments={"n1": 2},
+        input_file_ids=["n1"],
+    )
+    widget = _make_widget(
+        module,
+        {"n1": module.NeuronEntry(file_id="n1")},
+    )
+    widget._assignment_store = store
+    widget._cluster_column_by_id = {}
+    widget._configure_cluster_columns()
+
+    expected_headers = {
+        "default": [
+            "Neuron Name",
+            "Soma Location 1",
+            "Voxel Correlation 1 (active)",
+            "Color",
+        ],
+        "notes": [
+            "Neuron Name",
+            "Notes",
+            "Soma Location 1",
+            "Voxel Correlation 1 (active)",
+            "Color",
+        ],
+        "visibility": [
+            "Vis",
+            "Added",
+            "Heatmap",
+            "Neuron Name",
+            "Color",
+        ],
+        "label": [
+            "Neuron Name",
+            "Label",
+            "Group",
+            "Tags",
+            "Soma Location 1",
+            "Voxel Correlation 1 (active)",
+            "Color",
+        ],
+        "full": [
+            "Vis",
+            "Added",
+            "Heatmap",
+            "Neuron Name",
+            "Label",
+            "Group",
+            "Tags",
+            "Notes",
+            "Soma Location 1",
+            "Voxel Correlation 1 (active)",
+            "Color",
+        ],
+    }
+
+    assert [
+        definition[0] for definition in module._TABLE_VIEW_DEFINITIONS.values()
+    ] == ["Default", "Notes", "Visibility", "Label", "Full"]
+    for view_key, expected in expected_headers.items():
+        widget._current_table_view = view_key
+        widget._apply_table_view()
+        visible_headers = [
+            header
+            for column, header in enumerate(widget._table.headers)
+            if not widget._table.hidden_columns[column]
+        ]
+        assert visible_headers == expected
+
+
 def test_neuron_table_retain_file_ids_preserves_survivor_state() -> None:
     module = _import_neuron_table_module()
     entry_a = module.NeuronEntry(
         file_id="n1",
-        subject="s1",
         color=[0.1, 0.2, 0.3, 1.0],
         cluster_id=7,
         visible=False,
         added_to_scene=True,
         heatmap_layer_names=("alpha Heatmap",),
     )
-    entry_b = module.NeuronEntry(file_id="n2", subject="s2")
+    entry_b = module.NeuronEntry(file_id="n2")
     entry_c = module.NeuronEntry(
         file_id="n3",
-        subject="s3",
         cluster_id=3,
     )
     widget = _make_widget(
@@ -289,16 +382,15 @@ def test_neuron_table_retain_file_ids_preserves_survivor_state() -> None:
 
 def test_neuron_table_remove_file_ids_preserves_remaining_entry_state() -> None:
     module = _import_neuron_table_module()
-    entry_a = module.NeuronEntry(file_id="n1", subject="s1")
+    entry_a = module.NeuronEntry(file_id="n1")
     entry_b = module.NeuronEntry(
         file_id="n2",
-        subject="s2",
         color=[0.6, 0.4, 0.2, 1.0],
         cluster_id=5,
         visible=False,
         added_to_scene=True,
     )
-    entry_c = module.NeuronEntry(file_id="n3", subject="s3")
+    entry_c = module.NeuronEntry(file_id="n3")
     widget = _make_widget(
         module,
         {"n1": entry_a, "n2": entry_b, "n3": entry_c},
@@ -322,8 +414,8 @@ def test_neuron_table_sort_by_cluster_delegates_to_cluster_column_sort() -> None
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1", cluster_id=2),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2", cluster_id=1),
+            "n1": module.NeuronEntry(file_id="n1", cluster_id=2),
+            "n2": module.NeuronEntry(file_id="n2", cluster_id=1),
         },
     )
 
@@ -337,9 +429,9 @@ def test_update_cluster_assignments_clears_unassigned_rows() -> None:
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1", cluster_id=9),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2", cluster_id=8),
-            "n3": module.NeuronEntry(file_id="n3", subject="s3", cluster_id=7),
+            "n1": module.NeuronEntry(file_id="n1", cluster_id=9),
+            "n2": module.NeuronEntry(file_id="n2", cluster_id=8),
+            "n3": module.NeuronEntry(file_id="n3", cluster_id=7),
         },
     )
     cluster_cells: list[tuple[int, int | None]] = []
@@ -372,8 +464,8 @@ def test_neuron_table_set_heatmap_layer_names_updates_entries_with_string_fallba
     widget = _make_widget(
         module,
         {
-            1: module.NeuronEntry(file_id=1, subject="s1"),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+            1: module.NeuronEntry(file_id=1),
+            "n2": module.NeuronEntry(file_id="n2"),
         },
     )
     heatmap_cells: list[tuple[int, tuple[str, ...]]] = []
@@ -406,7 +498,6 @@ def test_neuron_table_export_state_includes_label_schema_fields() -> None:
         {
             "n1": module.NeuronEntry(
                 file_id="n1",
-                subject="s1",
                 color=[0.1, 0.2, 0.3, 1.0],
                 cluster_id=4,
                 visible=False,
@@ -423,7 +514,6 @@ def test_neuron_table_export_state_includes_label_schema_fields() -> None:
     assert state["entries"] == [
         {
             "file_id": "n1",
-            "subject": "s1",
             "color": [0.1, 0.2, 0.3, 1.0],
             "cluster_id": 4,
             "visible": False,
@@ -442,8 +532,8 @@ def test_neuron_table_apply_state_restores_matching_label_fields() -> None:
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+            "n1": module.NeuronEntry(file_id="n1"),
+            "n2": module.NeuronEntry(file_id="n2"),
         },
     )
     widget._update_visibility_checkbox = lambda row, visible: None
@@ -458,6 +548,7 @@ def test_neuron_table_apply_state_restores_matching_label_fields() -> None:
             "entries": [
                 {
                     "file_id": "n1",
+                    "subject": "legacy-subject-is-ignored",
                     "label": "projection",
                     "group": "A",
                     "tags": ["axon"],
@@ -486,9 +577,9 @@ def test_neuron_table_apply_filters_intersects_cluster_and_heatmap_filters() -> 
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1", cluster_id=1),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2", cluster_id=1),
-            "n3": module.NeuronEntry(file_id="n3", subject="s3", cluster_id=2),
+            "n1": module.NeuronEntry(file_id="n1", cluster_id=1),
+            "n2": module.NeuronEntry(file_id="n2", cluster_id=1),
+            "n3": module.NeuronEntry(file_id="n3", cluster_id=2),
         },
     )
 
@@ -507,8 +598,8 @@ def test_neuron_table_apply_filters_manual_heatmap_uses_string_fallback() -> Non
     widget = _make_widget(
         module,
         {
-            1: module.NeuronEntry(file_id=1, subject="s1"),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+            1: module.NeuronEntry(file_id=1),
+            "n2": module.NeuronEntry(file_id="n2"),
         },
     )
 
@@ -528,9 +619,9 @@ def test_neuron_table_select_file_ids_selects_multiple_visible_rows_once() -> No
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
-            "n3": module.NeuronEntry(file_id="n3", subject="s3"),
+            "n1": module.NeuronEntry(file_id="n1"),
+            "n2": module.NeuronEntry(file_id="n2"),
+            "n3": module.NeuronEntry(file_id="n3"),
         },
     )
     widget._table.setRowHidden(1, True)
@@ -546,8 +637,8 @@ def test_neuron_table_selected_file_ids_excludes_rows_hidden_after_selection() -
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
+            "n1": module.NeuronEntry(file_id="n1"),
+            "n2": module.NeuronEntry(file_id="n2"),
         },
     )
     widget._table._selected_rows = {0, 1}
@@ -576,9 +667,9 @@ def test_neuron_table_named_assignment_columns_preserve_prior_run_and_active_map
     widget = _make_widget(
         module,
         {
-            "n1": module.NeuronEntry(file_id="n1", subject="s1"),
-            "n2": module.NeuronEntry(file_id="n2", subject="s2"),
-            "n3": module.NeuronEntry(file_id="n3", subject="s3"),
+            "n1": module.NeuronEntry(file_id="n1"),
+            "n2": module.NeuronEntry(file_id="n2"),
+            "n3": module.NeuronEntry(file_id="n3"),
         },
     )
     widget._assignment_store = store
@@ -587,13 +678,13 @@ def test_neuron_table_named_assignment_columns_preserve_prior_run_and_active_map
     widget.refresh_cluster_assignments()
     widget.sort_by_cluster()
 
-    assert widget._table.headers[9:] == [
+    assert widget._table.headers[8:] == [
         "Soma Location 1",
         "Voxel Correlation 1 (active)",
         "Color",
     ]
     assert widget.get_cluster_map() == {"n1": None, "n2": 1, "n3": 2}
-    assert widget._table.sort_calls[-1] == (10, module.Qt.AscendingOrder)
+    assert widget._table.sort_calls[-1] == (9, module.Qt.AscendingOrder)
     state = widget.export_state()
     assert state["version"] == 2
     assert len(state["cluster_assignments"]["sets"]) == 2
