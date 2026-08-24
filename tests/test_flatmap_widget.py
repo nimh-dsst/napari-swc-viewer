@@ -51,12 +51,14 @@ class _DummySignal:
 def _load_flatmap_widget_module(monkeypatch):
     fake_qtwidgets = types.ModuleType("qtpy.QtWidgets")
     for name in (
+        "QAbstractItemView",
         "QCheckBox",
         "QComboBox",
         "QDoubleSpinBox",
         "QGroupBox",
         "QHBoxLayout",
         "QLabel",
+        "QListWidget",
         "QProgressBar",
         "QPushButton",
         "QScrollArea",
@@ -123,6 +125,38 @@ class _DummyButton:
         self.enabled = bool(enabled)
 
 
+class _DummyListItem:
+    def __init__(self, text: str) -> None:
+        self._text = str(text)
+        self._selected = False
+
+    def text(self) -> str:
+        return self._text
+
+    def setSelected(self, selected: bool) -> None:
+        self._selected = bool(selected)
+
+
+class _DummyListWidget:
+    def __init__(self) -> None:
+        self.items: list[_DummyListItem] = []
+
+    def addItem(self, text: str) -> None:
+        self.items.append(_DummyListItem(text))
+
+    def clear(self) -> None:
+        self.items.clear()
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def item(self, index: int) -> _DummyListItem:
+        return self.items[index]
+
+    def selectedItems(self) -> list[_DummyListItem]:
+        return [item for item in self.items if item._selected]
+
+
 class _DummyValueControl:
     def __init__(self, value=0, *, checked: bool = False) -> None:
         self.value = value
@@ -181,6 +215,7 @@ class _DummyLayer:
         self.data = np.asarray(data)
         self.name = kwargs["name"]
         self.metadata = kwargs.get("metadata", {})
+        self.gamma = kwargs.get("gamma", 1.0)
         self.edge_color = np.asarray(kwargs.get("edge_color", []))
         self.edge_width = kwargs.get("edge_width")
         self.face_color = np.asarray(kwargs.get("face_color", []))
@@ -2524,6 +2559,128 @@ def test_release_display_viewer_clears_only_matching_viewer_layer_handles(
     assert widget._region_outlines_layers == []
     assert widget._last_projected_nodes is projected_nodes
     assert widget._active_cache_profile is cache_profile
+
+
+def test_flatmap_heatmap_selector_lists_only_gamma_adjustable_heatmaps(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    heatmap_3d = _DummyLayer(
+        np.ones((2, 2, 2)),
+        name="3D heatmap",
+        metadata={"flatmap_render_mode": module._RENDER_HEATMAP},
+    )
+    heatmap_2d = _DummyLayer(
+        np.ones((2, 2)),
+        name="2D heatmap",
+        metadata={"flatmap_render_mode": module._RENDER_FLAT_HEATMAP},
+    )
+    allen_heatmap = _DummyLayer(
+        np.ones((6, 2, 2)),
+        name="Allen heatmap",
+        metadata={"flatmap_render_mode": module._RENDER_ALLEN_LAYERS},
+    )
+    points = _DummyLayer(
+        np.ones((2, 3)),
+        name="Flatmap points",
+        metadata={"flatmap_render_mode": module._RENDER_POINTS},
+    )
+    region_labels = _DummyLayer(
+        np.ones((2, 2)),
+        name="Region labels",
+        metadata={"projection_kind": "flatmap_region_labels"},
+    )
+    widget._viewer.layers.extend(
+        [heatmap_3d, heatmap_2d, allen_heatmap, points, region_labels]
+    )
+
+    layers = widget._flatmap_heatmap_layers()
+
+    assert layers == [heatmap_3d, heatmap_2d, allen_heatmap]
+
+
+def test_flatmap_heatmap_gamma_actions_apply_to_multi_selection(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    selected_a = _DummyLayer(
+        np.ones((2, 2)),
+        name="Neuron A",
+        metadata={"flatmap_render_mode": module._RENDER_FLAT_HEATMAP},
+    )
+    selected_b = _DummyLayer(
+        np.ones((2, 2)),
+        name="Neuron B",
+        metadata={"flatmap_render_mode": module._RENDER_FLAT_HEATMAP},
+        gamma=0.8,
+    )
+    unselected = _DummyLayer(
+        np.ones((2, 2)),
+        name="Neuron C",
+        metadata={"flatmap_render_mode": module._RENDER_FLAT_HEATMAP},
+        gamma=0.6,
+    )
+    widget._viewer.layers.extend([selected_a, selected_b, unselected])
+    widget._flatmap_heatmap_layer_list = _DummyListWidget()
+    widget._flatmap_heatmap_gamma_status_label = _DummyLabel()
+    widget._flatmap_enhance_fine_projections_btn = _DummyButton()
+    widget._flatmap_reset_gamma_btn = _DummyButton()
+
+    widget._refresh_flatmap_heatmap_layer_list()
+    widget._flatmap_heatmap_layer_list.item(0).setSelected(True)
+    widget._flatmap_heatmap_layer_list.item(1).setSelected(True)
+    widget._update_flatmap_heatmap_gamma_controls()
+
+    assert widget._flatmap_enhance_fine_projections_btn.enabled is True
+    assert widget._flatmap_reset_gamma_btn.enabled is True
+
+    widget._enhance_selected_flatmap_heatmap_projections()
+
+    assert selected_a.gamma == pytest.approx(0.2)
+    assert selected_b.gamma == pytest.approx(0.2)
+    assert unselected.gamma == pytest.approx(0.6)
+    assert widget._flatmap_heatmap_gamma_status_label.text == (
+        "Enhanced fine projections on 2 flatmap heatmap layer(s) (gamma 0.20)."
+    )
+
+    widget._reset_selected_flatmap_heatmap_gamma()
+
+    assert selected_a.gamma == pytest.approx(1.0)
+    assert selected_b.gamma == pytest.approx(1.0)
+    assert unselected.gamma == pytest.approx(0.6)
+    assert widget._flatmap_heatmap_gamma_status_label.text == (
+        "Reset gamma on 2 flatmap heatmap layer(s) (gamma 1.00)."
+    )
+
+
+def test_flatmap_heatmap_gamma_controls_disable_without_selection(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    heatmap = _DummyLayer(
+        np.ones((2, 2)),
+        name="Heatmap",
+        metadata={"flatmap_render_mode": module._RENDER_FLAT_HEATMAP},
+    )
+    widget._viewer.layers.append(heatmap)
+    widget._flatmap_heatmap_layer_list = _DummyListWidget()
+    widget._flatmap_heatmap_gamma_status_label = _DummyLabel()
+    widget._flatmap_enhance_fine_projections_btn = _DummyButton()
+    widget._flatmap_reset_gamma_btn = _DummyButton()
+
+    widget._refresh_flatmap_heatmap_layer_list()
+
+    assert widget._flatmap_enhance_fine_projections_btn.enabled is False
+    assert widget._flatmap_reset_gamma_btn.enabled is False
+    assert widget._flatmap_heatmap_gamma_status_label.text == (
+        "1 flatmap heatmap layer(s) available."
+    )
+
+    widget._enhance_selected_flatmap_heatmap_projections()
+
+    assert heatmap.gamma == pytest.approx(1.0)
+    assert widget._flatmap_heatmap_gamma_status_label.text == (
+        "Select at least one flatmap heatmap layer."
+    )
 
 
 def _simple_projection_summary(module, total_nodes: int = 1):

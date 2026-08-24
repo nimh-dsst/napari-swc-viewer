@@ -860,6 +860,7 @@ def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(
             [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0]],
         ),
     )
+    heatmap.gamma = 0.2
     mask = _DummyLayer(
         name="Mask: alpha Heatmap",
         data=np.array([[[0, 1], [1, 0]]], dtype=np.uint8),
@@ -910,6 +911,7 @@ def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(
     colormap = restored_heatmap.metadata["display"]["colormap"]
     assert colormap["name"] == "alpha_red"
     assert colormap["colors"] == [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0]]
+    assert restored_heatmap.metadata["display"]["gamma"] == pytest.approx(0.2)
     restored_mask = next(
         layer for layer in bundle.layers if layer.metadata["layer_type"] == "labels"
     )
@@ -978,6 +980,31 @@ def test_project_colormap_payload_restores_labels_colormap_kwargs() -> None:
     np.testing.assert_allclose(
         kwargs["colormap"].color_dict[1],
         [0.2, 0.4, 0.6, 1.0],
+    )
+
+
+def test_project_image_restore_applies_saved_gamma() -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+
+    viewer = SimpleNamespace(add_image=MagicMock())
+    widget = SimpleNamespace(
+        viewer=viewer,
+        _apply_project_colormap_kwargs=MagicMock(return_value=False),
+    )
+    volume = np.ones((2, 2, 2), dtype=np.float32)
+
+    NeuronViewerWidget._restore_project_image_layer(
+        widget,
+        volume,
+        {"name": "alpha Heatmap"},
+        {"gamma": 0.2},
+        {},
+    )
+
+    viewer.add_image.assert_called_once_with(
+        volume,
+        name="alpha Heatmap",
+        gamma=0.2,
     )
 
 
