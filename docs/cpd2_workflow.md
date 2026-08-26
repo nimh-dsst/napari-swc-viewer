@@ -52,8 +52,8 @@ SWC reconstructions. The CPD2 workflow uses the registered files ending in
    `napari_swc_viewer` in editable mode with `pip install -e .` inside the Pixi
    environment. After the editable install finishes, Pixi runs the `napari`
    executable from the locked environment. The current `pixi.lock` resolves
-   napari to `0.6.6`, so this command builds the plugin and then starts napari
-   0.6.6.
+   napari to `0.9.0`, so this command builds the plugin and then starts napari
+   0.9.0.
 
 4. In napari, open the plugin from the menu:
 

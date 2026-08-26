@@ -3,6 +3,9 @@ A Napari plugin that allows viewing of SWC files in napari
 
 ## Prerequisites
 
+The development environment requires Python 3.11 or 3.12 and napari 0.9.x;
+Pixi resolves both from the repository lock file.
+
 ### Installing Pixi
 
 This project uses [Pixi](https://pixi.sh) for environment and dependency management. To install Pixi, follow the instructions at:
@@ -31,8 +34,7 @@ pixi run napari
 
 This command will automatically build the package (if needed) before launching napari.
 
-To enable plugin debug logging for runtime diagnostics, including detached
-flatmap viewer lifecycle events:
+To enable plugin debug logging for runtime diagnostics:
 
 ```bash
 NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
@@ -45,40 +47,21 @@ NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log 
 ```
 
 The default file is `~/.napari-swc-viewer/debug.log`. It rotates at 10 MB and
-keeps three backups. Plugin DEBUG records are written to the file and console;
-focused napari layer-slicer DEBUG records are added to the file only.
+keeps three backups. Plugin DEBUG records are written to the file and console.
 
-Detached viewers are created hidden in 3D and shown only after their first
-flatmap layer is configured. A normal first render records
-`event=created_hidden`, `event=first_layer_ready`, `event=show_scheduled`, and
-`event=shown` in that order. `pending_first_show=false` on the final record
-confirms that the viewer left its hidden setup state.
+Flatmap projections use the main napari canvas. The current main-view layers,
+selection, dimensions, camera, and overlay state remain visible while a
+projection is computed. Immediately before the first flatmap layer is added,
+the plugin temporarily detaches those layer objects and shows only the flatmap
+coordinate space. Click **Return to Main View** or select another plugin tab to
+remove the transient flatmap layers and restore the same main-view objects and
+state. Opening a non-flatmap layer while a flatmap is active also restores the
+main scene automatically. A returned flatmap is not retained; run **Project to
+Flatmap** again to recreate it.
 
-On macOS the detached window is shown through a guarded normal-window path so
-it never inherits napari's app-wide saved fullscreen state. A normal render
-there reports `event=normal_show_requested`, `event=fullscreen_restore_suppressed`,
-and `show_path=normal_qt` on `event=shown` (other platforms report
-`show_path=napari`). If a user manually places the detached window in fullscreen
-and closes it, the close is briefly deferred so the native surface can return to
-normal before teardown: search for `event=fullscreen_close_deferred`,
-`event=fullscreen_exit_requested`, `event=fullscreen_exit_complete`, and
-`event=fullscreen_close_retried`. An `event=fullscreen_guard_failure` record
-marks any guarded fallback (missing Qt/napari private interface or a
-fullscreen-exit timeout). Each snapshot also reports `qt_fullscreen`,
-`qt_window_state`, `napari_saved_fullscreen`, and `fullscreen_close_state`.
-
-To diagnose a detached flatmap window that does not close, launch with a custom
-log path, create a projection, close **SWC Viewer Flatmap**, wait at least two
-seconds, and then close the main napari window. Search the retained trace for
-`flatmap_viewer_lifecycle event=qt_close`, the subsequent
-`event=close_checkpoint` records, `event=qt_deferreddelete`,
-`_LayerSlicer.shutdown`, `event=cleanup_complete`, and the three
-`event=post_destroy_checkpoint` records. A successful accepted close reports
-`cleanup_trigger=deferred_delete`, `cleanup_qt_viewer=closed`, zero retained
-layers, `napari_viewer_registered=false`, both plugin viewer-reference fields
-as `false`, and `slicer_executor_shutdown=true`. At the 2000 ms post-destroy
-checkpoint, both `qt_matching_top_level_widgets` and
-`qt_matching_native_windows` should be `empty`.
+This workflow creates no second napari window and does not depend on napari's
+private Qt window, slicer, or viewer-registry internals. The main window may
+remain in macOS Full Screen while entering and leaving flatmap space.
 
 For a complete CPD2 walkthrough covering clone/install, `pixi run napari`,
 left-hemisphere SWC-to-Parquet conversion, atlas loading, region queries, soma

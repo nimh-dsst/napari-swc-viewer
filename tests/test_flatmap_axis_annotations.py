@@ -44,7 +44,7 @@ def widget_class():
 
 @pytest.fixture
 def viewer():
-    from napari.components.viewer_model import ViewerModel
+    from napari.components import ViewerModel
 
     return ViewerModel()
 
@@ -86,14 +86,14 @@ def test_annotations_set_the_viewer_state_napari_renders(
     host._apply_display_axis_annotations(layer)
 
     assert viewer.dims.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
-    assert viewer.axes.visible is True
-    assert viewer.axes.labels is True
+    assert viewer.scene.overlays.axes.visible is True
+    assert viewer.scene.overlays.axes.labels is True
     # The two labels napari's axes overlay draws for the displayed axes.
     displayed = [viewer.dims.axis_labels[axis] for axis in viewer.dims.displayed[::-1]]
     assert displayed == ["Flatmap X", "Flatmap Y"]
-    assert viewer.text_overlay.visible is True
-    assert viewer.text_overlay.position.value == "top_left"
-    assert viewer.text_overlay.font_size == 12
+    assert viewer.canvas.overlays.text.visible is True
+    assert viewer.canvas.overlays.text.position == "top_left"
+    assert viewer.canvas.overlays.text.font_size == 12
 
 
 def test_plane_label_follows_a_real_dims_slider(widget_class, viewer, host) -> None:
@@ -103,13 +103,13 @@ def test_plane_label_follows_a_real_dims_slider(widget_class, viewer, host) -> N
 
     # napari opens a new six-plane axis at its middle position, not at zero.
     assert viewer.dims.current_step[0] == 2
-    assert viewer.text_overlay.text == "Allen layer: L4  (plane 3 of 6)"
+    assert viewer.canvas.overlays.text.text == "Allen layer: L4  (plane 3 of 6)"
 
     viewer.dims.set_current_step(0, 0)
-    assert viewer.text_overlay.text == "Allen layer: L1  (plane 1 of 6)"
+    assert viewer.canvas.overlays.text.text == "Allen layer: L1  (plane 1 of 6)"
 
     viewer.dims.set_current_step(0, 5)
-    assert viewer.text_overlay.text == "Allen layer: L6b  (plane 6 of 6)"
+    assert viewer.canvas.overlays.text.text == "Allen layer: L6b  (plane 6 of 6)"
 
 
 def test_clearing_restores_the_viewer_and_stops_following(
@@ -122,14 +122,16 @@ def test_clearing_restores_the_viewer_and_stops_following(
     host._apply_display_axis_annotations(layer)
     host._clear_display_axis_annotations()
 
-    assert viewer.dims.axis_labels == ("0", "1", "2")
-    assert viewer.axes.visible is False
-    assert viewer.text_overlay.visible is False
-    assert viewer.text_overlay.text == ""
+    # Clearing plugin-managed overlays does not override napari 0.9's labels;
+    # the still-present layer remains their source of truth.
+    assert viewer.dims.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
+    assert viewer.scene.overlays.axes.visible is False
+    assert viewer.canvas.overlays.text.visible is False
+    assert viewer.canvas.overlays.text.text == ""
 
     viewer.dims.set_current_step(0, 4)
 
-    assert viewer.text_overlay.text == ""
+    assert viewer.canvas.overlays.text.text == ""
 
 
 def test_depth_planes_are_named_by_micron_range(widget_class, viewer, host) -> None:
@@ -152,7 +154,7 @@ def test_depth_planes_are_named_by_micron_range(widget_class, viewer, host) -> N
     viewer.dims.set_current_step(0, 2)
 
     assert viewer.dims.axis_labels == ("Depth bin", "Flatmap Y", "Flatmap X")
-    assert viewer.text_overlay.text == "Depth bin: 50-75 um  (plane 3 of 3)"
+    assert viewer.canvas.overlays.text.text == "Depth bin: 50-75 um  (plane 3 of 3)"
 
 
 def test_flat_render_names_only_two_axes(widget_class, viewer, host) -> None:
@@ -169,10 +171,10 @@ def test_flat_render_names_only_two_axes(widget_class, viewer, host) -> None:
     host._apply_display_axis_annotations(layer)
 
     assert viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
-    assert viewer.axes.visible is True
+    assert viewer.scene.overlays.axes.visible is True
     # A collapsed render has no plane axis, so there is no plane to caption.
-    assert viewer.text_overlay.visible is False
-    assert viewer.text_overlay.text == ""
+    assert viewer.canvas.overlays.text.visible is False
+    assert viewer.canvas.overlays.text.text == ""
 
 
 def test_flat_render_retires_a_previous_plane_caption(
@@ -182,7 +184,7 @@ def test_flat_render_retires_a_previous_plane_caption(
 ) -> None:
     stack = _allen_layer_image(widget_class, viewer)
     host._apply_display_axis_annotations(stack)
-    assert viewer.text_overlay.text.startswith("Allen layer")
+    assert viewer.canvas.overlays.text.text.startswith("Allen layer")
 
     viewer.layers.remove(stack)
     flat = viewer.add_image(
@@ -193,8 +195,8 @@ def test_flat_render_retires_a_previous_plane_caption(
     )
     host._apply_display_axis_annotations(flat)
 
-    assert viewer.text_overlay.visible is False
-    assert viewer.text_overlay.text == ""
+    assert viewer.canvas.overlays.text.visible is False
+    assert viewer.canvas.overlays.text.text == ""
 
 
 def test_soma_points_layer_keeps_the_allen_plane_caption(
@@ -205,9 +207,9 @@ def test_soma_points_layer_keeps_the_allen_plane_caption(
     stack = _allen_layer_image(widget_class, viewer)
     host._apply_display_axis_annotations(stack)
     viewer.dims.set_current_step(0, 1)
-    assert viewer.text_overlay.text == "Allen layer: L2/3  (plane 2 of 6)"
+    assert viewer.canvas.overlays.text.text == "Allen layer: L2/3  (plane 2 of 6)"
 
-    # napari 0.6 accepts axis_labels on a Points layer; that is what keeps the
+    # napari 0.9 propagates axis_labels from a Points layer; that keeps the
     # soma overlay from reading as a foreign layer.
     somas = viewer.add_points(
         np.asarray([[1.0, 2.0, 3.0]]),
@@ -222,9 +224,9 @@ def test_soma_points_layer_keeps_the_allen_plane_caption(
     host._apply_display_axis_annotations(somas)
 
     assert viewer.dims.axis_labels == ("Allen layer", "Flatmap Y", "Flatmap X")
-    assert viewer.axes.visible is True
-    assert viewer.text_overlay.visible is True
-    assert viewer.text_overlay.text == "Allen layer: L2/3  (plane 2 of 6)"
+    assert viewer.scene.overlays.axes.visible is True
+    assert viewer.canvas.overlays.text.visible is True
+    assert viewer.canvas.overlays.text.text == "Allen layer: L2/3  (plane 2 of 6)"
 
 
 def test_flat_vector_layer_keeps_two_axis_labels(widget_class, viewer, host) -> None:
@@ -240,7 +242,7 @@ def test_flat_vector_layer_keeps_two_axis_labels(widget_class, viewer, host) -> 
     host._apply_display_axis_annotations(layer)
 
     assert viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
-    assert viewer.text_overlay.visible is False
+    assert viewer.canvas.overlays.text.visible is False
 
 
 def test_collapsed_region_overlays_get_two_axes_and_no_plane_caption(
@@ -269,9 +271,9 @@ def test_collapsed_region_overlays_get_two_axes_and_no_plane_caption(
 
         assert host._plane_labels_for_layer(layer) is None
         assert viewer.dims.axis_labels == ("Flatmap Y", "Flatmap X")
-        assert viewer.axes.visible is True
-        assert viewer.text_overlay.visible is False
-        assert viewer.text_overlay.text == ""
+        assert viewer.scene.overlays.axes.visible is True
+        assert viewer.canvas.overlays.text.visible is False
+        assert viewer.canvas.overlays.text.text == ""
 
 
 def test_foreign_layer_axis_labels_are_not_copied(viewer, host) -> None:
@@ -282,6 +284,38 @@ def test_foreign_layer_axis_labels_are_not_copied(viewer, host) -> None:
 
     host._apply_display_axis_annotations(points)
 
-    assert viewer.dims.axis_labels == ("0", "1", "2")
-    assert viewer.axes.visible is False
-    assert viewer.text_overlay.text == ""
+    assert viewer.dims.axis_labels == ("-3", "-2", "-1")
+    assert viewer.scene.overlays.axes.visible is False
+    assert viewer.canvas.overlays.text.text == ""
+
+
+def test_main_viewer_scene_swap_preserves_real_layer_objects(viewer) -> None:
+    from napari_swc_viewer.widgets.neuron_viewer import _MainViewerFlatmapScene
+
+    anatomy = viewer.add_image(
+        np.zeros((3, 4, 5), dtype=np.float32),
+        name="Anatomy",
+        axis_labels=("Anterior", "Dorsal", "Left"),
+    )
+    points = viewer.add_points(np.asarray([[1.0, 2.0, 3.0]]), name="Somas")
+    viewer.layers.selection.active = points
+    viewer.scene.camera.center = (7.0, 8.0, 9.0)
+    viewer.scene.camera.zoom = 3.0
+    scene = _MainViewerFlatmapScene(viewer)
+
+    assert scene.enter() is True
+    assert list(viewer.layers) == []
+    transient = viewer.add_image(
+        np.zeros((2, 6, 8), dtype=np.float32),
+        name="Flatmap",
+        axis_labels=("Depth bin", "Flatmap Y", "Flatmap X"),
+        metadata={"napari_swc_viewer_space": "flatmap"},
+    )
+    viewer.scene.camera.center = (1.0, 2.0, 3.0)
+
+    assert scene.restore() is True
+    assert list(viewer.layers) == [anatomy, points]
+    assert all(layer is not transient for layer in viewer.layers)
+    assert viewer.layers.selection.active is points
+    assert viewer.scene.camera.center == (7.0, 8.0, 9.0)
+    assert viewer.scene.camera.zoom == 3.0
