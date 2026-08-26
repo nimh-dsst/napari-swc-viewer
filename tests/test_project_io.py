@@ -642,6 +642,80 @@ def test_load_project_bundle_accepts_version_one_manifest_and_table_state(
     assert bundle.manifest["version"] == "1"
     assert bundle.table_state["version"] == "1"
     assert bundle.table_state["entries"][0]["cluster_id"] == 3
+    assert bundle.comparison_board is None
+
+
+def test_project_bundle_round_trips_comparison_board_and_heatmap_source_ids(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "comparison.swcv"
+    _write_source_parquet(source)
+    heatmap = _DummyLayer(
+        name="Cluster 3 Heatmap",
+        data=np.ones((2, 3, 4), dtype=np.float32),
+        metadata={
+            "heatmap_source": True,
+            "heatmap_kind": "analysis",
+            "comparison_source_id": "heatmap-source-3",
+            "comparison_assignment_id": "assignment-a",
+            "comparison_assignment_name": "Run A",
+            "comparison_filter_signature": {
+                "atlas_name": "allen_mouse_25um",
+                "region_ids": [1, 2],
+                "node_types": [2],
+                "soma_radius_um": None,
+                "depth_axis": 0,
+                "depth_bin_factor": 1,
+            },
+            "heatmap_cluster": 3,
+            "source_file_ids": ["n1"],
+        },
+    )
+    board = {
+        "version": 1,
+        "rows": 1,
+        "columns": 2,
+        "reference_assignment_id": "assignment-a",
+        "shared_intensity": True,
+        "cells": [
+            {
+                "cell_id": "cell-1",
+                "title": "Run A cluster heatmap",
+                "source_kind": "ccf_heatmap",
+                "assignment_id": "assignment-a",
+                "comparison_source_ids": ["heatmap-source-3"],
+                "ccf_plane": "coronal",
+                "reduction": "projection",
+            }
+        ],
+    }
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+        layers=[heatmap],
+        atlas_name="allen_mouse_25um",
+        comparison_board=board,
+    )
+
+    loaded = load_project_bundle(bundle_path)
+    assert loaded.comparison_board == board
+    assert loaded.layers[0].metadata["metadata"]["comparison_source_id"] == (
+        "heatmap-source-3"
+    )
+    assert loaded.layers[0].metadata["metadata"]["comparison_assignment_id"] == (
+        "assignment-a"
+    )
+    assert loaded.layers[0].metadata["metadata"]["comparison_filter_signature"] == {
+        "atlas_name": "allen_mouse_25um",
+        "depth_axis": 0,
+        "depth_bin_factor": 1,
+        "node_types": [2],
+        "region_ids": [1, 2],
+        "soma_radius_um": None,
+    }
 
 
 def test_project_bundle_filters_v2_assignments_to_current_membership(

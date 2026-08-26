@@ -11,6 +11,7 @@
 - Rendering neurons as lines, points, or both
 - Showing Allen reference layers (template, outline, region meshes, segmentation)
 - Running clustering and heatmap analysis
+- Comparing saved cluster mappings in an interactive 1×1 through 4×4 board
 
 The plugin adds:
 
@@ -392,8 +393,10 @@ Tabs:
 - Data
 - Regions
 - Visualization
+- Flatmap
 - Reference
 - Analysis
+- Compare
 - Tools
 - Histogram
 
@@ -628,6 +631,88 @@ Projects and Enhanced Parquet preserve assignment labels, palettes, cohorts,
 lineage, and run provenance. Projects do not store large clustering matrices,
 so dendrogram and distance exports show `Rerun required` after reload; filters,
 colors, grouping, and cluster heatmaps remain available.
+
+### Comparison Board (Compare tab)
+
+Use **Compare** → **Open Comparison Board** to open a separate lightweight
+pyqtgraph window for side-by-side cluster comparisons. The board belongs to the
+current project and supports 1×1 through 4×4 layouts. It coexists with the main
+napari window and the detached flatmap viewer; it does not create mini-napari
+viewers or duplicate full 3D scenes.
+
+Each cell can show:
+
+- **Flatmap somas** for one saved assignment
+- **Flatmap arbor heatmap**, built in a background worker and cached by source
+  Parquet signature, stable assignment ID, flatmap style, exact grid, and
+  filters
+- **CCFv3 somas** in coronal, sagittal, or horizontal view
+- **Existing CCFv3 heatmap(s)** created in **Analysis**, either one layer or a
+  metadata-compatible cluster set
+
+Select a cell by clicking it, edit its **Title**, **Map**, **Assignment** or
+**Heatmap source**, projection settings, point size, opacity, intensity range,
+and navigation option, then click **Apply and Render**. **Add Cell**,
+**Duplicate**, **Move Earlier**, **Move Later**, and **Remove** arrange recipes
+within the current grid.
+
+For CCFv3 cells, **Full projection** shows every soma or sums every heatmap
+voxel through the hidden axis. **Slice / slab** uses **Slice position** and
+**Slab thickness** in micrometers. Compatible slice cells share physical slice
+position when their navigation is linked. Coronal, sagittal, and horizontal
+cells use anatomical axes and retain physical spacing for binned, non-cubic
+heatmap arrays.
+
+Flatmap cells follow the same rectangular-grid policy as the Flatmap tab. The
+user chooses **Y bins**; **X bins** is derived once from the stored bounds and
+saved in the cell recipe. A restored recipe always reuses that exact X count.
+For canonical bounds, 256 Y bins gives 491 X bins for **Both hemispheres,
+shaped** and 512 for **Both hemispheres, square**.
+
+Set **Reference** to the assignment whose saved colors should define the visual
+comparison. Other assignments are matched by maximum overlap over shared
+`file_id` membership. This affects display colors only: original cluster IDs,
+saved palettes, and assignments remain unchanged, and the selected cell legend
+shows the mapping. Unmatched split or sparse clusters receive separate colors.
+
+The napari **Compare** tab also contains **Cluster Membership Comparison**.
+Choose a **Reference assignment** and a different **Candidate assignment** to
+see Adjusted Rand Index (ARI), Normalized Mutual Information (NMI), optimally
+matched agreement, cohort coverage, the cluster overlap matrix, and per-pair
+Jaccard similarity. The tab's reference is synchronized with the board's
+color-matching reference. Metrics align neurons only by `file_id`. ARI, NMI,
+and matched agreement use the shared cohort assigned in both runs; separate
+coverage counts show neurons assigned in only one run, unassigned in both, or
+present in only one assignment cohort. Jaccard cluster sizes use the complete
+shared cohort, so one-sided unassignment reduces the score.
+
+Pan/zoom is linked automatically only between cells with compatible coordinate
+provenance; flatmap and CCFv3 cells never link. Uncheck **Link when compatible**
+for a per-cell navigation override. Comparable heatmaps share one count range
+while **Share comparable intensity** is enabled. **Use per-cell maximum** opts
+one cell out and adds an override badge.
+
+Every cell reports assigned and omitted/unassigned neuron counts. Hover shows
+coordinates and heatmap count. Point picking and brush selection are not
+available in the first version; use the full napari and flatmap viewers for
+neuron-level inspection.
+
+Only newly generated Analysis heatmaps carry the stable source, assignment,
+atlas, and normalized filter metadata needed by the board. If a referenced
+assignment or heatmap is missing or incompatible, the cell shows **Source
+unavailable** and is never silently rebound by layer or assignment name. Use
+**Refresh Sources** after creating or removing Analysis heatmaps.
+
+**Export Board...** writes a labeled PNG and a neighboring
+`.comparison.json` sidecar containing the complete board recipe, source
+signature, cohort counts, color-matching table, intensity maxima, and cell
+provenance. The sidecar also stores one membership-comparison record per unique
+non-reference assignment on the board, including ARI, NMI, matched agreement,
+the overlap matrix, coverage counts, Jaccard matches, and contributing cell
+IDs. Missing stable assignment IDs are recorded as unavailable rather than
+replaced by a same-named assignment. Project bundles save the board recipe and
+referenced Analysis heatmap layers. Older projects load with an empty board.
+Enhanced Parquet does not store comparison-board state.
 
 ### Node Count Heatmap
 

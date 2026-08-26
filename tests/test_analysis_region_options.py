@@ -2213,6 +2213,8 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
         soma_radius_um=100.0,
         depth_bin_factor=3,
         depth_axis=1,
+        assignment_id="assignment-a",
+        assignment_name="Run A",
     )
 
     volume = np.zeros((2, 3, 4), dtype=np.float32)
@@ -2245,6 +2247,26 @@ def test_on_heatmap_finished_adds_stable_analysis_contrast_limits():
     assert layer.metadata["file_ids"] == ["n1", "n2"]
     assert layer.metadata["source_file_ids"] == ["n1", "n2"]
     assert layer.metadata["heatmap_autocontrast_policy"] == "stable_full_volume"
+    assert layer.metadata["comparison_source_id"]
+    assert layer.metadata["comparison_assignment_id"] == "assignment-a"
+    assert layer.metadata["comparison_assignment_name"] == "Run A"
+    assert layer.metadata["comparison_atlas_provenance"] == {
+        "atlas_name": "fake_atlas",
+        "resolution_um": [1.0, 1.0, 1.0],
+        "atlas_version": None,
+    }
+    assert layer.metadata["comparison_filter_signature"] == {
+        "atlas_provenance": {
+            "atlas_name": "fake_atlas",
+            "resolution_um": [1.0, 1.0, 1.0],
+            "atlas_version": None,
+        },
+        "region_ids": [567, 568],
+        "node_types": [3, 4],
+        "soma_radius_um": 100.0,
+        "depth_axis": 1,
+        "depth_bin_factor": 3,
+    }
 
 
 def test_all_cluster_heatmap_requests_excludes_all_neurons_entry():
