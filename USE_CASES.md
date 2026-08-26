@@ -40,6 +40,7 @@ Unless a use case says otherwise:
 | [UC-012](#uc-012-balance-cortical-depth-against-flat-map-position-when-clustering-somas) | Cluster somas with an isotropic flatmap metric and an explicit cortical-depth weight | Partially run |
 | [UC-013](#uc-013-overlay-cached-brain-regions-on-a-2d-flat-map) | Overlay cached region fills and outlines on depth-free flatmap renders | Not run |
 | [UC-014](#uc-014-control-and-share-region-appearance-across-ccfv3-and-flatmap-views) | Assign, stage, share, save, and restore region colors and visibility across CCFv3 and flatmap overlays | Not run |
+| [UC-015](#uc-015-compare-cluster-assignments-in-an-interactive-board) | Compare flatmap and CCFv3 cluster mappings side by side in a linked grid | Not run |
 
 ### UC-001: Download an Allen Mouse Atlas
 
@@ -1806,6 +1807,148 @@ visible at a given 2D pixel; the 3D layer continues to preserve depth planes.
   palette JSON and project round trips, import filtering, and old-project
   compatibility. Qt-dependent interaction and visual co-registration still
   require this manual napari run.
+
+### UC-015: Compare Cluster Assignments in an Interactive Board
+
+**Capability**
+
+The user can compare as many as 16 saved cluster mappings in a separate **SWC
+Viewer Comparison Board** window without duplicating full napari viewers. Each
+cell shows flatmap somas, flatmap arbor density, CCFv3 somas, or an existing
+Analysis heatmap set. The board keeps each cell bound to a saved assignment ID,
+matches display colors to a chosen reference by shared `file_id` membership,
+and links navigation only where the cells share coordinate provenance.
+
+This is intended for judging how alternate clustering runs split or preserve
+the same neuron cohort. It is a visual comparison surface, not a replacement
+for full napari inspection: v1 supports pan, zoom, and coordinate/value hover,
+but no point picking or brush selection.
+
+**Prerequisites**
+
+- A loaded neuron Parquet containing CCFv3 coordinates. To test flatmap cells,
+  use the v3-prepared Parquet from UC-003 with both shaped and square metadata.
+- A loaded atlas matching the CCFv3 data, such as `allen_mouse_25um` v1.2.
+- At least two saved assignment sets produced as in UC-007. Use assignments
+  with partly overlapping cohorts or relabeled clusters to make matching
+  visible.
+- To test CCF heatmap cells, use **Analysis** to create one complete
+  cluster-heatmap set for each assignment with identical region, node-type,
+  soma-radius, depth-axis, and bin-factor settings.
+- If those heatmaps filter `type = 2`, interpret the result as **axon-typed**,
+  not confirmed axon: this dataset contains dendritic projections mislabeled
+  as type 2, so a biological comparison still needs visual verification.
+- Start with the **SWC Viewer** plugin open. A 4×4 check needs enough screen
+  space to keep titles and hover readouts legible.
+
+**Steps and expected results**
+
+1. **Action:** Open **Compare** and click **Open Comparison Board**.
+   **Expected:** A separate **SWC Viewer Comparison Board** window opens with a
+   2×2 layout and a selected-cell inspector. Closing it hides the same board;
+   clicking **Open Comparison Board** again restores its cells and camera state.
+2. **Action:** Set **Rows** and **Columns** through the boundary layouts 1×1,
+   1×4, 4×1, and 4×4. Use **Add Cell**, **Duplicate**, **Move Earlier**, **Move
+   Later**, and **Remove**.
+   **Expected:** The board accepts only values 1–4 on each axis and at most 16
+   cells. It refuses to shrink below the current cell count and reports that
+   cells must be removed first. Duplicates retain the source recipe but get a
+   distinct title and board identity.
+3. **Action:** Add two cells. For each, set **Map** to **Flatmap somas**, choose
+   a different **Assignment**, set a useful **Title**, choose **Both
+   hemispheres, shaped**, and click **Apply and Render**. Set **Reference** to
+   the first run.
+   **Expected:** Both cells show the assignments' soma centroids and report
+   assigned and omitted/unassigned neuron counts. The reference keeps its saved
+   palette. The other cell's legend reports the maximum-overlap mappings to
+   reference clusters; split, sparse, and unmatched clusters remain separate
+   without changing either saved assignment.
+4. **Action:** Return to the napari **Compare** tab. Under **Cluster Membership
+   Comparison**, choose the first run as **Reference assignment** and the
+   second as **Candidate assignment**.
+   **Expected:** The tab reports ARI, NMI, optimally matched agreement, shared
+   and one-sided cohort counts, a reference-by-candidate cluster overlap
+   matrix, and per-pair Jaccard values. Changing **Reference assignment** also
+   changes the board's color-matching reference. All membership joins use
+   `file_id`; neurons unassigned in either run are reported in coverage and
+   excluded from ARI, NMI, and matched agreement.
+5. **Action:** Pan and zoom either shaped flatmap cell, then change one cell to
+   **Both hemispheres, square** and click **Apply and Render**.
+   **Expected:** Shaped cells navigate together. The square cell does not join
+   that camera group. No flatmap cell ever links to a CCFv3 cell.
+6. **Action:** Change one cell to **Flatmap arbor heatmap**. Set **Y bins** to
+   256 for shaped, apply, then repeat with square.
+   **Expected:** The inspector shows the resolved **X bins** as 491 for the
+   canonical shaped bounds and 512 for square. Each image is `Y × X`, aligns
+   with the corresponding soma points without a transpose, and is not
+   horizontally squashed. Returning to a saved cell or project uses its stored
+   X count verbatim.
+7. **Action:** Configure three cells as **CCFv3 somas**, using **Coronal**,
+   **Sagittal**, and **Horizontal** under **CCF plane**, and select **Full
+   projection**.
+   **Expected:** Each point cloud is projected through the full hidden axis.
+   Coronal displays left-right horizontally and dorsal-ventral vertically;
+   sagittal displays rostral-caudal horizontally and dorsal-ventral vertically;
+   horizontal displays left-right horizontally and rostral-caudal vertically.
+8. **Action:** Set two same-plane CCF cells to **Slice / slab**, use the same
+   **Slab thickness**, leave **Link when compatible** checked, and change
+   **Slice position** in one cell before clicking **Apply and Render**.
+   **Expected:** The physical slice position is copied to the compatible cell,
+   both cells retain only somas in that slab, and their pan/zoom stays linked.
+   Uncheck **Link when compatible** for one cell to opt it out.
+9. **Action:** Set a cell to **Existing CCFv3 heatmap(s)** and choose a complete
+   cluster set under **Heatmap source**. Repeat for the second assignment with
+   the same geometry and filters.
+   **Expected:** Cluster volumes are reduced with count-preserving sums through
+   the chosen slab or the full projection axis. Compatible cells use the same
+   displayed count maximum when **Share comparable intensity** is checked.
+   A set with mismatched atlas, shape, scale, assignment, or filter provenance
+   is not composed as one source.
+10. **Action:** Enable **Use per-cell maximum** in one heatmap cell, set
+   **Maximum**, and apply. Then uncheck **Share comparable intensity** globally.
+   **Expected:** The per-cell maximum is used and an `intensity override` badge
+   appears in that cell. Disabling the global option gives each non-overridden
+   heatmap its own observed maximum.
+11. **Action:** Hover over soma and heatmap cells, click between cells, and try
+    dragging and scrolling in each plot.
+    **Expected:** The footer reports physical/flatmap coordinates and heatmap
+    count where applicable. Clicking selects the cell for the inspector. Drag
+    and scroll pan/zoom; no neuron selection, brush, or napari layer is created.
+12. **Action:** Delete an assignment used by a cell, or delete an Analysis
+    heatmap layer referenced by a cell, then click **Refresh Sources**.
+    **Expected:** The affected cell becomes an explanatory **Source
+    unavailable** placeholder. A same-named assignment or layer is never used
+    as a substitute for the missing stable ID; other cells still render.
+13. **Action:** Click **Export Board...** and save `comparison.png`.
+    **Expected:** The labeled grid is written as `comparison.png`, and
+    `comparison.comparison.json` records the complete board recipe, source file
+    signature, cohort counts, source IDs, original and display palettes,
+    overlap mappings, intensity maxima, and per-cell provenance. Its
+    `membership_comparisons` section contains one ARI/NMI/agreement, overlap
+    matrix, coverage, and Jaccard record for each unique non-reference
+    assignment represented on the board; repeated cells share one record and
+    retain all source cell IDs.
+14. **Action:** Save the project, close and reload it, then reopen **Compare**.
+    Also load a project created before Comparison Board support.
+    **Expected:** The new project restores its one board after assignments,
+    heatmaps, atlas, and flatmap references are available. The legacy project
+    loads normally with an empty 2×2 board. Enhanced Parquet export remains
+    unchanged and does not contain board state.
+
+**Manual verification**
+
+- Status: Not run
+- Last verified: Never
+- Notes: Added on 2026-08-25. Automated tests cover `file_id`-only overlap
+  matching (including duplicate display `neuron_id` values), relabeled/split/
+  sparse/unmatched clusters, CCF plane orientation and count-preserving slab
+  reductions on non-cubic volumes, stored rectangular flatmap recipes, every
+  layout through 4×4, cell recipe operations, shared-intensity grouping and
+  overrides, stable heatmap source metadata, missing-source refusal, project
+  and legacy-project round trips, cluster membership statistics and cohort
+  accounting, and export-sidecar provenance. The 4×4 visual result, anatomical
+  screen orientation, pyqtgraph navigation links, metrics-table layout, window
+  close/reopen behavior, and PNG output still require this manual napari run.
 
 ## Use-Case Template
 

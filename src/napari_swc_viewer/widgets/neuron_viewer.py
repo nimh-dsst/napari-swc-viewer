@@ -64,6 +64,7 @@ from ..auto_center import (
     depth_axis_from_not_displayed,
 )
 from ..cluster_assignments import ClusterAssignmentStore
+from ..comparison import ComparisonBoardState, compare_cluster_memberships
 from ..db import NeuronDatabase
 from ..logging_utils import configure_debug_logging, startup_timing
 from ..neuron_table_ops import (
@@ -756,6 +757,9 @@ class NeuronViewerWidget(QWidget):
             self._saved_table_state: dict[str, object] = {}
             self._current_project_path: Path | None = None
             self._cluster_assignment_store = ClusterAssignmentStore()
+            self._comparison_board_state = ComparisonBoardState()
+            self._comparison_data_provider = None
+            self._comparison_window = None
             self._scene_render_modes: dict[object, str] = {}
             self._scene_display_state: dict[object, dict[str, object]] = {}
             self._layer_name_event_connections: dict[
@@ -2628,6 +2632,11 @@ class NeuronViewerWidget(QWidget):
             )
             tabs.addTab(self._analysis_tab, "Analysis")
 
+        with startup_timing(logger, "neuron_viewer_setup_tab", tab="Compare"):
+            compare_tab = QWidget()
+            tabs.addTab(compare_tab, "Compare")
+            self._setup_compare_tab(compare_tab)
+
         with startup_timing(logger, "neuron_viewer_setup_tab", tab="Tools"):
             tools_tab = QWidget()
             tabs.addTab(tools_tab, "Tools")
@@ -2637,6 +2646,418 @@ class NeuronViewerWidget(QWidget):
             histogram_tab = QWidget()
             tabs.addTab(histogram_tab, "Histogram")
             self._setup_histogram_tab(histogram_tab)
+
+    def _setup_compare_tab(self, parent: QWidget) -> None:
+        """Set up the launcher and status for the comparison board."""
+        layout = QVBoxLayout(parent)
+
+        introduction = QLabel(
+            "Compare saved cluster assignments in a separate interactive "
+            "1×1 through 4×4 board. Cells can show flatmap somas or arbor "
+            "density, and CCFv3 somas or Analysis heatmaps."
+        )
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
+
+        board_group = QGroupBox("Comparison Board")
+        board_layout = QVBoxLayout(board_group)
+        open_button = QPushButton("Open Comparison Board")
+        open_button.clicked.connect(self._open_comparison_board)
+        board_layout.addWidget(open_button)
+
+        clear_button = QPushButton("Clear Comparison Board")
+        clear_button.clicked.connect(self._clear_comparison_board)
+        board_layout.addWidget(clear_button)
+
+        self._comparison_status_label = QLabel()
+        self._comparison_status_label.setWordWrap(True)
+        board_layout.addWidget(self._comparison_status_label)
+        layout.addWidget(board_group)
+
+        metrics_group = QGroupBox("Cluster Membership Comparison")
+        metrics_layout = QVBoxLayout(metrics_group)
+        metrics_help = QLabel(
+            "Compare two saved assignments over their shared file_id cohort. "
+            "ARI, NMI, and matched agreement use neurons assigned in both runs."
+        )
+        metrics_help.setWordWrap(True)
+        metrics_layout.addWidget(metrics_help)
+
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(QLabel("Reference assignment:"))
+        self._comparison_metrics_reference_combo = QComboBox()
+        self._comparison_metrics_reference_combo.currentIndexChanged.connect(
+            self._on_comparison_metrics_reference_changed
+        )
+        reference_row.addWidget(self._comparison_metrics_reference_combo, 1)
+        metrics_layout.addLayout(reference_row)
+
+        candidate_row = QHBoxLayout()
+        candidate_row.addWidget(QLabel("Candidate assignment:"))
+        self._comparison_metrics_candidate_combo = QComboBox()
+        self._comparison_metrics_candidate_combo.currentIndexChanged.connect(
+            self._update_comparison_metrics
+        )
+        candidate_row.addWidget(self._comparison_metrics_candidate_combo, 1)
+        metrics_layout.addLayout(candidate_row)
+
+        self._comparison_metrics_summary_label = QLabel(
+            "Save at least two cluster assignments to calculate membership metrics."
+        )
+        self._comparison_metrics_summary_label.setWordWrap(True)
+        self._comparison_metrics_summary_label.setToolTip(
+            "ARI corrects pairwise grouping agreement for chance. NMI measures "
+            "shared information. Matched agreement applies maximum-overlap "
+            "one-to-one cluster label matching."
+        )
+        metrics_layout.addWidget(self._comparison_metrics_summary_label)
+
+        self._comparison_metrics_coverage_label = QLabel("")
+        self._comparison_metrics_coverage_label.setWordWrap(True)
+        metrics_layout.addWidget(self._comparison_metrics_coverage_label)
+
+        metrics_layout.addWidget(
+            QLabel("Cluster overlap counts (reference rows × candidate columns):")
+        )
+        self._comparison_overlap_table = QTableWidget(0, 0)
+        self._comparison_overlap_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._comparison_overlap_table.setMinimumHeight(140)
+        self._comparison_overlap_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self._comparison_overlap_table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        metrics_layout.addWidget(self._comparison_overlap_table)
+
+        metrics_layout.addWidget(QLabel("Optimally matched clusters:"))
+        self._comparison_cluster_match_table = QTableWidget(0, 7)
+        self._comparison_cluster_match_table.setHorizontalHeaderLabels(
+            [
+                "Reference",
+                "Candidate",
+                "Overlap",
+                "Reference size",
+                "Candidate size",
+                "Union",
+                "Jaccard",
+            ]
+        )
+        self._comparison_cluster_match_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers
+        )
+        self._comparison_cluster_match_table.setMinimumHeight(160)
+        self._comparison_cluster_match_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        metrics_layout.addWidget(self._comparison_cluster_match_table)
+        layout.addWidget(metrics_group, 1)
+
+        self._comparison_metrics_has_defaulted = False
+        self._update_comparison_status()
+        self._refresh_comparison_metric_controls()
+
+    def _refresh_comparison_metric_controls(self) -> None:
+        """Refresh metric selectors while preserving stable assignment IDs."""
+        reference_combo = getattr(
+            self,
+            "_comparison_metrics_reference_combo",
+            None,
+        )
+        candidate_combo = getattr(
+            self,
+            "_comparison_metrics_candidate_combo",
+            None,
+        )
+        if reference_combo is None or candidate_combo is None:
+            return
+        assignments = self._cluster_assignment_store.sets()
+        assignment_ids = {assignment.assignment_id for assignment in assignments}
+        reference_id = self._comparison_board_state.reference_assignment_id
+        previous_candidate = candidate_combo.currentData()
+        defaulted_reference = False
+
+        if (
+            reference_id is None
+            and assignments
+            and not self._comparison_metrics_has_defaulted
+        ):
+            reference_id = assignments[0].assignment_id
+            self._comparison_board_state.reference_assignment_id = reference_id
+            self._comparison_metrics_has_defaulted = True
+            defaulted_reference = True
+        elif reference_id is not None:
+            self._comparison_metrics_has_defaulted = True
+
+        blocked = reference_combo.blockSignals(True)
+        reference_combo.clear()
+        reference_combo.addItem("No reference / color matching", None)
+        for assignment in assignments:
+            reference_combo.addItem(assignment.name, assignment.assignment_id)
+        if reference_id is not None and reference_id not in assignment_ids:
+            reference_combo.addItem(
+                f"Missing reference ({reference_id})",
+                reference_id,
+            )
+        reference_index = reference_combo.findData(reference_id)
+        reference_combo.setCurrentIndex(max(0, reference_index))
+        reference_combo.blockSignals(blocked)
+
+        blocked = candidate_combo.blockSignals(True)
+        candidate_combo.clear()
+        candidates = [
+            assignment
+            for assignment in assignments
+            if assignment.assignment_id != reference_id
+        ]
+        if not candidates:
+            candidate_combo.addItem("No different assignment available", None)
+        else:
+            for assignment in candidates:
+                candidate_combo.addItem(assignment.name, assignment.assignment_id)
+            candidate_index = candidate_combo.findData(previous_candidate)
+            candidate_combo.setCurrentIndex(max(0, candidate_index))
+        candidate_combo.blockSignals(blocked)
+        if defaulted_reference:
+            window = getattr(self, "_comparison_window", None)
+            setter = getattr(window, "set_reference_assignment_id", None)
+            if callable(setter):
+                setter(reference_id)
+        self._update_comparison_metrics()
+
+    def _on_comparison_metrics_reference_changed(self, index: int) -> None:
+        """Use the metrics reference as the board's color-matching reference."""
+        combo = self._comparison_metrics_reference_combo
+        reference_id = combo.itemData(index) if index >= 0 else None
+        self._comparison_metrics_has_defaulted = True
+        self._comparison_board_state.reference_assignment_id = (
+            str(reference_id) if reference_id not in (None, "") else None
+        )
+        window = getattr(self, "_comparison_window", None)
+        setter = getattr(window, "set_reference_assignment_id", None)
+        if callable(setter):
+            setter(self._comparison_board_state.reference_assignment_id)
+        self._update_comparison_status()
+        self._refresh_comparison_metric_controls()
+
+    @staticmethod
+    def _comparison_metric_text(value: float | None) -> str:
+        return "—" if value is None else f"{value:.3f}"
+
+    def _clear_comparison_metric_tables(self) -> None:
+        overlap = getattr(self, "_comparison_overlap_table", None)
+        if overlap is not None:
+            overlap.clear()
+            overlap.setRowCount(0)
+            overlap.setColumnCount(0)
+        matches = getattr(self, "_comparison_cluster_match_table", None)
+        if matches is not None:
+            matches.setRowCount(0)
+
+    def _update_comparison_metrics(self, _index: int | None = None) -> None:
+        """Calculate and display one selected saved-assignment comparison."""
+        reference_combo = getattr(
+            self,
+            "_comparison_metrics_reference_combo",
+            None,
+        )
+        candidate_combo = getattr(
+            self,
+            "_comparison_metrics_candidate_combo",
+            None,
+        )
+        if reference_combo is None or candidate_combo is None:
+            return
+        reference = self._cluster_assignment_store.get(reference_combo.currentData())
+        candidate = self._cluster_assignment_store.get(candidate_combo.currentData())
+        summary = self._comparison_metrics_summary_label
+        coverage = self._comparison_metrics_coverage_label
+        if reference is None or candidate is None:
+            self._clear_comparison_metric_tables()
+            reference_id = reference_combo.currentData()
+            if reference_id not in (None, "") and reference is None:
+                summary.setText(
+                    f"Reference assignment {reference_id!s} is unavailable. "
+                    "Choose another saved assignment; no name-based substitute "
+                    "will be used."
+                )
+            else:
+                summary.setText(
+                    "Choose two different saved assignments to calculate "
+                    "membership metrics."
+                )
+            coverage.setText("")
+            return
+
+        result = compare_cluster_memberships(reference, candidate)
+        agreement = (
+            "—"
+            if result.matched_agreement is None
+            else f"{100.0 * result.matched_agreement:.1f}% "
+            f"({result.matched_file_ids:,} / "
+            f"{result.cohort_counts.assigned_in_both:,})"
+        )
+        summary.setText(
+            f"ARI: {self._comparison_metric_text(result.adjusted_rand_index)} · "
+            f"NMI: {self._comparison_metric_text(result.normalized_mutual_information)} · "
+            f"Matched agreement: {agreement}"
+        )
+        counts = result.cohort_counts
+        coverage.setText(
+            f"Shared cohort: {counts.shared_cohort:,} · assigned in both: "
+            f"{counts.assigned_in_both:,} · reference assigned only: "
+            f"{counts.reference_assigned_only:,} · candidate assigned only: "
+            f"{counts.candidate_assigned_only:,} · unassigned in both: "
+            f"{counts.unassigned_in_both:,} · cohort-only: "
+            f"{counts.reference_cohort_only:,} reference / "
+            f"{counts.candidate_cohort_only:,} candidate"
+        )
+        if result.status != "ok":
+            coverage.setText(f"{result.status_message} {coverage.text()}")
+
+        overlap = self._comparison_overlap_table
+        overlap.clear()
+        overlap.setRowCount(len(result.reference_cluster_ids))
+        overlap.setColumnCount(len(result.candidate_cluster_ids))
+        overlap.setVerticalHeaderLabels(
+            [str(label) for label in result.reference_cluster_ids]
+        )
+        overlap.setHorizontalHeaderLabels(
+            [str(label) for label in result.candidate_cluster_ids]
+        )
+        for row, values in enumerate(result.overlap_counts):
+            for column, value in enumerate(values):
+                overlap.setItem(row, column, QTableWidgetItem(f"{value:,}"))
+
+        matches = self._comparison_cluster_match_table
+        matches.setRowCount(len(result.cluster_matches))
+        for row, match in enumerate(result.cluster_matches):
+            values = (
+                "Unmatched" if match.reference_label is None else match.reference_label,
+                "Unmatched" if match.candidate_label is None else match.candidate_label,
+                f"{match.intersection:,}",
+                f"{match.reference_size:,}",
+                f"{match.candidate_size:,}",
+                f"{match.union:,}",
+                f"{match.jaccard:.3f}",
+            )
+            for column, value in enumerate(values):
+                matches.setItem(row, column, QTableWidgetItem(str(value)))
+
+    def _comparison_state_payload(self) -> dict[str, object]:
+        """Return the latest serializable comparison-board recipe."""
+        window = getattr(self, "_comparison_window", None)
+        if window is not None:
+            try:
+                self._comparison_board_state = window.state()
+            except Exception:
+                logger.debug("Could not read comparison board state", exc_info=True)
+        provider = getattr(self, "_comparison_data_provider", None)
+        if provider is not None:
+            for index, cell in enumerate(self._comparison_board_state.cells):
+                try:
+                    self._comparison_board_state.cells[index] = provider.prepare_spec(
+                        cell
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not finalize comparison cell grid before save",
+                        exc_info=True,
+                    )
+        return self._comparison_board_state.to_state()
+
+    def _on_comparison_board_state_changed(
+        self,
+        state: ComparisonBoardState,
+    ) -> None:
+        """Retain board edits independently of the window's visibility."""
+        prior_reference = self._comparison_board_state.reference_assignment_id
+        self._comparison_board_state = ComparisonBoardState.from_state(state.to_state())
+        self._update_comparison_status()
+        if prior_reference != self._comparison_board_state.reference_assignment_id:
+            self._refresh_comparison_metric_controls()
+
+    def _update_comparison_status(self) -> None:
+        """Describe the current project board in the Compare tab."""
+        label = getattr(self, "_comparison_status_label", None)
+        if label is None:
+            return
+        state = self._comparison_board_state
+        source_count = len(state.cells)
+        if source_count:
+            label.setText(
+                f"Current board: {state.rows}×{state.columns} · "
+                f"{source_count} configured cell(s)."
+            )
+        else:
+            label.setText(
+                f"Current board: {state.rows}×{state.columns} · no cells configured."
+            )
+
+    def _comparison_provider(self):
+        """Create the project-backed comparison data provider on demand."""
+        provider = getattr(self, "_comparison_data_provider", None)
+        if provider is None:
+            from ..comparison_data import ComparisonDataProvider
+
+            provider = ComparisonDataProvider(
+                database_provider=lambda: self._db,
+                assignment_store_provider=lambda: self._cluster_assignment_store,
+                viewer_layers_provider=self._iter_viewer_layers,
+                atlas_provider=lambda: self._atlas,
+            )
+            self._comparison_data_provider = provider
+        return provider
+
+    def _open_comparison_board(self) -> None:
+        """Show the project's separate lightweight comparison window."""
+        if self._db is None:
+            show_warning("Load a neuron Parquet before opening the comparison board.")
+            return
+        window = getattr(self, "_comparison_window", None)
+        if window is None:
+            from .comparison_board import ComparisonBoardWindow
+
+            window = ComparisonBoardWindow(
+                provider=self._comparison_provider(),
+                state=ComparisonBoardState.from_state(
+                    self._comparison_board_state.to_state()
+                ),
+                state_changed_callback=self._on_comparison_board_state_changed,
+                parent=None,
+            )
+            self._comparison_window = window
+        else:
+            window.refresh_sources()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _clear_comparison_board(self) -> None:
+        """Reset the current project's board recipe to an empty 2×2 board."""
+        self._comparison_board_state = ComparisonBoardState()
+        window = getattr(self, "_comparison_window", None)
+        if window is not None:
+            window.set_state(self._comparison_board_state)
+        self._update_comparison_status()
+        self._refresh_comparison_metric_controls()
+
+    def _restore_comparison_board(self, payload: object) -> None:
+        """Restore a versioned board recipe or an empty legacy-project state."""
+        state = ComparisonBoardState.from_state(
+            payload if isinstance(payload, dict) else None
+        )
+        self._comparison_board_state = state
+        if state.reference_assignment_id is not None:
+            self._comparison_metrics_has_defaulted = True
+        provider = getattr(self, "_comparison_data_provider", None)
+        if provider is not None:
+            provider.clear_cache()
+        window = getattr(self, "_comparison_window", None)
+        if window is not None:
+            window.set_state(state)
+        self._update_comparison_status()
+        self._refresh_comparison_metric_controls()
 
     def _setup_data_tab(self, parent: QWidget) -> None:
         """Set up the data loading tab."""
@@ -3319,9 +3740,7 @@ class NeuronViewerWidget(QWidget):
         sources_layout.addWidget(self._heatmap_layer_list)
 
         gamma_btn_row = QHBoxLayout()
-        self._enhance_fine_projections_btn = QPushButton(
-            "Enhance Fine Projections"
-        )
+        self._enhance_fine_projections_btn = QPushButton("Enhance Fine Projections")
         self._enhance_fine_projections_btn.setToolTip(
             "Set gamma to 0.20 on each selected heatmap to brighten "
             "low-intensity projections."
@@ -3789,6 +4208,9 @@ class NeuronViewerWidget(QWidget):
             except Exception:
                 logger.debug("Failed to close previous neuron database", exc_info=True)
         self._set_current_project_path(None)
+        comparison_restorer = getattr(self, "_restore_comparison_board", None)
+        if callable(comparison_restorer):
+            comparison_restorer(None)
 
         self._file_label.setText(Path(filepath).name)
 
@@ -4114,6 +4536,11 @@ class NeuronViewerWidget(QWidget):
                 if callable(appearance_getter)
                 else RegionAppearanceStore()
             )
+            comparison_getter = getattr(
+                self,
+                "_comparison_state_payload",
+                None,
+            )
             saved = save_project_bundle(
                 bundle_path,
                 source_parquet_path=self._db.parquet_path,
@@ -4123,6 +4550,9 @@ class NeuronViewerWidget(QWidget):
                 analysis_metadata=self._analysis_project_metadata(),
                 region_appearance=appearance_store.to_palette_dict(),
                 flatmap_cache_reference=(self._flatmap_tab.active_cache_reference()),
+                comparison_board=(
+                    comparison_getter() if callable(comparison_getter) else None
+                ),
                 progress_callback=_on_save_progress,
                 overwrite=overwrite,
             )
@@ -4250,6 +4680,7 @@ class NeuronViewerWidget(QWidget):
         self._apply_active_cluster_assignment()
 
         self._restore_project_layers(bundle)
+        self._restore_comparison_board(getattr(bundle, "comparison_board", None))
         if bundle.region_appearance:
             self._on_region_appearance_applied(self._region_appearance_store())
         self._sync_neuron_table_heatmap_membership()
@@ -4708,6 +5139,9 @@ class NeuronViewerWidget(QWidget):
             atlas=atlas_name,
         ):
             self._update_point_import_controls()
+        comparison_window = getattr(self, "_comparison_window", None)
+        if comparison_window is not None and comparison_window.isVisible():
+            comparison_window.refresh_sources()
 
     def _set_custom_region_hierarchy_for_atlas(self, atlas: object) -> None:
         """Populate every scope-specific custom selector from one atlas."""
@@ -5698,6 +6132,9 @@ class NeuronViewerWidget(QWidget):
         refresh_manual_heatmaps = getattr(self, "_refresh_manual_heatmap_combo", None)
         if callable(refresh_manual_heatmaps):
             refresh_manual_heatmaps()
+        comparison_window = getattr(self, "_comparison_window", None)
+        if comparison_window is not None and comparison_window.isVisible():
+            comparison_window.refresh_sources()
 
     def _iter_viewer_layers(self) -> list:
         """Return current viewer layers as a list."""
@@ -8283,6 +8720,7 @@ class NeuronViewerWidget(QWidget):
         enabled = len(store) > 0
         self._rename_cluster_assignment_btn.setEnabled(enabled)
         self._delete_cluster_assignment_btn.setEnabled(enabled)
+        self._refresh_comparison_metric_controls()
 
     def _active_assignment_color_map(self) -> dict[object, list[float]]:
         """Return active-set colors for all table and rendered neurons."""
@@ -8321,6 +8759,9 @@ class NeuronViewerWidget(QWidget):
         handler = getattr(analysis_tab, "on_active_cluster_assignment_changed", None)
         if callable(handler):
             handler()
+        comparison_window = getattr(self, "_comparison_window", None)
+        if comparison_window is not None and comparison_window.isVisible():
+            comparison_window.refresh_sources()
 
     def _on_active_cluster_assignment_changed(self, index: int) -> None:
         """Activate the assignment selected in the Data tab."""
@@ -8357,6 +8798,9 @@ class NeuronViewerWidget(QWidget):
         self._refresh_cluster_assignment_controls()
         self._neuron_table.refresh_cluster_assignments(preserve_selection=True)
         self._refresh_neuron_table_summary()
+        comparison_window = getattr(self, "_comparison_window", None)
+        if comparison_window is not None:
+            comparison_window.refresh_sources()
 
     def _delete_active_cluster_assignment(self) -> None:
         """Confirm and delete the active assignment without removing neurons."""
@@ -9670,6 +10114,9 @@ class NeuronViewerWidget(QWidget):
         self._neuron_table.sort_by_cluster()
         self._refresh_cluster_filter_controls()
         self._refresh_apply_existing_clusters_button()
+        comparison_window = getattr(self, "_comparison_window", None)
+        if comparison_window is not None and comparison_window.isVisible():
+            comparison_window.refresh_sources()
 
     def _clear_all_neuron_layers(self, _checked: bool = False) -> None:
         """Clear all neuron layers from the UI button without preserving scene state."""

@@ -65,6 +65,7 @@ class ProjectBundle:
     layers: tuple[ProjectLayer, ...]
     flatmap_cache_reference: dict[str, Any] | None = None
     region_appearance: dict[str, Any] | None = None
+    comparison_board: dict[str, Any] | None = None
 
 
 def _json_safe(value: Any) -> Any:
@@ -1145,6 +1146,7 @@ def _write_project_bundle_contents(
     analysis_metadata: Mapping[str, Any] | None,
     region_appearance: Mapping[str, Any] | None,
     flatmap_cache_reference: Mapping[str, Any] | None,
+    comparison_board: Mapping[str, Any] | None,
     progress_callback: _ProgressCallback | None,
     total_steps: int,
 ) -> None:
@@ -1257,6 +1259,10 @@ def _write_project_bundle_contents(
         # Keep the potentially large region cache external to the project.
         # The reference is informational and may be relocated by the user.
         manifest["flatmap_cache"] = dict(flatmap_cache_reference)
+    if comparison_board:
+        # Comparison recipes are intentionally small and contain no volume
+        # arrays.  Referenced heatmaps remain ordinary project layers.
+        manifest["comparison_board"] = dict(comparison_board)
     _write_json(bundle / "manifest.json", manifest)
 
 
@@ -1270,6 +1276,7 @@ def save_project_bundle(
     analysis_metadata: Mapping[str, Any] | None = None,
     region_appearance: Mapping[str, Any] | None = None,
     flatmap_cache_reference: Mapping[str, Any] | None = None,
+    comparison_board: Mapping[str, Any] | None = None,
     progress_callback: _ProgressCallback | None = None,
     overwrite: bool = False,
 ) -> Path:
@@ -1301,6 +1308,7 @@ def save_project_bundle(
             analysis_metadata=analysis_metadata,
             region_appearance=region_appearance,
             flatmap_cache_reference=flatmap_cache_reference,
+            comparison_board=comparison_board,
             progress_callback=progress_callback,
             total_steps=total_steps,
         )
@@ -1365,6 +1373,11 @@ def load_project_bundle(bundle_path: str | Path) -> ProjectBundle:
         region_appearance=(
             dict(manifest["region_appearance"])
             if isinstance(manifest.get("region_appearance"), Mapping)
+            else None
+        ),
+        comparison_board=(
+            dict(manifest["comparison_board"])
+            if isinstance(manifest.get("comparison_board"), Mapping)
             else None
         ),
     )

@@ -16,6 +16,7 @@ from pathlib import Path
 from time import perf_counter
 from types import MethodType
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -125,6 +126,8 @@ class _HeatmapRequest:
     soma_radius_um: float | None
     depth_bin_factor: int
     depth_axis: int
+    assignment_id: str | None = None
+    assignment_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2095,6 +2098,11 @@ class AnalysisTabWidget(QWidget):
             else int(depth_bin_factor)
         )
 
+        assignment = None
+        if request_cluster is not None:
+            store = self.__dict__.get("_cluster_assignment_store")
+            assignment = getattr(store, "active", None)
+
         return _HeatmapRequest(
             selected_region_id=selected_region_id,
             selected_region_acronym=selected_region_acronym,
@@ -2105,6 +2113,10 @@ class AnalysisTabWidget(QWidget):
             soma_radius_um=self._selected_heatmap_soma_radius_um(),
             depth_bin_factor=resolved_depth_bin,
             depth_axis=resolved_depth_axis,
+            assignment_id=(
+                str(assignment.assignment_id) if assignment is not None else None
+            ),
+            assignment_name=(str(assignment.name) if assignment is not None else None),
         )
 
     def _selected_heatmap_request(self) -> _HeatmapRequest | None:
@@ -2482,6 +2494,15 @@ class AnalysisTabWidget(QWidget):
         source_file_ids = (
             list(request.file_ids) if request.file_ids is not None else None
         )
+        atlas_version = getattr(self._atlas, "version", None)
+        atlas_provenance = {
+            "atlas_name": getattr(self._atlas, "atlas_name", None),
+            "resolution_um": [
+                float(value)
+                for value in getattr(self._atlas, "resolution", (1.0, 1.0, 1.0))
+            ],
+            "atlas_version": (None if atlas_version is None else str(atlas_version)),
+        }
         metadata = {
             "heatmap_source": True,
             "heatmap_native_grid": request.depth_bin_factor == 1,
@@ -2507,6 +2528,29 @@ class AnalysisTabWidget(QWidget):
             "depth_axis": request.depth_axis,
             "heatmap_contrast_limits": contrast_limits,
             "heatmap_autocontrast_policy": "stable_full_volume",
+            # Stable machine-readable provenance used by the comparison board.
+            # The UUID identifies this exact layer payload; assignment identity
+            # remains separate so several cluster layers can form one set.
+            "comparison_source_id": uuid4().hex,
+            "comparison_assignment_id": request.assignment_id,
+            "comparison_assignment_name": request.assignment_name,
+            "comparison_atlas_provenance": atlas_provenance,
+            "comparison_filter_signature": {
+                "atlas_provenance": atlas_provenance,
+                "region_ids": (
+                    sorted({int(value) for value in request.region_ids})
+                    if request.region_ids is not None
+                    else None
+                ),
+                "node_types": (
+                    sorted({int(value) for value in request.node_types})
+                    if request.node_types is not None
+                    else None
+                ),
+                "soma_radius_um": request.soma_radius_um,
+                "depth_axis": int(request.depth_axis),
+                "depth_bin_factor": int(request.depth_bin_factor),
+            },
         }
 
         layer = self._viewer.add_image(
