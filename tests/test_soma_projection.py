@@ -103,6 +103,10 @@ class _FakeQTimer:
     def stop(self, *_args, **_kwargs) -> None:
         return None
 
+    @staticmethod
+    def singleShot(_delay, callback) -> None:
+        callback()
+
 
 class _FakeQt:
     Horizontal = 1
@@ -119,6 +123,9 @@ class _FakeQEvent:
     Hide = 7
     DeferredDelete = 8
     Destroy = 9
+
+    class Type:
+        Close = 6
 
 
 class _FakeWidget:
@@ -753,48 +760,6 @@ def test_widget_startup_schedules_cached_template_autoload_without_atlas_load(
     atlas_factory.assert_not_called()
 
 
-class _SceneSelection(set):
-    def __init__(self, values=()) -> None:
-        super().__init__(values)
-        self.active = None
-
-
-class _SceneLayers(list):
-    def __init__(self, values=()) -> None:
-        super().__init__(values)
-        self.selection = _SceneSelection()
-
-
-class _SceneViewer:
-    def __init__(self, layers=()) -> None:
-        self.layers = _SceneLayers(layers)
-        self.dims = types.SimpleNamespace(
-            order=(2, 0, 1),
-            current_step=(3, 4, 5),
-            ndisplay=3,
-        )
-        camera = types.SimpleNamespace(
-            center=(10.0, 20.0, 30.0),
-            zoom=2.5,
-            angles=(5.0, 10.0, 15.0),
-            perspective=12.0,
-        )
-        axes = types.SimpleNamespace(visible=False, labels=False)
-        text = types.SimpleNamespace(
-            visible=True,
-            text="main",
-            position="bottom_right",
-            font_size=9,
-        )
-        self.scene = types.SimpleNamespace(
-            camera=camera,
-            overlays=types.SimpleNamespace(axes=axes),
-        )
-        self.canvas = types.SimpleNamespace(
-            overlays=types.SimpleNamespace(text=text),
-        )
-
-
 class _SceneLayer:
     def __init__(
         self,
@@ -806,9 +771,7 @@ class _SceneLayer:
         self.name = name
         self.visible = visible
         self.metadata = (
-            {"napari_swc_viewer_space": "flatmap"}
-            if flatmap
-            else {"source": "main"}
+            {"napari_swc_viewer_space": "flatmap"} if flatmap else {"source": "main"}
         )
 
 
@@ -816,111 +779,117 @@ def _scene_layer(name: str, *, flatmap: bool = False, visible: bool = True):
     return _SceneLayer(name, flatmap=flatmap, visible=visible)
 
 
-def _main_viewer_scene_class():
-    return NeuronViewerWidget.__init__.__globals__["_MainViewerFlatmapScene"]
+class _FlatmapQtWindow:
+    def __init__(self) -> None:
+        self.hidden = False
+        self.fullscreen = False
+        self.show_normal_calls = 0
+        self.updates_enabled = True
+        self.installed_filters = []
+        self.removed_filters = []
+
+    def installEventFilter(self, event_filter) -> None:
+        self.installed_filters.append(event_filter)
+
+    def removeEventFilter(self, event_filter) -> None:
+        self.removed_filters.append(event_filter)
+
+    def setUpdatesEnabled(self, enabled: bool) -> None:
+        self.updates_enabled = bool(enabled)
+
+    def hide(self) -> None:
+        self.hidden = True
+
+    def isFullScreen(self) -> bool:
+        return self.fullscreen
+
+    def showNormal(self) -> None:
+        self.show_normal_calls += 1
+        self.fullscreen = False
 
 
-def test_flatmap_main_scene_restores_layer_identity_selection_and_view_state() -> None:
-    first = _scene_layer("first")
-    second = _scene_layer("second", visible=False)
-    viewer = _SceneViewer([first, second])
-    viewer.layers.selection.update([first, second])
-    viewer.layers.selection.active = second
-    scene = _main_viewer_scene_class()(viewer)
+class _FlatmapWindow:
+    def __init__(self) -> None:
+        self.open = True
+        self._qt_window = _FlatmapQtWindow()
 
-    assert scene.enter() is True
-    assert scene.active is True
-    assert viewer.layers == []
-
-    flatmap = _scene_layer("flatmap", flatmap=True)
-    foreign = _scene_layer("opened while flatmap active")
-    viewer.layers.extend([flatmap, foreign])
-    viewer.dims.order = (0, 1)
-    viewer.dims.current_step = (0, 0)
-    viewer.dims.ndisplay = 2
-    viewer.scene.camera.center = (1.0, 2.0)
-    viewer.scene.camera.zoom = 9.0
-    viewer.scene.overlays.axes.visible = True
-    viewer.canvas.overlays.text.text = "flatmap"
-
-    assert scene.restore() is True
-    assert scene.active is False
-    assert len(viewer.layers) == 3
-    assert viewer.layers[0] is first
-    assert viewer.layers[1] is second
-    assert first.visible is True
-    assert second.visible is False
-    assert viewer.layers[2] is foreign
-    assert flatmap not in viewer.layers
-    assert viewer.layers.selection == {first, second}
-    assert viewer.layers.selection.active is second
-    assert viewer.dims.order == (2, 0, 1)
-    assert viewer.dims.current_step == (3, 4, 5)
-    assert viewer.dims.ndisplay == 3
-    assert viewer.scene.camera.center == (10.0, 20.0, 30.0)
-    assert viewer.scene.camera.zoom == 2.5
-    assert viewer.scene.camera.angles == (5.0, 10.0, 15.0)
-    assert viewer.scene.camera.perspective == 12.0
-    assert viewer.scene.overlays.axes.visible is False
-    assert viewer.canvas.overlays.text.text == "main"
+    def geometry(self):
+        if not self.open:
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+        return (0, 0, 800, 600)
 
 
-def test_flatmap_main_scene_is_idempotent_and_invalidates_generations() -> None:
-    layer = _scene_layer("main")
-    viewer = _SceneViewer([layer])
-    scene = _main_viewer_scene_class()(viewer)
-    initial_generation = scene.generation
+class _FlatmapViewer:
+    def __init__(self, *, title: str, ndisplay: int, show: bool) -> None:
+        self.title = title
+        self.ndisplay = ndisplay
+        self.initial_show = show
+        self.layers = []
+        self.window = _FlatmapWindow()
+        self.show_calls = 0
+        self.close_calls = 0
 
-    assert scene.enter() is True
-    entered_generation = scene.generation
-    assert entered_generation == initial_generation + 1
-    assert scene.enter() is False
-    assert scene.generation == entered_generation
+    def show(self) -> None:
+        if not self.window.open:
+            raise RuntimeError("viewer window is closed")
+        self.show_calls += 1
+        self.window._qt_window.hidden = False
 
-    viewer.layers.append(_scene_layer("flatmap", flatmap=True))
-    assert scene.restore() is True
-    assert scene.generation == entered_generation + 1
-    assert scene.restore() is False
-    assert scene.generation == entered_generation + 2
-    assert viewer.layers == [layer]
-
-
-def test_flatmap_main_scene_supports_three_repeated_swap_cycles() -> None:
-    first = _scene_layer("first")
-    second = _scene_layer("second", visible=False)
-    viewer = _SceneViewer([first, second])
-    viewer.layers.selection.active = first
-    scene = _main_viewer_scene_class()(viewer)
-
-    for cycle in range(3):
-        assert scene.enter() is True
-        viewer.layers.append(_scene_layer(f"flatmap {cycle}", flatmap=True))
-        viewer.scene.camera.zoom = 20.0 + cycle
-
-        assert scene.restore() is True
-        assert viewer.layers == [first, second]
-        assert viewer.layers[0] is first
-        assert viewer.layers[1] is second
-        assert second.visible is False
-        assert viewer.layers.selection.active is first
-        assert viewer.scene.camera.zoom == 2.5
+    def close(self) -> None:
+        self.close_calls += 1
+        self.layers.clear()
+        self.window.open = False
 
 
-def test_flatmap_display_provider_uses_main_viewer_without_private_qt() -> None:
-    viewer = _SceneViewer([_scene_layer("main")])
+class _FlatmapTab:
+    def __init__(self) -> None:
+        self.released = []
+
+    def _release_display_viewer(self, viewer) -> None:
+        self.released.append(viewer)
+
+
+def _flatmap_window_widget(main_viewer=None):
     widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget.viewer = viewer
-    widget._flatmap_main_scene = _main_viewer_scene_class()(viewer)
-    widget._flatmap_tab = types.SimpleNamespace(
-        set_main_view_scene_active=lambda active: None
+    widget.viewer = main_viewer or types.SimpleNamespace(layers=[])
+    widget._flatmap_viewer = None
+    widget._flatmap_viewer_pending_show = False
+    widget._flatmap_viewer_generation = 0
+    widget._flatmap_viewer_watch_timer = None
+    widget._flatmap_close_guards = {}
+    widget._flatmap_tab = _FlatmapTab()
+    return widget
+
+
+def test_flatmap_display_provider_creates_hidden_secondary_viewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_layer = _scene_layer("main")
+    main_viewer = types.SimpleNamespace(layers=[main_layer])
+    widget = _flatmap_window_widget(main_viewer)
+    created = []
+
+    def create_viewer(**kwargs):
+        viewer = _FlatmapViewer(**kwargs)
+        created.append(viewer)
+        return viewer
+
+    monkeypatch.setitem(
+        sys.modules, "napari", types.SimpleNamespace(Viewer=create_viewer)
     )
-    widget._tabs = None
-    widget._flatmap_tab_index = None
 
     display = widget._get_or_create_flatmap_viewer(create=True)
 
-    assert display is viewer
-    assert widget._flatmap_main_scene.active is True
+    assert display is created[0]
+    assert display is not main_viewer
+    assert display.title == "SWC Viewer Flatmap"
+    assert display.ndisplay == 3
+    assert display.initial_show is False
+    assert display.show_calls == 0
+    assert main_viewer.layers == [main_layer]
+    assert widget._get_or_create_flatmap_viewer(create=False) is display
+    assert widget._get_or_create_flatmap_viewer(create=True) is display
+    assert len(created) == 1
     for obsolete_method in (
         "_cleanup_flatmap_viewer",
         "_connect_flatmap_viewer_destroyed",
@@ -931,89 +900,268 @@ def test_flatmap_display_provider_uses_main_viewer_without_private_qt() -> None:
         assert not hasattr(NeuronViewerWidget, obsolete_method)
 
 
-def test_leaving_flatmap_tab_restores_scene_and_disconnects_handlers() -> None:
-    main_layer = _scene_layer("main")
-    viewer = _SceneViewer([main_layer])
-    scene = _main_viewer_scene_class()(viewer)
-    scene.enter()
-    viewer.layers.append(_scene_layer("flatmap", flatmap=True))
-    released = []
-    active_states = []
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget.viewer = viewer
-    widget._flatmap_main_scene = scene
-    widget._flatmap_tab_index = 3
-    widget._flatmap_tab = types.SimpleNamespace(
-        _release_display_viewer=lambda current: released.append(current),
-        set_main_view_scene_active=lambda active: active_states.append(active),
+def test_flatmap_viewer_shows_only_after_marked_layer_is_ready() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
     )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = True
+    layer = _scene_layer("flatmap", flatmap=True)
+    viewer.layers.append(layer)
 
-    widget._on_plugin_tab_changed(1)
+    widget._on_flatmap_display_viewer_ready(viewer, layer)
 
-    assert viewer.layers == [main_layer]
-    assert released == [viewer]
-    assert active_states == [False]
+    assert viewer.show_calls == 1
+    assert widget._flatmap_viewer_pending_show is False
 
 
-def test_foreign_layer_insertion_restores_main_scene_and_keeps_new_layer() -> None:
-    main_layer = _scene_layer("main")
-    viewer = _SceneViewer([main_layer])
-    scene = _main_viewer_scene_class()(viewer)
-    scene.enter()
-    flatmap_layer = _scene_layer("flatmap", flatmap=True)
-    foreign_layer = _scene_layer("opened image")
-    viewer.layers.extend([flatmap_layer, foreign_layer])
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget.viewer = viewer
-    widget._flatmap_main_scene = scene
-    widget._flatmap_tab = types.SimpleNamespace(
-        _release_display_viewer=lambda _viewer: None,
-        set_main_view_scene_active=lambda _active: None,
+def test_unmarked_first_layer_closes_hidden_flatmap_viewer() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
     )
-    widget._comparison_window = None
-    for method_name in (
-        "_refresh_heatmap_layer_list",
-        "_refresh_histogram_layer_list",
-        "_refresh_mask_layer_options",
-        "_update_tools_controls",
-        "_update_histogram_controls",
-    ):
-        setattr(widget, method_name, lambda: None)
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = True
+    layer = _scene_layer("not flatmap")
+    viewer.layers.append(layer)
 
-    widget._on_viewer_layers_changed(
-        types.SimpleNamespace(type="inserted", value=(1, foreign_layer))
+    widget._on_flatmap_display_viewer_ready(viewer, layer)
+
+    assert viewer.show_calls == 0
+    assert viewer.close_calls == 1
+    assert widget._flatmap_viewer is None
+    assert widget._flatmap_viewer_generation == 1
+
+
+def test_failed_first_render_closes_window_but_failed_rerender_keeps_it() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
     )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = True
 
-    assert scene.active is False
-    assert viewer.layers == [main_layer, foreign_layer]
-    assert flatmap_layer not in viewer.layers
-
-
-def test_failed_rerender_keeps_valid_flatmap_but_empty_first_render_rolls_back() -> None:
-    main_layer = _scene_layer("main")
-    viewer = _SceneViewer([main_layer])
-    scene = _main_viewer_scene_class()(viewer)
-    scene.enter()
-    flatmap_layer = _scene_layer("flatmap", flatmap=True)
-    viewer.layers.append(flatmap_layer)
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget.viewer = viewer
-    widget._flatmap_main_scene = scene
-    widget._flatmap_tab = types.SimpleNamespace(
-        _release_display_viewer=lambda _viewer: None,
-        set_main_view_scene_active=lambda _active: None,
-    )
-
-    widget._on_flatmap_display_viewer_failed(viewer, "rerender_failed")
-
-    assert scene.active is True
-    assert viewer.layers == [flatmap_layer]
-
-    viewer.layers.remove(flatmap_layer)
     widget._on_flatmap_display_viewer_failed(viewer, "first_render_failed")
 
-    assert scene.active is False
-    assert viewer.layers == [main_layer]
+    assert viewer.close_calls == 1
+    assert widget._flatmap_viewer is None
+
+    replacement = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = replacement
+    widget._flatmap_viewer_pending_show = False
+
+    widget._on_flatmap_display_viewer_failed(replacement, "rerender_failed")
+
+    assert replacement.close_calls == 0
+    assert widget._flatmap_viewer is replacement
+
+
+def test_close_flatmap_viewer_uses_public_close_off_macos_and_invalidates_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        NeuronViewerWidget._close_flatmap_viewer.__globals__, "_IS_MACOS", False
+    )
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+
+    assert widget._close_flatmap_viewer() is True
+
+    assert viewer.close_calls == 1
+    assert widget._flatmap_viewer is None
+    assert widget._flatmap_viewer_generation == 1
+    assert widget._flatmap_tab.released == [viewer]
+
+
+def test_macos_close_hides_clears_and_retains_viewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method_globals = NeuronViewerWidget._close_flatmap_viewer.__globals__
+    monkeypatch.setitem(method_globals, "_IS_MACOS", True)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    guard = qt_window.installed_filters[0]
+    viewer.layers.append(_scene_layer("flatmap", flatmap=True))
+
+    assert widget._close_flatmap_viewer() is True
+
+    assert qt_window.hidden is True
+    assert qt_window.updates_enabled is True
+    assert viewer.close_calls == 0
+    assert viewer.layers == []
+    assert widget._flatmap_viewer is viewer
+    assert widget._flatmap_viewer_pending_show is True
+    assert widget._flatmap_viewer_generation == 1
+    assert widget._flatmap_tab.released == [viewer]
+    assert qt_window.removed_filters == []
+    assert widget._flatmap_close_guards == {id(viewer): (qt_window, guard)}
+
+
+def test_macos_window_close_event_uses_the_same_hide_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CloseEvent:
+        def __init__(self) -> None:
+            self.ignored = False
+
+        def type(self):
+            return _FakeQEvent.Type.Close
+
+        def ignore(self) -> None:
+            self.ignored = True
+
+    method_globals = NeuronViewerWidget._close_flatmap_viewer.__globals__
+    monkeypatch.setitem(method_globals, "_IS_MACOS", True)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    event = _CloseEvent()
+
+    consumed = qt_window.installed_filters[0].eventFilter(qt_window, event)
+
+    assert consumed is True
+    assert event.ignored is True
+    assert qt_window.hidden is True
+    assert viewer.close_calls == 0
+    assert widget._flatmap_viewer is viewer
+    assert widget._flatmap_viewer_pending_show is True
+
+
+def test_macos_fullscreen_close_exits_fullscreen_before_hiding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method_globals = NeuronViewerWidget._close_flatmap_viewer.__globals__
+    monkeypatch.setitem(method_globals, "_IS_MACOS", True)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    qt_window.fullscreen = True
+
+    assert widget._close_flatmap_viewer() is True
+
+    assert qt_window.show_normal_calls == 1
+    assert qt_window.fullscreen is False
+    assert qt_window.hidden is True
+    assert viewer.close_calls == 0
+    assert widget._flatmap_viewer is viewer
+
+
+def test_macos_widget_teardown_never_closes_a_visible_flatmap_viewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        NeuronViewerWidget._close_flatmap_viewer.__globals__, "_IS_MACOS", True
+    )
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    guard = qt_window.installed_filters[0]
+    viewer.layers.append(_scene_layer("flatmap", flatmap=True))
+
+    widget._on_neuron_viewer_destroyed()
+
+    assert qt_window.hidden is True
+    assert viewer.close_calls == 0
+    assert viewer.layers == []
+    assert widget._flatmap_viewer is None
+    assert qt_window.removed_filters == [guard]
+    assert widget._flatmap_close_guards == {}
+
+
+def test_closed_window_is_retired_without_private_qt_state() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    viewer.window.open = False
+
+    assert widget._flatmap_viewer_generation_value() == 1
+    assert widget._flatmap_viewer is None
+    assert viewer.close_calls == 0
+    assert widget._get_or_create_flatmap_viewer(create=False) is None
+    assert widget._flatmap_tab.released == [viewer]
+
+
+def test_macos_flatmap_viewer_supports_three_hide_and_reuse_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        NeuronViewerWidget._close_flatmap_viewer.__globals__, "_IS_MACOS", True
+    )
+    widget = _flatmap_window_widget()
+    created = []
+
+    def create_viewer(**kwargs):
+        viewer = _FlatmapViewer(**kwargs)
+        created.append(viewer)
+        return viewer
+
+    monkeypatch.setitem(
+        sys.modules, "napari", types.SimpleNamespace(Viewer=create_viewer)
+    )
+
+    for cycle in range(3):
+        viewer = widget._get_or_create_flatmap_viewer(create=True)
+        layer = _scene_layer(f"flatmap {cycle}", flatmap=True)
+        viewer.layers.append(layer)
+        widget._on_flatmap_display_viewer_ready(viewer, layer)
+        assert widget._close_flatmap_viewer() is True
+
+    assert len(created) == 1
+    assert created[0].show_calls == 3
+    assert created[0].close_calls == 0
+    assert created[0].layers == []
+    assert widget._flatmap_viewer is created[0]
+    assert widget._flatmap_viewer_pending_show is True
+    assert widget._flatmap_viewer_generation == 3
 
 
 def test_reference_template_checkbox_defaults_to_lazy_load(

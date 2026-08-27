@@ -49,19 +49,22 @@ NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log 
 The default file is `~/.napari-swc-viewer/debug.log`. It rotates at 10 MB and
 keeps three backups. Plugin DEBUG records are written to the file and console.
 
-Flatmap projections use the main napari canvas. The current main-view layers,
-selection, dimensions, camera, and overlay state remain visible while a
-projection is computed. Immediately before the first flatmap layer is added,
-the plugin temporarily detaches those layer objects and shows only the flatmap
-coordinate space. Click **Return to Main View** or select another plugin tab to
-remove the transient flatmap layers and restore the same main-view objects and
-state. Opening a non-flatmap layer while a flatmap is active also restores the
-main scene automatically. A returned flatmap is not retained; run **Project to
-Flatmap** again to recreate it.
+Flatmap projections use a dedicated napari window named **SWC Viewer Flatmap**.
+The main viewer and all of its layers, selection, dimensions, camera, and
+overlays remain untouched while projection data is computed and displayed. The
+flatmap viewer is created hidden, populated, and then shown, so a long-running
+calculation does not expose a blank second window. Re-projecting reuses the open
+flatmap viewer. Selecting another plugin tab leaves both windows available.
 
-This workflow creates no second napari window and does not depend on napari's
-private Qt window, slicer, or viewer-registry internals. The main window may
-remain in macOS Full Screen while entering and leaving flatmap space.
+Use the flatmap window's operating-system close control to discard its transient
+layers; project again to display a fresh flatmap scene. The plugin intentionally
+does not provide its own close button. On Windows and Linux the window closes
+through napari's public API. On macOS, napari 0.9 can leave a Cocoa repaint
+queued after it deletes a visible secondary viewer's Vispy canvas. A small
+macOS-only guard therefore hides and empties the private Qt top-level but keeps
+its viewer and canvas alive for the next projection. It never calls
+`Viewer.close()` on that visible macOS window and does not manipulate napari's
+slicer, status thread, viewer registry, or model teardown.
 
 For a complete CPD2 walkthrough covering clone/install, `pixi run napari`,
 left-hemisphere SWC-to-Parquet conversion, atlas loading, region queries, soma

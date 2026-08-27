@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -423,32 +424,29 @@ def _widget(module):
     return widget
 
 
-def test_return_button_delegates_to_main_scene_coordinator(monkeypatch) -> None:
+def test_flatmap_widget_exposes_no_plugin_close_callback(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
-    widget = _widget(module)
-    calls = []
-    widget._return_to_main_view_callback = lambda: calls.append("return")
-    widget._return_to_main_view_btn = _DummyButton()
+    widget_class = module.FlatmapProjectionWidget
 
-    widget.set_main_view_scene_active(True)
-    widget._return_to_main_view_requested()
-
-    assert widget._return_to_main_view_btn.enabled is True
-    assert calls == ["return"]
+    assert "close_display_viewer_callback" not in inspect.signature(
+        widget_class.__init__
+    ).parameters
+    assert not hasattr(widget_class, "set_flatmap_window_open")
+    assert not hasattr(widget_class, "_close_flatmap_window_requested")
 
 
 def test_stale_precomputed_completion_cannot_insert_a_layer(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
-    widget._precomputed_heatmap_scene_generation = 4
-    widget._display_scene_generation_provider = lambda: 5
+    widget._precomputed_heatmap_display_generation = 4
+    widget._display_generation_provider = lambda: 5
     widget._apply_precomputed_heatmap_result = lambda _result: pytest.fail(
         "stale result was applied"
     )
 
     widget._on_precomputed_heatmap_finished(object())
 
-    assert "display scene changed" in widget._status_label.text
+    assert "window changed or closed" in widget._status_label.text
 
 
 class _DummySection:

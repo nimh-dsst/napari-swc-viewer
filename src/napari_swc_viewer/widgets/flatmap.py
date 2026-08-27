@@ -226,8 +226,7 @@ class FlatmapProjectionWidget(QWidget):
         display_viewer_provider: Callable[..., object | None] | None = None,
         display_viewer_ready_callback: Callable[[object, object], None] | None = None,
         display_viewer_failed_callback: Callable[[object, str], None] | None = None,
-        return_to_main_view_callback: Callable[[], object] | None = None,
-        display_scene_generation_provider: Callable[[], int] | None = None,
+        display_generation_provider: Callable[[], int] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -235,10 +234,7 @@ class FlatmapProjectionWidget(QWidget):
         self._display_viewer_provider = display_viewer_provider
         self._display_viewer_ready_callback = display_viewer_ready_callback
         self._display_viewer_failed_callback = display_viewer_failed_callback
-        self._return_to_main_view_callback = return_to_main_view_callback
-        self._display_scene_generation_provider = (
-            display_scene_generation_provider or (lambda: 0)
-        )
+        self._display_generation_provider = display_generation_provider or (lambda: 0)
         self._last_display_viewer = None
         self._display_axis_annotation_state: dict | None = None
         self._flatmap_display_layer_event_viewer = None
@@ -303,11 +299,11 @@ class FlatmapProjectionWidget(QWidget):
         self._region_label_atlas_cache: dict[str, object] = {}
         self._region_label_atlas_load_thread = None
         self._region_label_atlas_load_worker = None
-        self._region_label_request_scene_generation: int | None = None
+        self._region_label_request_display_generation: int | None = None
         self._pending_region_label_request = False
         self._precomputed_heatmap_thread = None
         self._precomputed_heatmap_worker = None
-        self._precomputed_heatmap_scene_generation: int | None = None
+        self._precomputed_heatmap_display_generation: int | None = None
         self._last_projected_nodes: pd.DataFrame | None = None
         self._last_summary: ProjectionSummary | None = None
         self._last_render_summary: FlatmapRenderSummary | None = None
@@ -356,7 +352,7 @@ class FlatmapProjectionWidget(QWidget):
         return self._resolve_display_viewer(create=False)
 
     def _release_display_viewer(self, viewer) -> bool:
-        """Forget transient layer handles when the main scene is restored."""
+        """Forget layer handles when a flatmap display viewer closes."""
         if getattr(self, "_last_display_viewer", None) is not viewer:
             return False
 
@@ -405,27 +401,16 @@ class FlatmapProjectionWidget(QWidget):
                 exc_info=True,
             )
 
-    def set_main_view_scene_active(self, active: bool) -> None:
-        """Reflect whether the main napari canvas currently shows flatmap space."""
-        button = getattr(self, "_return_to_main_view_btn", None)
-        if button is not None:
-            button.setEnabled(bool(active))
-
-    def _return_to_main_view_requested(self) -> None:
-        callback = getattr(self, "_return_to_main_view_callback", None)
-        if callable(callback):
-            callback()
-
-    def _display_scene_generation(self) -> int:
-        provider = getattr(self, "_display_scene_generation_provider", None)
+    def _display_generation(self) -> int:
+        provider = getattr(self, "_display_generation_provider", None)
         try:
             return int(provider()) if callable(provider) else 0
         except Exception:
-            logger.debug("Could not read flatmap scene generation", exc_info=True)
+            logger.debug("Could not read flatmap viewer generation", exc_info=True)
             return 0
 
-    def _display_scene_generation_matches(self, expected: int | None) -> bool:
-        return expected is None or self._display_scene_generation() == int(expected)
+    def _display_generation_matches(self, expected: int | None) -> bool:
+        return expected is None or self._display_generation() == int(expected)
 
     def _display_layers(self, *, create: bool = True):
         viewer = self._resolve_display_viewer(create=create)
@@ -482,9 +467,7 @@ class FlatmapProjectionWidget(QWidget):
         status = getattr(self, "_flatmap_heatmap_gamma_status_label", None)
         if status is not None:
             if layers:
-                status.setText(
-                    f"{len(layers)} flatmap heatmap layer(s) available."
-                )
+                status.setText(f"{len(layers)} flatmap heatmap layer(s) available.")
             else:
                 status.setText("No rendered flatmap heatmaps are available.")
         self._update_flatmap_heatmap_gamma_controls()
@@ -669,7 +652,7 @@ class FlatmapProjectionWidget(QWidget):
             connections.pop(layer_id, None)
 
     def _disconnect_flatmap_display_layer_events(self, viewer=None) -> None:
-        """Stop following a flatmap scene being replaced or restored."""
+        """Stop following a flatmap viewer that is closing or being replaced."""
         tracked_viewer = getattr(self, "_flatmap_display_layer_event_viewer", None)
         if viewer is not None and tracked_viewer is not viewer:
             return
@@ -944,16 +927,6 @@ class FlatmapProjectionWidget(QWidget):
         self._project_btn = QPushButton("Project to Flatmap")
         self._project_btn.clicked.connect(self._project)
         actions_row.addWidget(self._project_btn)
-        self._return_to_main_view_btn = QPushButton("Return to Main View")
-        self._return_to_main_view_btn.setEnabled(False)
-        self._return_to_main_view_btn.setToolTip(
-            "Remove transient flatmap layers and restore the previous main-view "
-            "layers, selection, dimensions, and camera."
-        )
-        self._return_to_main_view_btn.clicked.connect(
-            self._return_to_main_view_requested
-        )
-        actions_row.addWidget(self._return_to_main_view_btn)
         self._add_soma_btn = QPushButton("Add Soma")
         self._add_soma_btn.setToolTip(
             "Project only soma nodes into flatmap + depth space as a "
@@ -2944,7 +2917,7 @@ class FlatmapProjectionWidget(QWidget):
             else None
         )
         self._precomputed_heatmap_file_ids = [str(file_id) for file_id in file_ids]
-        self._precomputed_heatmap_scene_generation = self._display_scene_generation()
+        self._precomputed_heatmap_display_generation = self._display_generation()
         worker = FlatmapHeatmapWorker(
             str(source_path),
             style_key=self._current_style_key(),
@@ -2981,11 +2954,11 @@ class FlatmapProjectionWidget(QWidget):
         thread.start()
 
     def _on_precomputed_heatmap_finished(self, result) -> None:
-        if not self._display_scene_generation_matches(
-            getattr(self, "_precomputed_heatmap_scene_generation", None)
+        if not self._display_generation_matches(
+            getattr(self, "_precomputed_heatmap_display_generation", None)
         ):
             self._status_label.setText(
-                "Flatmap projection finished after the display scene changed; "
+                "Flatmap projection finished after its window changed or closed; "
                 "run it again to display the result."
             )
             return
@@ -3010,8 +2983,8 @@ class FlatmapProjectionWidget(QWidget):
             show_warning(f"Flatmap projection failed: {exc}")
 
     def _on_precomputed_heatmap_error(self, message: str) -> None:
-        if not self._display_scene_generation_matches(
-            getattr(self, "_precomputed_heatmap_scene_generation", None)
+        if not self._display_generation_matches(
+            getattr(self, "_precomputed_heatmap_display_generation", None)
         ):
             return
         logger.error("Flatmap heatmap pipeline error: %s", message)
@@ -3024,7 +2997,7 @@ class FlatmapProjectionWidget(QWidget):
             self._precomputed_heatmap_thread = None
         if getattr(self, "_precomputed_heatmap_worker", None) is worker:
             self._precomputed_heatmap_worker = None
-            self._precomputed_heatmap_scene_generation = None
+            self._precomputed_heatmap_display_generation = None
         self._hide_projection_progress()
         self._set_projection_controls_enabled(True)
 
@@ -4455,9 +4428,7 @@ class FlatmapProjectionWidget(QWidget):
 
     def _start_region_label_atlas_load(self, atlas_name: str) -> None:
         self._pending_region_label_request = True
-        self._region_label_request_scene_generation = (
-            self._display_scene_generation()
-        )
+        self._region_label_request_display_generation = self._display_generation()
         if self._region_label_atlas_load_running():
             self._set_region_labels_status(
                 f"Loading region-label atlas {atlas_name}..."
@@ -4512,21 +4483,22 @@ class FlatmapProjectionWidget(QWidget):
         self._set_region_label_controls_enabled(True)
         self._set_region_labels_status(f"Loaded region-label atlas {resolved_name}.")
 
-        if self._pending_region_label_request and self._display_scene_generation_matches(
-            getattr(self, "_region_label_request_scene_generation", None)
+        if self._pending_region_label_request and self._display_generation_matches(
+            getattr(self, "_region_label_request_display_generation", None)
         ):
             self._pending_region_label_request = False
             self._create_region_labels()
         elif self._pending_region_label_request:
             self._pending_region_label_request = False
             self._set_region_labels_status(
-                "Region-label atlas loaded after the display scene changed; "
+                "Region-label atlas loaded after the flatmap window changed or "
+                "closed; "
                 "choose Show Region Labels again."
             )
 
     def _on_region_label_atlas_load_error(self, error_msg: str) -> None:
         self._pending_region_label_request = False
-        self._region_label_request_scene_generation = None
+        self._region_label_request_display_generation = None
         self._set_region_label_controls_enabled(True)
         message = f"Region-label atlas load failed: {error_msg}"
         logger.error(message)
@@ -4538,7 +4510,7 @@ class FlatmapProjectionWidget(QWidget):
             self._region_label_atlas_load_thread = None
         if getattr(self, "_region_label_atlas_load_worker", None) is worker:
             self._region_label_atlas_load_worker = None
-            self._region_label_request_scene_generation = None
+            self._region_label_request_display_generation = None
 
     def _set_region_label_controls_enabled(self, enabled: bool) -> None:
         states = self._cached_region_control_states()

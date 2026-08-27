@@ -289,8 +289,8 @@ def test_foreign_layer_axis_labels_are_not_copied(viewer, host) -> None:
     assert viewer.canvas.overlays.text.text == ""
 
 
-def test_main_viewer_scene_swap_preserves_real_layer_objects(viewer) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import _MainViewerFlatmapScene
+def test_flatmap_layers_use_a_separate_real_viewer_model(viewer) -> None:
+    from napari.components import ViewerModel
 
     anatomy = viewer.add_image(
         np.zeros((3, 4, 5), dtype=np.float32),
@@ -301,21 +301,24 @@ def test_main_viewer_scene_swap_preserves_real_layer_objects(viewer) -> None:
     viewer.layers.selection.active = points
     viewer.scene.camera.center = (7.0, 8.0, 9.0)
     viewer.scene.camera.zoom = 3.0
-    scene = _MainViewerFlatmapScene(viewer)
+    flatmap_viewer = ViewerModel(title="SWC Viewer Flatmap", ndisplay=3)
 
-    assert scene.enter() is True
-    assert list(viewer.layers) == []
-    transient = viewer.add_image(
+    flatmap = flatmap_viewer.add_image(
         np.zeros((2, 6, 8), dtype=np.float32),
         name="Flatmap",
         axis_labels=("Depth bin", "Flatmap Y", "Flatmap X"),
         metadata={"napari_swc_viewer_space": "flatmap"},
     )
-    viewer.scene.camera.center = (1.0, 2.0, 3.0)
+    flatmap_viewer.scene.camera.center = (1.0, 2.0, 3.0)
 
-    assert scene.restore() is True
     assert list(viewer.layers) == [anatomy, points]
-    assert all(layer is not transient for layer in viewer.layers)
+    assert list(flatmap_viewer.layers) == [flatmap]
+    assert all(layer is not flatmap for layer in viewer.layers)
     assert viewer.layers.selection.active is points
     assert viewer.scene.camera.center == (7.0, 8.0, 9.0)
     assert viewer.scene.camera.zoom == 3.0
+    assert flatmap_viewer.dims.axis_labels == (
+        "Depth bin",
+        "Flatmap Y",
+        "Flatmap X",
+    )

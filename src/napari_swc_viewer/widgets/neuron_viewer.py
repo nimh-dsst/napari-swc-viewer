@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import colorsys
 import logging
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from brainglobe_atlasapi import BrainGlobeAtlas
 from napari.utils.notifications import show_info, show_warning
-from qtpy.QtCore import QEvent, Qt, QThread, QTimer, Signal
+from qtpy.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -127,10 +128,11 @@ _REGION_QUERY_PAGE_MASK = 2
 
 _FLATMAP_LAYER_SPACE_KEY = "napari_swc_viewer_space"
 _FLATMAP_LAYER_SPACE_VALUE = "flatmap"
+_IS_MACOS = sys.platform == "darwin"
 
 
 def _flatmap_layer(layer: object) -> bool:
-    """Return whether a layer belongs to the transient flatmap scene."""
+    """Return whether a layer belongs to the flatmap display viewer."""
     metadata = getattr(layer, "metadata", None)
     return bool(
         isinstance(metadata, Mapping)
@@ -138,197 +140,18 @@ def _flatmap_layer(layer: object) -> bool:
     )
 
 
-def _scene_model(viewer: object, *path: str):
-    """Resolve one public napari scene/canvas model without legacy aliases."""
-    current = viewer
-    for name in path:
-        current = getattr(current, name, None)
-        if current is None:
-            return None
-    return current
+class _FlatmapWindowCloseGuard(QObject):
+    """Route a macOS Qt close event through the safe flatmap hide path."""
 
+    def __init__(self, viewer, callback, parent=None) -> None:
+        super().__init__(parent)
+        self._viewer = viewer
+        self._callback = callback
 
-def _snapshot_attributes(owner: object, names: tuple[str, ...]) -> dict[str, object]:
-    """Copy simple model attributes while tolerating minimal test doubles."""
-    if owner is None:
-        return {}
-    values: dict[str, object] = {}
-    for name in names:
-        try:
-            value = getattr(owner, name)
-        except Exception:
-            continue
-        if isinstance(value, np.ndarray):
-            value = value.copy()
-        elif isinstance(value, list):
-            value = list(value)
-        elif isinstance(value, tuple):
-            value = tuple(value)
-        values[name] = value
-    return values
-
-
-def _restore_attributes(owner: object, values: dict[str, object]) -> None:
-    """Restore a guarded set of public model attributes."""
-    if owner is None:
-        return
-    for name, value in values.items():
-        try:
-            setattr(owner, name, value)
-        except Exception:
-            logger.debug("Could not restore scene attribute %s", name, exc_info=True)
-
-
-@dataclass
-class _MainViewerSceneSnapshot:
-    layers: tuple[object, ...]
-    selected_layers: tuple[object, ...]
-    active_layer: object | None
-    dims: dict[str, object]
-    camera: dict[str, object]
-    axes: dict[str, object]
-    text_overlay: dict[str, object]
-
-
-class _MainViewerFlatmapScene:
-    """Swap a main napari viewer between anatomical and flatmap coordinates."""
-
-    def __init__(self, viewer: object) -> None:
-        self.viewer = viewer
-        self._snapshot: _MainViewerSceneSnapshot | None = None
-        self._mutating = False
-        self._generation = 0
-
-    @property
-    def active(self) -> bool:
-        return self._snapshot is not None
-
-    @property
-    def generation(self) -> int:
-        return self._generation
-
-    @property
-    def mutating(self) -> bool:
-        return self._mutating
-
-    def _capture(self) -> _MainViewerSceneSnapshot:
-        layers = getattr(self.viewer, "layers", ())
-        layer_list = tuple(layer for layer in list(layers) if not _flatmap_layer(layer))
-        selection = getattr(layers, "selection", None)
-        try:
-            selected_layers = tuple(selection) if selection is not None else ()
-        except Exception:
-            selected_layers = ()
-        active_layer = getattr(selection, "active", None)
-        return _MainViewerSceneSnapshot(
-            layers=layer_list,
-            selected_layers=selected_layers,
-            active_layer=active_layer,
-            dims=_snapshot_attributes(
-                getattr(self.viewer, "dims", None),
-                ("order", "current_step", "ndisplay"),
-            ),
-            camera=_snapshot_attributes(
-                _scene_model(self.viewer, "scene", "camera"),
-                ("center", "zoom", "angles", "perspective"),
-            ),
-            axes=_snapshot_attributes(
-                _scene_model(self.viewer, "scene", "overlays", "axes"),
-                ("visible", "labels"),
-            ),
-            text_overlay=_snapshot_attributes(
-                _scene_model(self.viewer, "canvas", "overlays", "text"),
-                ("visible", "text", "position", "font_size"),
-            ),
-        )
-
-    def enter(self) -> bool:
-        """Detach the main scene exactly once before flatmap layer insertion."""
-        if self.active:
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() != QEvent.Type.Close:
             return False
-        self._snapshot = self._capture()
-        self._generation += 1
-        layers = getattr(self.viewer, "layers", None)
-        if layers is None:
-            self._snapshot = None
-            return False
-        self._mutating = True
-        try:
-            for layer in list(layers):
-                try:
-                    layers.remove(layer)
-                except (KeyError, RuntimeError, ValueError):
-                    logger.debug("Could not detach main-view layer", exc_info=True)
-        finally:
-            self._mutating = False
-        return True
-
-    def restore(self) -> bool:
-        """Remove flatmap layers and restore the same main-scene layer objects."""
-        self._generation += 1
-        snapshot = self._snapshot
-        if snapshot is None:
-            return False
-        self._snapshot = None
-        layers = getattr(self.viewer, "layers", None)
-        if layers is None:
-            return False
-
-        current_layers = list(layers)
-        foreign_layers = [
-            layer
-            for layer in current_layers
-            if not _flatmap_layer(layer)
-            and not any(layer is saved for saved in snapshot.layers)
-        ]
-        self._mutating = True
-        try:
-            for layer in current_layers:
-                try:
-                    layers.remove(layer)
-                except (KeyError, RuntimeError, ValueError):
-                    logger.debug("Could not clear transient scene layer", exc_info=True)
-            for layer in (*snapshot.layers, *foreign_layers):
-                if any(existing is layer for existing in list(layers)):
-                    continue
-                try:
-                    layers.append(layer)
-                except Exception:
-                    logger.debug("Could not restore main-view layer", exc_info=True)
-
-            selection = getattr(layers, "selection", None)
-            if selection is not None:
-                clear = getattr(selection, "clear", None)
-                update = getattr(selection, "update", None)
-                if callable(clear):
-                    clear()
-                present = [
-                    layer
-                    for layer in snapshot.selected_layers
-                    if any(existing is layer for existing in list(layers))
-                ]
-                if callable(update):
-                    update(present)
-                if any(
-                    existing is snapshot.active_layer for existing in list(layers)
-                ):
-                    selection.active = snapshot.active_layer
-
-            _restore_attributes(getattr(self.viewer, "dims", None), snapshot.dims)
-            _restore_attributes(
-                _scene_model(self.viewer, "scene", "camera"), snapshot.camera
-            )
-            _restore_attributes(
-                _scene_model(self.viewer, "scene", "overlays", "axes"),
-                snapshot.axes,
-            )
-            _restore_attributes(
-                _scene_model(self.viewer, "canvas", "overlays", "text"),
-                snapshot.text_overlay,
-            )
-        finally:
-            self._mutating = False
-        return True
+        return bool(self._callback(self._viewer, watched, event))
 
 
 _SomaSelectionKey = tuple[int, frozenset[int], tuple[object, ...]]
@@ -811,7 +634,11 @@ class NeuronViewerWidget(QWidget):
                 int,
                 tuple[object, object, object],
             ] = {}
-            self._flatmap_main_scene = _MainViewerFlatmapScene(self.viewer)
+            self._flatmap_viewer = None
+            self._flatmap_viewer_pending_show = False
+            self._flatmap_viewer_generation = 0
+            self._flatmap_viewer_watch_timer = None
+            self._flatmap_close_guards: dict[int, tuple[object, object]] = {}
 
             with startup_timing(
                 logger,
@@ -909,85 +736,282 @@ class NeuronViewerWidget(QWidget):
             ):
                 QTimer.singleShot(0, self._start_cached_template_autoload)
 
-    def _flatmap_tab_is_current(self) -> bool:
-        """Return whether flatmap display work may take over the main canvas."""
-        tabs = getattr(self, "_tabs", None)
-        flatmap_index = getattr(self, "_flatmap_tab_index", None)
-        if tabs is None or flatmap_index is None:
+    @staticmethod
+    def _flatmap_viewer_is_open(viewer) -> bool:
+        """Probe a viewer through napari's public window API."""
+        if viewer is None:
+            return False
+        geometry = getattr(getattr(viewer, "window", None), "geometry", None)
+        if not callable(geometry):
+            return False
+        try:
+            geometry()
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+        return True
+
+    def _start_flatmap_viewer_watch(self) -> None:
+        timer = getattr(self, "_flatmap_viewer_watch_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(250)
+            timer.timeout.connect(self._retire_closed_flatmap_viewer)
+            self._flatmap_viewer_watch_timer = timer
+        timer.start()
+
+    def _stop_flatmap_viewer_watch(self) -> None:
+        timer = getattr(self, "_flatmap_viewer_watch_timer", None)
+        stop = getattr(timer, "stop", None)
+        if callable(stop):
+            stop()
+
+    def _install_flatmap_macos_close_guard(self, viewer) -> None:
+        """Intercept close before napari deletes a still-visible Vispy canvas."""
+        if not _IS_MACOS:
+            return
+        qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+        install = getattr(qt_window, "installEventFilter", None)
+        if not callable(install):
+            logger.warning(
+                "The macOS flatmap close guard could not access napari's Qt window."
+            )
+            return
+        guards = getattr(self, "_flatmap_close_guards", None)
+        if guards is None:
+            guards = {}
+            self._flatmap_close_guards = guards
+        key = id(viewer)
+        if key in guards:
+            return
+        guard = _FlatmapWindowCloseGuard(
+            viewer,
+            self._on_flatmap_macos_close_event,
+            parent=self,
+        )
+        guards[key] = (qt_window, guard)
+        install(guard)
+
+    def _remove_flatmap_macos_close_guard(self, viewer) -> None:
+        guards = getattr(self, "_flatmap_close_guards", None)
+        record = guards.pop(id(viewer), None) if guards is not None else None
+        if record is None:
+            return
+        qt_window, guard = record
+        remove = getattr(qt_window, "removeEventFilter", None)
+        if callable(remove):
+            try:
+                remove(guard)
+            except RuntimeError:
+                pass
+
+    def _hide_flatmap_macos_viewer(self, viewer) -> bool:
+        """Hide and reset a macOS viewer without destroying its Vispy canvas."""
+        if not _IS_MACOS:
+            return False
+        if getattr(self, "_flatmap_viewer", None) is not viewer:
+            return False
+        was_visible = not bool(
+            getattr(self, "_flatmap_viewer_pending_show", False)
+        )
+        guards = getattr(self, "_flatmap_close_guards", None) or {}
+        record = guards.get(id(viewer))
+        qt_window = (
+            record[0]
+            if record is not None
+            else getattr(getattr(viewer, "window", None), "_qt_window", None)
+        )
+        hide = getattr(qt_window, "hide", None)
+        is_fullscreen = getattr(qt_window, "isFullScreen", None)
+        show_normal = getattr(qt_window, "showNormal", None)
+        if not callable(hide):
+            logger.warning(
+                "The macOS flatmap viewer could not be hidden safely; "
+                "leaving it open."
+            )
+            return False
+        try:
+            if callable(is_fullscreen) and callable(show_normal) and is_fullscreen():
+                # Return the hidden window to a normal state so the next
+                # public Viewer.show() does not reopen it in a stale Space.
+                show_normal()
+            hide()
+        except RuntimeError:
+            return False
+
+        if not was_visible:
             return True
-        return int(tabs.currentIndex()) == int(flatmap_index)
+
+        self._flatmap_viewer_pending_show = True
+        self._flatmap_viewer_generation = (
+            int(getattr(self, "_flatmap_viewer_generation", 0)) + 1
+        )
+
+        # The viewer and canvas stay alive on macOS. Disconnect plugin-owned
+        # handlers and discard transient layers only after the native window
+        # is hidden, then reuse this empty viewer for the next projection.
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        release = getattr(flatmap_tab, "_release_display_viewer", None)
+        if callable(release):
+            release(viewer)
+        layers = getattr(viewer, "layers", None)
+        clear = getattr(layers, "clear", None)
+        if callable(clear):
+            try:
+                clear()
+            except (AttributeError, RuntimeError):
+                logger.debug(
+                    "Could not clear hidden flatmap layers.",
+                    exc_info=True,
+                )
+        return True
+
+    @staticmethod
+    def _close_flatmap_viewer_now(viewer) -> None:
+        close_viewer = getattr(viewer, "close", None)
+        if not callable(close_viewer):
+            return
+        try:
+            close_viewer()
+        except (AttributeError, RuntimeError):
+            logger.debug(
+                "Flatmap viewer was already closed while being released.",
+                exc_info=True,
+            )
+
+    def _on_flatmap_macos_close_event(self, viewer, qt_window, event) -> bool:
+        """Consume a native close and hide the viewer without canvas teardown."""
+        guards = getattr(self, "_flatmap_close_guards", None) or {}
+        record = guards.get(id(viewer))
+        if (
+            getattr(self, "_flatmap_viewer", None) is not viewer
+            or record is None
+            or record[0] is not qt_window
+        ):
+            return False
+        ignore = getattr(event, "ignore", None)
+        if callable(ignore):
+            ignore()
+        if not self._hide_flatmap_macos_viewer(viewer):
+            logger.warning(
+                "Ignored an unsafe macOS flatmap close because the window "
+                "could not be hidden."
+            )
+        return True
+
+    def _release_flatmap_viewer(self, viewer, *, close: bool) -> bool:
+        """Forget one flatmap viewer and optionally close it safely."""
+        if getattr(self, "_flatmap_viewer", None) is not viewer:
+            return False
+
+        self._flatmap_viewer = None
+        self._flatmap_viewer_pending_show = False
+        self._flatmap_viewer_generation = (
+            int(getattr(self, "_flatmap_viewer_generation", 0)) + 1
+        )
+        self._stop_flatmap_viewer_watch()
+
+        flatmap_tab = getattr(self, "_flatmap_tab", None)
+        release = getattr(flatmap_tab, "_release_display_viewer", None)
+        if callable(release):
+            release(viewer)
+
+        self._remove_flatmap_macos_close_guard(viewer)
+        if close:
+            self._close_flatmap_viewer_now(viewer)
+        return True
+
+    def _retire_closed_flatmap_viewer(self) -> bool:
+        """Drop references after a user closes the flatmap window."""
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if viewer is None or self._flatmap_viewer_is_open(viewer):
+            return False
+        return self._release_flatmap_viewer(viewer, close=False)
 
     def _get_or_create_flatmap_viewer(self, *, create: bool = True):
-        """Return the main viewer while its transient flatmap scene is active."""
-        scene = getattr(self, "_flatmap_main_scene", None)
-        if scene is None:
-            return None
-        if not create:
-            return self.viewer if scene.active else None
-        if not self._flatmap_tab_is_current():
-            return None
-        scene.enter()
-        flatmap_tab = getattr(self, "_flatmap_tab", None)
-        setter = getattr(flatmap_tab, "set_main_view_scene_active", None)
-        if callable(setter):
-            setter(True)
-        return self.viewer
+        """Return the dedicated napari viewer used for flatmap display."""
+        self._retire_closed_flatmap_viewer()
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if viewer is not None or not create:
+            return viewer
+
+        import napari
+
+        viewer = napari.Viewer(
+            title="SWC Viewer Flatmap",
+            ndisplay=3,
+            show=False,
+        )
+        self._flatmap_viewer = viewer
+        self._flatmap_viewer_pending_show = True
+        self._install_flatmap_macos_close_guard(viewer)
+        self._start_flatmap_viewer_watch()
+        return viewer
 
     def _on_flatmap_display_viewer_ready(self, viewer, layer) -> None:
-        """Commit a flatmap layer to the active main-viewer scene."""
-        if viewer is not self.viewer or not _flatmap_layer(layer):
+        """Show the flatmap window after its first layer is fully configured."""
+        if (
+            viewer is not getattr(self, "_flatmap_viewer", None)
+            or not _flatmap_layer(layer)
+            or not any(candidate is layer for candidate in list(viewer.layers))
+        ):
             logger.warning(
                 "Rejected a flatmap display layer without the flatmap space marker."
             )
-            self._return_to_main_view()
+            if getattr(self, "_flatmap_viewer_pending_show", False):
+                self._release_flatmap_viewer(viewer, close=True)
             return
-        flatmap_tab = getattr(self, "_flatmap_tab", None)
-        setter = getattr(flatmap_tab, "set_main_view_scene_active", None)
-        if callable(setter):
-            setter(True)
+
+        try:
+            viewer.show()
+        except (AttributeError, RuntimeError):
+            logger.warning("Could not show the flatmap viewer.", exc_info=True)
+            if _IS_MACOS:
+                self._hide_flatmap_macos_viewer(viewer)
+                self._release_flatmap_viewer(viewer, close=False)
+            else:
+                self._release_flatmap_viewer(viewer, close=True)
+            return
+        self._flatmap_viewer_pending_show = False
 
     def _on_flatmap_display_viewer_failed(self, viewer, reason: str) -> None:
-        """Roll back an empty first render without discarding a prior flatmap."""
-        scene = getattr(self, "_flatmap_main_scene", None)
-        if viewer is not self.viewer or scene is None or not scene.active:
+        """Close a hidden viewer after an unsuccessful first render."""
+        if viewer is not getattr(self, "_flatmap_viewer", None) or not getattr(
+            self, "_flatmap_viewer_pending_show", False
+        ):
             return
-        layers = getattr(self.viewer, "layers", ())
-        if any(_flatmap_layer(layer) for layer in list(layers)):
-            return
-        logger.debug("Restoring main scene after flatmap failure: %s", reason)
-        self._return_to_main_view()
+        logger.debug("Closing hidden flatmap viewer after failure: %s", reason)
+        self._release_flatmap_viewer(viewer, close=True)
 
-    def _flatmap_scene_generation_value(self) -> int:
-        scene = getattr(self, "_flatmap_main_scene", None)
-        return int(scene.generation) if scene is not None else 0
+    def _flatmap_viewer_generation_value(self) -> int:
+        self._retire_closed_flatmap_viewer()
+        return int(getattr(self, "_flatmap_viewer_generation", 0))
 
-    def _return_to_main_view(self, *_args) -> bool:
-        """Remove transient flatmap layers and restore the saved main scene."""
-        scene = getattr(self, "_flatmap_main_scene", None)
-        if scene is None:
+    def _close_flatmap_viewer(self, *_args) -> bool:
+        """Dismiss the flatmap window without racing macOS canvas paints."""
+        viewer = getattr(self, "_flatmap_viewer", None)
+        if viewer is None:
             return False
-        flatmap_tab = getattr(self, "_flatmap_tab", None)
-        release = getattr(flatmap_tab, "_release_display_viewer", None)
-        if scene.active and callable(release):
-            release(self.viewer)
-        restored = scene.restore()
-        setter = getattr(flatmap_tab, "set_main_view_scene_active", None)
-        if callable(setter):
-            setter(False)
-        return restored
-
-    def _on_plugin_tab_changed(self, index: int) -> None:
-        """Automatically restore the main scene when leaving the Flatmap tab."""
-        if int(index) == int(getattr(self, "_flatmap_tab_index", -1)):
-            return
-        self._return_to_main_view()
+        if _IS_MACOS:
+            return self._hide_flatmap_macos_viewer(viewer)
+        return self._release_flatmap_viewer(viewer, close=True)
 
     def _on_neuron_viewer_destroyed(self, *_args) -> None:
-        """Best-effort scene restoration during plugin widget teardown."""
+        """Release the plugin-owned flatmap viewer during widget teardown."""
         try:
-            self._return_to_main_view()
+            viewer = getattr(self, "_flatmap_viewer", None)
+            if viewer is not None and _IS_MACOS:
+                self._hide_flatmap_macos_viewer(viewer)
+                released = self._release_flatmap_viewer(viewer, close=False)
+            else:
+                released = self._close_flatmap_viewer()
+            if not released:
+                self._flatmap_viewer_generation = (
+                    int(getattr(self, "_flatmap_viewer_generation", 0)) + 1
+                )
         except Exception:
-            logger.debug("Could not restore main scene during teardown", exc_info=True)
+            logger.debug(
+                "Could not release flatmap viewer during teardown", exc_info=True
+            )
 
     def _setup_ui(self) -> None:
         """Set up the widget UI."""
@@ -1040,12 +1064,9 @@ class NeuronViewerWidget(QWidget):
                 display_viewer_provider=self._get_or_create_flatmap_viewer,
                 display_viewer_ready_callback=(self._on_flatmap_display_viewer_ready),
                 display_viewer_failed_callback=(self._on_flatmap_display_viewer_failed),
-                return_to_main_view_callback=self._return_to_main_view,
-                display_scene_generation_provider=(
-                    self._flatmap_scene_generation_value
-                ),
+                display_generation_provider=(self._flatmap_viewer_generation_value),
             )
-            self._flatmap_tab_index = tabs.addTab(self._flatmap_tab, "Flatmap")
+            tabs.addTab(self._flatmap_tab, "Flatmap")
 
         with startup_timing(logger, "neuron_viewer_setup_tab", tab="Reference"):
             ref_tab = QWidget()
@@ -1089,8 +1110,6 @@ class NeuronViewerWidget(QWidget):
             histogram_tab = QWidget()
             tabs.addTab(histogram_tab, "Histogram")
             self._setup_histogram_tab(histogram_tab)
-
-        tabs.currentChanged.connect(self._on_plugin_tab_changed)
 
     def _setup_compare_tab(self, parent: QWidget) -> None:
         """Set up the launcher and status for the comparison board."""
@@ -4563,21 +4582,6 @@ class NeuronViewerWidget(QWidget):
 
     def _on_viewer_layers_changed(self, _event=None) -> None:
         """Refresh UI that depends on viewer layers."""
-        scene = getattr(self, "_flatmap_main_scene", None)
-        if (
-            scene is not None
-            and scene.active
-            and not scene.mutating
-            and getattr(_event, "type", None) == "inserted"
-        ):
-            inserted = getattr(_event, "value", None)
-            if isinstance(inserted, tuple) and inserted:
-                inserted = inserted[-1]
-            if inserted is not None and not _flatmap_layer(inserted):
-                # A file opened or a main-view action completed while the
-                # flatmap was active. Restore anatomy immediately and keep the
-                # new layer as part of the main scene instead of mixing spaces.
-                self._return_to_main_view()
         sync_layer_names = getattr(self, "_sync_layer_name_event_connections", None)
         if callable(sync_layer_names):
             sync_layer_names()
