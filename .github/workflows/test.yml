@@ -28,6 +28,9 @@ jobs:
       - name: Verify Python version
         run: pixi run -e ci python -c "import sys; assert sys.version_info[:2] == (3, 11), sys.version"
 
+      - name: Verify napari version
+        run: pixi run -e ci python -c "import napari; assert napari.__version__.startswith('0.9.'), napari.__version__"
+
       - name: Install package in development mode
         run: pixi run -e ci pip install -e . --no-deps
 
@@ -50,6 +53,9 @@ jobs:
 
       - name: Verify Python version
         run: pixi run -e ci python -c "import sys; assert sys.version_info[:2] == (3, 11), sys.version"
+
+      - name: Verify napari version
+        run: pixi run -e ci python -c "import napari; assert napari.__version__.startswith('0.9.'), napari.__version__"
 
       - name: Install package in development mode
         run: pixi run -e ci pip install -e . --no-deps

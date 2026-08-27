@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-import sys
 import dataclasses
+import importlib.util
+import inspect
+import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -78,6 +79,11 @@ def _load_flatmap_widget_module(monkeypatch):
     fake_notifications.show_warning = lambda *_args, **_kwargs: None
     fake_utils = types.ModuleType("napari.utils")
     fake_utils.notifications = fake_notifications
+    fake_colormaps = types.ModuleType("napari.utils.colormaps")
+    fake_colormaps.Colormap = lambda *args, **kwargs: types.SimpleNamespace(
+        colors=kwargs.get("colors", args[0] if args else None),
+        name=kwargs.get("name"),
+    )
     fake_napari = types.ModuleType("napari")
     fake_napari.utils = fake_utils
 
@@ -91,6 +97,7 @@ def _load_flatmap_widget_module(monkeypatch):
         "napari.utils.notifications",
         fake_notifications,
     )
+    monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
 
     module_path = (
         Path(__file__).resolve().parents[1]
@@ -331,47 +338,59 @@ class _DummyViewer:
     def __init__(self) -> None:
         self.layers: list[_DummyLayer] = []
         self.dims = _DummyDims()
-        self.camera = types.SimpleNamespace(center=None, zoom=None)
-        self.axes = types.SimpleNamespace(visible=False, labels=True)
-        self.text_overlay = types.SimpleNamespace(
+        camera = types.SimpleNamespace(center=None, zoom=None)
+        axes = types.SimpleNamespace(visible=False, labels=True)
+        text_overlay = types.SimpleNamespace(
             visible=False,
             text="",
             position="top_left",
             font_size=10,
         )
+        self.scene = types.SimpleNamespace(
+            camera=camera,
+            overlays=types.SimpleNamespace(axes=axes),
+        )
+        self.canvas = types.SimpleNamespace(
+            overlays=types.SimpleNamespace(text=text_overlay),
+        )
+        # Compatibility aliases keep older assertions readable while the code
+        # under test exclusively exercises napari 0.9's public models.
+        self.camera = camera
+        self.axes = axes
+        self.text_overlay = text_overlay
+
+    def _append_layer(self, layer: _DummyLayer) -> _DummyLayer:
+        self.layers.append(layer)
+        if layer.axis_labels:
+            self.dims.axis_labels = tuple(layer.axis_labels)
+        return layer
 
     def add_shapes(self, data, **kwargs) -> _DummyLayer:
         layer = _DummyLayer(data, **kwargs)
-        self.layers.append(layer)
-        return layer
+        return self._append_layer(layer)
 
     def add_image(self, data, **kwargs) -> _DummyLayer:
         layer = _DummyLayer(data, **kwargs)
-        self.layers.append(layer)
-        return layer
+        return self._append_layer(layer)
 
     def add_points(self, data, **kwargs) -> _DummyLayer:
         layer = _DummyLayer(data, **kwargs)
-        self.layers.append(layer)
-        return layer
+        return self._append_layer(layer)
 
     def add_labels(self, data, **kwargs) -> _DummyLayer:
         layer = _DummyLayer(data, **kwargs)
-        self.layers.append(layer)
-        return layer
+        return self._append_layer(layer)
 
     def add_surface(self, data, **kwargs) -> _DummyLayer:
         vertices, faces, values = data
         layer = _DummyLayer(vertices, **kwargs)
         layer.faces = np.asarray(faces)
         layer.values = np.asarray(values)
-        self.layers.append(layer)
-        return layer
+        return self._append_layer(layer)
 
     def add_vectors(self, data, **kwargs) -> _DummyLayer:
         layer = _DummyLayer(data, **kwargs)
-        self.layers.append(layer)
-        return layer
+        return self._append_layer(layer)
 
 
 def _widget(module):
@@ -403,6 +422,31 @@ def _widget(module):
     widget._negative_one_sentinel_cb = types.SimpleNamespace(isChecked=lambda: True)
     widget._flatmap_correlation_source_changed_callback = None
     return widget
+
+
+def test_flatmap_widget_exposes_no_plugin_close_callback(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget_class = module.FlatmapProjectionWidget
+
+    assert "close_display_viewer_callback" not in inspect.signature(
+        widget_class.__init__
+    ).parameters
+    assert not hasattr(widget_class, "set_flatmap_window_open")
+    assert not hasattr(widget_class, "_close_flatmap_window_requested")
+
+
+def test_stale_precomputed_completion_cannot_insert_a_layer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._precomputed_heatmap_display_generation = 4
+    widget._display_generation_provider = lambda: 5
+    widget._apply_precomputed_heatmap_result = lambda _result: pytest.fail(
+        "stale result was applied"
+    )
+
+    widget._on_precomputed_heatmap_finished(object())
+
+    assert "window changed or closed" in widget._status_label.text
 
 
 class _DummySection:
@@ -1630,6 +1674,7 @@ def test_add_soma_projects_only_soma_nodes_to_dedicated_layer(monkeypatch) -> No
     assert len(soma_layers) == 1
     assert widget._soma_layer is soma_layers[0]
     assert soma_layers[0].metadata["flatmap_soma_only"] is True
+    assert soma_layers[0].metadata["napari_swc_viewer_space"] == "flatmap"
     np.testing.assert_allclose(
         soma_layers[0].face_color,
         [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]],
@@ -2298,6 +2343,7 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
 
     assert layer.name == "Isocortex Flatmap Heatmap"
     assert layer.metadata["projection_kind"] == "isocortex_flatmap"
+    assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
     assert layer.metadata["flatmap_render_mode"] == "heatmap"
     assert layer.metadata["flatmap_heatmap_color_mode"] == "single"
     assert layer.metadata["render_summary"]["rendered_nodes"] == 3
@@ -3086,6 +3132,41 @@ def test_flat_vector_render_reports_a_selection_without_edges(monkeypatch) -> No
     assert widget._viewer.layers == []
 
 
+def test_failed_vector_rerender_keeps_the_existing_flatmap_layer(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    existing = _DummyLayer(
+        np.ones((2, 4, 4), dtype=np.float32),
+        name=module._HEATMAP_LAYER_NAME,
+        metadata={
+            "napari_swc_viewer_space": "flatmap",
+            "flatmap_render_mode": module._RENDER_HEATMAP,
+        },
+    )
+    widget._viewer.layers.append(existing)
+    widget._projection_layer = existing
+    widget._render_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._RENDER_FLAT_VECTOR
+    )
+    widget._heatmap_color_mode_combo = types.SimpleNamespace(
+        currentData=lambda: module._HEATMAP_COLOR_SINGLE
+    )
+    render_result = _flat_vector_render_result(module)
+    render_result.projected_nodes.loc[:, "parent_id"] = -1
+
+    with pytest.raises(RuntimeError, match="parent-child edges"):
+        widget._create_or_update_render_layer(
+            render_result,
+            _simple_projection_summary(module, total_nodes=3),
+            flatmap_style="both_shaped",
+            coordinate_mode="parquet_columns",
+            render_mode=module._RENDER_FLAT_VECTOR,
+        )
+
+    assert widget._viewer.layers == [existing]
+    assert widget._projection_layer is existing
+
+
 def test_flat_vector_projection_failure_reaches_the_status_label(monkeypatch) -> None:
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -3531,7 +3612,14 @@ def test_removing_render_layers_restores_the_viewer_overlays(monkeypatch) -> Non
 
     widget._remove_projection_layer()
 
-    assert viewer.dims.axis_labels == ("0", "1", "2")
+    # The widget no longer writes dims labels directly. A real napari 0.9
+    # ViewerModel derives its negative defaults when the last layer is removed;
+    # this minimal list double deliberately retains the most recent labels.
+    assert viewer.dims.axis_labels == (
+        "Allen layer",
+        "Flatmap Y",
+        "Flatmap X",
+    )
     assert viewer.axes.visible is False
     assert viewer.text_overlay.visible is False
     assert viewer.text_overlay.text == ""
@@ -3910,6 +3998,7 @@ def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None
     assert layer.name == "Flatmap Region Labels"
     np.testing.assert_array_equal(layer.data, first.labels)
     assert layer.metadata["projection_kind"] == "flatmap_region_labels"
+    assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
     assert layer._napari_swc_flatmap_region_labels_result is first
     assert widget._viewer.layers == [layer]
 
@@ -4383,6 +4472,7 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     np.testing.assert_allclose(widget._viewer.layers[2].edge_color, expected_visp)
     for layer in widget._viewer.layers:
         assert layer.metadata["source"] == "precomputed_cache"
+        assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
         assert layer.metadata["region_selection_source"] == "custom_regions"
         assert layer.metadata["region_selection_scope"] == "current_table"
         assert layer.metadata["selected_region_ids"] == [10, 11]
@@ -4777,6 +4867,7 @@ def test_cached_flat_region_outlines_use_only_materialized_cache_arrays(
         )
         assert layer.metadata["flatmap_plane_mode"] == module.FLATMAP_PLANE_MODE_FLAT
         assert layer.metadata["projection_kind"] == "flatmap_flat_region_outlines"
+        assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
         assert layer.metadata["planar_bin_count"] == 3
         assert layer.metadata["geometry_grouping"] == "selected_root"
         assert "scale" not in layer.init_kwargs

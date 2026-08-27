@@ -328,8 +328,9 @@ projecting meshes, or converting region coordinates while viewing.
   X bin count is derived per style so bins are square, giving 512 X bins for
   the square style and 491 for the shaped style.
 - Select at least one parent region with descendants in the **Regions** tab.
-- For the detached-window close check, launch with a dedicated trace:
-  `NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari`.
+- Put at least two main-view layers in different visibility states and select
+  one of them before testing that the flatmap window leaves the main viewer
+  untouched.
 
 **Steps and expected results**
 
@@ -348,12 +349,13 @@ projecting meshes, or converting region coordinates while viewing.
    BrainGlobe atlas with the same atlas/version structure catalog, choose
    **Precomputed Parquet + Cache**, set **Render** to **Heatmap** and its color
    mode to **Single color**, then click **Project to Flatmap**. After the
-   heatmap appears in the detached flatmap window, click **Choose Cache
+   heatmap appears in **SWC Viewer Flatmap**, click **Choose Cache
    Directory...** and select the existing cache. Repeat the cache selection
    several times on both Windows and macOS when those systems are available.
    **Expected:** Cache validation runs without freezing either napari window.
-   The detached window first becomes visible with its populated 3D heatmap;
-   there is no visible blank intermediate flatmap window.
+   The main viewer stays visible and unchanged during computation. The separate
+   flatmap viewer is first shown with its populated 3D heatmap; there is no
+   blank intermediate window.
    The plugin parses `flatmap-region-cache.json`, memory-maps its arrays, and
    lists only profiles compatible with the Parquet lookup-set ID and selected
    style. A heatmap whose fixed grid matches the selected profile remains
@@ -393,49 +395,29 @@ projecting meshes, or converting region coordinates while viewing.
 8. **Action:** Explicitly choose **Recompute from NRRDs**.
    **Expected:** The legacy runtime lookup workflow becomes available only for
    this explicit fallback choice.
-9. **Action:** After a projection appears, use the operating-system close
-   control on the detached **SWC Viewer Flatmap** window while leaving the main
-   napari window open, and accept napari's close confirmation. Wait at least
-   two seconds, then click **Project to Flatmap** again. Repeat the accepted
-   close and reopen cycle three times, then close the main napari window and
-   retain the debug log. Repeat once while cancelling napari's confirmation.
-   **Expected:** The detached window closes completely, the main napari window
-   remains responsive, and the detached viewer releases its resources. The
-   next projection opens exactly one fresh detached flatmap window with the
-   expected layers and never exposes a blank setup window. Cancelling the
-   confirmation keeps the original detached viewer and its layers usable. Each
-   fresh viewer records `event=created_hidden`, `event=first_layer_ready`,
-   `event=show_scheduled`, and `event=shown` before the close records, with
-   `pending_first_show=false` after it is shown. For each accepted close, the
-   log contains
-   `event=qt_close`, three `event=close_checkpoint` records,
-   `event=qt_deferreddelete`, `_LayerSlicer.shutdown`, and
-   `event=cleanup_complete` with `cleanup_trigger=deferred_delete`,
-   `cleanup_qt_viewer=closed`, zero layers, `napari_viewer_registered=false`,
-   both plugin viewer references false, and `slicer_executor_shutdown=true`.
-   Three `event=post_destroy_checkpoint` records follow; the 2000 ms record has
-   no matching flat-map QWidget or native QWindow. The trace contains no
-   `event=cleanup_failure`.
+9. **Action:** After a projection appears, use the flatmap window's
+   operating-system close control. Verify that the main layers, order,
+   visibility, active selection, dimensions, and camera never changed, then
+   project again. Repeat three times. Finally, trigger a projection error or
+   cancellation before any flatmap layer is committed.
+   **Expected:** The Flatmap tab has no plugin-provided close button. On macOS
+   the operating-system close control hides the visible Qt top-level and clears
+   its transient layers, but its live viewer and canvas are reused by the next
+   projection; `Viewer.close()` is not called on the visible secondary window.
+   On Windows and Linux napari's public close API is used and the next
+   projection creates one fresh viewer. A failed first render never exposes an
+   empty window, while a failed re-render retains an already valid flatmap. The
+   main viewer remains unchanged throughout.
 10. **Action (macOS only):** Put the main napari window in macOS Full Screen,
-    then create a flat-map projection. Close and reopen the detached window three
-    times while the main viewer stays fullscreen. Then manually place the
-    detached **SWC Viewer Flatmap** window in fullscreen and close it; cancel the
-    confirmation once and confirm the viewer is still usable, then close it again
-    and accept.
-    **Expected:** The detached window opens normally with populated content while
-    the main window remains fullscreen — the trace shows `show_path=normal_qt`,
-    `event=normal_show_requested`, and `event=fullscreen_restore_suppressed`, and
-    the main window stays fullscreen and registered. Closing the manually
-    fullscreened detached window safely exits fullscreen, presents confirmation,
-    and closes completely, recording `event=fullscreen_close_deferred`,
-    `event=fullscreen_exit_requested`, `event=fullscreen_exit_complete`, and
-    `event=fullscreen_close_retried`, then the normal
-    `event=qt_deferreddelete`/`event=cleanup_complete` cleanup. Cancelling leaves
-    the viewer usable in normal window mode. There is no ghost window, no crash
-    or OS crash report, no `event=fullscreen_guard_failure`, and no change to the
-    main viewer's fullscreen state. napari itself writes `window_fullscreen` to
-    its global settings on close; the detached viewer must still open normally on
-    the next projection regardless of that saved value.
+    project, and dismiss/redisplay **SWC Viewer Flatmap** three times using its
+    operating-system close control. Then put the flatmap window itself in Full
+    Screen and use the same close control.
+    **Expected:** The main window remains fullscreen and responsive. The
+    flatmap window opens populated, disappears without a ghost window, and can
+    be reused. Dismissal produces no native crash or operating-system crash
+    report. The macOS hide guard is the only private Qt integration; no
+    slicer, status-thread, viewer-registry, or model cleanup is performed by the
+    plugin.
 
 **Manual verification**
 
@@ -450,22 +432,25 @@ projecting meshes, or converting region coordinates while viewing.
   different labels and different profile contents than the last passing run, and
   step 3's "reopen an existing cache" path must be re-exercised with a cache
   rebuilt under the new format. The earlier run below still stands for the
-  window-lifecycle behavior (steps 3 and 10), which this change does not touch.
-  Previous result, macOS (macOS 26.5.1 arm64, napari 0.6.6, PyQt6
-  6.8.1). Cache build/reopen/parse and shaped/square switching all behave as
-  expected. The detached flatmap window now closes completely while the main
-  napari window stays open, and the plugin creates the viewer hidden in 3D,
-  showing it only after its first configured layer (no blank intermediate
-  window). The macOS fullscreen workflow (step 10) also passed: the detached
-  window opens normally even when the main window is in Full Screen
-  (`show_path=normal_qt`), and closing a manually fullscreened detached window
-  safely exits fullscreen and tears down without a crash — the trace shows
-  `fullscreen_close_deferred` → `fullscreen_exit_complete` →
-  `cleanup_complete` with `cleanup_status_thread=stopped`, and no
-  `QThread: Destroyed while thread is still running` warning. Cancelling the
-  close confirmation left the viewer usable, and reopening produced exactly one
-  fresh detached window. This remains a macOS-specific workaround for
-  napari 0.6.6 whose Qt-dependent behavior can only be validated manually.
+  previous cache format, but it does not verify napari 0.9 or the revised
+  flatmap-window dismissal path.
+  **Failed experiments:** On 2026-08-26, napari 0.9.0 on macOS 26.5.1 arm64
+  crashed when **Close Flatmap Window** called `Viewer.close()` directly. It
+  crashed again when the plugin first hid the window, disabled painting, waited
+  50 ms, and then called `Viewer.close()`. Both macOS reports recorded
+  `EXC_BAD_ACCESS` in `gleRunVertexSubmitImmediate` while Qt flushed a queued
+  backing-store repaint. The resource-tracker semaphore warning after the
+  second crash was shutdown fallout from `SIGSEGV`, not its cause.
+  **Partial manual result:** The revised retain-and-reuse guard was stable when
+  reached through the macOS operating-system close control, but invoking the
+  same dismissal from the plugin button still caused a native crash. The plugin
+  button and its callback were therefore removed; the complete repeated and
+  fullscreen sequence in steps 9 and 10 remains `Not run`.
+  **Superseded historical result:** macOS 26.5.1 arm64 with napari 0.6.6 and
+  PyQt6 6.8.1 passed cache build/reopen/parse, shaped/square switching, and the
+  former detached-window close/fullscreen checks without a crash or retained
+  window. The napari 0.9 implementation now retains a macOS hide/reuse guard,
+  so steps 3, 9, and 10 must be run again.
 
 ### UC-005: View an Allen Isocortex Layer Flatmap Stack
 
@@ -481,7 +466,7 @@ The six images are one napari image stack, ordered from superficial to deep.
 The default single-color mode creates one stack; the existing individual and
 cluster color modes create one six-plane stack per color group.
 
-The flatmap window names what is on screen. The plane axis is captioned
+The flatmap window's canvas names what is on screen. The plane axis is captioned
 **Allen layer**, an on-canvas line reports the layer of the plane under the
 slider, and labelled **Flatmap X** / **Flatmap Y** axis arrows show the image
 orientation. The same annotations serve the depth-binned **3D Heatmap**, where
@@ -518,15 +503,15 @@ axes without asserting physical units or anatomical direction.
 2. **Action:** In **Regions**, choose **Atlas Regions**, select a cortical
    parent region, return to **Flatmap**, and click **Show Region Labels**
    before projecting neurons.
-   **Expected:** The detached **SWC Viewer Flatmap** can open with a label-only
+   **Expected:** A separate **SWC Viewer Flatmap** window opens with a label-only
    2D stack named **Flatmap Region Labels**. It has six planes ordered `L1`,
    `L2/3`, `L4`, `L5`, `L6a`, `L6b`, contains only the selected region's
    terminal Allen-layer descendants, uses atlas colors, and reads only the
    active cache arrays and structure catalog—not NRRDs or `atlas.annotation`.
 3. **Action:** Keep **Heatmap colors** at **Single color** and click **Project
    to Flatmap**.
-   **Expected:** The detached **SWC Viewer Flatmap** opens in 2D with one image
-   layer named **Isocortex Flatmap Allen Layers**. The first-axis slider is
+   **Expected:** The flatmap window remains open and shows one image layer named
+   **Isocortex Flatmap Allen Layers**. The first-axis slider is
    captioned **Allen layer** and the canvas names the plane the slider opened
    on in its upper-left corner — napari starts a six-plane axis at its middle
    position, so this reads `Allen layer: L4  (plane 3 of 6)`. Labelled
@@ -568,7 +553,7 @@ axes without asserting physical units or anatomical direction.
 9. **Action:** With the categorical stack on screen, click **Add Soma**.
    **Expected:** Somas appear on the layer plane their own `region_id` assigns,
    not on a depth bin, so moving the plane slider shows each soma only on its own
-   layer. The window stays in 2D and the **Allen layer** plane caption and
+   layer. The flatmap canvas stays in 2D and the **Allen layer** plane caption and
    **Flatmap X** / **Flatmap Y** labels remain. UC-011 covers the soma coordinate
    space across every render mode.
 10. **Action:** Switch **Render** back to **3D Heatmap** and project, then
@@ -587,7 +572,9 @@ axes without asserting physical units or anatomical direction.
     Labels** with no active Atlas/Custom selection, a non-Isocortex-only Atlas
     selection, and terminal layer regions with no occupancy in the active cache.
    **Expected:** Each attempt reports a specific corrective message and does
-   not leave a blank detached flatmap window or a stale Labels overlay.
+   not leave a blank flatmap window or a stale Labels overlay. If no valid
+   flatmap window existed, no second window is shown and the main viewer remains
+   visible and unchanged.
 
 **Manual verification**
 
@@ -602,7 +589,7 @@ axes without asserting physical units or anatomical direction.
   cover them against a viewer double only, which cannot show whether the
   overlays are legible or correctly placed on the canvas. Step 9 was added on
   2026-08-05 with the per-render-mode soma fix and has not been exercised either;
-  before that fix, **Add Soma** placed somas on depth bins and forced the window
+  before that fix, **Add Soma** placed somas on depth bins and forced the canvas
   back to 3D.
 
 ### UC-006: Inspect and Query Custom Isocortex Layer Regions
@@ -1195,8 +1182,8 @@ footprint of an arbor without cortical-depth structure.
 Collapsing removes the depth *axis*, not any node: **Exclude depth -1 nodes**
 still decides whether depth `-1` nodes render, so a **2D Heatmap** is exactly the
 matching **3D Heatmap** summed over its planes and reports the same node counts.
-The flatmap window opens in 2D with only **Flatmap Y** / **Flatmap X** axes, no
-plane slider, and no plane caption.
+The dedicated flatmap canvas uses 2D with only **Flatmap Y** / **Flatmap X**
+axes, no plane slider, and no plane caption.
 
 **2D Vector** draws one line per parent-child edge on the same pixel grid the
 **2D Heatmap** uses, colored per neuron from the table. It is a per-node render
@@ -1207,7 +1194,7 @@ incomplete subset of neurons.
 mode uses, so soma points land on the visible render in all five modes.
 
 The collapsed **Heatmap Appearance** section lists rendered flatmap heatmap
-layers from the detached flatmap window. It can apply the minimum supported
+layers from the dedicated flatmap viewer. It can apply the minimum supported
 gamma to one or several selected 3D, 2D, or Allen-layer heatmaps so faint
 projections remain visible without changing their node-count data.
 
@@ -1226,8 +1213,8 @@ projections remain visible without changing their node-count data.
 1. **Action:** Select a few neuron rows, open **Flatmap**, choose **Precomputed
    Parquet + Cache** and **Both hemispheres, shaped**, set **Render** to **2D
    Heatmap**, and click **Project to Flatmap**.
-   **Expected:** The flatmap window shows one image named **Isocortex Flatmap 2D
-   Heatmap** in 2D. There is no plane slider and no plane caption in the
+   **Expected:** **SWC Viewer Flatmap** shows one image named **Isocortex Flatmap
+   2D Heatmap** in 2D. There is no plane slider and no plane caption in the
    upper-left corner. Labelled **Flatmap X** / **Flatmap Y** axis arrows are
    drawn at the image origin. The summary panel ends with `Depth: collapsed into
    one flatmap plane`.
@@ -1261,14 +1248,14 @@ projections remain visible without changing their node-count data.
 8. **Action:** Select every neuron in the table and project in **2D Vector**.
    **Expected:** The projection is refused with a message naming the segment
    count and the 250,000 limit and suggesting 2D Heatmap. No vector layer is
-   added, no blank detached flatmap window is left open, and the viewer stays
-   responsive.
+   added, the existing flatmap remains usable (or no window opens on a first
+   failure), and both viewers stay responsive.
 9. **Action:** In each of the five **Render** modes in turn — **3D Heatmap**, **3D
    Points**, **2D Heatmap**, **2D Vector**, **Allen Layer Heatmap (2D stack)** —
    project, then click **Add Soma**.
    **Expected:** In every mode the somas appear on the render that is on screen.
-   In the two 2D modes and the Allen stack the window stays in 2D. In the Allen
-   stack the plane caption (for example `Allen layer: L2/3  (plane 2 of 6)`) and
+   In the two 2D modes and the Allen stack the flatmap canvas stays in 2D. In the
+   Allen stack the plane caption (for example `Allen layer: L2/3  (plane 2 of 6)`) and
    the **Flatmap X** / **Flatmap Y** labels survive adding the somas, and moving
    the plane slider shows somas only on their own layer's plane.
 10. **Action:** With a soma layer visible, change **Render** to a different mode.
@@ -1293,8 +1280,9 @@ projections remain visible without changing their node-count data.
     **Expected:** Enhancement applies gamma `0.20` to the two selected flatmap
     heatmaps, brightening their faint projections without changing their data,
     contrast limits, or the unselected control. Reset restores gamma `1.00` on
-    both selected layers. Renaming or removing a heatmap in the detached viewer
-    refreshes the list, and closing that viewer clears it.
+    both selected layers. Renaming or removing a heatmap in **SWC Viewer
+    Flatmap** refreshes the list. Using the flatmap window's operating-system
+    close control clears the transient heatmaps and the list.
 
 **Manual verification**
 
@@ -1577,8 +1565,8 @@ descendant ID in each pixel.
    **Precomputed Parquet + Cache** and **Style** to **Both hemispheres, shaped**,
    click **Choose Cache Directory...** and pick the compatible profile, set
    **Render** to **2D Heatmap**, and click **Project to Flatmap**.
-   **Expected:** An **Isocortex Flatmap 2D Heatmap** layer appears in the flatmap
-   window with no plane slider. In **Cached Regions**, **Show Region Labels**,
+   **Expected:** An **Isocortex Flatmap 2D Heatmap** layer appears on the main
+   canvas with no plane slider. In **Cached Regions**, **Show Region Labels**,
    **Show Region Outlines**, and **Clear Geometry** are enabled, while **Show
    Region Surfaces** and the **Atlas** combo are disabled. Hovering **Show Region
    Surfaces** explains that cached surfaces are 3D voxel shells and points to

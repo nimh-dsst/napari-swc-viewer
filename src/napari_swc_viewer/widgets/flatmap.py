@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from pathlib import Path
-import re
 from time import perf_counter
 from types import MethodType
 from typing import Callable
@@ -31,17 +31,17 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ..flatmap_export import export_projected_nodes_csv
 from ..analysis.flatmap_correlation import FlatmapVoxelCorrelationSource
+from ..flatmap_export import export_projected_nodes_csv
 from ..flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_Y_BINS,
-    FLATMAP_Y_BINS_TOOLTIP,
-    MAX_FLATMAP_Y_BINS,
     FLATMAP_PLANE_MODE_ALLEN_LAYERS,
     FLATMAP_PLANE_MODE_DEPTH,
     FLATMAP_PLANE_MODE_FLAT,
+    FLATMAP_Y_BINS_TOOLTIP,
     MAX_FLATMAP_VECTOR_SEGMENTS,
+    MAX_FLATMAP_Y_BINS,
     AllenLayerHeatmapVolumeResult,
     AllenLayerStackResult,
     AllenLayerStackSummary,
@@ -187,6 +187,8 @@ _ALLEN_LAYER_AXIS_LABEL = "Allen layer"
 _DEPTH_AXIS_LABEL = "Depth bin"
 _PLANE_TEXT_OVERLAY_FONT_SIZE = 12
 _PLANE_TEXT_OVERLAY_POSITION = "top_left"
+_FLATMAP_LAYER_SPACE_KEY = "napari_swc_viewer_space"
+_FLATMAP_LAYER_SPACE_VALUE = "flatmap"
 
 _LOOKUP_FILES_PURPOSE_TEXT = (
     "These lookup files generate flatmap coordinates from CCF coordinates. "
@@ -224,6 +226,7 @@ class FlatmapProjectionWidget(QWidget):
         display_viewer_provider: Callable[..., object | None] | None = None,
         display_viewer_ready_callback: Callable[[object, object], None] | None = None,
         display_viewer_failed_callback: Callable[[object, str], None] | None = None,
+        display_generation_provider: Callable[[], int] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -231,6 +234,7 @@ class FlatmapProjectionWidget(QWidget):
         self._display_viewer_provider = display_viewer_provider
         self._display_viewer_ready_callback = display_viewer_ready_callback
         self._display_viewer_failed_callback = display_viewer_failed_callback
+        self._display_generation_provider = display_generation_provider or (lambda: 0)
         self._last_display_viewer = None
         self._display_axis_annotation_state: dict | None = None
         self._flatmap_display_layer_event_viewer = None
@@ -295,9 +299,11 @@ class FlatmapProjectionWidget(QWidget):
         self._region_label_atlas_cache: dict[str, object] = {}
         self._region_label_atlas_load_thread = None
         self._region_label_atlas_load_worker = None
+        self._region_label_request_display_generation: int | None = None
         self._pending_region_label_request = False
         self._precomputed_heatmap_thread = None
         self._precomputed_heatmap_worker = None
+        self._precomputed_heatmap_display_generation: int | None = None
         self._last_projected_nodes: pd.DataFrame | None = None
         self._last_summary: ProjectionSummary | None = None
         self._last_render_summary: FlatmapRenderSummary | None = None
@@ -335,17 +341,6 @@ class FlatmapProjectionWidget(QWidget):
             if viewer is not None:
                 self._last_display_viewer = viewer
                 if viewer is not previous_viewer:
-                    logger.debug(
-                        "flatmap_viewer_lifecycle "
-                        "event=display_target_selected "
-                        "viewer_object_id=%s previous_viewer_object_id=%s "
-                        "create=%s",
-                        hex(id(viewer)),
-                        hex(id(previous_viewer))
-                        if previous_viewer is not None
-                        else "none",
-                        str(bool(create)).lower(),
-                    )
                     self._connect_flatmap_display_layer_events(viewer)
             return viewer
         return getattr(self, "_viewer", None)
@@ -357,7 +352,7 @@ class FlatmapProjectionWidget(QWidget):
         return self._resolve_display_viewer(create=False)
 
     def _release_display_viewer(self, viewer) -> bool:
-        """Forget viewer-owned layer handles after its Qt window is destroyed."""
+        """Forget layer handles when a flatmap display viewer closes."""
         if getattr(self, "_last_display_viewer", None) is not viewer:
             return False
 
@@ -391,7 +386,7 @@ class FlatmapProjectionWidget(QWidget):
             )
 
     def _notify_display_viewer_failed(self, reason: str) -> None:
-        """Report an unsuccessful first render so a hidden viewer can close."""
+        """Report an unsuccessful first render so the main scene can recover."""
         viewer = self._current_display_viewer()
         if viewer is None:
             return
@@ -405,6 +400,17 @@ class FlatmapProjectionWidget(QWidget):
                 "Failed to report an unsuccessful flatmap display render.",
                 exc_info=True,
             )
+
+    def _display_generation(self) -> int:
+        provider = getattr(self, "_display_generation_provider", None)
+        try:
+            return int(provider()) if callable(provider) else 0
+        except Exception:
+            logger.debug("Could not read flatmap viewer generation", exc_info=True)
+            return 0
+
+    def _display_generation_matches(self, expected: int | None) -> bool:
+        return expected is None or self._display_generation() == int(expected)
 
     def _display_layers(self, *, create: bool = True):
         viewer = self._resolve_display_viewer(create=create)
@@ -461,9 +467,7 @@ class FlatmapProjectionWidget(QWidget):
         status = getattr(self, "_flatmap_heatmap_gamma_status_label", None)
         if status is not None:
             if layers:
-                status.setText(
-                    f"{len(layers)} flatmap heatmap layer(s) available."
-                )
+                status.setText(f"{len(layers)} flatmap heatmap layer(s) available.")
             else:
                 status.setText("No rendered flatmap heatmaps are available.")
         self._update_flatmap_heatmap_gamma_controls()
@@ -648,7 +652,7 @@ class FlatmapProjectionWidget(QWidget):
             connections.pop(layer_id, None)
 
     def _disconnect_flatmap_display_layer_events(self, viewer=None) -> None:
-        """Stop following a detached flatmap viewer being replaced or closed."""
+        """Stop following a flatmap viewer that is closing or being replaced."""
         tracked_viewer = getattr(self, "_flatmap_display_layer_event_viewer", None)
         if viewer is not None and tracked_viewer is not viewer:
             return
@@ -2913,6 +2917,7 @@ class FlatmapProjectionWidget(QWidget):
             else None
         )
         self._precomputed_heatmap_file_ids = [str(file_id) for file_id in file_ids]
+        self._precomputed_heatmap_display_generation = self._display_generation()
         worker = FlatmapHeatmapWorker(
             str(source_path),
             style_key=self._current_style_key(),
@@ -2949,6 +2954,14 @@ class FlatmapProjectionWidget(QWidget):
         thread.start()
 
     def _on_precomputed_heatmap_finished(self, result) -> None:
+        if not self._display_generation_matches(
+            getattr(self, "_precomputed_heatmap_display_generation", None)
+        ):
+            self._status_label.setText(
+                "Flatmap projection finished after its window changed or closed; "
+                "run it again to display the result."
+            )
+            return
         try:
             if isinstance(result, AllenLayerHeatmapVolumeResult):
                 self._apply_precomputed_allen_layer_result(result)
@@ -2970,6 +2983,10 @@ class FlatmapProjectionWidget(QWidget):
             show_warning(f"Flatmap projection failed: {exc}")
 
     def _on_precomputed_heatmap_error(self, message: str) -> None:
+        if not self._display_generation_matches(
+            getattr(self, "_precomputed_heatmap_display_generation", None)
+        ):
+            return
         logger.error("Flatmap heatmap pipeline error: %s", message)
         self._notify_display_viewer_failed("projection_failed")
         self._status_label.setText(f"Flatmap projection failed: {message}")
@@ -2980,6 +2997,7 @@ class FlatmapProjectionWidget(QWidget):
             self._precomputed_heatmap_thread = None
         if getattr(self, "_precomputed_heatmap_worker", None) is worker:
             self._precomputed_heatmap_worker = None
+            self._precomputed_heatmap_display_generation = None
         self._hide_projection_progress()
         self._set_projection_controls_enabled(True)
 
@@ -3077,7 +3095,6 @@ class FlatmapProjectionWidget(QWidget):
         )
 
         if render_summary.rendered_nodes == 0:
-            self._remove_projection_layer(create=False)
             self._notify_display_viewer_failed("no_render_layer")
         else:
             metadata = self._render_metadata(
@@ -3135,7 +3152,6 @@ class FlatmapProjectionWidget(QWidget):
         )
 
         if summary.rendered_nodes == 0:
-            self._remove_projection_layer(create=False)
             self._notify_display_viewer_failed("no_render_layer")
             raise RuntimeError(
                 "No selected flatmap-valid nodes belong to a terminal Allen "
@@ -4243,6 +4259,7 @@ class FlatmapProjectionWidget(QWidget):
                 "The selected regions have no occupancy in the active flatmap cache."
             )
         metadata = {
+            _FLATMAP_LAYER_SPACE_KEY: _FLATMAP_LAYER_SPACE_VALUE,
             "projection_kind": "flatmap_region_labels",
             "source": "precomputed_cache",
             "cache_path": str(self._region_cache_dir),
@@ -4411,6 +4428,7 @@ class FlatmapProjectionWidget(QWidget):
 
     def _start_region_label_atlas_load(self, atlas_name: str) -> None:
         self._pending_region_label_request = True
+        self._region_label_request_display_generation = self._display_generation()
         if self._region_label_atlas_load_running():
             self._set_region_labels_status(
                 f"Loading region-label atlas {atlas_name}..."
@@ -4465,12 +4483,22 @@ class FlatmapProjectionWidget(QWidget):
         self._set_region_label_controls_enabled(True)
         self._set_region_labels_status(f"Loaded region-label atlas {resolved_name}.")
 
-        if self._pending_region_label_request:
+        if self._pending_region_label_request and self._display_generation_matches(
+            getattr(self, "_region_label_request_display_generation", None)
+        ):
             self._pending_region_label_request = False
             self._create_region_labels()
+        elif self._pending_region_label_request:
+            self._pending_region_label_request = False
+            self._set_region_labels_status(
+                "Region-label atlas loaded after the flatmap window changed or "
+                "closed; "
+                "choose Show Region Labels again."
+            )
 
     def _on_region_label_atlas_load_error(self, error_msg: str) -> None:
         self._pending_region_label_request = False
+        self._region_label_request_display_generation = None
         self._set_region_label_controls_enabled(True)
         message = f"Region-label atlas load failed: {error_msg}"
         logger.error(message)
@@ -4482,6 +4510,7 @@ class FlatmapProjectionWidget(QWidget):
             self._region_label_atlas_load_thread = None
         if getattr(self, "_region_label_atlas_load_worker", None) is worker:
             self._region_label_atlas_load_worker = None
+            self._region_label_request_display_generation = None
 
     def _set_region_label_controls_enabled(self, enabled: bool) -> None:
         states = self._cached_region_control_states()
@@ -4518,6 +4547,7 @@ class FlatmapProjectionWidget(QWidget):
             for acronym in (self._selected_region_acronyms_provider() or [])
         ]
         return {
+            _FLATMAP_LAYER_SPACE_KEY: _FLATMAP_LAYER_SPACE_VALUE,
             "projection_kind": "flatmap_region_labels",
             "flatmap_style": self._current_style_filename(),
             "flatmap_path": str(self._flatmap_path) if self._flatmap_path else "",
@@ -4544,6 +4574,7 @@ class FlatmapProjectionWidget(QWidget):
         layer_name: str = _REGION_LABELS_LAYER_NAME,
     ):
         metadata = dict(metadata)
+        metadata[_FLATMAP_LAYER_SPACE_KEY] = _FLATMAP_LAYER_SPACE_VALUE
         metadata["region_layer_kind"] = "flatmap_labels"
         viewer = self._display_viewer()
         layer = self._region_labels_layer
@@ -4761,6 +4792,7 @@ class FlatmapProjectionWidget(QWidget):
     ) -> dict[str, object]:
         acronym, region_name = self._atlas_region_identity(atlas, region_id)
         return {
+            _FLATMAP_LAYER_SPACE_KEY: _FLATMAP_LAYER_SPACE_VALUE,
             "projection_kind": projection_kind,
             "source": "precomputed_cache",
             "cache_path": str(self._region_cache_dir),
@@ -4804,9 +4836,7 @@ class FlatmapProjectionWidget(QWidget):
             from ..flatmap_region_cache import materialize_region_surface
 
             profile, geometry_ids, atlas = self._cached_geometry_inputs()
-            self._clear_region_surface_layers()
-            viewer = self._display_viewer()
-            created = []
+            prepared = []
             for region_id in geometry_ids:
                 surface = materialize_region_surface(
                     profile,
@@ -4832,12 +4862,37 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 metadata["component_count"] = int(surface.component_count)
                 metadata["region_layer_kind"] = "flatmap_surface"
-                layer = viewer.add_surface(
+                prepared.append(
                     (
-                        np.array(surface.vertices, dtype=np.float32, copy=True),
-                        np.array(surface.faces, dtype=np.int32, copy=True),
-                        np.ones(len(surface.vertices), dtype=np.float32),
-                    ),
+                        (
+                            np.array(surface.vertices, dtype=np.float32, copy=True),
+                            np.array(surface.faces, dtype=np.int32, copy=True),
+                            np.ones(len(surface.vertices), dtype=np.float32),
+                        ),
+                        name,
+                        rgba,
+                        effective,
+                        metadata,
+                    )
+                )
+
+            if not prepared:
+                self._clear_region_surface_layers()
+                self._notify_display_viewer_failed("region_surfaces_empty")
+                self._set_region_labels_status(
+                    "Loaded 0 cached region surface layer(s)."
+                )
+                show_warning(
+                    "The selected cache profile has no surface for this selection."
+                )
+                return
+
+            self._clear_region_surface_layers()
+            viewer = self._display_viewer()
+            created = []
+            for data, name, rgba, effective, metadata in prepared:
+                layer = viewer.add_surface(
+                    data,
                     name=name,
                     colormap=Colormap(np.vstack([rgba, rgba])),
                     contrast_limits=(0.0, 1.0),
@@ -4854,16 +4909,9 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 created.append(layer)
             self._region_surfaces_layers = created
-            if created:
-                self._notify_display_viewer_ready(created[0])
-            else:
-                self._notify_display_viewer_failed("region_surfaces_empty")
+            self._notify_display_viewer_ready(created[0])
             message = f"Loaded {len(created)} cached region surface layer(s)."
             self._set_region_labels_status(message)
-            if not created:
-                show_warning(
-                    "The selected cache profile has no surface for this selection."
-                )
         except Exception as exc:
             logger.exception("Cached flatmap region surfaces failed")
             self._notify_display_viewer_failed("region_surfaces_failed")
@@ -4882,8 +4930,6 @@ class FlatmapProjectionWidget(QWidget):
             from ..flatmap_region_cache import materialize_flat_region_selection
 
             profile, geometry_ids, atlas = self._cached_geometry_inputs()
-            self._clear_region_outline_layers()
-            viewer = self._display_viewer()
             # One call for the whole selection: it resolves the region hierarchy
             # once and returns one collapsed perimeter per selected region.
             try:
@@ -4901,7 +4947,7 @@ class FlatmapProjectionWidget(QWidget):
                     "combine more than one selected region into a 2D outline, "
                     "or select a single region."
                 ) from exc
-            created = []
+            prepared = []
             for outlines in result.outlines:
                 if not len(outlines.vectors):
                     continue
@@ -4934,15 +4980,41 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 effective = self._effective_region_appearance(atlas, region_id)
                 metadata["region_layer_kind"] = "flatmap_outline"
+                prepared.append(
+                    (
+                        np.array(outlines.vectors, dtype=np.float32, copy=True),
+                        self._cached_geometry_layer_name(
+                            _FLAT_REGION_OUTLINES_LAYER_NAME,
+                            atlas,
+                            region_id,
+                            selection_count=len(geometry_ids),
+                        ),
+                        np.asarray(effective.color_rgba, dtype=np.float32),
+                        effective,
+                        metadata,
+                    )
+                )
+
+            if not prepared:
+                self._clear_region_outline_layers()
+                self._notify_display_viewer_failed("region_outlines_empty")
+                self._set_region_labels_status(
+                    "Loaded 0 collapsed region outline layer(s) "
+                    f"from profile {result.profile_id}."
+                )
+                show_warning(
+                    "The selected cache profile has no outlines for this selection."
+                )
+                return
+
+            self._clear_region_outline_layers()
+            viewer = self._display_viewer()
+            created = []
+            for data, name, edge_color, effective, metadata in prepared:
                 layer = viewer.add_vectors(
-                    np.array(outlines.vectors, dtype=np.float32, copy=True),
-                    name=self._cached_geometry_layer_name(
-                        _FLAT_REGION_OUTLINES_LAYER_NAME,
-                        atlas,
-                        region_id,
-                        selection_count=len(geometry_ids),
-                    ),
-                    edge_color=np.asarray(effective.color_rgba, dtype=np.float32),
+                    data,
+                    name=name,
+                    edge_color=edge_color,
                     edge_width=_FLAT_REGION_OUTLINE_EDGE_WIDTH,
                     opacity=0.9 * effective.outline_opacity,
                     visible=effective.outline_visible,
@@ -4962,23 +5034,16 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 created.append(layer)
             self._region_outlines_layers = created
-            if created:
-                # Deliberately not _focus_projection_view: re-centring would
-                # yank the user off the heatmap they are inspecting.
-                self._ensure_flat_overlay_ndisplay()
-                self._apply_display_axis_annotations(created[0])
-                self._notify_display_viewer_ready(created[0])
-            else:
-                self._notify_display_viewer_failed("region_outlines_empty")
+            # Deliberately not _focus_projection_view: re-centring would yank
+            # the user off the heatmap they are inspecting.
+            self._ensure_flat_overlay_ndisplay()
+            self._apply_display_axis_annotations(created[0])
+            self._notify_display_viewer_ready(created[0])
             message = (
                 f"Loaded {len(created)} collapsed region outline layer(s) "
                 f"from profile {result.profile_id}."
             )
             self._set_region_labels_status(message)
-            if not created:
-                show_warning(
-                    "The selected cache profile has no outlines for this selection."
-                )
         except Exception as exc:
             logger.exception("Collapsed flatmap region outlines failed")
             self._notify_display_viewer_failed("region_outlines_failed")
@@ -5000,9 +5065,7 @@ class FlatmapProjectionWidget(QWidget):
             from ..flatmap_region_cache import materialize_region_outlines
 
             profile, geometry_ids, atlas = self._cached_geometry_inputs()
-            self._clear_region_outline_layers()
-            viewer = self._display_viewer()
-            created = []
+            prepared = []
             for region_id in geometry_ids:
                 outlines = materialize_region_outlines(
                     profile,
@@ -5027,8 +5090,33 @@ class FlatmapProjectionWidget(QWidget):
                     selected_region_ids=geometry_ids,
                 )
                 metadata["region_layer_kind"] = "flatmap_outline"
+                prepared.append(
+                    (
+                        np.array(outlines.vectors, dtype=np.float32, copy=True),
+                        name,
+                        rgba,
+                        effective,
+                        metadata,
+                    )
+                )
+
+            if not prepared:
+                self._clear_region_outline_layers()
+                self._notify_display_viewer_failed("region_outlines_empty")
+                self._set_region_labels_status(
+                    "Loaded 0 cached region outline layer(s)."
+                )
+                show_warning(
+                    "The selected cache profile has no outlines for this selection."
+                )
+                return
+
+            self._clear_region_outline_layers()
+            viewer = self._display_viewer()
+            created = []
+            for data, name, rgba, effective, metadata in prepared:
                 layer = viewer.add_vectors(
-                    np.array(outlines.vectors, dtype=np.float32, copy=True),
+                    data,
                     name=name,
                     edge_color=rgba,
                     edge_width=1.5,
@@ -5048,16 +5136,9 @@ class FlatmapProjectionWidget(QWidget):
                 )
                 created.append(layer)
             self._region_outlines_layers = created
-            if created:
-                self._notify_display_viewer_ready(created[0])
-            else:
-                self._notify_display_viewer_failed("region_outlines_empty")
+            self._notify_display_viewer_ready(created[0])
             message = f"Loaded {len(created)} cached region outline layer(s)."
             self._set_region_labels_status(message)
-            if not created:
-                show_warning(
-                    "The selected cache profile has no outlines for this selection."
-                )
         except Exception as exc:
             logger.exception("Cached flatmap region outlines failed")
             self._notify_display_viewer_failed("region_outlines_failed")
@@ -5314,6 +5395,7 @@ class FlatmapProjectionWidget(QWidget):
         heatmap_color_mode: str | None = None,
     ) -> dict[str, object]:
         metadata = {
+            _FLATMAP_LAYER_SPACE_KEY: _FLATMAP_LAYER_SPACE_VALUE,
             "projection_kind": "isocortex_flatmap",
             "flatmap_render_mode": render_mode,
             "flatmap_projection_source": str(
@@ -5490,7 +5572,6 @@ class FlatmapProjectionWidget(QWidget):
         coordinate_mode: str,
     ):
         if stack_result.summary.rendered_nodes == 0:
-            self._remove_projection_layer(create=False)
             return None
 
         color_mode = self._current_heatmap_color_mode()
@@ -5592,8 +5673,17 @@ class FlatmapProjectionWidget(QWidget):
     ):
         """Create or update the napari depth-aware flatmap render layer."""
         if render_result.summary.rendered_nodes == 0:
-            self._remove_projection_layer(create=False)
             return None
+
+        # Validate and build vectors before changing the visible scene. Both
+        # the segment limit and a selection with no usable edges are expected
+        # user-facing failures, and a failed re-render must keep the previous
+        # valid flatmap intact.
+        vectors = (
+            self._flat_vector_data(render_result)
+            if render_mode == _RENDER_FLAT_VECTOR
+            else None
+        )
 
         grouped_capable = render_mode in {_RENDER_HEATMAP, _RENDER_FLAT_HEATMAP}
         heatmap_color_mode = (
@@ -5623,7 +5713,7 @@ class FlatmapProjectionWidget(QWidget):
         data_kind = "image"
 
         if render_mode == _RENDER_FLAT_VECTOR:
-            vectors = self._flat_vector_data(render_result)
+            assert vectors is not None
             metadata = dict(metadata)
             metadata["flatmap_vector_segments"] = int(len(vectors.data))
             metadata["flatmap_vector_total_segments"] = int(vectors.total_segments)
@@ -6436,6 +6526,7 @@ class FlatmapProjectionWidget(QWidget):
         colors = self._colors_for_file_ids(point_file_ids)
         axis_labels = self._axis_labels_for_render_mode(render_mode)
         metadata = {
+            _FLATMAP_LAYER_SPACE_KEY: _FLATMAP_LAYER_SPACE_VALUE,
             "projection_kind": "isocortex_flatmap",
             "flatmap_render_mode": _RENDER_POINTS,
             "flatmap_soma_only": True,
@@ -6584,7 +6675,7 @@ class FlatmapProjectionWidget(QWidget):
         center = tuple(((lower + upper) / 2.0).tolist())
         span = float(np.max(upper - lower))
 
-        camera = getattr(viewer, "camera", None)
+        camera = getattr(getattr(viewer, "scene", None), "camera", None)
         if camera is None:
             reset_view = getattr(viewer, "reset_view", None)
             if callable(reset_view):
@@ -6647,8 +6738,8 @@ class FlatmapProjectionWidget(QWidget):
     def _apply_display_axis_annotations(self, layer) -> None:
         """Name the display viewer's axes and show which plane is on screen.
 
-        napari renders the dims slider caption and the axes overlay from
-        ``viewer.dims.axis_labels``; ``layer.axis_labels`` never reaches either.
+        napari 0.9 derives ``viewer.dims.axis_labels`` from layer axis labels,
+        so this method only manages the public axes and text overlay models.
         """
         viewer = self._current_display_viewer()
         if viewer is None or layer is None:
@@ -6666,12 +6757,11 @@ class FlatmapProjectionWidget(QWidget):
         if state is None:
             return
 
-        try:
-            dims.axis_labels = axis_labels
-        except Exception:
-            logger.debug("Failed to set flatmap dims axis labels.", exc_info=True)
-
-        axes = getattr(viewer, "axes", None)
+        axes = getattr(
+            getattr(getattr(viewer, "scene", None), "overlays", None),
+            "axes",
+            None,
+        )
         if axes is not None:
             try:
                 axes.visible = True
@@ -6721,16 +6811,22 @@ class FlatmapProjectionWidget(QWidget):
         if state is not None:
             self._clear_display_axis_annotations(state.get("viewer"))
 
-        dims = getattr(viewer, "dims", None)
-        axes = getattr(viewer, "axes", None)
-        text_overlay = getattr(viewer, "text_overlay", None)
+        axes = getattr(
+            getattr(getattr(viewer, "scene", None), "overlays", None),
+            "axes",
+            None,
+        )
+        text_overlay = getattr(
+            getattr(getattr(viewer, "canvas", None), "overlays", None),
+            "text",
+            None,
+        )
         state = {
             "viewer": viewer,
             "connected": False,
             "plane_labels": None,
             "plane_caption": _DEPTH_AXIS_LABEL,
             "plane_count": 0,
-            "previous_axis_labels": getattr(dims, "axis_labels", None),
             "previous_axes_visible": getattr(axes, "visible", None),
             "previous_axes_labels": getattr(axes, "labels", None),
             "previous_text_visible": getattr(text_overlay, "visible", None),
@@ -6767,7 +6863,11 @@ class FlatmapProjectionWidget(QWidget):
         if state is None:
             return
         viewer = state.get("viewer")
-        text_overlay = getattr(viewer, "text_overlay", None)
+        text_overlay = getattr(
+            getattr(getattr(viewer, "canvas", None), "overlays", None),
+            "text",
+            None,
+        )
         if text_overlay is None:
             return
 
@@ -6834,16 +6934,25 @@ class FlatmapProjectionWidget(QWidget):
                         exc_info=True,
                     )
 
+        axes = getattr(
+            getattr(getattr(target, "scene", None), "overlays", None),
+            "axes",
+            None,
+        )
+        text_overlay = getattr(
+            getattr(getattr(target, "canvas", None), "overlays", None),
+            "text",
+            None,
+        )
         for owner, attribute, key in (
-            (dims, "axis_labels", "previous_axis_labels"),
-            (getattr(target, "axes", None), "visible", "previous_axes_visible"),
-            (getattr(target, "axes", None), "labels", "previous_axes_labels"),
+            (axes, "visible", "previous_axes_visible"),
+            (axes, "labels", "previous_axes_labels"),
             (
-                getattr(target, "text_overlay", None),
+                text_overlay,
                 "visible",
                 "previous_text_visible",
             ),
-            (getattr(target, "text_overlay", None), "text", "previous_text"),
+            (text_overlay, "text", "previous_text"),
         ):
             previous = state.get(key)
             if owner is None or previous is None:

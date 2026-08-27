@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import importlib
-import gc
 import inspect
-import logging
 import os
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
-import weakref
 
 import numpy as np
 import pandas as pd
@@ -106,6 +103,10 @@ class _FakeQTimer:
     def stop(self, *_args, **_kwargs) -> None:
         return None
 
+    @staticmethod
+    def singleShot(_delay, callback) -> None:
+        callback()
+
 
 class _FakeQt:
     Horizontal = 1
@@ -122,6 +123,9 @@ class _FakeQEvent:
     Hide = 7
     DeferredDelete = 8
     Destroy = 9
+
+    class Type:
+        Close = 6
 
 
 class _FakeWidget:
@@ -756,1628 +760,408 @@ def test_widget_startup_schedules_cached_template_autoload_without_atlas_load(
     atlas_factory.assert_not_called()
 
 
-class _LifecycleSignal:
-    def __init__(self) -> None:
-        self.callbacks = []
-
-    def connect(self, callback) -> None:
-        self.callbacks.append(callback)
-
-    def emit(self) -> None:
-        for callback in list(self.callbacks):
-            callback()
-
-
-class _LifecycleQtViewer:
-    def __init__(self, *, close_error: Exception | None = None) -> None:
-        self.close_calls = 0
-        self._close_error = close_error
-
-    def close(self) -> None:
-        self.close_calls += 1
-        if self._close_error is not None:
-            raise self._close_error
-
-
-class _LifecycleStatusThread:
-    """Stand-in for napari's StatusChecker QThread."""
-
-    def __init__(self, *, running: bool = True) -> None:
-        self._running = running
-        self.close_terminate_calls = 0
-        self.wait_calls = 0
-
-    def isRunning(self) -> bool:
-        return self._running
-
-    def close_terminate(self) -> None:
-        self.close_terminate_calls += 1
-        self._running = False
-
-    def wait(self) -> None:
-        self.wait_calls += 1
-
-
-class _LifecycleWindow:
+class _SceneLayer:
     def __init__(
         self,
+        name: str,
         *,
+        flatmap: bool = False,
         visible: bool = True,
-        teardown_error: Exception | None = None,
-        qt_viewer_close_error: Exception | None = None,
-        status_thread_running: bool = True,
     ) -> None:
-        self.destroyed = _LifecycleSignal()
-        self.filters = []
-        self.teardown_calls = 0
-        self.close_calls = 0
-        self.visible = bool(visible)
-        self._teardown_error = teardown_error
-        self._qt_viewer = _LifecycleQtViewer(
-            close_error=qt_viewer_close_error,
+        self.name = name
+        self.visible = visible
+        self.metadata = (
+            {"napari_swc_viewer_space": "flatmap"} if flatmap else {"source": "main"}
         )
-        self.status_thread = _LifecycleStatusThread(
-            running=status_thread_running,
-        )
+
+
+def _scene_layer(name: str, *, flatmap: bool = False, visible: bool = True):
+    return _SceneLayer(name, flatmap=flatmap, visible=visible)
+
+
+class _FlatmapQtWindow:
+    def __init__(self) -> None:
+        self.hidden = False
+        self.fullscreen = False
+        self.show_normal_calls = 0
+        self.updates_enabled = True
+        self.installed_filters = []
+        self.removed_filters = []
 
     def installEventFilter(self, event_filter) -> None:
-        self.filters.append(event_filter)
+        self.installed_filters.append(event_filter)
 
-    def isVisible(self) -> bool:
-        return self.visible
+    def removeEventFilter(self, event_filter) -> None:
+        self.removed_filters.append(event_filter)
 
-    def isHidden(self) -> bool:
-        return not self.visible
+    def setUpdatesEnabled(self, enabled: bool) -> None:
+        self.updates_enabled = bool(enabled)
 
-    def isActiveWindow(self) -> bool:
-        return True
-
-    def windowTitle(self) -> str:
-        return "SWC Viewer Flatmap"
-
-    def _teardown(self) -> None:
-        self.teardown_calls += 1
-        if self._teardown_error is not None:
-            raise self._teardown_error
-
-    def close(self) -> None:
-        self.close_calls += 1
-        raise AssertionError("cleanup must not close the deleted Qt window")
-
-
-class _LifecycleLayerList(list):
-    def __init__(self, values=(), *, clear_error: Exception | None = None) -> None:
-        super().__init__(values)
-        self.clear_calls = 0
-        self._clear_error = clear_error
-
-    def clear(self) -> None:
-        self.clear_calls += 1
-        if self._clear_error is not None:
-            raise self._clear_error
-        super().clear()
-
-
-class _LifecycleEmitter:
-    def __init__(self, *, disconnect_error: Exception | None = None) -> None:
-        self.disconnect_calls = 0
-        self._disconnect_error = disconnect_error
-
-    def disconnect(self, _listener) -> None:
-        self.disconnect_calls += 1
-        if self._disconnect_error is not None:
-            raise self._disconnect_error
-
-
-class _LifecycleSlicer:
-    def __init__(self, *, shutdown_error: Exception | None = None) -> None:
-        self._layers_to_task = {"pending": object()}
-        self._executor = types.SimpleNamespace(_shutdown=False)
-        self.shutdown_calls = 0
-        self._shutdown_error = shutdown_error
-
-    def shutdown(self) -> None:
-        self.shutdown_calls += 1
-        if self._shutdown_error is not None:
-            raise self._shutdown_error
-        self._executor._shutdown = True
-        self._layers_to_task.clear()
-
-
-class _LifecycleViewer:
-    _instances = []
-
-    def __init__(
-        self,
-        qt_window: _LifecycleWindow,
-        *,
-        slicer_error: Exception | None = None,
-        disconnect_error: Exception | None = None,
-        clear_error: Exception | None = None,
-    ) -> None:
-        self.window = types.SimpleNamespace(
-            _qt_window=qt_window,
-            _teardown=qt_window._teardown,
-            close=qt_window.close,
-        )
-        self.layers = _LifecycleLayerList(
-            [types.SimpleNamespace(name="Flatmap Heatmap")],
-            clear_error=clear_error,
-        )
-        self._dims_emitter = _LifecycleEmitter(
-            disconnect_error=disconnect_error,
-        )
-        self.dims = types.SimpleNamespace(
-            events=types.SimpleNamespace(emitters={"dims": self._dims_emitter}),
-            ndisplay=2,
-        )
-        self._layer_slicer = _LifecycleSlicer(shutdown_error=slicer_error)
-        self.close_calls = 0
-        self.show_calls = 0
-
-    def show(self) -> None:
-        self.show_calls += 1
-        self.window._qt_window.visible = True
-
-    def close(self) -> None:
-        self.close_calls += 1
-        raise AssertionError("destroyed-window cleanup must not call Viewer.close")
-
-
-class _LifecycleTab:
-    def __init__(self, viewer) -> None:
-        self._last_display_viewer = viewer
-        self._projection_layer = viewer.layers[0]
-        self._region_labels_layer = object()
-        self._region_surfaces_layers = [object()]
-        self._region_outlines_layers = [object()]
-        self.release_calls = 0
-
-    def _release_display_viewer(self, viewer) -> bool:
-        self.release_calls += 1
-        if self._last_display_viewer is not viewer:
-            return False
-        self._last_display_viewer = None
-        self._projection_layer = None
-        self._region_labels_layer = None
-        self._region_surfaces_layers = []
-        self._region_outlines_layers = []
-        return True
-
-
-class _LifecycleEvent:
-    def __init__(self, event_type: int, *, accepted: bool = True) -> None:
-        self._event_type = event_type
-        self.accepted = accepted
-
-    def type(self) -> int:
-        return self._event_type
-
-    def spontaneous(self) -> bool:
-        return True
-
-    def isAccepted(self) -> bool:
-        return self.accepted
-
-
-def _lifecycle_widget(viewer, tab=None):
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._flatmap_viewer = viewer
-    widget._flatmap_tab = tab
-    widget._flatmap_debug_sequence = 1
-    widget._flatmap_debug_tokens = {id(viewer): "flatmap-1"}
-    widget._flatmap_debug_filters = {"flatmap-1": object()}
-    widget._flatmap_cleanup_filters = {}
-    widget._flatmap_close_guard_filters = {}
-    widget._flatmap_fullscreen_close_state = {}
-    widget._flatmap_cleanup_states = {}
-    widget._flatmap_pending_show_token = None
-    widget._flatmap_show_scheduled_tokens = set()
-    return widget
-
-
-class _FullscreenWindow:
-    """Minimal detached Qt window exercising the fullscreen-close guard."""
-
-    def __init__(self, *, fullscreen: bool = True) -> None:
-        self._fullscreen = fullscreen
-        self.window_state = None
-        self.show_normal_calls = 0
-        self.raise_calls = 0
-        self.activate_calls = 0
-        self.close_calls: list = []
-        self.visible = not fullscreen
+    def hide(self) -> None:
+        self.hidden = True
 
     def isFullScreen(self) -> bool:
-        return self._fullscreen
+        return self.fullscreen
 
     def showNormal(self) -> None:
         self.show_normal_calls += 1
-        self._fullscreen = False
-        self.window_state = _FakeQt.WindowNoState
-        self.visible = True
-
-    def setWindowState(self, state) -> None:
-        self.window_state = state
-
-    def windowState(self):
-        return self.window_state
-
-    def raise_(self) -> None:
-        self.raise_calls += 1
-
-    def activateWindow(self) -> None:
-        self.activate_calls += 1
-
-    def isVisible(self) -> bool:
-        return self.visible
-
-    def close(self, confirm_need: bool = False) -> None:
-        self.close_calls.append(confirm_need)
+        self.fullscreen = False
 
 
-class _FullscreenWindowNoConfirm(_FullscreenWindow):
-    """Detached window lacking napari's private ``confirm_need`` interface."""
+class _FlatmapWindow:
+    def __init__(self) -> None:
+        self.open = True
+        self._qt_window = _FlatmapQtWindow()
 
-    def close(self) -> None:  # type: ignore[override]
-        self.close_calls.append(None)
+    def geometry(self):
+        if not self.open:
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+        return (0, 0, 800, 600)
 
 
-class _FullscreenViewer:
-    """Napari-like viewer wrapping a fullscreen-capable Qt window."""
-
-    def __init__(self, qt_window) -> None:
-        dims = types.SimpleNamespace(_resize_axis_labels=self._resize_axis_labels)
-        self.window = types.SimpleNamespace(
-            _qt_window=qt_window,
-            _qt_viewer=types.SimpleNamespace(dims=dims),
-        )
-        self.resize_calls = 0
+class _FlatmapViewer:
+    def __init__(self, *, title: str, ndisplay: int, show: bool) -> None:
+        self.title = title
+        self.ndisplay = ndisplay
+        self.initial_show = show
+        self.layers = []
+        self.window = _FlatmapWindow()
         self.show_calls = 0
-
-    def _resize_axis_labels(self) -> None:
-        self.resize_calls += 1
+        self.close_calls = 0
 
     def show(self) -> None:
+        if not self.window.open:
+            raise RuntimeError("viewer window is closed")
         self.show_calls += 1
-        if self.window._qt_window is not None:
-            self.window._qt_window.visible = True
+        self.window._qt_window.hidden = False
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.layers.clear()
+        self.window.open = False
 
 
-def _fullscreen_widget(qt_window):
-    viewer = _FullscreenViewer(qt_window)
-    widget = _lifecycle_widget(viewer)
-    return widget, viewer
+class _FlatmapTab:
+    def __init__(self) -> None:
+        self.released = []
+
+    def _release_display_viewer(self, viewer) -> None:
+        self.released.append(viewer)
 
 
-def test_flatmap_debug_event_filter_observes_without_consuming_event() -> None:
-    filter_class = NeuronViewerWidget._install_flatmap_debug_event_filter.__globals__[
-        "_FlatmapWindowLifecycleEventFilter"
-    ]
-    calls = []
-    lifecycle_filter = filter_class(
-        "flatmap-1",
-        lambda *args: calls.append(args),
-    )
-    watched = object()
-    event = _LifecycleEvent(_FakeQEvent.Close)
-
-    consumed = lifecycle_filter.eventFilter(watched, event)
-
-    assert consumed is False
-    assert event.accepted is True
-    assert calls == [("flatmap-1", "Close", watched, event)]
+def _flatmap_window_widget(main_viewer=None):
+    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
+    widget.viewer = main_viewer or types.SimpleNamespace(layers=[])
+    widget._flatmap_viewer = None
+    widget._flatmap_viewer_pending_show = False
+    widget._flatmap_viewer_generation = 0
+    widget._flatmap_viewer_watch_timer = None
+    widget._flatmap_close_guards = {}
+    widget._flatmap_tab = _FlatmapTab()
+    return widget
 
 
-def test_flatmap_cleanup_event_filter_only_handles_deferred_delete() -> None:
-    filter_class = NeuronViewerWidget._install_flatmap_cleanup_event_filter.__globals__[
-        "_FlatmapWindowCleanupEventFilter"
-    ]
-    viewer = _LifecycleViewer(_LifecycleWindow())
-    calls = []
-    lifecycle_filter = filter_class(
-        "flatmap-1",
-        viewer,
-        lambda *args: calls.append(args),
-    )
-    watched = object()
-    close_event = _LifecycleEvent(_FakeQEvent.Close, accepted=False)
-    deferred_delete = _LifecycleEvent(_FakeQEvent.DeferredDelete)
-
-    assert lifecycle_filter.eventFilter(watched, close_event) is False
-    assert calls == []
-    assert close_event.accepted is False
-
-    assert lifecycle_filter.eventFilter(watched, deferred_delete) is False
-    assert calls == [("flatmap-1", viewer, watched)]
-    assert deferred_delete.accepted is True
-
-
-def test_flatmap_cleanup_event_filter_installation_is_idempotent() -> None:
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    widget = _lifecycle_widget(viewer)
-
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    first_filter = widget._flatmap_cleanup_filters["flatmap-1"]
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-
-    assert widget._flatmap_cleanup_filters == {"flatmap-1": first_filter}
-    assert qt_window.filters == [first_filter]
-
-
-def test_flatmap_deferred_delete_closes_qt_children_before_destroyed_signal(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    main_viewer = _LifecycleViewer(_LifecycleWindow())
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [main_viewer, viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__["logger"]
-    widget._connect_flatmap_viewer_destroyed(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    cleanup_filter = widget._flatmap_cleanup_filters["flatmap-1"]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        event = _LifecycleEvent(_FakeQEvent.DeferredDelete)
-        consumed = cleanup_filter.eventFilter(qt_window, event)
-
-        assert consumed is False
-        assert event.accepted is True
-        assert qt_window._qt_viewer.close_calls == 1
-        assert qt_window.teardown_calls == 1
-        assert viewer._layer_slicer.shutdown_calls == 1
-        assert viewer.layers == []
-        assert viewer not in _LifecycleViewer._instances
-        assert widget._flatmap_viewer is None
-        assert tab._last_display_viewer is None
-        assert hasattr(viewer.window, "_qt_window")
-
-        qt_window.destroyed.emit()
-
-    assert qt_window._qt_viewer.close_calls == 1
-    assert qt_window.teardown_calls == 1
-    assert viewer.close_calls == 0
-    assert qt_window.close_calls == 0
-    assert not hasattr(viewer.window, "_qt_window")
-    completion = next(
-        record.getMessage()
-        for record in caplog.records
-        if "event=cleanup_complete" in record.getMessage()
-    )
-    assert "cleanup_trigger=deferred_delete" in completion
-    assert "cleanup_qt_viewer=closed" in completion
-    assert "cleanup_status=ok" in completion
-    assert any(
-        "event=cleanup_skipped" in record.getMessage()
-        and "reason=cleanup_complete" in record.getMessage()
-        for record in caplog.records
-    )
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_cleanup_stops_napari_status_thread(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Regression: a detached window closed while fullscreen can reach
-    # DeferredDelete without napari's closeEvent stopping its StatusChecker
-    # QThread, which crashes Qt on destruction.  Our cleanup must stop it.
-    main_viewer = _LifecycleViewer(_LifecycleWindow())
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [main_viewer, viewer]
-    widget = _lifecycle_widget(viewer, _LifecycleTab(viewer))
-    widget._install_flatmap_cleanup_event_filter(viewer, viewer_token="flatmap-1")
-    cleanup_filter = widget._flatmap_cleanup_filters["flatmap-1"]
-    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__["logger"]
-
-    assert qt_window.status_thread.isRunning() is True
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        cleanup_filter.eventFilter(
-            qt_window, _LifecycleEvent(_FakeQEvent.DeferredDelete)
-        )
-
-    assert qt_window.status_thread.close_terminate_calls == 1
-    assert qt_window.status_thread.wait_calls == 1
-    assert qt_window.status_thread.isRunning() is False
-    completion = next(
-        record.getMessage()
-        for record in caplog.records
-        if "event=cleanup_complete" in record.getMessage()
-    )
-    assert "cleanup_status_thread=stopped" in completion
-    assert "cleanup_status=ok" in completion
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_cleanup_status_thread_stop_is_idempotent() -> None:
-    widget = _lifecycle_widget(_LifecycleViewer(_LifecycleWindow()))
-    thread = _LifecycleStatusThread(running=False)
-
-    # An already-stopped thread is left untouched and reported, not re-stopped.
-    result = widget._stop_flatmap_status_thread(thread, viewer_token="flatmap-1")
-
-    assert result == "already_stopped"
-    assert thread.close_terminate_calls == 0
-    assert widget._stop_flatmap_status_thread(None, viewer_token="flatmap-1") == (
-        "unavailable"
-    )
-
-
-def test_flatmap_destroyed_finalizes_model_and_releases_plugin_references(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    main_viewer = _LifecycleViewer(_LifecycleWindow())
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [main_viewer, viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._connect_flatmap_viewer_destroyed.__globals__[
-        "logger"
-    ]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._connect_flatmap_viewer_destroyed(
-            viewer,
-            viewer_token="flatmap-1",
-        )
-        qt_window.destroyed.emit()
-
-    assert widget._flatmap_viewer is None
-    assert tab._last_display_viewer is None
-    assert tab._projection_layer is None
-    assert tab._region_labels_layer is None
-    assert tab._region_surfaces_layers == []
-    assert tab._region_outlines_layers == []
-    assert tab.release_calls == 1
-    assert viewer._layer_slicer.shutdown_calls == 1
-    assert viewer._layer_slicer._executor._shutdown is True
-    assert viewer._dims_emitter.disconnect_calls == 1
-    assert viewer.layers == []
-    assert viewer.layers.clear_calls == 1
-    assert qt_window.teardown_calls == 1
-    assert qt_window._qt_viewer.close_calls == 0
-    assert viewer.close_calls == 0
-    assert qt_window.close_calls == 0
-    assert _LifecycleViewer._instances == [main_viewer]
-    assert main_viewer.layers != []
-    completion = next(
-        record.getMessage()
-        for record in caplog.records
-        if "event=cleanup_complete" in record.getMessage()
-    )
-    assert "cleanup_status=ok" in completion
-    assert "layer_count=0" in completion
-    assert "napari_viewer_count=1" in completion
-    assert "napari_viewer_registered=false" in completion
-    assert "owner_ref_is_viewer=false" in completion
-    assert "tab_ref_is_viewer=false" in completion
-    assert "slicer_executor_shutdown=true" in completion
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_destroyed_then_request_creates_one_fresh_viewer(
+def test_flatmap_display_provider_creates_hidden_secondary_viewer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    main_viewer = _LifecycleViewer(_LifecycleWindow())
-    old_window = _LifecycleWindow()
-    old_viewer = _LifecycleViewer(old_window)
-    _LifecycleViewer._instances = [main_viewer, old_viewer]
-    tab = _LifecycleTab(old_viewer)
-    widget = _lifecycle_widget(old_viewer, tab)
-    widget._connect_flatmap_viewer_destroyed(
-        old_viewer,
-        viewer_token="flatmap-1",
-    )
-    widget._install_flatmap_cleanup_event_filter(
-        old_viewer,
-        viewer_token="flatmap-1",
-    )
-    widget._flatmap_cleanup_filters["flatmap-1"].eventFilter(
-        old_window,
-        _LifecycleEvent(_FakeQEvent.DeferredDelete),
-    )
-    old_window.destroyed.emit()
-
+    main_layer = _scene_layer("main")
+    main_viewer = types.SimpleNamespace(layers=[main_layer])
+    widget = _flatmap_window_widget(main_viewer)
     created = []
 
-    def create_viewer(*, title: str, ndisplay: int, show: bool):
-        assert title == "SWC Viewer Flatmap"
-        assert ndisplay == 3
-        assert show is False
-        viewer = _LifecycleViewer(_LifecycleWindow(visible=show))
-        viewer.dims.ndisplay = ndisplay
+    def create_viewer(**kwargs):
+        viewer = _FlatmapViewer(**kwargs)
         created.append(viewer)
-        _LifecycleViewer._instances.append(viewer)
         return viewer
-
-    fake_napari_module = types.ModuleType("napari")
-    fake_napari_module.Viewer = create_viewer
-    monkeypatch.setitem(sys.modules, "napari", fake_napari_module)
-
-    new_viewer = widget._get_or_create_flatmap_viewer(create=True)
-
-    assert created == [new_viewer]
-    assert new_viewer is not old_viewer
-    assert widget._flatmap_viewer is new_viewer
-    assert old_viewer not in _LifecycleViewer._instances
-    assert old_window._qt_viewer.close_calls == 1
-    assert _LifecycleViewer._instances == [main_viewer, new_viewer]
-    assert main_viewer.layers != []
-    assert new_viewer.dims.ndisplay == 3
-    assert widget._flatmap_debug_tokens[id(new_viewer)] == "flatmap-2"
-    assert widget._flatmap_pending_show_token == "flatmap-2"
-    assert new_viewer.window._qt_window.isHidden() is True
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_hidden_viewer_is_reused_before_first_show(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._flatmap_viewer = None
-    widget._flatmap_tab = None
-    widget._flatmap_pending_show_token = None
-    widget._flatmap_show_scheduled_tokens = set()
-    widget._flatmap_debug_sequence = 0
-    widget._flatmap_debug_tokens = {}
-    widget._flatmap_debug_filters = {}
-    widget._flatmap_cleanup_filters = {}
-    widget._flatmap_cleanup_states = {}
-    created = []
-
-    def create_viewer(*, title: str, ndisplay: int, show: bool):
-        assert (title, ndisplay, show) == ("SWC Viewer Flatmap", 3, False)
-        viewer = _LifecycleViewer(_LifecycleWindow(visible=show))
-        viewer.layers.clear()
-        viewer.layers.clear_calls = 0
-        viewer.dims.ndisplay = ndisplay
-        created.append(viewer)
-        _LifecycleViewer._instances.append(viewer)
-        return viewer
-
-    fake_napari_module = types.ModuleType("napari")
-    fake_napari_module.Viewer = create_viewer
-    monkeypatch.setitem(sys.modules, "napari", fake_napari_module)
-    _LifecycleViewer._instances = []
-
-    first = widget._get_or_create_flatmap_viewer(create=True)
-    second = widget._get_or_create_flatmap_viewer(create=True)
-    current = widget._get_or_create_flatmap_viewer(create=False)
-
-    assert created == [first]
-    assert second is first
-    assert current is first
-    assert first.dims.ndisplay == 3
-    assert first.window._qt_window.isVisible() is False
-    assert widget._flatmap_pending_show_token == "flatmap-1"
-    assert _LifecycleViewer._instances == [first]
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_first_layer_schedules_one_show_after_focus_turn(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    scheduled = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(delay, callback) -> None:
-            scheduled.append((delay, callback))
-
-    method_globals = NeuronViewerWidget._on_flatmap_display_viewer_ready.__globals__
-    monkeypatch.setitem(method_globals, "QTimer", _TimerRecorder)
-    viewer = _LifecycleViewer(_LifecycleWindow(visible=False))
-    _LifecycleViewer._instances = [viewer]
-    widget = _lifecycle_widget(viewer)
-    widget._flatmap_pending_show_token = "flatmap-1"
-    lifecycle_logger = method_globals["logger"]
-    layer = viewer.layers[0]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._on_flatmap_display_viewer_ready(viewer, layer)
-        widget._on_flatmap_display_viewer_ready(viewer, layer)
-        assert viewer.show_calls == 0
-        assert [(delay) for delay, _callback in scheduled] == [0]
-        scheduled[0][1]()
-
-    assert viewer.show_calls == 1
-    assert viewer.window._qt_window.isVisible() is True
-    assert widget._flatmap_pending_show_token is None
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("event=first_layer_ready" in message for message in messages)
-    assert any("event=show_scheduled" in message for message in messages)
-    assert any("event=shown" in message for message in messages)
-    assert any(
-        "event=show_skipped" in message and "reason=show_already_scheduled" in message
-        for message in messages
-    )
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_scheduled_show_ignores_replaced_viewer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scheduled = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(_delay, callback) -> None:
-            scheduled.append(callback)
-
-    method_globals = NeuronViewerWidget._on_flatmap_display_viewer_ready.__globals__
-    monkeypatch.setitem(method_globals, "QTimer", _TimerRecorder)
-    old_viewer = _LifecycleViewer(_LifecycleWindow(visible=False))
-    new_viewer = _LifecycleViewer(_LifecycleWindow(visible=False))
-    _LifecycleViewer._instances = [old_viewer, new_viewer]
-    widget = _lifecycle_widget(old_viewer)
-    widget._flatmap_pending_show_token = "flatmap-1"
-
-    widget._on_flatmap_display_viewer_ready(old_viewer, old_viewer.layers[0])
-    widget._flatmap_viewer = new_viewer
-    widget._flatmap_debug_tokens[id(new_viewer)] = "flatmap-2"
-    widget._flatmap_pending_show_token = "flatmap-2"
-    scheduled[0]()
-
-    assert old_viewer.show_calls == 0
-    assert new_viewer.show_calls == 0
-    assert widget._flatmap_pending_show_token == "flatmap-2"
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_scheduled_show_uses_weak_viewer_reference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scheduled = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(_delay, callback) -> None:
-            scheduled.append(callback)
-
-    method_globals = NeuronViewerWidget._on_flatmap_display_viewer_ready.__globals__
-    monkeypatch.setitem(method_globals, "QTimer", _TimerRecorder)
-    viewer = _LifecycleViewer(_LifecycleWindow(visible=False))
-    _LifecycleViewer._instances = [viewer]
-    widget = _lifecycle_widget(viewer)
-    widget._flatmap_pending_show_token = "flatmap-1"
-    viewer_ref = weakref.ref(viewer)
-
-    widget._on_flatmap_display_viewer_ready(viewer, viewer.layers[0])
-    widget._flatmap_viewer = None
-    widget._flatmap_pending_show_token = None
-    _LifecycleViewer._instances = []
-    del viewer
-    gc.collect()
-
-    assert viewer_ref() is None
-    scheduled[0]()
-
-
-def test_flatmap_failed_first_render_discards_only_pending_viewer() -> None:
-    class _ClosableLifecycleViewer(_LifecycleViewer):
-        def close(self) -> None:
-            self.close_calls += 1
-            self._layer_slicer.shutdown()
-            self.layers.clear()
-            self.window._qt_window.visible = False
-            type(self)._instances.remove(self)
-
-    main_viewer = _LifecycleViewer(_LifecycleWindow())
-    pending_viewer = _ClosableLifecycleViewer(_LifecycleWindow(visible=False))
-    _ClosableLifecycleViewer._instances = [main_viewer, pending_viewer]
-    tab = _LifecycleTab(pending_viewer)
-    widget = _lifecycle_widget(pending_viewer, tab)
-    widget._flatmap_pending_show_token = "flatmap-1"
-
-    widget._on_flatmap_display_viewer_failed(
-        pending_viewer,
-        "projection_failed",
-    )
-
-    assert pending_viewer.close_calls == 1
-    assert pending_viewer.layers == []
-    assert pending_viewer not in _ClosableLifecycleViewer._instances
-    assert main_viewer in _ClosableLifecycleViewer._instances
-    assert widget._flatmap_viewer is None
-    assert widget._flatmap_pending_show_token is None
-    assert tab._last_display_viewer is None
-    _ClosableLifecycleViewer._instances = []
-
-
-def test_flatmap_failed_later_render_does_not_close_visible_viewer() -> None:
-    viewer = _LifecycleViewer(_LifecycleWindow(visible=True))
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-
-    widget._on_flatmap_display_viewer_failed(viewer, "projection_failed")
-
-    assert viewer.close_calls == 0
-    assert widget._flatmap_viewer is viewer
-    assert tab._last_display_viewer is viewer
-    assert viewer in _LifecycleViewer._instances
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_close_without_destroy_keeps_viewer_usable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scheduled = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(delay, callback) -> None:
-            scheduled.append((delay, callback))
-
-    method_globals = NeuronViewerWidget._on_flatmap_debug_qt_event.__globals__
-    monkeypatch.setitem(method_globals, "QTimer", _TimerRecorder)
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    widget._connect_flatmap_viewer_destroyed(viewer, viewer_token="flatmap-1")
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    cleanup_filter = widget._flatmap_cleanup_filters["flatmap-1"]
-
-    close_event = _LifecycleEvent(_FakeQEvent.Close, accepted=False)
-    assert cleanup_filter.eventFilter(qt_window, close_event) is False
-    assert close_event.accepted is False
-
-    widget._on_flatmap_debug_qt_event(
-        "flatmap-1",
-        "Close",
-        qt_window,
-        close_event,
-    )
-
-    assert [delay for delay, _callback in scheduled] == [0, 250, 2000]
-    assert widget._flatmap_viewer is viewer
-    assert tab._last_display_viewer is viewer
-    assert viewer._layer_slicer.shutdown_calls == 0
-    assert qt_window._qt_viewer.close_calls == 0
-    assert viewer.layers != []
-    assert viewer in _LifecycleViewer._instances
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_destroyed_cleanup_runs_with_debug_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._connect_flatmap_viewer_destroyed.__globals__[
-        "logger"
-    ]
-    monkeypatch.setattr(lifecycle_logger, "level", logging.WARNING)
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    cleanup_filter = widget._flatmap_cleanup_filters["flatmap-1"]
-
-    cleanup_filter.eventFilter(
-        qt_window,
-        _LifecycleEvent(_FakeQEvent.DeferredDelete),
-    )
-
-    assert widget._flatmap_viewer is None
-    assert tab._last_display_viewer is None
-    assert viewer._layer_slicer.shutdown_calls == 1
-    assert qt_window._qt_viewer.close_calls == 1
-    assert viewer.layers == []
-    assert viewer not in _LifecycleViewer._instances
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_destroyed_cleanup_is_idempotent(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._connect_flatmap_viewer_destroyed.__globals__[
-        "logger"
-    ]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._connect_flatmap_viewer_destroyed(
-            viewer,
-            viewer_token="flatmap-1",
-        )
-        qt_window.destroyed.emit()
-        qt_window.destroyed.emit()
-
-    assert viewer._layer_slicer.shutdown_calls == 1
-    assert viewer.layers.clear_calls == 1
-    assert qt_window.teardown_calls == 1
-    assert tab.release_calls == 1
-    assert any(
-        "event=cleanup_skipped" in record.getMessage()
-        and "reason=cleanup_complete" in record.getMessage()
-        for record in caplog.records
-    )
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_destroyed_skips_model_teardown_when_napari_already_closed(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    viewer._layer_slicer._executor._shutdown = True
-    viewer.layers.clear()
-    viewer.layers.clear_calls = 0
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab.__new__(_LifecycleTab)
-    tab._last_display_viewer = viewer
-    tab._projection_layer = None
-    tab._region_labels_layer = None
-    tab._region_surfaces_layers = []
-    tab._region_outlines_layers = []
-    tab.release_calls = 0
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._connect_flatmap_viewer_destroyed.__globals__[
-        "logger"
-    ]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._connect_flatmap_viewer_destroyed(
-            viewer,
-            viewer_token="flatmap-1",
-        )
-        qt_window.destroyed.emit()
-
-    assert widget._flatmap_viewer is None
-    assert tab._last_display_viewer is None
-    assert viewer._layer_slicer.shutdown_calls == 0
-    assert viewer.layers.clear_calls == 0
-    assert qt_window.teardown_calls == 0
-    assert qt_window._qt_viewer.close_calls == 0
-    assert viewer not in _LifecycleViewer._instances
-    assert any(
-        "event=cleanup_skipped" in record.getMessage()
-        and "reason=napari_model_already_closed" in record.getMessage()
-        for record in caplog.records
-    )
-
-
-def test_flatmap_destroyed_cleanup_logs_stage_failures_and_continues(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class _FailingRegistry(list):
-        def discard(self, _viewer) -> None:
-            raise RuntimeError("registry failed")
-
-    qt_window = _LifecycleWindow(teardown_error=RuntimeError("window failed"))
-    viewer = _LifecycleViewer(
-        qt_window,
-        slicer_error=RuntimeError("slicer failed"),
-        disconnect_error=RuntimeError("dims failed"),
-        clear_error=RuntimeError("layers failed"),
-    )
-    _LifecycleViewer._instances = _FailingRegistry([viewer])
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._connect_flatmap_viewer_destroyed.__globals__[
-        "logger"
-    ]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._connect_flatmap_viewer_destroyed(
-            viewer,
-            viewer_token="flatmap-1",
-        )
-        qt_window.destroyed.emit()
-
-    assert widget._flatmap_viewer is None
-    assert tab._last_display_viewer is None
-    assert viewer._layer_slicer.shutdown_calls == 1
-    assert viewer._dims_emitter.disconnect_calls == 1
-    assert viewer.layers.clear_calls == 1
-    assert qt_window.teardown_calls == 1
-    failure_messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "event=cleanup_failure" in record.getMessage()
-    ]
-    expected_stages = {
-        "slicer_shutdown",
-        "disconnect_dims",
-        "clear_layers",
-        "window_teardown",
-        "unregister_viewer",
-    }
-    observed_stages = {
-        stage
-        for stage in expected_stages
-        if any(f"stage={stage}" in message for message in failure_messages)
-    }
-    assert observed_stages == expected_stages
-    completion = next(
-        record.getMessage()
-        for record in caplog.records
-        if "event=cleanup_complete" in record.getMessage()
-    )
-    assert "cleanup_status=partial" in completion
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_qt_viewer_close_failure_does_not_repeat_after_destroy(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    qt_window = _LifecycleWindow(
-        qt_viewer_close_error=RuntimeError("qt viewer failed"),
-    )
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    lifecycle_logger = NeuronViewerWidget._cleanup_flatmap_viewer.__globals__["logger"]
-    widget._connect_flatmap_viewer_destroyed(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._flatmap_cleanup_filters["flatmap-1"].eventFilter(
-            qt_window,
-            _LifecycleEvent(_FakeQEvent.DeferredDelete),
-        )
-        qt_window.destroyed.emit()
-
-    assert qt_window._qt_viewer.close_calls == 1
-    assert qt_window.teardown_calls == 1
-    assert viewer._layer_slicer.shutdown_calls == 1
-    assert viewer.layers.clear_calls == 1
-    assert tab.release_calls == 1
-    assert any(
-        "event=cleanup_failure" in record.getMessage()
-        and "stage=qt_viewer_close" in record.getMessage()
-        for record in caplog.records
-    )
-    completions = [
-        record.getMessage()
-        for record in caplog.records
-        if "event=cleanup_complete" in record.getMessage()
-    ]
-    assert completions
-    assert all("cleanup_status=partial" in message for message in completions)
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_destroyed_fallback_retries_only_failed_model_stages() -> None:
-    qt_window = _LifecycleWindow(teardown_error=RuntimeError("window failed"))
-    viewer = _LifecycleViewer(
-        qt_window,
-        slicer_error=RuntimeError("slicer failed"),
-        disconnect_error=RuntimeError("dims failed"),
-        clear_error=RuntimeError("layers failed"),
-    )
-    _LifecycleViewer._instances = [viewer]
-    tab = _LifecycleTab(viewer)
-    widget = _lifecycle_widget(viewer, tab)
-    widget._connect_flatmap_viewer_destroyed(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-    widget._install_flatmap_cleanup_event_filter(
-        viewer,
-        viewer_token="flatmap-1",
-    )
-
-    widget._flatmap_cleanup_filters["flatmap-1"].eventFilter(
-        qt_window,
-        _LifecycleEvent(_FakeQEvent.DeferredDelete),
-    )
-    qt_window._teardown_error = None
-    viewer._layer_slicer._shutdown_error = None
-    viewer._dims_emitter._disconnect_error = None
-    viewer.layers._clear_error = None
-    qt_window.destroyed.emit()
-
-    assert viewer._layer_slicer.shutdown_calls == 2
-    assert viewer._dims_emitter.disconnect_calls == 2
-    assert viewer.layers.clear_calls == 2
-    assert qt_window.teardown_calls == 2
-    assert qt_window._qt_viewer.close_calls == 1
-    assert tab.release_calls == 1
-    assert viewer not in _LifecycleViewer._instances
-    cleanup_state = widget._flatmap_cleanup_states[("flatmap-1", id(viewer))]
-    assert cleanup_state["status"] == "complete"
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_close_checkpoints_use_weak_references(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    scheduled = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(delay, callback) -> None:
-            scheduled.append((delay, callback))
-
-    method_globals = NeuronViewerWidget._on_flatmap_debug_qt_event.__globals__
-    monkeypatch.setitem(method_globals, "QTimer", _TimerRecorder)
-    lifecycle_logger = method_globals["logger"]
-
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [viewer]
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._flatmap_viewer = viewer
-    widget._flatmap_debug_tokens = {id(viewer): "flatmap-1"}
-    widget._flatmap_debug_filters = {}
-    widget._flatmap_tab = None
-    viewer_ref = weakref.ref(viewer)
-    window_ref = weakref.ref(qt_window)
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._on_flatmap_debug_qt_event(
-            "flatmap-1",
-            "Close",
-            qt_window,
-            _LifecycleEvent(_FakeQEvent.Close),
-        )
-
-        assert [delay for delay, _callback in scheduled] == [0, 250, 2000]
-        _LifecycleViewer._instances = []
-        widget._flatmap_viewer = None
-        del viewer
-        del qt_window
-        gc.collect()
-        assert viewer_ref() is None
-        assert window_ref() is None
-
-        for _delay, callback in scheduled:
-            callback()
-
-    checkpoint_messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "event=close_checkpoint" in record.getMessage()
-    ]
-    assert len(checkpoint_messages) == 3
-    assert all("viewer_available=false" in message for message in checkpoint_messages)
-    assert all(
-        "qt_window_available=false" in message for message in checkpoint_messages
-    )
-
-
-def test_flatmap_post_destroy_checkpoints_use_weak_references(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    scheduled = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(delay, callback) -> None:
-            scheduled.append((delay, callback))
-
-    method_globals = (
-        NeuronViewerWidget._schedule_flatmap_post_destroy_snapshots.__globals__
-    )
-    monkeypatch.setitem(method_globals, "QTimer", _TimerRecorder)
-    lifecycle_logger = method_globals["logger"]
-
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    viewer_ref = weakref.ref(viewer)
-    window_ref = weakref.ref(qt_window)
-    widget = _lifecycle_widget(viewer)
-    widget._flatmap_viewer = None
-    widget._flatmap_tab = None
-    widget._flatmap_cleanup_filters = {"flatmap-1": object()}
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._schedule_flatmap_post_destroy_snapshots(
-            viewer,
-            qt_window,
-            viewer_token="flatmap-1",
-        )
-
-        assert [delay for delay, _callback in scheduled] == [0, 250, 2000]
-        del viewer
-        del qt_window
-        gc.collect()
-        assert viewer_ref() is None
-        assert window_ref() is None
-
-        for _delay, callback in scheduled:
-            callback()
-
-    checkpoint_messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "event=post_destroy_checkpoint" in record.getMessage()
-    ]
-    assert len(checkpoint_messages) == 3
-    assert all("viewer_available=false" in message for message in checkpoint_messages)
-    assert all(
-        "qt_window_available=false" in message for message in checkpoint_messages
-    )
-    assert "flatmap-1" not in widget._flatmap_debug_filters
-    assert "flatmap-1" not in widget._flatmap_cleanup_filters
-
-
-def test_flatmap_debug_snapshot_reports_references_workers_and_slicer(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class _RunningThread:
-        def __init__(self, running: bool) -> None:
-            self.running = running
-
-        def isRunning(self) -> bool:
-            return self.running
-
-    class _NativeWindow:
-        def title(self) -> str:
-            return "SWC Viewer Flatmap"
-
-        def isVisible(self) -> bool:
-            return True
-
-        def parent(self):
-            return None
-
-        def winId(self) -> int:
-            return 4242
-
-    qt_window = _LifecycleWindow()
-    viewer = _LifecycleViewer(qt_window)
-    _LifecycleViewer._instances = [viewer]
-    tab = types.SimpleNamespace(
-        _last_display_viewer=viewer,
-        _projection_layer=viewer.layers[0],
-        _region_labels_layer=None,
-        _region_surfaces_layers=[object()],
-        _region_outlines_layers=[],
-        _cache_open_thread=_RunningThread(True),
-        _cache_build_thread=_RunningThread(False),
-        _region_label_atlas_load_thread=None,
-        _augment_thread=_RunningThread(True),
-    )
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._flatmap_viewer = viewer
-    widget._flatmap_tab = tab
-    lifecycle_logger = NeuronViewerWidget._log_flatmap_viewer_snapshot.__globals__[
-        "logger"
-    ]
-    application = NeuronViewerWidget._log_flatmap_viewer_snapshot.__globals__[
-        "QApplication"
-    ]
-    monkeypatch.setattr(
-        application,
-        "topLevelWidgets",
-        staticmethod(lambda: [qt_window]),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        application,
-        "topLevelWindows",
-        staticmethod(lambda: [_NativeWindow()]),
-        raising=False,
-    )
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._log_flatmap_viewer_snapshot(
-            "unit_snapshot",
-            "flatmap-1",
-            viewer=viewer,
-            qt_window=qt_window,
-        )
-
-    message = next(
-        record.getMessage()
-        for record in caplog.records
-        if "event=unit_snapshot" in record.getMessage()
-    )
-    assert "napari_viewer_registered=true" in message
-    assert "owner_ref_is_viewer=true" in message
-    assert "tab_ref_is_viewer=true" in message
-    assert "cache_open_thread=running" in message
-    assert "cache_build_thread=stopped" in message
-    assert "parquet_prepare_thread=running" in message
-    assert "slicer_task_count=1" in message
-    assert "slicer_executor_shutdown=false" in message
-    assert "qt_matching_top_level_widgets=" in message
-    assert "_LifecycleWindow" in message
-    assert "qt_matching_native_windows=" in message
-    assert "4242" in message
-    _LifecycleViewer._instances = []
-
-
-def test_flatmap_debug_snapshot_handles_deleted_qt_wrapper(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class _DeletedQtWindow:
-        def isVisible(self) -> bool:
-            raise RuntimeError("wrapped C/C++ object has been deleted")
-
-        isHidden = isVisible
-        isActiveWindow = isVisible
-        windowTitle = isVisible
-
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._flatmap_viewer = None
-    widget._flatmap_tab = None
-    lifecycle_logger = NeuronViewerWidget._log_flatmap_viewer_snapshot.__globals__[
-        "logger"
-    ]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._log_flatmap_viewer_snapshot(
-            "deleted_qt_snapshot",
-            "flatmap-1",
-            qt_window=_DeletedQtWindow(),
-        )
-
-    message = next(
-        record.getMessage()
-        for record in caplog.records
-        if "event=deleted_qt_snapshot" in record.getMessage()
-    )
-    assert "qt_window_available=true" in message
-    assert "qt_window_accessible=false" in message
-    assert "qt_visible=unavailable" in message
-
-
-def test_stale_flatmap_destroyed_signal_is_logged_without_clearing_new_viewer(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    old_window = _LifecycleWindow()
-    old_viewer = _LifecycleViewer(old_window)
-    new_viewer = _LifecycleViewer(_LifecycleWindow())
-    _LifecycleViewer._instances = [old_viewer, new_viewer]
-    widget = NeuronViewerWidget.__new__(NeuronViewerWidget)
-    widget._flatmap_viewer = old_viewer
-    widget._flatmap_tab = _LifecycleTab(new_viewer)
-    widget._flatmap_debug_tokens = {id(old_viewer): "flatmap-1"}
-    widget._flatmap_debug_filters = {"flatmap-1": object()}
-    widget._flatmap_cleanup_filters = {}
-    widget._flatmap_cleanup_states = {}
-    lifecycle_logger = NeuronViewerWidget._connect_flatmap_viewer_destroyed.__globals__[
-        "logger"
-    ]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._connect_flatmap_viewer_destroyed(
-            old_viewer,
-            viewer_token="flatmap-1",
-        )
-        widget._flatmap_viewer = new_viewer
-        old_window.destroyed.emit()
-
-    assert widget._flatmap_viewer is new_viewer
-    assert widget._flatmap_tab._last_display_viewer is new_viewer
-    assert old_viewer._layer_slicer.shutdown_calls == 1
-    assert new_viewer._layer_slicer.shutdown_calls == 0
-    assert old_viewer not in _LifecycleViewer._instances
-    assert new_viewer in _LifecycleViewer._instances
-    assert "flatmap-1" not in widget._flatmap_debug_filters
-    assert id(old_viewer) not in widget._flatmap_debug_tokens
-    messages = [record.getMessage() for record in caplog.records]
-    before = next(message for message in messages if "event=destroyed " in message)
-    after = next(
-        message for message in messages if "event=references_released" in message
-    )
-    assert "owner_ref_is_viewer=false" in before
-    assert "owner_ref_is_viewer=false" in after
-    _LifecycleViewer._instances = []
-
-
-# ---------------------------------------------------------------------------
-# macOS fullscreen inheritance / close guard
-# ---------------------------------------------------------------------------
-
-
-def _show_globals():
-    return NeuronViewerWidget._show_flatmap_viewer_window.__globals__
-
-
-def test_flatmap_macos_show_path_never_calls_viewer_show(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setitem(_show_globals(), "_IS_MACOS", True)
-    qt_window = _FullscreenWindow(fullscreen=False)
-    widget, viewer = _fullscreen_widget(qt_window)
-
-    show_path = widget._show_flatmap_viewer_window(viewer, "flatmap-1")
-
-    assert show_path == "normal_qt"
-    assert viewer.show_calls == 0
-    assert qt_window.window_state == _FakeQt.WindowNoState
-    assert qt_window.show_normal_calls == 1
-    assert qt_window.raise_calls == 1
-    assert qt_window.activate_calls == 1
-    assert viewer.resize_calls == 1
-
-
-def test_flatmap_non_macos_show_path_uses_viewer_show(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setitem(_show_globals(), "_IS_MACOS", False)
-    qt_window = _FullscreenWindow(fullscreen=False)
-    widget, viewer = _fullscreen_widget(qt_window)
-
-    show_path = widget._show_flatmap_viewer_window(viewer, "flatmap-1")
-
-    assert show_path == "napari"
-    assert viewer.show_calls == 1
-    assert qt_window.show_normal_calls == 0
-
-
-def test_flatmap_macos_show_falls_back_when_qt_window_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setitem(_show_globals(), "_IS_MACOS", True)
-    viewer = _FullscreenViewer(None)
-    widget = _lifecycle_widget(viewer)
-
-    show_path = widget._show_flatmap_viewer_window(viewer, "flatmap-1")
-
-    assert show_path == "napari"
-    assert viewer.show_calls == 1
-
-
-def _install_immediate_timer(monkeypatch, still_fullscreen_ticks=0):
-    """Patch QTimer so scheduled callbacks run immediately, in order."""
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(_delay, callback) -> None:
-            callback()
 
     monkeypatch.setitem(
-        NeuronViewerWidget._on_flatmap_fullscreen_close.__globals__,
-        "QTimer",
-        _TimerRecorder,
+        sys.modules, "napari", types.SimpleNamespace(Viewer=create_viewer)
     )
 
+    display = widget._get_or_create_flatmap_viewer(create=True)
 
-def test_flatmap_normal_close_is_not_consumed_by_guard(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_immediate_timer(monkeypatch)
-    guard_class = (
-        NeuronViewerWidget._install_flatmap_fullscreen_close_guard.__globals__[
-            "_FlatmapFullscreenCloseGuard"
-        ]
-    )
-    qt_window = _FullscreenWindow(fullscreen=False)
-    widget, viewer = _fullscreen_widget(qt_window)
-    guard = guard_class("flatmap-1", widget._on_flatmap_fullscreen_close)
-
-    # A normal-window close is passed straight through to napari: the guard
-    # never consumes it and no deferral is armed.
-    consumed = guard.eventFilter(qt_window, _LifecycleEvent(_FakeQEvent.Close))
-
-    assert consumed is False
-    assert qt_window.close_calls == []
-    assert widget._flatmap_fullscreen_close_state == {}
-
-
-def test_flatmap_fullscreen_close_defers_then_retries_once(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    _install_immediate_timer(monkeypatch)
-    qt_window = _FullscreenWindow(fullscreen=True)
-    widget, viewer = _fullscreen_widget(qt_window)
-    lifecycle_logger = _show_globals()["logger"]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        consumed = widget._on_flatmap_fullscreen_close(
-            "flatmap-1",
-            qt_window,
-            _LifecycleEvent(_FakeQEvent.Close),
-        )
-
-    # The initial fullscreen close is consumed so napari's blocking workaround
-    # never runs, and the window is returned to normal before the retry.
-    assert consumed is True
-    assert qt_window.show_normal_calls == 1
-    assert qt_window.isFullScreen() is False
-    assert qt_window.close_calls == [True]
-    assert widget._flatmap_fullscreen_close_state == {}
-    messages = [record.getMessage() for record in caplog.records]
-    for event in (
-        "event=fullscreen_close_deferred",
-        "event=fullscreen_exit_requested",
-        "event=fullscreen_exit_complete",
-        "event=fullscreen_close_retried",
+    assert display is created[0]
+    assert display is not main_viewer
+    assert display.title == "SWC Viewer Flatmap"
+    assert display.ndisplay == 3
+    assert display.initial_show is False
+    assert display.show_calls == 0
+    assert main_viewer.layers == [main_layer]
+    assert widget._get_or_create_flatmap_viewer(create=False) is display
+    assert widget._get_or_create_flatmap_viewer(create=True) is display
+    assert len(created) == 1
+    for obsolete_method in (
+        "_cleanup_flatmap_viewer",
+        "_connect_flatmap_viewer_destroyed",
+        "_install_flatmap_fullscreen_close_guard",
+        "_show_flatmap_viewer_window",
+        "_stop_flatmap_status_thread",
     ):
-        assert any(event in message for message in messages), event
+        assert not hasattr(NeuronViewerWidget, obsolete_method)
 
 
-def test_flatmap_fullscreen_close_dedupes_duplicate_events(
+def test_flatmap_viewer_shows_only_after_marked_layer_is_ready() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = True
+    layer = _scene_layer("flatmap", flatmap=True)
+    viewer.layers.append(layer)
+
+    widget._on_flatmap_display_viewer_ready(viewer, layer)
+
+    assert viewer.show_calls == 1
+    assert widget._flatmap_viewer_pending_show is False
+
+
+def test_unmarked_first_layer_closes_hidden_flatmap_viewer() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = True
+    layer = _scene_layer("not flatmap")
+    viewer.layers.append(layer)
+
+    widget._on_flatmap_display_viewer_ready(viewer, layer)
+
+    assert viewer.show_calls == 0
+    assert viewer.close_calls == 1
+    assert widget._flatmap_viewer is None
+    assert widget._flatmap_viewer_generation == 1
+
+
+def test_failed_first_render_closes_window_but_failed_rerender_keeps_it() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = True
+
+    widget._on_flatmap_display_viewer_failed(viewer, "first_render_failed")
+
+    assert viewer.close_calls == 1
+    assert widget._flatmap_viewer is None
+
+    replacement = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = replacement
+    widget._flatmap_viewer_pending_show = False
+
+    widget._on_flatmap_display_viewer_failed(replacement, "rerender_failed")
+
+    assert replacement.close_calls == 0
+    assert widget._flatmap_viewer is replacement
+
+
+def test_close_flatmap_viewer_uses_public_close_off_macos_and_invalidates_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scheduled: list = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(_delay, callback) -> None:
-            scheduled.append(callback)
-
     monkeypatch.setitem(
-        NeuronViewerWidget._on_flatmap_fullscreen_close.__globals__,
-        "QTimer",
-        _TimerRecorder,
+        NeuronViewerWidget._close_flatmap_viewer.__globals__, "_IS_MACOS", False
     )
-    qt_window = _FullscreenWindow(fullscreen=True)
-    widget, viewer = _fullscreen_widget(qt_window)
-    event = _LifecycleEvent(_FakeQEvent.Close)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
 
-    first = widget._on_flatmap_fullscreen_close("flatmap-1", qt_window, event)
-    second = widget._on_flatmap_fullscreen_close("flatmap-1", qt_window, event)
+    assert widget._close_flatmap_viewer() is True
 
-    assert first is True
-    assert second is True
-    # Only the first close arms a transition timer.
-    assert len(scheduled) == 1
+    assert viewer.close_calls == 1
+    assert widget._flatmap_viewer is None
+    assert widget._flatmap_viewer_generation == 1
+    assert widget._flatmap_tab.released == [viewer]
 
 
-def test_flatmap_fullscreen_close_missing_confirm_leaves_window_open(
+def test_macos_close_hides_clears_and_retains_viewer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_immediate_timer(monkeypatch)
-    warnings: list = []
-    monkeypatch.setitem(_show_globals(), "show_warning", warnings.append)
-    qt_window = _FullscreenWindowNoConfirm(fullscreen=True)
-    widget, viewer = _fullscreen_widget(qt_window)
-
-    consumed = widget._on_flatmap_fullscreen_close(
-        "flatmap-1",
-        qt_window,
-        _LifecycleEvent(_FakeQEvent.Close),
+    method_globals = NeuronViewerWidget._close_flatmap_viewer.__globals__
+    monkeypatch.setitem(method_globals, "_IS_MACOS", True)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
     )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    guard = qt_window.installed_filters[0]
+    viewer.layers.append(_scene_layer("flatmap", flatmap=True))
+
+    assert widget._close_flatmap_viewer() is True
+
+    assert qt_window.hidden is True
+    assert qt_window.updates_enabled is True
+    assert viewer.close_calls == 0
+    assert viewer.layers == []
+    assert widget._flatmap_viewer is viewer
+    assert widget._flatmap_viewer_pending_show is True
+    assert widget._flatmap_viewer_generation == 1
+    assert widget._flatmap_tab.released == [viewer]
+    assert qt_window.removed_filters == []
+    assert widget._flatmap_close_guards == {id(viewer): (qt_window, guard)}
+
+
+def test_macos_window_close_event_uses_the_same_hide_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CloseEvent:
+        def __init__(self) -> None:
+            self.ignored = False
+
+        def type(self):
+            return _FakeQEvent.Type.Close
+
+        def ignore(self) -> None:
+            self.ignored = True
+
+    method_globals = NeuronViewerWidget._close_flatmap_viewer.__globals__
+    monkeypatch.setitem(method_globals, "_IS_MACOS", True)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    event = _CloseEvent()
+
+    consumed = qt_window.installed_filters[0].eventFilter(qt_window, event)
 
     assert consumed is True
+    assert event.ignored is True
+    assert qt_window.hidden is True
+    assert viewer.close_calls == 0
+    assert widget._flatmap_viewer is viewer
+    assert widget._flatmap_viewer_pending_show is True
+
+
+def test_macos_fullscreen_close_exits_fullscreen_before_hiding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method_globals = NeuronViewerWidget._close_flatmap_viewer.__globals__
+    monkeypatch.setitem(method_globals, "_IS_MACOS", True)
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    qt_window.fullscreen = True
+
+    assert widget._close_flatmap_viewer() is True
+
     assert qt_window.show_normal_calls == 1
-    # Without confirm_need support we do not retry the close automatically.
-    assert qt_window.close_calls == []
-    assert widget._flatmap_fullscreen_close_state == {}
-    assert warnings and "fullscreen" in warnings[0].lower()
+    assert qt_window.fullscreen is False
+    assert qt_window.hidden is True
+    assert viewer.close_calls == 0
+    assert widget._flatmap_viewer is viewer
 
 
-def test_flatmap_fullscreen_transition_ignores_replaced_viewer(
+def test_macos_widget_teardown_never_closes_a_visible_flatmap_viewer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scheduled: list = []
-
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(_delay, callback) -> None:
-            scheduled.append(callback)
-
     monkeypatch.setitem(
-        NeuronViewerWidget._on_flatmap_fullscreen_close.__globals__,
-        "QTimer",
-        _TimerRecorder,
+        NeuronViewerWidget._close_flatmap_viewer.__globals__, "_IS_MACOS", True
     )
-    qt_window = _FullscreenWindow(fullscreen=True)
-    widget, viewer = _fullscreen_widget(qt_window)
-
-    assert (
-        widget._on_flatmap_fullscreen_close(
-            "flatmap-1",
-            qt_window,
-            _LifecycleEvent(_FakeQEvent.Close),
-        )
-        is True
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
     )
-    # A replacement viewer supersedes the pending transition before it runs.
-    replacement = _FullscreenViewer(_FullscreenWindow(fullscreen=False))
-    widget._flatmap_viewer = replacement
-    widget._flatmap_debug_tokens[id(replacement)] = "flatmap-2"
+    widget._flatmap_viewer = viewer
+    widget._flatmap_viewer_pending_show = False
+    widget._install_flatmap_macos_close_guard(viewer)
+    qt_window = viewer.window._qt_window
+    guard = qt_window.installed_filters[0]
+    viewer.layers.append(_scene_layer("flatmap", flatmap=True))
 
-    for callback in scheduled:
-        callback()
+    widget._on_neuron_viewer_destroyed()
 
-    assert qt_window.close_calls == []
-    assert qt_window.show_normal_calls <= 1
+    assert qt_window.hidden is True
+    assert viewer.close_calls == 0
+    assert viewer.layers == []
+    assert widget._flatmap_viewer is None
+    assert qt_window.removed_filters == [guard]
+    assert widget._flatmap_close_guards == {}
 
 
-def test_flatmap_fullscreen_exit_times_out_without_closing(
+def test_closed_window_is_retired_without_private_qt_state() -> None:
+    widget = _flatmap_window_widget()
+    viewer = _FlatmapViewer(
+        title="SWC Viewer Flatmap",
+        ndisplay=3,
+        show=False,
+    )
+    widget._flatmap_viewer = viewer
+    viewer.window.open = False
+
+    assert widget._flatmap_viewer_generation_value() == 1
+    assert widget._flatmap_viewer is None
+    assert viewer.close_calls == 0
+    assert widget._get_or_create_flatmap_viewer(create=False) is None
+    assert widget._flatmap_tab.released == [viewer]
+
+
+def test_macos_flatmap_viewer_supports_three_hide_and_reuse_cycles(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class _StuckWindow(_FullscreenWindow):
-        def showNormal(self) -> None:
-            # Simulate a window that never leaves fullscreen.
-            self.show_normal_calls += 1
+    monkeypatch.setitem(
+        NeuronViewerWidget._close_flatmap_viewer.__globals__, "_IS_MACOS", True
+    )
+    widget = _flatmap_window_widget()
+    created = []
 
-    class _TimerRecorder:
-        @staticmethod
-        def singleShot(_delay, callback) -> None:
-            callback()
+    def create_viewer(**kwargs):
+        viewer = _FlatmapViewer(**kwargs)
+        created.append(viewer)
+        return viewer
 
     monkeypatch.setitem(
-        NeuronViewerWidget._on_flatmap_fullscreen_close.__globals__,
-        "QTimer",
-        _TimerRecorder,
-    )
-    qt_window = _StuckWindow(fullscreen=True)
-    widget, viewer = _fullscreen_widget(qt_window)
-    lifecycle_logger = _show_globals()["logger"]
-
-    with caplog.at_level(logging.DEBUG, logger=lifecycle_logger.name):
-        widget._on_flatmap_fullscreen_close(
-            "flatmap-1",
-            qt_window,
-            _LifecycleEvent(_FakeQEvent.Close),
-        )
-
-    assert qt_window.close_calls == []
-    assert widget._flatmap_fullscreen_close_state == {}
-    messages = [record.getMessage() for record in caplog.records]
-    assert any(
-        "event=fullscreen_guard_failure" in message
-        and "reason=exit_timed_out" in message
-        for message in messages
+        sys.modules, "napari", types.SimpleNamespace(Viewer=create_viewer)
     )
 
+    for cycle in range(3):
+        viewer = widget._get_or_create_flatmap_viewer(create=True)
+        layer = _scene_layer(f"flatmap {cycle}", flatmap=True)
+        viewer.layers.append(layer)
+        widget._on_flatmap_display_viewer_ready(viewer, layer)
+        assert widget._close_flatmap_viewer() is True
 
-def test_flatmap_close_guard_filter_only_consumes_fullscreen_close() -> None:
-    guard_class = (
-        NeuronViewerWidget._install_flatmap_fullscreen_close_guard.__globals__[
-            "_FlatmapFullscreenCloseGuard"
-        ]
-    )
-    calls = []
-    guard = guard_class(
-        "flatmap-1",
-        lambda token, watched, event: calls.append((token, watched)) or True,
-    )
-
-    normal_window = _FullscreenWindow(fullscreen=False)
-    assert guard.eventFilter(normal_window, _LifecycleEvent(_FakeQEvent.Close)) is False
-    assert calls == []
-
-    fullscreen_window = _FullscreenWindow(fullscreen=True)
-    assert (
-        guard.eventFilter(fullscreen_window, _LifecycleEvent(_FakeQEvent.Close)) is True
-    )
-    assert calls == [("flatmap-1", fullscreen_window)]
-
-    # Non-close events are ignored regardless of fullscreen state.
-    assert (
-        guard.eventFilter(fullscreen_window, _LifecycleEvent(_FakeQEvent.Show)) is False
-    )
+    assert len(created) == 1
+    assert created[0].show_calls == 3
+    assert created[0].close_calls == 0
+    assert created[0].layers == []
+    assert widget._flatmap_viewer is created[0]
+    assert widget._flatmap_viewer_pending_show is True
+    assert widget._flatmap_viewer_generation == 3
 
 
 def test_reference_template_checkbox_defaults_to_lazy_load(

@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "A napari plugin for viewing SWC files"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: napari",
@@ -17,13 +17,12 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
-    "napari[pyqt6]>=0.5.0",
+    "napari[pyqt6]>=0.9,<0.10",
     "numpy>=1.24",
     "matplotlib",
     "brainglobe-atlasapi>=2.0",
@@ -60,4 +59,5 @@ testpaths = ["tests"]
 filterwarnings = [
     "error",
     "ignore:datetime\\.datetime\\.utcnow\\(\\) is deprecated and scheduled for removal in a future version\\.:DeprecationWarning:nrrd\\.writer",
+    "ignore:`json_encoders` is deprecated.*:pydantic.warnings.PydanticDeprecatedSince20",
 ]
