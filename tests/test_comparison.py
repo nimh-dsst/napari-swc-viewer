@@ -5,8 +5,8 @@ import json
 import numpy as np
 import pytest
 
-from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
-from napari_swc_viewer.comparison import (
+from napari_neuron_navigator.cluster_assignments import ClusterAssignmentStore
+from napari_neuron_navigator.comparison import (
     CCF_PLANE_CORONAL,
     CCF_PLANE_HORIZONTAL,
     CCF_PLANE_SAGITTAL,

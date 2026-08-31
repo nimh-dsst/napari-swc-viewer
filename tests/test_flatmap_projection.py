@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.flatmap_heatmap import build_flatmap_render_data
-from napari_swc_viewer.flatmap_projection import (
+from napari_neuron_navigator.flatmap_heatmap import build_flatmap_render_data
+from napari_neuron_navigator.flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
     FLATMAP_LOOKUP_DIRECT,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from napari_swc_viewer.analysis import clustering
+from napari_neuron_navigator.analysis import clustering
 
 
 def test_query_ccf_soma_coordinates_counts_retained_source_rows(tmp_path) -> None:

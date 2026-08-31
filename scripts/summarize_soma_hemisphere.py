@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from napari_swc_viewer.soma_summary import (
+from napari_neuron_navigator.soma_summary import (
     DEFAULT_COORD_AXIS,
     DEFAULT_MIDLINE,
     DEFAULT_TOLERANCE,

@@ -1,5 +1,7 @@
 # napari-neuron-navigator
-A Napari plugin that allows viewing of SWC files in napari
+
+A napari plugin for navigating, visualizing, and analyzing neuronal morphology
+data from SWC and Parquet files.
 
 ## Prerequisites
 
@@ -37,19 +39,31 @@ This command will automatically build the package (if needed) before launching n
 To enable plugin debug logging for runtime diagnostics:
 
 ```bash
-NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
+NAPARI_NEURON_NAVIGATOR_DEBUG=1 pixi run napari
 ```
 
 To write the debug trace to a custom file:
 
 ```bash
-NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
+NAPARI_NEURON_NAVIGATOR_DEBUG=1 NAPARI_NEURON_NAVIGATOR_LOG_FILE=/tmp/napari-neuron-navigator.log pixi run napari
 ```
 
-The default file is `~/.napari-swc-viewer/debug.log`. It rotates at 10 MB and
+The default file is `~/.napari-neuron-navigator/debug.log`. It rotates at 10 MB and
 keeps three backups. Plugin DEBUG records are written to the file and console.
 
-Flatmap projections use a dedicated napari window named **SWC Viewer Flatmap**.
+### Compatibility with napari-swc-viewer data
+
+The distribution and import package are now `napari-neuron-navigator` and
+`napari_neuron_navigator`. New project bundles use the `.nnproj` suffix and new
+serialized metadata uses the `napari_neuron_navigator` namespace. Existing
+`.swcv` projects, enhanced/flatmap Parquet metadata, flatmap region caches,
+region palettes, and the former debug environment-variable names remain
+readable so data created before the rename can be migrated in place. Saving old
+project bundles rewrites their manifest and generated metadata with the new
+namespace. `pixi run build` also removes stale editable-install metadata for the
+former distribution so napari discovers only Neuron Navigator.
+
+Flatmap projections use a dedicated napari window named **Neuron Navigator Flatmap**.
 The main viewer and all of its layers, selection, dimensions, camera, and
 overlays remain untouched while projection data is computed and displayed. The
 flatmap viewer is created hidden, populated, and then shown, so a long-running

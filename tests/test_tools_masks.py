@@ -10,8 +10,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from napari_swc_viewer.analysis.heatmap import build_node_counts_volume
-from napari_swc_viewer.analysis.mask import (
+from napari_neuron_navigator.analysis.heatmap import build_node_counts_volume
+from napari_neuron_navigator.analysis.mask import (
     build_binary_mask_from_heatmap,
     build_binary_mask_from_threshold_range,
     get_expanded_region_voxel_ids_for_regions,
@@ -21,7 +21,7 @@ from napari_swc_viewer.analysis.mask import (
     otsu_threshold_positive,
     smooth_heatmap_volume,
 )
-from napari_swc_viewer.db import NeuronDatabase
+from napari_neuron_navigator.db import NeuronDatabase
 
 
 class FakeAtlas:
@@ -151,7 +151,7 @@ def test_get_expanded_region_voxel_ids_for_regions_dilates_after_union(monkeypat
         return np.asarray(mask, dtype=bool)
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.dilate_mask_to_volume_increase",
+        "napari_neuron_navigator.analysis.mask.dilate_mask_to_volume_increase",
         fake_dilate,
     )
 

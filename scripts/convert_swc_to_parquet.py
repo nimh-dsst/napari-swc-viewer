@@ -7,8 +7,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from napari_swc_viewer.hemisphere import Hemisphere
-from napari_swc_viewer.parquet import (
+from napari_neuron_navigator.hemisphere import Hemisphere
+from napari_neuron_navigator.parquet import (
     BatchParquetConversionSummary,
     batch_convert_swc_to_parquet,
 )

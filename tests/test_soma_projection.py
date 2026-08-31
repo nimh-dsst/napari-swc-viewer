@@ -12,8 +12,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
-from napari_swc_viewer.neuron_table_ops import (
+from napari_neuron_navigator.isocortex_layers import CustomRegionSelectionGroup
+from napari_neuron_navigator.neuron_table_ops import (
     ClusterFilterSelection,
     distinct_colors_for_file_ids,
 )
@@ -27,15 +27,15 @@ _PATCHED_MODULE_NAMES = [
     "qtpy",
     "qtpy.QtCore",
     "qtpy.QtWidgets",
-    "napari_swc_viewer.widgets",
-    "napari_swc_viewer.widgets.analysis_tab",
-    "napari_swc_viewer.widgets.custom_region_selector",
-    "napari_swc_viewer.widgets.mask_layer_selector",
-    "napari_swc_viewer.widgets.neuron_table",
-    "napari_swc_viewer.widgets.region_selector",
-    "napari_swc_viewer.widgets.reference_layers",
-    "napari_swc_viewer.widgets.neuron_viewer",
-    "napari_swc_viewer.widgets.slice_projection",
+    "napari_neuron_navigator.widgets",
+    "napari_neuron_navigator.widgets.analysis_tab",
+    "napari_neuron_navigator.widgets.custom_region_selector",
+    "napari_neuron_navigator.widgets.mask_layer_selector",
+    "napari_neuron_navigator.widgets.neuron_table",
+    "napari_neuron_navigator.widgets.region_selector",
+    "napari_neuron_navigator.widgets.reference_layers",
+    "napari_neuron_navigator.widgets.neuron_viewer",
+    "napari_neuron_navigator.widgets.slice_projection",
 ]
 _ORIGINAL_MODULES = {name: sys.modules.get(name) for name in _PATCHED_MODULE_NAMES}
 
@@ -195,36 +195,36 @@ fake_napari = types.ModuleType("napari")
 fake_napari.utils = fake_napari_utils
 sys.modules["napari"] = fake_napari
 
-fake_analysis_module = types.ModuleType("napari_swc_viewer.widgets.analysis_tab")
+fake_analysis_module = types.ModuleType("napari_neuron_navigator.widgets.analysis_tab")
 fake_analysis_module.AnalysisTabWidget = _FakeAnalysisTabWidget
-sys.modules["napari_swc_viewer.widgets.analysis_tab"] = fake_analysis_module
+sys.modules["napari_neuron_navigator.widgets.analysis_tab"] = fake_analysis_module
 
 fake_custom_region_selector_module = types.ModuleType(
-    "napari_swc_viewer.widgets.custom_region_selector"
+    "napari_neuron_navigator.widgets.custom_region_selector"
 )
 fake_custom_region_selector_module.CustomRegionSelectorWidget = _FakeWidget
-sys.modules["napari_swc_viewer.widgets.custom_region_selector"] = (
+sys.modules["napari_neuron_navigator.widgets.custom_region_selector"] = (
     fake_custom_region_selector_module
 )
 
 fake_mask_selector_module = types.ModuleType(
-    "napari_swc_viewer.widgets.mask_layer_selector"
+    "napari_neuron_navigator.widgets.mask_layer_selector"
 )
 fake_mask_selector_module.MaskLayerSelectorWidget = _FakeWidget
-sys.modules["napari_swc_viewer.widgets.mask_layer_selector"] = fake_mask_selector_module
+sys.modules["napari_neuron_navigator.widgets.mask_layer_selector"] = fake_mask_selector_module
 
-fake_neuron_table_module = types.ModuleType("napari_swc_viewer.widgets.neuron_table")
+fake_neuron_table_module = types.ModuleType("napari_neuron_navigator.widgets.neuron_table")
 fake_neuron_table_module.NeuronTableWidget = _FakeWidget
-sys.modules["napari_swc_viewer.widgets.neuron_table"] = fake_neuron_table_module
+sys.modules["napari_neuron_navigator.widgets.neuron_table"] = fake_neuron_table_module
 
 fake_region_selector_module = types.ModuleType(
-    "napari_swc_viewer.widgets.region_selector"
+    "napari_neuron_navigator.widgets.region_selector"
 )
 fake_region_selector_module.RegionSelectorWidget = _FakeWidget
-sys.modules["napari_swc_viewer.widgets.region_selector"] = fake_region_selector_module
+sys.modules["napari_neuron_navigator.widgets.region_selector"] = fake_region_selector_module
 
 fake_reference_layers_module = types.ModuleType(
-    "napari_swc_viewer.widgets.reference_layers"
+    "napari_neuron_navigator.widgets.reference_layers"
 )
 for _name in (
     "add_allen_template",
@@ -237,20 +237,20 @@ for _name in (
     "remove_region_segmentation",
 ):
     setattr(fake_reference_layers_module, _name, lambda *args, **kwargs: None)
-sys.modules["napari_swc_viewer.widgets.reference_layers"] = fake_reference_layers_module
+sys.modules["napari_neuron_navigator.widgets.reference_layers"] = fake_reference_layers_module
 
-sys.modules.pop("napari_swc_viewer.widgets.neuron_viewer", None)
-widgets_package = types.ModuleType("napari_swc_viewer.widgets")
+sys.modules.pop("napari_neuron_navigator.widgets.neuron_viewer", None)
+widgets_package = types.ModuleType("napari_neuron_navigator.widgets")
 widgets_package.__path__ = [
-    str(Path(__file__).resolve().parents[1] / "src" / "napari_swc_viewer" / "widgets")
+    str(Path(__file__).resolve().parents[1] / "src" / "napari_neuron_navigator" / "widgets")
 ]
-sys.modules["napari_swc_viewer.widgets"] = widgets_package
+sys.modules["napari_neuron_navigator.widgets"] = widgets_package
 
 NeuronViewerWidget = importlib.import_module(
-    "napari_swc_viewer.widgets.neuron_viewer"
+    "napari_neuron_navigator.widgets.neuron_viewer"
 ).NeuronViewerWidget
 SomaSliceProjector = importlib.import_module(
-    "napari_swc_viewer.widgets.slice_projection"
+    "napari_neuron_navigator.widgets.slice_projection"
 ).SomaSliceProjector
 
 for _name, _module in _ORIGINAL_MODULES.items():
@@ -771,7 +771,7 @@ class _SceneLayer:
         self.name = name
         self.visible = visible
         self.metadata = (
-            {"napari_swc_viewer_space": "flatmap"} if flatmap else {"source": "main"}
+            {"napari_neuron_navigator_space": "flatmap"} if flatmap else {"source": "main"}
         )
 
 
@@ -882,7 +882,7 @@ def test_flatmap_display_provider_creates_hidden_secondary_viewer(
 
     assert display is created[0]
     assert display is not main_viewer
-    assert display.title == "SWC Viewer Flatmap"
+    assert display.title == "Neuron Navigator Flatmap"
     assert display.ndisplay == 3
     assert display.initial_show is False
     assert display.show_calls == 0
@@ -903,7 +903,7 @@ def test_flatmap_display_provider_creates_hidden_secondary_viewer(
 def test_flatmap_viewer_shows_only_after_marked_layer_is_ready() -> None:
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -921,7 +921,7 @@ def test_flatmap_viewer_shows_only_after_marked_layer_is_ready() -> None:
 def test_unmarked_first_layer_closes_hidden_flatmap_viewer() -> None:
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -941,7 +941,7 @@ def test_unmarked_first_layer_closes_hidden_flatmap_viewer() -> None:
 def test_failed_first_render_closes_window_but_failed_rerender_keeps_it() -> None:
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -954,7 +954,7 @@ def test_failed_first_render_closes_window_but_failed_rerender_keeps_it() -> Non
     assert widget._flatmap_viewer is None
 
     replacement = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -975,7 +975,7 @@ def test_close_flatmap_viewer_uses_public_close_off_macos_and_invalidates_genera
     )
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -996,7 +996,7 @@ def test_macos_close_hides_clears_and_retains_viewer(
     monkeypatch.setitem(method_globals, "_IS_MACOS", True)
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -1038,7 +1038,7 @@ def test_macos_window_close_event_uses_the_same_hide_path(
     monkeypatch.setitem(method_globals, "_IS_MACOS", True)
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -1065,7 +1065,7 @@ def test_macos_fullscreen_close_exits_fullscreen_before_hiding(
     monkeypatch.setitem(method_globals, "_IS_MACOS", True)
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -1092,7 +1092,7 @@ def test_macos_widget_teardown_never_closes_a_visible_flatmap_viewer(
     )
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -1116,7 +1116,7 @@ def test_macos_widget_teardown_never_closes_a_visible_flatmap_viewer(
 def test_closed_window_is_retired_without_private_qt_state() -> None:
     widget = _flatmap_window_widget()
     viewer = _FlatmapViewer(
-        title="SWC Viewer Flatmap",
+        title="Neuron Navigator Flatmap",
         ndisplay=3,
         show=False,
     )
@@ -1330,9 +1330,9 @@ def test_load_atlas_starts_background_worker(
         def deleteLater(self) -> None:
             return None
 
-    fake_workers = types.ModuleType("napari_swc_viewer.workers")
+    fake_workers = types.ModuleType("napari_neuron_navigator.workers")
     fake_workers.AtlasLoadWorker = _FakeAtlasLoadWorker
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", fake_workers)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", fake_workers)
     monkeypatch.setitem(
         NeuronViewerWidget._load_atlas.__globals__,
         "QThread",

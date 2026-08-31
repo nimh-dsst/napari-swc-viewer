@@ -85,6 +85,7 @@ from ..point_import import (
     validate_point_metadata_against_atlas,
 )
 from ..project_io import (
+    PROJECT_SUFFIX,
     ProjectBundle,
     export_enhanced_neuron_parquet,
     is_recognized_project_bundle,
@@ -126,7 +127,8 @@ _REGION_QUERY_PAGE_ATLAS = 0
 _REGION_QUERY_PAGE_CUSTOM = 1
 _REGION_QUERY_PAGE_MASK = 2
 
-_FLATMAP_LAYER_SPACE_KEY = "napari_swc_viewer_space"
+_FLATMAP_LAYER_SPACE_KEY = "napari_neuron_navigator_space"
+_LEGACY_FLATMAP_LAYER_SPACE_KEY = "napari_swc_viewer_space"
 _FLATMAP_LAYER_SPACE_VALUE = "flatmap"
 _IS_MACOS = sys.platform == "darwin"
 
@@ -136,7 +138,13 @@ def _flatmap_layer(layer: object) -> bool:
     metadata = getattr(layer, "metadata", None)
     return bool(
         isinstance(metadata, Mapping)
-        and metadata.get(_FLATMAP_LAYER_SPACE_KEY) == _FLATMAP_LAYER_SPACE_VALUE
+        and any(
+            metadata.get(key) == _FLATMAP_LAYER_SPACE_VALUE
+            for key in (
+                _FLATMAP_LAYER_SPACE_KEY,
+                _LEGACY_FLATMAP_LAYER_SPACE_KEY,
+            )
+        )
     )
 
 
@@ -937,7 +945,7 @@ class NeuronViewerWidget(QWidget):
         import napari
 
         viewer = napari.Viewer(
-            title="SWC Viewer Flatmap",
+            title="Neuron Navigator Flatmap",
             ndisplay=3,
             show=False,
         )
@@ -1626,7 +1634,7 @@ class NeuronViewerWidget(QWidget):
         self._save_project_btn = QPushButton("Save Project")
         self._save_project_btn.setEnabled(False)
         self._save_project_btn.setToolTip(
-            "Load or create an SWC Viewer project before saving in place."
+            "Load or create a Neuron Navigator project before saving in place."
         )
         self._save_project_btn.clicked.connect(self._save_current_project)
         project_io_row.addWidget(self._save_project_btn)
@@ -2867,7 +2875,7 @@ class NeuronViewerWidget(QWidget):
         button.setEnabled(self._current_project_path is not None)
         if self._current_project_path is None:
             button.setToolTip(
-                "Load or create an SWC Viewer project before saving in place."
+                "Load or create a Neuron Navigator project before saving in place."
             )
         else:
             button.setToolTip(f"Save changes to {self._current_project_path}")
@@ -2888,24 +2896,24 @@ class NeuronViewerWidget(QWidget):
             return
 
         if self._current_project_path is None:
-            default_name = f"{Path(self._db.parquet_path).stem}.swcv"
+            default_name = f"{Path(self._db.parquet_path).stem}{PROJECT_SUFFIX}"
         else:
             default_name = str(
                 self._current_project_path.with_name(
-                    f"{self._current_project_path.stem}_copy.swcv"
+                    f"{self._current_project_path.stem}_copy{PROJECT_SUFFIX}"
                 )
             )
         output_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save SWC Viewer Project As",
+            "Save Neuron Navigator Project As",
             default_name,
-            "SWC Viewer Project (*.swcv);;All Files (*)",
+            f"Neuron Navigator Project (*{PROJECT_SUFFIX});;All Files (*)",
         )
         if not output_path:
             return
         bundle_path = Path(output_path)
-        if bundle_path.suffix.lower() != ".swcv":
-            bundle_path = bundle_path.with_suffix(".swcv")
+        if bundle_path.suffix.lower() != PROJECT_SUFFIX:
+            bundle_path = bundle_path.with_suffix(PROJECT_SUFFIX)
         if bundle_path.exists() or bundle_path.is_symlink():
             message = (
                 f"Project destination already exists: {bundle_path}. "
@@ -2923,7 +2931,7 @@ class NeuronViewerWidget(QWidget):
     def _project_overwrite_confirmation_text(bundle_path: Path) -> str:
         """Return the destructive-save confirmation text for a project path."""
         return (
-            "Replace the current SWC Viewer project?\n\n"
+            "Replace the current Neuron Navigator project?\n\n"
             f"{bundle_path}\n\n"
             "All existing contents in this project folder will be replaced. "
             "This cannot be undone."
@@ -2935,7 +2943,7 @@ class NeuronViewerWidget(QWidget):
 
         message = QMessageBox(self)
         message.setIcon(QMessageBox.Warning)
-        message.setWindowTitle("Overwrite SWC Viewer Project?")
+        message.setWindowTitle("Overwrite Neuron Navigator Project?")
         message.setText(self._project_overwrite_confirmation_text(bundle_path))
         overwrite_button = message.addButton("Overwrite", QMessageBox.DestructiveRole)
         cancel_button = message.addButton("Cancel", QMessageBox.RejectRole)
@@ -2951,7 +2959,7 @@ class NeuronViewerWidget(QWidget):
         if not is_recognized_project_bundle(bundle_path):
             message = (
                 "The current project is no longer available or is not a recognized "
-                f"SWC Viewer project: {bundle_path}"
+                f"Neuron Navigator project: {bundle_path}"
             )
             self._set_current_project_path(None)
             self._project_status_label.setText(message)
@@ -3047,7 +3055,7 @@ class NeuronViewerWidget(QWidget):
         """Prompt for and restore a project bundle directory."""
         directory = QFileDialog.getExistingDirectory(
             self,
-            "Open SWC Viewer Project",
+            "Open Neuron Navigator Project",
             "",
         )
         if not directory:
@@ -8923,7 +8931,7 @@ class NeuronViewerWidget(QWidget):
             kind = str(metadata.get("region_layer_kind", "") or "")
             if kind not in {"mesh", "mesh_group"}:
                 continue
-            setattr(layer, "_napari_swc_region_base_opacity", base_opacity)
+            setattr(layer, "_napari_neuron_navigator_region_base_opacity", base_opacity)
             if kind == "mesh":
                 region_id = int(metadata.get("region_id", 0) or 0)
                 if region_id > 0 and self._atlas is not None:

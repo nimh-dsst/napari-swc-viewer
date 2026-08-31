@@ -1,12 +1,12 @@
 $ErrorActionPreference = "Stop"
 
-$repoDir = Join-Path $env:USERPROFILE "repos\napari-swc-viewer"
+$repoDir = Join-Path $env:USERPROFILE "repos\napari-neuron-navigator"
 
 if (-not (Test-Path -LiteralPath $repoDir)) {
     Write-Host "Could not find the repository at:"
     Write-Host "  $repoDir"
     Write-Host ""
-    Write-Host "Clone the repository to %USERPROFILE%\repos\napari-swc-viewer, or edit this script to use your actual path."
+    Write-Host "Clone the repository to %USERPROFILE%\repos\napari-neuron-navigator, or edit this script to use your actual path."
     Write-Host ""
     Read-Host "Press Enter to close this window"
     exit 1

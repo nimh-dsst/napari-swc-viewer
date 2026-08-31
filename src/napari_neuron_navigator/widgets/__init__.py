@@ -1,4 +1,4 @@
-"""napari widgets for the SWC viewer."""
+"""napari widgets for Neuron Navigator."""
 
 import logging
 

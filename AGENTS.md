@@ -40,7 +40,7 @@ naive graph code:
 `type`, region, or any spatial bound, apply the restriction to *which nodes are
 reported*, never to the node set the child lookup searches. Filtering nodes away
 first strands their parents, which then look childless and get reported as
-termini. See `src/napari_swc_viewer/terminals.py` for the correct shape and the
+termini. See `src/napari_neuron_navigator/terminals.py` for the correct shape and the
 two tests that guard both traps.
 
 Note that `type = 2` covers only 13,750 of the 18,621 neurons in that file; the
@@ -148,7 +148,7 @@ visually inspecting detected termini in napari: points labelled as axon termini
 sat on arbors that are plainly dendritic.
 
 This is a defect in the source SWC annotations, not in this repository's code.
-The childless/leaf detection in `src/napari_swc_viewer/terminals.py` is correct —
+The childless/leaf detection in `src/napari_neuron_navigator/terminals.py` is correct —
 a reported node genuinely has no children. What is unreliable is the *meaning*
 of the `type` column on those nodes.
 
@@ -172,13 +172,13 @@ points, path lengths) as long as it does not filter or interpret by `type`.
 ## Expected Workflow
 
 - Use `pixi` commands instead of creating a separate virtual environment or invoking `pip`, `pytest`, or `napari` directly.
-- Develop `napari_swc_viewer` inside the pixi environment.
+- Develop `napari_neuron_navigator` inside the pixi environment.
 - Let pixi manage installation of napari and the other project dependencies.
 
 ## Common Commands
 
 - `pixi run build`
-  Installs `napari_swc_viewer` in editable mode for development.
+  Installs `napari_neuron_navigator` in editable mode for development.
 
 - `pixi run napari`
   Launches napari with the plugin available. This task depends on `build`, so the package is installed before napari starts.

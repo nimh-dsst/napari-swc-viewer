@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import napari_swc_viewer.comparison_data as comparison_data_module
-from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
-from napari_swc_viewer.comparison import (
+import napari_neuron_navigator.comparison_data as comparison_data_module
+from napari_neuron_navigator.cluster_assignments import ClusterAssignmentStore
+from napari_neuron_navigator.comparison import (
     CCF_PLANE_CORONAL,
     REDUCTION_PROJECTION,
     SOURCE_CCF_HEATMAP,
@@ -17,7 +17,7 @@ from napari_swc_viewer.comparison import (
     SOURCE_FLATMAP_SOMAS,
     ComparisonCellSpec,
 )
-from napari_swc_viewer.comparison_data import ComparisonDataProvider
+from napari_neuron_navigator.comparison_data import ComparisonDataProvider
 
 
 def _provider(

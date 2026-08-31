@@ -349,29 +349,29 @@ def _import_termini_section_module():
         setattr(qtwidgets_module, name, value)
 
     repo_root = Path(__file__).resolve().parent.parent
-    package_root = repo_root / "src" / "napari_swc_viewer"
+    package_root = repo_root / "src" / "napari_neuron_navigator"
     widgets_root = package_root / "widgets"
 
-    napari_package = types.ModuleType("napari_swc_viewer")
+    napari_package = types.ModuleType("napari_neuron_navigator")
     napari_package.__path__ = [str(package_root)]
 
-    widgets_package = types.ModuleType("napari_swc_viewer.widgets")
+    widgets_package = types.ModuleType("napari_neuron_navigator.widgets")
     widgets_package.__path__ = [str(widgets_root)]
 
     collapsible_module = types.ModuleType(
-        "napari_swc_viewer.widgets.collapsible_section"
+        "napari_neuron_navigator.widgets.collapsible_section"
     )
     collapsible_module.CollapsibleSection = _DummyCollapsibleSection
 
     replacements = {
         "qtpy.QtCore": qtcore_module,
         "qtpy.QtWidgets": qtwidgets_module,
-        "napari_swc_viewer": napari_package,
-        "napari_swc_viewer.widgets": widgets_package,
-        "napari_swc_viewer.widgets.collapsible_section": collapsible_module,
+        "napari_neuron_navigator": napari_package,
+        "napari_neuron_navigator.widgets": widgets_package,
+        "napari_neuron_navigator.widgets.collapsible_section": collapsible_module,
     }
     previous = {name: sys.modules.get(name) for name in replacements}
-    module_name = "napari_swc_viewer.widgets.termini_section"
+    module_name = "napari_neuron_navigator.widgets.termini_section"
     previous_module = sys.modules.get(module_name)
 
     try:
@@ -420,9 +420,9 @@ def _install_fake_terminus_worker(monkeypatch, created):
             self.kwargs = kwargs
             created.append(self)
 
-    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module = types.ModuleType("napari_neuron_navigator.workers")
     workers_module.TerminusWorker = _FakeTerminusWorker
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", workers_module)
 
 
 def _frame(file_ids, node_ids=None):

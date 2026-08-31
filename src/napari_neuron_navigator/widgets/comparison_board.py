@@ -356,7 +356,7 @@ class ComparisonBoardWindow(QMainWindow):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("SWC Viewer Comparison Board")
+        self.setWindowTitle("Neuron Navigator Comparison Board")
         self.resize(1500, 900)
         self._provider = provider
         self._state = state or ComparisonBoardState()

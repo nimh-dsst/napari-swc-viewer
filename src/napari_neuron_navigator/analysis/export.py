@@ -20,7 +20,8 @@ from scipy.cluster.hierarchy import dendrogram
 from .clustering import ClusterResult
 
 PARQUET_EXPORT_VERSION = "1"
-PARQUET_METADATA_PREFIX = "napari_swc_viewer.analysis_export."
+PARQUET_METADATA_PREFIX = "napari_neuron_navigator.analysis_export."
+LEGACY_PARQUET_METADATA_PREFIX = "napari_swc_viewer.analysis_export."
 DEFAULT_PREVIEW_HEATMAP_SIZE = 1024
 MIN_EXPORT_HEATMAP_SIZE = 512
 DENDROGRAM_LINEWIDTH = 0.5
@@ -668,9 +669,12 @@ def read_extended_parquet_analysis_metadata(
 ) -> dict[str, object]:
     """Read back analysis export metadata for tests or inspection."""
     metadata = dict(pq.read_schema(parquet_path).metadata or {})
-    json_key = f"{PARQUET_METADATA_PREFIX}metadata_json".encode("utf-8")
-    distance_key = f"{PARQUET_METADATA_PREFIX}distance_matrix_npy_zlib".encode("utf-8")
-    linkage_key = f"{PARQUET_METADATA_PREFIX}linkage_matrix_npy_zlib".encode("utf-8")
+    prefix = PARQUET_METADATA_PREFIX
+    if f"{prefix}metadata_json".encode("utf-8") not in metadata:
+        prefix = LEGACY_PARQUET_METADATA_PREFIX
+    json_key = f"{prefix}metadata_json".encode("utf-8")
+    distance_key = f"{prefix}distance_matrix_npy_zlib".encode("utf-8")
+    linkage_key = f"{prefix}linkage_matrix_npy_zlib".encode("utf-8")
 
     payload = json.loads(metadata[json_key].decode("utf-8"))
     payload["distance_matrix"] = _decoded_array_payload(metadata[distance_key])

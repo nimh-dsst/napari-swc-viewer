@@ -1,11 +1,11 @@
-"""Basic import tests for napari-swc-viewer."""
+"""Basic import tests for napari-neuron-navigator."""
 
 
 def test_import():
     """Test that the package can be imported."""
-    import napari_swc_viewer
+    import napari_neuron_navigator
 
-    assert napari_swc_viewer.__version__ is not None
+    assert napari_neuron_navigator.__version__ is not None
 
 
 def test_napari_import():

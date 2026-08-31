@@ -9,8 +9,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from napari_swc_viewer.db import NeuronDatabase
-from napari_swc_viewer.flatmap_parquet import (
+from napari_neuron_navigator.db import NeuronDatabase
+from napari_neuron_navigator.flatmap_parquet import (
     FLATMAP_INVALID_CODE_INVALID_DEPTH,
     FLATMAP_INVALID_CODE_INVALID_FLATMAP,
     FLATMAP_INVALID_CODE_OUT_OF_BOUNDS,
@@ -18,13 +18,14 @@ from napari_swc_viewer.flatmap_parquet import (
     FLATMAP_PARQUET_METADATA_KEY,
     FLATMAP_PARQUET_FORMAT_VERSION,
     FLATMAP_V3_AUGMENTED_COLUMNS,
+    LEGACY_FLATMAP_PARQUET_METADATA_KEY,
     LEGACY_SINGLE_FLATMAP_PARQUET_FORMAT_VERSION,
     FlatmapParquetCancelledError,
     augment_neuron_parquet_with_flatmap,
     augment_neuron_parquet_with_flatmaps,
     read_flatmap_parquet_transform_info,
 )
-from napari_swc_viewer.flatmap_profiles import (
+from napari_neuron_navigator.flatmap_profiles import (
     FlatmapLookupCancelledError,
     build_flatmap_lookup_set,
     discover_flatmap_lookup_set,
@@ -134,6 +135,23 @@ def test_read_flatmap_parquet_transform_info_flags_version_one_mirror_fallback(
 
     assert info.has_full_transform is True
     assert info.uses_legacy_mirror_fallback is True
+
+
+def test_read_flatmap_parquet_transform_info_accepts_pre_rename_metadata(
+    tmp_path,
+) -> None:
+    source = tmp_path / "legacy_namespace.parquet"
+    _write_source_parquet(source)
+    table = pq.read_table(source)
+    metadata = dict(table.schema.metadata or {})
+    metadata[LEGACY_FLATMAP_PARQUET_METADATA_KEY] = json.dumps(
+        {"version": 3, "lookup_set_id": "legacy-lookup"}
+    ).encode("utf-8")
+    pq.write_table(table.replace_schema_metadata(metadata), source)
+
+    info = read_flatmap_parquet_transform_info(source)
+
+    assert info.metadata == {"version": 3, "lookup_set_id": "legacy-lookup"}
 
 
 def test_augment_neuron_parquet_adds_flatmap_columns_with_mirror_fallback(

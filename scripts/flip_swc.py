@@ -19,7 +19,7 @@ from pathlib import Path
 
 from brainglobe_atlasapi import BrainGlobeAtlas
 
-from napari_swc_viewer import (
+from napari_neuron_navigator import (
     detect_soma_hemisphere,
     flip_swc,
     get_atlas_midline,

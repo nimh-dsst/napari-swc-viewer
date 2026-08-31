@@ -3,9 +3,9 @@ requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "napari-swc-viewer"
+name = "napari-neuron-navigator"
 dynamic = ["version"]
-description = "A napari plugin for viewing SWC files"
+description = "A napari plugin for navigating and analyzing neuronal morphologies"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
 requires-python = ">=3.11"
@@ -46,10 +46,10 @@ testing = [
 ]
 
 [project.entry-points."napari.manifest"]
-napari-swc-viewer = "napari_swc_viewer:napari.yaml"
+napari-neuron-navigator = "napari_neuron_navigator:napari.yaml"
 
 [tool.setuptools_scm]
-write_to = "src/napari_swc_viewer/_version.py"
+write_to = "src/napari_neuron_navigator/_version.py"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -20,9 +20,17 @@ import pyarrow.parquet as pq
 
 from .cluster_assignments import ClusterAssignmentStore
 
-PROJECT_BUNDLE_FORMAT = "napari_swc_viewer.project_bundle"
+PROJECT_BUNDLE_FORMAT = "napari_neuron_navigator.project_bundle"
+LEGACY_PROJECT_BUNDLE_FORMAT = "napari_swc_viewer.project_bundle"
+PROJECT_BUNDLE_FORMATS = frozenset(
+    {PROJECT_BUNDLE_FORMAT, LEGACY_PROJECT_BUNDLE_FORMAT}
+)
 PROJECT_FORMAT_VERSION = "2"
-PROJECT_METADATA_PREFIX = "napari_swc_viewer.project."
+PROJECT_METADATA_PREFIX = "napari_neuron_navigator.project."
+LEGACY_PROJECT_METADATA_PREFIX = "napari_swc_viewer.project."
+PROJECT_SUFFIX = ".nnproj"
+LEGACY_PROJECT_SUFFIX = ".swcv"
+PROJECT_SUFFIXES = frozenset({PROJECT_SUFFIX, LEGACY_PROJECT_SUFFIX})
 
 ENHANCED_NEURON_COLUMNS = (
     "neuron_label",
@@ -41,6 +49,18 @@ _SOURCE_FILE_ID_INLINE_LIMIT = 10_000
 _ProgressCallback = Callable[[str, int, int], None]
 
 logger = logging.getLogger(__name__)
+
+
+def _project_metadata_value(
+    metadata: Mapping[bytes, bytes],
+    field: str,
+) -> bytes | None:
+    """Return current or legacy project metadata, preferring the current key."""
+    for prefix in (PROJECT_METADATA_PREFIX, LEGACY_PROJECT_METADATA_PREFIX):
+        value = metadata.get(f"{prefix}{field}".encode("utf-8"))
+        if value is not None:
+            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -209,8 +229,7 @@ def _cluster_store_from_table_state(
 def _app_owned_cluster_columns(schema: pa.Schema) -> set[str]:
     """Return dynamic assignment columns declared by existing app metadata."""
     metadata = dict(schema.metadata or {})
-    key = f"{PROJECT_METADATA_PREFIX}metadata_json".encode("utf-8")
-    raw_payload = metadata.get(key)
+    raw_payload = _project_metadata_value(metadata, "metadata_json")
     if raw_payload is None:
         return set()
     try:
@@ -797,15 +816,15 @@ def read_enhanced_parquet_metadata(parquet_path: str | Path) -> dict[str, Any]:
     path = Path(parquet_path)
     schema = pq.read_schema(path)
     metadata = dict(schema.metadata or {})
-    json_key = f"{PROJECT_METADATA_PREFIX}metadata_json".encode("utf-8")
-    if json_key in metadata:
-        payload = json.loads(metadata[json_key].decode("utf-8"))
+    raw_payload = _project_metadata_value(metadata, "metadata_json")
+    if raw_payload is not None:
+        payload = json.loads(raw_payload.decode("utf-8"))
     else:
         payload = {"version": PROJECT_FORMAT_VERSION}
 
     if "table_state" not in payload:
         payload["table_state"] = _table_state_from_enhanced_columns(path, schema)
-    payload["has_project_metadata"] = json_key in metadata
+    payload["has_project_metadata"] = raw_payload is not None
     enhanced_columns = [
         column for column in ENHANCED_NEURON_COLUMNS if column in schema.names
     ]
@@ -1062,16 +1081,19 @@ def _recognized_project_bundle_error(bundle: Path) -> str | None:
         return f"Project overwrite target does not exist: {bundle}"
     if not bundle.is_dir():
         return f"Project overwrite target is not a directory: {bundle}"
-    if bundle.suffix.lower() != ".swcv":
-        return f"Project overwrite target must end in .swcv: {bundle}"
+    if bundle.suffix.lower() not in PROJECT_SUFFIXES:
+        return (
+            f"Project overwrite target must end in {PROJECT_SUFFIX} "
+            f"(or legacy {LEGACY_PROJECT_SUFFIX}): {bundle}"
+        )
 
     manifest_path = bundle / "manifest.json"
     try:
         manifest = _read_json(manifest_path)
     except (OSError, ValueError) as exc:
         return f"Project overwrite target has no readable manifest: {bundle} ({exc})"
-    if manifest.get("format") != PROJECT_BUNDLE_FORMAT:
-        return f"Directory is not an SWC Viewer project: {bundle}"
+    if manifest.get("format") not in PROJECT_BUNDLE_FORMATS:
+        return f"Directory is not a Neuron Navigator project: {bundle}"
     return None
 
 
@@ -1325,7 +1347,7 @@ def load_project_bundle(bundle_path: str | Path) -> ProjectBundle:
     """Load a project bundle manifest, table state, and saved layer arrays."""
     bundle = Path(bundle_path)
     manifest = _read_json(bundle / "manifest.json")
-    if manifest.get("format") != PROJECT_BUNDLE_FORMAT:
+    if manifest.get("format") not in PROJECT_BUNDLE_FORMATS:
         raise ValueError(f"Unsupported project bundle format: {manifest.get('format')}")
 
     source_info = manifest.get("source_parquet")

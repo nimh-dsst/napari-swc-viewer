@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import napari_swc_viewer.flatmap_region_cache as region_cache_module
-from napari_swc_viewer.flatmap_region_cache import (
+import napari_neuron_navigator.flatmap_region_cache as region_cache_module
+from napari_neuron_navigator.flatmap_region_cache import (
+    LEGACY_REGION_CACHE_FORMAT,
     REGION_CACHE_MANIFEST_FILENAME,
     RegionCacheError,
     RegionCacheCancelled,
@@ -24,8 +25,8 @@ from napari_swc_viewer.flatmap_region_cache import (
     open_region_cache,
     structure_catalog_id,
 )
-from napari_swc_viewer.flatmap_heatmap import resolve_flatmap_bin_counts
-from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
+from napari_neuron_navigator.flatmap_heatmap import resolve_flatmap_bin_counts
+from napari_neuron_navigator.isocortex_layers import AllenIsocortexLayerMap
 
 
 def _lookup_arrays():
@@ -416,7 +417,7 @@ def test_flat_region_selection_labels_terminal_selections_without_a_hierarchy(tm
 
 
 def test_flat_region_outlines_are_two_dimensional_and_occupancy_derived(tmp_path):
-    from napari_swc_viewer.flatmap_region_cache import _outlines_for_bins
+    from napari_neuron_navigator.flatmap_region_cache import _outlines_for_bins
 
     profile = _build(tmp_path / "cache")
 
@@ -489,6 +490,19 @@ def test_flat_materializers_do_not_change_profile_identity(tmp_path):
     assert manifest_path.read_text(encoding="utf-8") == before
 
 
+def test_open_accepts_pre_rename_cache_format(tmp_path):
+    profile = _build(tmp_path / "cache")
+    manifest_path = tmp_path / "cache" / REGION_CACHE_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format"] = LEGACY_REGION_CACHE_FORMAT
+    manifest_path.write_text(json.dumps(manifest))
+
+    cache = open_region_cache(tmp_path / "cache")
+
+    assert cache.profile(profile.profile_id).profile_id == profile.profile_id
+    cache.close()
+
+
 def test_region_cache_close_releases_loaded_maps_and_is_terminal(tmp_path):
     profile = _build(tmp_path / "cache")
     cache = open_region_cache(tmp_path / "cache")
@@ -514,7 +528,7 @@ def test_region_cache_close_releases_loaded_maps_and_is_terminal(tmp_path):
 
 
 def test_surface_and_outline_are_voxel_faithful_for_adjacent_bins():
-    from napari_swc_viewer.flatmap_region_cache import (
+    from napari_neuron_navigator.flatmap_region_cache import (
         _outlines_for_bins,
         _surface_for_bins,
     )
@@ -960,7 +974,7 @@ def test_build_rejects_annotation_lookup_shape_mismatch(tmp_path):
 def test_build_uses_lookup_set_grid_contract_and_requires_exact_resolution(
     tmp_path,
 ):
-    from napari_swc_viewer.flatmap_profiles import FlatmapGridSpec
+    from napari_neuron_navigator.flatmap_profiles import FlatmapGridSpec
 
     annotation, shaped, square, depth = _lookup_arrays()
 

@@ -1,6 +1,6 @@
 """Named, persistent cluster-assignment sets.
 
-The analysis pipeline produces one :class:`~napari_swc_viewer.analysis.clustering.ClusterResult`
+The analysis pipeline produces one :class:`~napari_neuron_navigator.analysis.clustering.ClusterResult`
 at a time.  This module keeps the comparatively small, durable part of those
 results (labels and provenance) independently from the potentially large
 correlation, distance, and linkage matrices.

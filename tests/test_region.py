@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from napari_swc_viewer.region import get_region_at_coords, get_region_ids_vectorized
+from napari_neuron_navigator.region import get_region_at_coords, get_region_ids_vectorized
 
 
 class _DummyStructureTree:

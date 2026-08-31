@@ -7,19 +7,19 @@ import types
 
 import numpy as np
 
-from napari_swc_viewer.analysis.clustering import ClusterResult
-from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
+from napari_neuron_navigator.analysis.clustering import ClusterResult
+from napari_neuron_navigator.cluster_assignments import ClusterAssignmentStore
 
 
 def _import_neuron_table_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "src"
-        / "napari_swc_viewer"
+        / "napari_neuron_navigator"
         / "widgets"
         / "neuron_table.py"
     )
-    package_name = "napari_swc_viewer.widgets"
+    package_name = "napari_neuron_navigator.widgets"
     original_package = sys.modules.get(package_name)
     if original_package is None:
         package = types.ModuleType(package_name)
@@ -27,17 +27,17 @@ def _import_neuron_table_module():
         sys.modules[package_name] = package
 
     spec = importlib.util.spec_from_file_location(
-        "napari_swc_viewer.widgets.neuron_table",
+        "napari_neuron_navigator.widgets.neuron_table",
         module_path,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["napari_swc_viewer.widgets.neuron_table"] = module
+    sys.modules["napari_neuron_navigator.widgets.neuron_table"] = module
     try:
         spec.loader.exec_module(module)
         return module
     finally:
-        sys.modules.pop("napari_swc_viewer.widgets.neuron_table", None)
+        sys.modules.pop("napari_neuron_navigator.widgets.neuron_table", None)
         if original_package is None:
             sys.modules.pop(package_name, None)
 

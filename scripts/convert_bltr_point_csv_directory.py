@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from napari_swc_viewer.point_import import (
+from napari_neuron_navigator.point_import import (
     BLTR_EXTRA_COLUMNS,
     OPTIONAL_POINT_COLUMNS,
     REQUIRED_POINT_COLUMNS,

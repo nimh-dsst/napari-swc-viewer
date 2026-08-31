@@ -12,13 +12,13 @@ from unittest.mock import MagicMock
 import numpy as np
 import pandas as pd
 
-from napari_swc_viewer.analysis.clustering import ClusterRegionSelection, ClusterResult
-from napari_swc_viewer.analysis.flatmap_correlation import (
+from napari_neuron_navigator.analysis.clustering import ClusterRegionSelection, ClusterResult
+from napari_neuron_navigator.analysis.flatmap_correlation import (
     FlatmapVoxelCorrelationSource,
 )
-from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
-from napari_swc_viewer.point_import import PointParquetAppendSummary
-from napari_swc_viewer.parquet import BatchParquetConversionSummary
+from napari_neuron_navigator.isocortex_layers import AllenIsocortexLayerMap
+from napari_neuron_navigator.point_import import PointParquetAppendSummary
+from napari_neuron_navigator.parquet import BatchParquetConversionSummary
 
 
 class _BoundSignal:
@@ -68,18 +68,18 @@ def _import_workers_module():
     qtpy_module.QtCore = qtcore_module
     previous_qtpy = sys.modules.get("qtpy")
     previous_qtcore = sys.modules.get("qtpy.QtCore")
-    previous_workers = sys.modules.get("napari_swc_viewer.workers")
+    previous_workers = sys.modules.get("napari_neuron_navigator.workers")
 
     try:
         sys.modules["qtpy"] = qtpy_module
         sys.modules["qtpy.QtCore"] = qtcore_module
-        sys.modules.pop("napari_swc_viewer.workers", None)
-        return importlib.import_module("napari_swc_viewer.workers")
+        sys.modules.pop("napari_neuron_navigator.workers", None)
+        return importlib.import_module("napari_neuron_navigator.workers")
     finally:
         if previous_workers is None:
-            sys.modules.pop("napari_swc_viewer.workers", None)
+            sys.modules.pop("napari_neuron_navigator.workers", None)
         else:
-            sys.modules["napari_swc_viewer.workers"] = previous_workers
+            sys.modules["napari_neuron_navigator.workers"] = previous_workers
 
         if previous_qtpy is None:
             sys.modules.pop("qtpy", None)
@@ -138,7 +138,7 @@ def test_cached_brainglobe_atlas_dir_finds_single_cache(tmp_path):
 
 def test_region_cache_open_worker_emits_validated_cache(monkeypatch, tmp_path):
     workers = _import_workers_module()
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     cache = object()
     opened = []
@@ -163,7 +163,7 @@ def test_region_cache_open_worker_emits_validated_cache(monkeypatch, tmp_path):
 
 def test_region_cache_open_worker_emits_validation_error(monkeypatch, tmp_path):
     workers = _import_workers_module()
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     def fail_open(_path):
         raise ValueError("manifest is corrupt")
@@ -444,7 +444,7 @@ def test_convert_worker_uses_batch_conversion_with_alignment(monkeypatch, tmp_pa
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        "napari_neuron_navigator.parquet.batch_convert_swc_to_parquet",
         fake_batch_convert_swc_to_parquet,
     )
 
@@ -516,7 +516,7 @@ def test_convert_worker_passes_cached_atlas_inputs(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        "napari_neuron_navigator.parquet.batch_convert_swc_to_parquet",
         fake_batch_convert_swc_to_parquet,
     )
 
@@ -577,15 +577,15 @@ def test_convert_worker_chains_atomic_v3_flatmap_preparation(
         return types.SimpleNamespace(rows=2, output_parquet=Path(output))
 
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        "napari_neuron_navigator.parquet.batch_convert_swc_to_parquet",
         fake_batch,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.flatmap_profiles.discover_flatmap_lookup_set",
+        "napari_neuron_navigator.flatmap_profiles.discover_flatmap_lookup_set",
         fake_discover,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.flatmap_parquet.augment_neuron_parquet_with_flatmaps",
+        "napari_neuron_navigator.flatmap_parquet.augment_neuron_parquet_with_flatmaps",
         fake_augment,
     )
     output = tmp_path / "neurons.parquet"
@@ -651,11 +651,11 @@ def test_flatmap_preparation_worker_reuses_cache_and_finishes_after_publication_
         return summary
 
     monkeypatch.setattr(
-        "napari_swc_viewer.flatmap_profiles.discover_flatmap_lookup_set",
+        "napari_neuron_navigator.flatmap_profiles.discover_flatmap_lookup_set",
         fake_discover,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.flatmap_parquet.augment_neuron_parquet_with_flatmaps",
+        "napari_neuron_navigator.flatmap_parquet.augment_neuron_parquet_with_flatmaps",
         fake_augment,
     )
     finished: list[object] = []
@@ -694,7 +694,7 @@ def test_heatmap_worker_forwards_node_type_and_radius_filters(monkeypatch):
 
     monkeypatch.setattr("duckdb.connect", lambda: _FakeConn())
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.heatmap.build_node_counts_volume",
+        "napari_neuron_navigator.analysis.heatmap.build_node_counts_volume",
         fake_build_node_counts_volume,
     )
 
@@ -766,7 +766,7 @@ def test_convert_worker_accepts_directory_source(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        "napari_neuron_navigator.parquet.batch_convert_swc_to_parquet",
         fake_batch_convert_swc_to_parquet,
     )
 
@@ -831,7 +831,7 @@ def test_convert_worker_logs_files_source_timing(monkeypatch, tmp_path, caplog):
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        "napari_neuron_navigator.parquet.batch_convert_swc_to_parquet",
         fake_batch_convert_swc_to_parquet,
     )
 
@@ -879,7 +879,7 @@ def test_convert_worker_logs_directory_source_timing(monkeypatch, tmp_path, capl
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.batch_convert_swc_to_parquet",
+        "napari_neuron_navigator.parquet.batch_convert_swc_to_parquet",
         fake_batch_convert_swc_to_parquet,
     )
 
@@ -944,19 +944,19 @@ def test_correlation_worker_uses_multi_region_mask_and_attaches_metadata(monkeyp
         return _make_cluster_result(["n1", "n2"], [1, 2])
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         fake_get_expanded_region_voxel_ids_for_regions,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.correlation.compute_pearson_correlation_matrix",
+        "napari_neuron_navigator.analysis.correlation.compute_pearson_correlation_matrix",
         fake_compute_pearson_correlation_matrix,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.correlation.correlation_long_to_matrix",
+        "napari_neuron_navigator.analysis.correlation.correlation_long_to_matrix",
         fake_correlation_long_to_matrix,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.compute_clustermap_data",
+        "napari_neuron_navigator.analysis.clustering.compute_clustermap_data",
         fake_compute_clustermap_data,
     )
     monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection())
@@ -1032,11 +1032,11 @@ def test_correlation_worker_allows_unfiltered_ccf_scope(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.correlation.compute_pearson_correlation_matrix",
+        "napari_neuron_navigator.analysis.correlation.compute_pearson_correlation_matrix",
         fake_compute_pearson,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.compute_clustermap_data",
+        "napari_neuron_navigator.analysis.clustering.compute_clustermap_data",
         lambda mat, neuron_ids, method, n_clusters: _make_cluster_result(
             list(neuron_ids), [1, 2]
         ),
@@ -1068,11 +1068,11 @@ def test_clustering_preflight_counts_with_reusable_region_map(monkeypatch):
     mask_builder = MagicMock(return_value=voxel_id_map)
     count_helper = MagicMock(return_value=500_001)
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         mask_builder,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.correlation.count_correlation_input_nodes",
+        "napari_neuron_navigator.analysis.correlation.count_correlation_input_nodes",
         count_helper,
     )
     monkeypatch.setattr("duckdb.connect", lambda: _FakeDuckConnection())
@@ -1131,8 +1131,8 @@ def test_flatmap_correlation_worker_projects_region_mask_with_sentinel_plane(
         represented_region_acronyms=["FRP1"],
     )
 
-    import napari_swc_viewer.flatmap_labels as labels_module
-    import napari_swc_viewer.flatmap_loader as loader_module
+    import napari_neuron_navigator.flatmap_labels as labels_module
+    import napari_neuron_navigator.flatmap_loader as loader_module
 
     monkeypatch.setattr(
         loader_module,
@@ -1213,8 +1213,8 @@ def test_flatmap_correlation_worker_uses_cache_without_nrrd_or_annotation(
         represented_region_ids=[68],
         represented_region_acronyms=["FRP1"],
     )
-    import napari_swc_viewer.flatmap_loader as loader_module
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_loader as loader_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     monkeypatch.setattr(
         loader_module,
@@ -1300,11 +1300,11 @@ def test_soma_cluster_worker_hierarchical_attaches_true_linkage(monkeypatch):
     SomaClusterWorker = workers.SomaClusterWorker
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
+        "napari_neuron_navigator.analysis.clustering.cluster_somas_hierarchical",
         lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(
             neuron_ids, [1, 2]
         ),
@@ -1360,7 +1360,7 @@ def test_soma_cluster_worker_filters_to_current_table_file_ids(monkeypatch):
     observed: dict[str, object] = {}
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
     )
 
@@ -1370,7 +1370,7 @@ def test_soma_cluster_worker_filters_to_current_table_file_ids(monkeypatch):
         return _make_cluster_result(list(neuron_ids), [1, 2])
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
+        "napari_neuron_navigator.analysis.clustering.cluster_somas_hierarchical",
         fake_cluster_somas_hierarchical,
     )
     monkeypatch.setattr(
@@ -1420,11 +1420,11 @@ def test_soma_cluster_worker_allows_unfiltered_ccf_scope(monkeypatch):
     SomaClusterWorker = workers.SomaClusterWorker
     mask_builder = MagicMock()
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         mask_builder,
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.query_ccf_soma_coordinates",
+        "napari_neuron_navigator.analysis.clustering.query_ccf_soma_coordinates",
         lambda parquet_path, resolution, file_ids, voxel_id_map: (
             ["n1", "n2"],
             np.array([[0.0, 0.0, 0.0], [25.0, 25.0, 25.0]]),
@@ -1432,7 +1432,7 @@ def test_soma_cluster_worker_allows_unfiltered_ccf_scope(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.cluster_somas_hierarchical",
+        "napari_neuron_navigator.analysis.clustering.cluster_somas_hierarchical",
         lambda coords, neuron_ids, method, n_clusters: _make_cluster_result(
             list(neuron_ids), [1, 2]
         ),
@@ -1464,11 +1464,11 @@ def test_soma_cluster_worker_kmeans_uses_synthesized_dendrogram_linkage(monkeypa
     SomaClusterWorker = workers.SomaClusterWorker
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.cluster_somas_kmeans",
+        "napari_neuron_navigator.analysis.clustering.cluster_somas_kmeans",
         lambda coords, neuron_ids, n_clusters: _make_cluster_result(neuron_ids, [1, 1]),
     )
     monkeypatch.setattr(
@@ -1518,11 +1518,11 @@ def test_soma_cluster_worker_dbscan_records_dbscan_parameters(monkeypatch):
     SomaClusterWorker = workers.SomaClusterWorker
 
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.mask.get_expanded_region_voxel_ids_for_regions",
+        "napari_neuron_navigator.analysis.mask.get_expanded_region_voxel_ids_for_regions",
         lambda atlas, acronyms, increase_fraction: np.zeros((4, 4, 4), dtype=np.int32),
     )
     monkeypatch.setattr(
-        "napari_swc_viewer.analysis.clustering.cluster_somas_dbscan",
+        "napari_neuron_navigator.analysis.clustering.cluster_somas_dbscan",
         lambda coords, neuron_ids, eps, min_samples: _make_cluster_result(
             neuron_ids, [1, 2]
         ),
@@ -1590,7 +1590,7 @@ def test_append_point_file_worker_routes_csv_to_append_helper(monkeypatch, tmp_p
         return PointParquetAppendSummary(appended_rows=2, total_rows=5)
 
     monkeypatch.setattr(
-        "napari_swc_viewer.point_import.append_point_csv_to_parquet",
+        "napari_neuron_navigator.point_import.append_point_csv_to_parquet",
         fake_append_point_csv_to_parquet,
     )
 
@@ -1644,7 +1644,7 @@ def test_append_point_file_worker_routes_parquet_to_append_helper(
         return PointParquetAppendSummary(appended_rows=3, total_rows=8)
 
     monkeypatch.setattr(
-        "napari_swc_viewer.point_import.append_point_parquet_to_parquet",
+        "napari_neuron_navigator.point_import.append_point_parquet_to_parquet",
         fake_append_point_parquet_to_parquet,
     )
 
@@ -1690,7 +1690,7 @@ def test_append_point_file_worker_emits_error(monkeypatch, tmp_path):
         raise ValueError("schema mismatch")
 
     monkeypatch.setattr(
-        "napari_swc_viewer.point_import.append_point_csv_to_parquet",
+        "napari_neuron_navigator.point_import.append_point_csv_to_parquet",
         fake_append_point_csv_to_parquet,
     )
 
@@ -1734,7 +1734,7 @@ def test_convert_point_csv_worker_delegates_to_batch_helper(monkeypatch, tmp_pat
         )
 
     monkeypatch.setattr(
-        "napari_swc_viewer.point_import.convert_point_csv_files_to_parquet",
+        "napari_neuron_navigator.point_import.convert_point_csv_files_to_parquet",
         fake_convert_point_csv_files_to_parquet,
     )
 
@@ -1780,7 +1780,7 @@ def test_convert_point_csv_worker_emits_error(monkeypatch, tmp_path):
         raise ValueError("bad headers")
 
     monkeypatch.setattr(
-        "napari_swc_viewer.point_import.convert_point_csv_files_to_parquet",
+        "napari_neuron_navigator.point_import.convert_point_csv_files_to_parquet",
         fake_convert_point_csv_files_to_parquet,
     )
 

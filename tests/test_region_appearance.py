@@ -5,7 +5,8 @@ import json
 import numpy as np
 import pytest
 
-from napari_swc_viewer.region_appearance import (
+from napari_neuron_navigator.region_appearance import (
+    LEGACY_REGION_PALETTE_FORMAT,
     REGION_PALETTE_FORMAT,
     EffectiveRegionAppearance,
     RegionAppearanceOverride,
@@ -132,6 +133,15 @@ def test_palette_state_round_trip(override: RegionAppearanceOverride) -> None:
     assert payload["format"] == REGION_PALETTE_FORMAT
     assert payload["overrides"] == {"3": override.to_dict()}
     assert restored == source
+
+
+def test_palette_state_accepts_pre_rename_format() -> None:
+    payload = RegionAppearanceStore(overrides={2: RegionAppearanceOverride()}).to_palette_dict()
+    payload["format"] = LEGACY_REGION_PALETTE_FORMAT
+
+    restored = RegionAppearanceStore.from_palette_dict(payload)
+
+    assert restored.region_ids == ()
 
 
 def test_palette_file_round_trip(tmp_path) -> None:

@@ -11,12 +11,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.flatmap_heatmap import flatmap_pixel_coordinates
-from napari_swc_viewer.flatmap_labels import (
+from napari_neuron_navigator.flatmap_heatmap import flatmap_pixel_coordinates
+from napari_neuron_navigator.flatmap_labels import (
     FlatmapRegionLabelsResult,
     FlatmapRegionLabelsSummary,
 )
-from napari_swc_viewer.region_appearance import (
+from napari_neuron_navigator.region_appearance import (
     RegionAppearanceOverride,
     RegionAppearanceStore,
 )
@@ -102,11 +102,11 @@ def _load_flatmap_widget_module(monkeypatch):
     module_path = (
         Path(__file__).resolve().parents[1]
         / "src"
-        / "napari_swc_viewer"
+        / "napari_neuron_navigator"
         / "widgets"
         / "flatmap.py"
     )
-    module_name = "napari_swc_viewer.widgets.flatmap_test_module"
+    module_name = "napari_neuron_navigator.widgets.flatmap_test_module"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
@@ -715,7 +715,7 @@ def test_project_cache_profile_restore_waits_for_atlas_then_selects_saved_profil
     cache = types.SimpleNamespace(
         profiles={first.profile_id: first, saved.profile_id: saved}
     )
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     monkeypatch.setattr(cache_module, "open_region_cache", lambda _path: cache)
     monkeypatch.setattr(
@@ -808,7 +808,7 @@ def test_set_cache_directory_commits_before_closing_superseded_cache(
     old_cache = _Cache("old")
     new_cache = _Cache("new")
     new_profile = types.SimpleNamespace(profile_id="new-profile")
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     monkeypatch.setattr(cache_module, "open_region_cache", lambda _path: new_cache)
     widget._region_cache_dir = Path("old-cache")
@@ -1327,9 +1327,9 @@ def _install_fake_region_label_atlas_worker(monkeypatch, module):
 
     fake_qtcore = sys.modules["qtpy.QtCore"]
     fake_qtcore.QThread = _FakeThread
-    fake_workers = types.ModuleType("napari_swc_viewer.workers")
+    fake_workers = types.ModuleType("napari_neuron_navigator.workers")
     fake_workers.AtlasLoadWorker = _FakeAtlasLoadWorker
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", fake_workers)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", fake_workers)
     return workers, threads
 
 
@@ -1674,7 +1674,7 @@ def test_add_soma_projects_only_soma_nodes_to_dedicated_layer(monkeypatch) -> No
     assert len(soma_layers) == 1
     assert widget._soma_layer is soma_layers[0]
     assert soma_layers[0].metadata["flatmap_soma_only"] is True
-    assert soma_layers[0].metadata["napari_swc_viewer_space"] == "flatmap"
+    assert soma_layers[0].metadata["napari_neuron_navigator_space"] == "flatmap"
     np.testing.assert_allclose(
         soma_layers[0].face_color,
         [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 0.5]],
@@ -2343,16 +2343,16 @@ def test_create_heatmap_layer_uses_metadata_and_3d_focus(monkeypatch) -> None:
 
     assert layer.name == "Isocortex Flatmap Heatmap"
     assert layer.metadata["projection_kind"] == "isocortex_flatmap"
-    assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
+    assert layer.metadata["napari_neuron_navigator_space"] == "flatmap"
     assert layer.metadata["flatmap_render_mode"] == "heatmap"
     assert layer.metadata["flatmap_heatmap_color_mode"] == "single"
     assert layer.metadata["render_summary"]["rendered_nodes"] == 3
     assert layer.metadata["flatmap_heatmap_contrast_limits"] == (0.0, 2.0)
     assert layer.colormap == "hot"
     assert layer.contrast_limits == (0.0, 2.0)
-    assert layer._napari_swc_flatmap_projected_nodes is projected
-    assert layer._napari_swc_flatmap_summary is summary
-    assert layer._napari_swc_flatmap_render_summary is render_summary
+    assert layer._napari_neuron_navigator_flatmap_projected_nodes is projected
+    assert layer._napari_neuron_navigator_flatmap_summary is summary
+    assert layer._napari_neuron_navigator_flatmap_render_summary is render_summary
     assert old_layer not in widget._viewer.layers
     assert widget._viewer.dims.ndisplay == 3
     assert layer.slice_dims_calls[-1] == (widget._viewer.dims, True)
@@ -3139,7 +3139,7 @@ def test_failed_vector_rerender_keeps_the_existing_flatmap_layer(monkeypatch) ->
         np.ones((2, 4, 4), dtype=np.float32),
         name=module._HEATMAP_LAYER_NAME,
         metadata={
-            "napari_swc_viewer_space": "flatmap",
+            "napari_neuron_navigator_space": "flatmap",
             "flatmap_render_mode": module._RENDER_HEATMAP,
         },
     )
@@ -3998,8 +3998,8 @@ def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None
     assert layer.name == "Flatmap Region Labels"
     np.testing.assert_array_equal(layer.data, first.labels)
     assert layer.metadata["projection_kind"] == "flatmap_region_labels"
-    assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
-    assert layer._napari_swc_flatmap_region_labels_result is first
+    assert layer.metadata["napari_neuron_navigator_space"] == "flatmap"
+    assert layer._napari_neuron_navigator_flatmap_region_labels_result is first
     assert widget._viewer.layers == [layer]
 
     second = FlatmapRegionLabelsResult(
@@ -4012,7 +4012,7 @@ def test_create_region_labels_layer_adds_and_updates_labels(monkeypatch) -> None
 
     assert updated is layer
     np.testing.assert_array_equal(layer.data, second.labels)
-    assert layer._napari_swc_flatmap_region_labels_result is second
+    assert layer._napari_neuron_navigator_flatmap_region_labels_result is second
     assert layer.refresh_count == 1
 
 
@@ -4092,7 +4092,7 @@ def test_cached_region_labels_do_not_access_nrrd_or_atlas_annotation(
             to_dict=lambda: {"labeled_bins": 2},
         ),
     )
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     captured = {}
     monkeypatch.setattr(
@@ -4197,7 +4197,7 @@ def test_cached_allen_layer_labels_create_synchronized_planar_stack(
         layer_labels=layer_map.layer_labels,
         summary=summary,
     )
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     captured = {}
     monkeypatch.setattr(
@@ -4265,7 +4265,7 @@ def test_cached_allen_layer_labels_reject_unmapped_and_clear_empty_results(
     )
     widget._selected_region_ids_provider = lambda: [99]
     widget._current_allen_layer_map = lambda: object()
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     result = types.SimpleNamespace(
         labels=np.zeros((6, 2, 2), dtype=np.int32),
@@ -4320,7 +4320,7 @@ def test_cached_depth_labels_clear_stale_layer_when_selection_has_no_occupancy(
         represented_region_ids=(),
         summary=types.SimpleNamespace(labeled_bins=0),
     )
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     monkeypatch.setattr(
         cache_module,
@@ -4408,7 +4408,7 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     fake_colormaps.Colormap = lambda colors: np.asarray(colors)
     monkeypatch.setitem(sys.modules, "napari.utils.colormaps", fake_colormaps)
 
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     materialized_surfaces = []
     materialized_outlines = []
@@ -4472,7 +4472,7 @@ def test_cached_region_geometry_uses_only_materialized_cache_arrays(
     np.testing.assert_allclose(widget._viewer.layers[2].edge_color, expected_visp)
     for layer in widget._viewer.layers:
         assert layer.metadata["source"] == "precomputed_cache"
-        assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
+        assert layer.metadata["napari_neuron_navigator_space"] == "flatmap"
         assert layer.metadata["region_selection_source"] == "custom_regions"
         assert layer.metadata["region_selection_scope"] == "current_table"
         assert layer.metadata["selected_region_ids"] == [10, 11]
@@ -4540,7 +4540,7 @@ def test_apply_region_appearance_restyles_layers_without_materializing_cache(
         opacity=0.45,
         metadata={"region_layer_kind": "flatmap_surface", "region_id": 10},
     )
-    setattr(surface, "_napari_swc_region_base_opacity", 0.45)
+    setattr(surface, "_napari_neuron_navigator_region_base_opacity", 0.45)
     outline = _DummyLayer(
         np.zeros((1, 2, 3), dtype=np.float32),
         name="Flatmap Region Outlines: VISp (10)",
@@ -4548,7 +4548,7 @@ def test_apply_region_appearance_restyles_layers_without_materializing_cache(
         opacity=0.9,
         metadata={"region_layer_kind": "flatmap_outline", "region_id": 10},
     )
-    setattr(outline, "_napari_swc_region_base_opacity", 0.9)
+    setattr(outline, "_napari_neuron_navigator_region_base_opacity", 0.9)
     widget._viewer.layers.extend([labels, surface, outline])
 
     widget.apply_region_appearance()
@@ -4631,7 +4631,7 @@ def test_apply_region_appearance_restyles_flat_labels_by_descendant_id(
     )
     setattr(
         labels,
-        "_napari_swc_flatmap_region_labels_result",
+        "_napari_neuron_navigator_flatmap_region_labels_result",
         types.SimpleNamespace(
             represented_region_ids=(1,),
             represented_source_region_ids=(2, 3),
@@ -4705,7 +4705,7 @@ def test_cached_flat_region_labels_create_a_two_dimensional_layer(monkeypatch) -
             to_dict=lambda: {"labeled_bins": 2, "output_shape": [2, 2]},
         ),
     )
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     captured = {}
     monkeypatch.setattr(
@@ -4810,7 +4810,7 @@ def test_cached_flat_region_outlines_use_only_materialized_cache_arrays(
     widget._atlas_provider = _AtlasWithoutRuntimeGeometry
     widget._set_region_labels_status = lambda _message: None
 
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     def _outline(region_id):
         return types.SimpleNamespace(
@@ -4867,7 +4867,7 @@ def test_cached_flat_region_outlines_use_only_materialized_cache_arrays(
         )
         assert layer.metadata["flatmap_plane_mode"] == module.FLATMAP_PLANE_MODE_FLAT
         assert layer.metadata["projection_kind"] == "flatmap_flat_region_outlines"
-        assert layer.metadata["napari_swc_viewer_space"] == "flatmap"
+        assert layer.metadata["napari_neuron_navigator_space"] == "flatmap"
         assert layer.metadata["planar_bin_count"] == 3
         assert layer.metadata["geometry_grouping"] == "selected_root"
         assert "scale" not in layer.init_kwargs
@@ -4932,7 +4932,7 @@ def test_empty_custom_geometry_replaces_stale_layer_families(monkeypatch) -> Non
     widget._viewer.layers.extend([stale_surface, stale_outline])
     widget._region_surfaces_layers = [stale_surface]
     widget._region_outlines_layers = [stale_outline]
-    import napari_swc_viewer.flatmap_region_cache as cache_module
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
 
     monkeypatch.setattr(
         cache_module,
@@ -4988,7 +4988,7 @@ def test_heatmap_workaround_swallows_thumbnail_rank_mismatch(monkeypatch) -> Non
     widget._install_heatmap_layer_workarounds(layer)
 
     layer._update_thumbnail()
-    assert layer._napari_swc_flatmap_thumbnail_warning_logged is True
+    assert layer._napari_neuron_navigator_flatmap_thumbnail_warning_logged is True
 
 
 def test_heatmap_workaround_keeps_stable_limits_during_3d_slice_update(
@@ -5245,7 +5245,7 @@ def test_precomputed_heatmap_uses_duckdb_fast_path(monkeypatch) -> None:
 
 
 def test_apply_precomputed_heatmap_result_single_disables_per_node(monkeypatch) -> None:
-    from napari_swc_viewer import flatmap_heatmap as fh
+    from napari_neuron_navigator import flatmap_heatmap as fh
 
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -5304,7 +5304,7 @@ def test_apply_precomputed_heatmap_result_single_disables_per_node(monkeypatch) 
 def test_apply_precomputed_heatmap_result_grouped_creates_layer_per_group(
     monkeypatch,
 ) -> None:
-    from napari_swc_viewer import flatmap_heatmap as fh
+    from napari_neuron_navigator import flatmap_heatmap as fh
 
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -5364,7 +5364,7 @@ def test_apply_precomputed_heatmap_result_grouped_creates_layer_per_group(
 def test_apply_precomputed_allen_layer_result_uses_2d_stack(
     monkeypatch,
 ) -> None:
-    from napari_swc_viewer import flatmap_heatmap as fh
+    from napari_neuron_navigator import flatmap_heatmap as fh
 
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)
@@ -5416,7 +5416,7 @@ def test_apply_precomputed_allen_layer_result_uses_2d_stack(
 def test_apply_precomputed_allen_layer_result_rejects_no_mapped_nodes(
     monkeypatch,
 ) -> None:
-    from napari_swc_viewer import flatmap_heatmap as fh
+    from napari_neuron_navigator import flatmap_heatmap as fh
 
     module = _load_flatmap_widget_module(monkeypatch)
     widget = _widget(module)

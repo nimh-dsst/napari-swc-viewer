@@ -7,14 +7,14 @@ import argparse
 from pathlib import Path
 import sys
 
-from napari_swc_viewer.flatmap_parquet import (
+from napari_neuron_navigator.flatmap_parquet import (
     DEFAULT_CCFV3_MIRROR_MIDLINE_UM,
     DEFAULT_FLATMAP_PARQUET_BATCH_SIZE,
     augment_neuron_parquet_with_flatmap,
     augment_neuron_parquet_with_flatmaps,
 )
-from napari_swc_viewer.flatmap_profiles import discover_flatmap_lookup_set
-from napari_swc_viewer.flatmap_projection import COORDINATE_MODE_MICRONS
+from napari_neuron_navigator.flatmap_profiles import discover_flatmap_lookup_set
+from napari_neuron_navigator.flatmap_projection import COORDINATE_MODE_MICRONS
 
 
 def _positive_int(value: str) -> int:

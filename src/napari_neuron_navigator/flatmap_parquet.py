@@ -36,7 +36,8 @@ from .flatmap_projection import (
     resolve_flatmap_mirror_midline,
 )
 
-FLATMAP_PARQUET_METADATA_KEY = b"napari_swc_viewer.flatmap_projection_json"
+FLATMAP_PARQUET_METADATA_KEY = b"napari_neuron_navigator.flatmap_projection_json"
+LEGACY_FLATMAP_PARQUET_METADATA_KEY = b"napari_swc_viewer.flatmap_projection_json"
 FLATMAP_PARQUET_FORMAT_VERSION = 3
 LEGACY_SINGLE_FLATMAP_PARQUET_FORMAT_VERSION = 2
 DEFAULT_CCFV3_MIRROR_MIDLINE_UM = _DEFAULT_CCFV3_MIRROR_MIDLINE_UM
@@ -237,6 +238,8 @@ def _decode_flatmap_projection_metadata(
     metadata: dict[bytes, bytes],
 ) -> dict[str, Any] | None:
     raw = metadata.get(FLATMAP_PARQUET_METADATA_KEY)
+    if raw is None:
+        raw = metadata.get(LEGACY_FLATMAP_PARQUET_METADATA_KEY)
     if raw is None:
         return None
     try:
@@ -496,7 +499,7 @@ def _schema_metadata(
 ) -> dict[bytes, bytes]:
     metadata = dict(source_metadata)
     payload = {
-        "format": "napari_swc_viewer.flatmap_projection",
+        "format": "napari_neuron_navigator.flatmap_projection",
         "version": LEGACY_SINGLE_FLATMAP_PARQUET_FORMAT_VERSION,
         "source_parquet": _source_signature(source_parquet),
         "flatmap_nrrd": _source_signature(flatmap_path),
@@ -549,7 +552,7 @@ def _v3_schema_metadata(
     metadata = dict(source_metadata)
     shaped_grid = lookup_set.shaped_grid
     payload = {
-        "format": "napari_swc_viewer.flatmap_projection",
+        "format": "napari_neuron_navigator.flatmap_projection",
         "version": FLATMAP_PARQUET_FORMAT_VERSION,
         "lookup_set_id": lookup_set.lookup_set_id,
         "lookup_set": lookup_set.to_dict(include_paths=True),

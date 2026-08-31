@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from napari_swc_viewer.analysis.clustering import ClusterResult
+from napari_neuron_navigator.analysis.clustering import ClusterResult
 
 
 def _make_cluster_result(neuron_ids, labels):
@@ -26,7 +26,7 @@ class TestColorByClusterLines:
 
     def test_single_layer_edge_colors_updated(self):
         """Cluster colors are applied as per-segment edge_color array."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
 
@@ -65,7 +65,7 @@ class TestColorByClusterLines:
 
     def test_unrecognized_neuron_gets_default_color(self):
         """Neurons not in the cluster result receive a grey default."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         lines_layer = MagicMock()
@@ -97,7 +97,7 @@ class TestColorByClusterLines:
 
     def test_no_lines_layer_returns_empty_render_summary(self):
         """No rendered layers should return a zeroed color-application summary."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         viewer.layers = []
@@ -124,7 +124,7 @@ class TestCustomColorsSmallClusters:
 
     def test_two_clusters_get_distinct_custom_colors(self):
         """With n_clusters=2, neurons get explicit blue and red."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         lines_layer = MagicMock()
@@ -163,7 +163,7 @@ class TestCustomColorsSmallClusters:
 
     def test_three_clusters_get_distinct_custom_colors(self):
         """With n_clusters=3, neurons get explicit blue, red, green."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         lines_layer = MagicMock()
@@ -210,7 +210,7 @@ class TestCustomColorsSmallClusters:
 
     def test_fewer_clusters_than_requested(self):
         """When fcluster returns fewer clusters than asked, colors still work."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         lines_layer = MagicMock()
@@ -248,7 +248,7 @@ class TestCustomColorsSmallClusters:
 
     def test_all_same_cluster(self):
         """When all neurons land in one cluster, no crash and single color."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         lines_layer = MagicMock()
@@ -290,7 +290,7 @@ class TestColorByClusterPoints:
 
     def test_single_layer_face_colors_updated(self):
         """Cluster colors are applied as per-point face_color array."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         points_layer = MagicMock()
@@ -325,7 +325,7 @@ class TestColorByClusterBothLayers:
 
     def test_both_layers_counted(self):
         """Color summary counts both updated layers and one rendered neuron."""
-        from napari_swc_viewer.widgets.analysis_tab import AnalysisTabWidget
+        from napari_neuron_navigator.widgets.analysis_tab import AnalysisTabWidget
 
         viewer = MagicMock()
         lines_layer = MagicMock()
@@ -363,7 +363,7 @@ class TestSliceProjectorColorUpdate:
 
     def test_update_neuron_colors_changes_source_data(self):
         """update_neuron_colors updates stored colors and triggers rebuild."""
-        from napari_swc_viewer.widgets.slice_projection import NeuronSliceProjector
+        from napari_neuron_navigator.widgets.slice_projection import NeuronSliceProjector
 
         viewer = MagicMock()
         viewer.dims.ndisplay = 3
@@ -403,7 +403,7 @@ class TestSliceProjectorColorUpdate:
 
     def test_update_neuron_colors_skips_unknown(self):
         """Neurons not in source_data are silently ignored."""
-        from napari_swc_viewer.widgets.slice_projection import NeuronSliceProjector
+        from napari_neuron_navigator.widgets.slice_projection import NeuronSliceProjector
 
         projector = NeuronSliceProjector.__new__(NeuronSliceProjector)
         projector._enabled = False
@@ -425,7 +425,7 @@ class TestSliceProjectorColorUpdate:
 
     def test_update_no_change_skips_rebuild(self):
         """If color hasn't changed, _rebuild_arrays is not called again."""
-        from napari_swc_viewer.widgets.slice_projection import NeuronSliceProjector
+        from napari_neuron_navigator.widgets.slice_projection import NeuronSliceProjector
 
         projector = NeuronSliceProjector.__new__(NeuronSliceProjector)
         projector._enabled = False
@@ -473,7 +473,7 @@ class TestLayerMetadata:
 
 def _make_projector(**overrides):
     """Create a NeuronSliceProjector via __new__ with sensible defaults."""
-    from napari_swc_viewer.widgets.slice_projection import NeuronSliceProjector
+    from napari_neuron_navigator.widgets.slice_projection import NeuronSliceProjector
 
     proj = NeuronSliceProjector.__new__(NeuronSliceProjector)
     proj._viewer = MagicMock()

@@ -1223,7 +1223,7 @@ def comparison_provenance(
 ) -> dict[str, Any]:
     """Return the JSON sidecar payload for one exported board."""
     return {
-        "format": "napari_swc_viewer.comparison_board",
+        "format": "napari_neuron_navigator.comparison_board",
         "version": COMPARISON_EXPORT_VERSION,
         "source_parquet": source_parquet,
         "source_signature": dict(source_signature or {}),

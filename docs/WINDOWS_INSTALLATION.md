@@ -1,9 +1,9 @@
-# Windows Installation Guide for napari-swc-viewer
+# Windows Installation Guide for napari-neuron-navigator
 
-This guide installs `napari-swc-viewer` into a standard folder:
+This guide installs `napari-neuron-navigator` into a standard folder:
 
 ```text
-%USERPROFILE%\repos\napari-swc-viewer
+%USERPROFILE%\repos\napari-neuron-navigator
 ```
 
 `%USERPROFILE%` means your Windows home folder, usually something like:
@@ -219,7 +219,7 @@ The repository is public. You do not need special GitHub permission to download 
 1. Open a web browser.
 2. Go to:
 
-   <https://github.com/nimh-dsst/napari-swc-viewer>
+   <https://github.com/nimh-dsst/napari-neuron-navigator>
 
 3. Click the green `Code` button.
 4. Choose either `HTTPS` or `SSH`.
@@ -231,13 +231,13 @@ Use `HTTPS` unless you already know that SSH keys are set up for your GitHub acc
 In PowerShell, make sure you are in `%USERPROFILE%\repos`, then run:
 
 ```powershell
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
 ```
 
 Then enter the repository folder:
 
 ```powershell
-Set-Location "$env:USERPROFILE\repos\napari-swc-viewer"
+Set-Location "$env:USERPROFILE\repos\napari-neuron-navigator"
 ```
 
 ### Alternative: Clone with SSH
@@ -245,24 +245,24 @@ Set-Location "$env:USERPROFILE\repos\napari-swc-viewer"
 Only use SSH if your GitHub SSH keys are already configured.
 
 ```powershell
-git clone git@github.com:nimh-dsst/napari-swc-viewer.git
-Set-Location "$env:USERPROFILE\repos\napari-swc-viewer"
+git clone git@github.com:nimh-dsst/napari-neuron-navigator.git
+Set-Location "$env:USERPROFILE\repos\napari-neuron-navigator"
 ```
 
 ### Command Prompt Version
 
 ```bat
 cd /d "%USERPROFILE%\repos"
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
-cd /d "%USERPROFILE%\repos\napari-swc-viewer"
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
+cd /d "%USERPROFILE%\repos\napari-neuron-navigator"
 ```
 
 ### Git Bash Version
 
 ```bash
 cd ~/repos
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
-cd ~/repos/napari-swc-viewer
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
+cd ~/repos/napari-neuron-navigator
 ```
 
 ### Confirm the Clone Worked
@@ -330,7 +330,7 @@ Pixi should add that folder to your `PATH`. Restarting Windows can also help Win
 Run:
 
 ```powershell
-Set-Location "$env:USERPROFILE\repos\napari-swc-viewer"
+Set-Location "$env:USERPROFILE\repos\napari-neuron-navigator"
 pixi run napari
 ```
 
@@ -339,7 +339,7 @@ pixi run napari
 Run:
 
 ```bat
-cd /d "%USERPROFILE%\repos\napari-swc-viewer"
+cd /d "%USERPROFILE%\repos\napari-neuron-navigator"
 pixi run napari
 ```
 
@@ -348,7 +348,7 @@ pixi run napari
 Run:
 
 ```bash
-cd ~/repos/napari-swc-viewer
+cd ~/repos/napari-neuron-navigator
 pixi run napari
 ```
 
@@ -372,23 +372,23 @@ For non-developers, the BAT file is usually easiest because it can be double-cli
 In PowerShell, run:
 
 ```powershell
-Copy-Item "$env:USERPROFILE\repos\napari-swc-viewer\run_scripts\run_napari.bat" "$env:USERPROFILE\Desktop\Run napari SWC Viewer.bat"
+Copy-Item "$env:USERPROFILE\repos\napari-neuron-navigator\run_scripts\run_napari.bat" "$env:USERPROFILE\Desktop\Run napari Neuron Navigator.bat"
 ```
 
-Double-click `Run napari SWC Viewer.bat` on your Desktop.
+Double-click `Run napari Neuron Navigator.bat` on your Desktop.
 
 ### Copy the PowerShell Launcher to the Desktop
 
 In PowerShell, run:
 
 ```powershell
-Copy-Item "$env:USERPROFILE\repos\napari-swc-viewer\run_scripts\run_napari.ps1" "$env:USERPROFILE\Desktop\Run napari SWC Viewer.ps1"
+Copy-Item "$env:USERPROFILE\repos\napari-neuron-navigator\run_scripts\run_napari.ps1" "$env:USERPROFILE\Desktop\Run napari Neuron Navigator.ps1"
 ```
 
 To run it from PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Desktop\Run napari SWC Viewer.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Desktop\Run napari Neuron Navigator.ps1"
 ```
 
 If double-clicking the `.ps1` file opens it in Notepad instead of running it, use the BAT launcher or run the PowerShell command above.
@@ -398,7 +398,7 @@ If double-clicking the `.ps1` file opens it in Notepad instead of running it, us
 To get the newest public version from GitHub later:
 
 ```powershell
-Set-Location "$env:USERPROFILE\repos\napari-swc-viewer"
+Set-Location "$env:USERPROFILE\repos\napari-neuron-navigator"
 git pull
 pixi run napari
 ```
@@ -410,13 +410,13 @@ pixi run napari
 If this command:
 
 ```powershell
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
 ```
 
 says the folder already exists, the repository may already be downloaded. Try:
 
 ```powershell
-Set-Location "$env:USERPROFILE\repos\napari-swc-viewer"
+Set-Location "$env:USERPROFILE\repos\napari-neuron-navigator"
 git pull
 ```
 
@@ -425,13 +425,13 @@ git pull
 If this command fails:
 
 ```powershell
-git clone git@github.com:nimh-dsst/napari-swc-viewer.git
+git clone git@github.com:nimh-dsst/napari-neuron-navigator.git
 ```
 
 use HTTPS instead:
 
 ```powershell
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
 ```
 
 ### Pixi Takes a Long Time the First Time
@@ -443,14 +443,14 @@ That is expected. The first `pixi run napari` has to create the environment and 
 The launchers assume this exact folder:
 
 ```text
-%USERPROFILE%\repos\napari-swc-viewer
+%USERPROFILE%\repos\napari-neuron-navigator
 ```
 
 If you cloned the repository somewhere else, either move it to that folder or edit the launcher script to use your actual path.
 
 ## Reference Links
 
-- Project repository: <https://github.com/nimh-dsst/napari-swc-viewer>
+- Project repository: <https://github.com/nimh-dsst/napari-neuron-navigator>
 - Pixi installation: <https://pixi.prefix.dev/latest/installation/>
 - Git for Windows: <https://gitforwindows.org/>
 - Git installation guide: <https://git-scm.com/book/en/v2/Getting-Started-Installing-Git>

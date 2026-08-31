@@ -6,7 +6,7 @@ import logging
 
 import numpy as np
 
-from napari_swc_viewer.analysis.clustering import (
+from napari_neuron_navigator.analysis.clustering import (
     cluster_somas_hierarchical,
     compute_linkage,
 )
@@ -23,7 +23,7 @@ def test_compute_linkage_emits_debug_phase_logs(caplog) -> None:
         dtype=np.float32,
     )
 
-    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.analysis.clustering"):
+    with caplog.at_level(logging.DEBUG, logger="napari_neuron_navigator.analysis.clustering"):
         linkage_matrix = compute_linkage(dist, method="average")
 
     assert linkage_matrix.shape == (2, 4)
@@ -46,7 +46,7 @@ def test_cluster_somas_hierarchical_emits_debug_phase_logs(caplog) -> None:
     )
     neuron_ids = ["n1", "n2", "n3", "n4"]
 
-    with caplog.at_level(logging.DEBUG, logger="napari_swc_viewer.analysis.clustering"):
+    with caplog.at_level(logging.DEBUG, logger="napari_neuron_navigator.analysis.clustering"):
         result = cluster_somas_hierarchical(
             coords,
             neuron_ids,

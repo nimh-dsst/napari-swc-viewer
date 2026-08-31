@@ -13,13 +13,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.analysis.flatmap_correlation import (
+from napari_neuron_navigator.analysis.flatmap_correlation import (
     compute_flatmap_voxel_correlation_from_parquet,
     count_flatmap_voxel_correlation_nodes,
     query_flatmap_soma_coordinates,
     query_flatmap_soma_coordinates_and_count,
 )
-from napari_swc_viewer.flatmap_parquet import read_flatmap_parquet_transform_info
+from napari_neuron_navigator.flatmap_parquet import read_flatmap_parquet_transform_info
 
 
 _V3_COLUMNS = (
@@ -268,7 +268,7 @@ def test_collapse_depth_merges_layers_at_one_flatmap_position(
     Uncollapsed they occupy disjoint voxels, so the correlation cannot see that
     they cover the same part of the cortical sheet.
     """
-    from napari_swc_viewer.analysis.flatmap_correlation import (
+    from napari_neuron_navigator.analysis.flatmap_correlation import (
         pearson_correlation_from_counts,
     )
 
@@ -318,7 +318,7 @@ def test_collapse_depth_preflight_count_matches_the_run(layered_parquet) -> None
 
 def test_count_matrix_rejects_3d_shape_without_depth_bins() -> None:
     """A 3-D volume needs a depth_bin column; the rank decides, not the column."""
-    from napari_swc_viewer.analysis.flatmap_correlation import (
+    from napari_neuron_navigator.analysis.flatmap_correlation import (
         build_flatmap_count_matrix_from_bin_counts,
     )
 
@@ -348,7 +348,7 @@ def test_count_matrix_rejects_3d_shape_without_depth_bins() -> None:
 
 
 def test_count_matrix_rejects_unsupported_volume_rank() -> None:
-    from napari_swc_viewer.analysis.flatmap_correlation import (
+    from napari_neuron_navigator.analysis.flatmap_correlation import (
         build_flatmap_count_matrix_from_bin_counts,
     )
 
@@ -413,7 +413,7 @@ def test_flatmap_preflight_counts_exact_contributing_nodes(flatmap_parquet) -> N
 
 
 def test_flatmap_parquet_correlation_worker(flatmap_parquet) -> None:
-    from napari_swc_viewer import workers
+    from napari_neuron_navigator import workers
 
     _frame, path = flatmap_parquet
     finished: list = []
@@ -442,7 +442,7 @@ def test_flatmap_correlation_worker_records_collapse_provenance(
     layered_parquet,
 ) -> None:
     """A collapsed run must be identifiable from its recorded metadata."""
-    from napari_swc_viewer import workers
+    from napari_neuron_navigator import workers
 
     _frame, path = layered_parquet
     finished: list = []
@@ -471,7 +471,7 @@ def test_flatmap_correlation_worker_records_collapse_provenance(
 
 
 def test_flatmap_soma_cluster_worker(flatmap_parquet) -> None:
-    from napari_swc_viewer import workers
+    from napari_neuron_navigator import workers
 
     _frame, path = flatmap_parquet
     finished: list = []

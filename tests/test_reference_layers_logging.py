@@ -10,12 +10,12 @@ import types
 
 import numpy as np
 
-from napari_swc_viewer.region_appearance import (
+from napari_neuron_navigator.region_appearance import (
     RegionAppearanceOverride,
     RegionAppearanceStore,
 )
 
-from napari_swc_viewer.isocortex_layers import CustomRegionSelectionGroup
+from napari_neuron_navigator.isocortex_layers import CustomRegionSelectionGroup
 
 
 def _import_reference_layers_module():
@@ -23,12 +23,12 @@ def _import_reference_layers_module():
     module_path = (
         Path(__file__).resolve().parent.parent
         / "src"
-        / "napari_swc_viewer"
+        / "napari_neuron_navigator"
         / "widgets"
         / "reference_layers.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "napari_swc_viewer.widgets.reference_layers_test_module",
+        "napari_neuron_navigator.widgets.reference_layers_test_module",
         module_path,
     )
     assert spec is not None

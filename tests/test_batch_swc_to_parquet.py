@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-import napari_swc_viewer.parquet as parquet_module
-from napari_swc_viewer.db import NeuronDatabase
-from napari_swc_viewer.parquet import (
+import napari_neuron_navigator.parquet as parquet_module
+from napari_neuron_navigator.db import NeuronDatabase
+from napari_neuron_navigator.parquet import (
     NEURON_SCHEMA,
     batch_convert_swc_to_parquet,
     swc_files_to_parquet,
@@ -52,7 +52,7 @@ class _InlineProcessPoolExecutor:
 def _install_inline_process_pool(monkeypatch) -> None:
     """Route the parallel code path through a synchronous fake executor."""
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.ProcessPoolExecutor",
+        "napari_neuron_navigator.parquet.ProcessPoolExecutor",
         _InlineProcessPoolExecutor,
     )
 
@@ -126,10 +126,10 @@ def _install_fake_annotation(monkeypatch, seen_coords: list[np.ndarray] | None =
             seen_coords.append(coords.copy())
         return np.where(coords[:, 2] > 50.0, 11, 5)
 
-    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fake_setup_allen_sdk)
-    monkeypatch.setattr("napari_swc_viewer.parquet.build_region_lookup", fake_build_region_lookup)
+    monkeypatch.setattr("napari_neuron_navigator.parquet.setup_allen_sdk", fake_setup_allen_sdk)
+    monkeypatch.setattr("napari_neuron_navigator.parquet.build_region_lookup", fake_build_region_lookup)
     monkeypatch.setattr(
-        "napari_swc_viewer.parquet.get_region_ids_vectorized",
+        "napari_neuron_navigator.parquet.get_region_ids_vectorized",
         fake_get_region_ids_vectorized,
     )
 
@@ -202,7 +202,7 @@ def test_batch_convert_empty_directory_skips_atlas_setup(tmp_path, monkeypatch):
     def fail_setup_allen_sdk(*_args, **_kwargs):
         raise AssertionError("setup_allen_sdk should not run for an empty directory")
 
-    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fail_setup_allen_sdk)
+    monkeypatch.setattr("napari_neuron_navigator.parquet.setup_allen_sdk", fail_setup_allen_sdk)
 
     events: list[tuple[str, int, int]] = []
     summary = batch_convert_swc_to_parquet(
@@ -260,7 +260,7 @@ def test_batch_convert_uses_provided_annotation_inputs(tmp_path, monkeypatch, ca
     def fail_setup_allen_sdk(*_args, **_kwargs):
         raise AssertionError("setup_allen_sdk should not run with cached inputs")
 
-    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fail_setup_allen_sdk)
+    monkeypatch.setattr("napari_neuron_navigator.parquet.setup_allen_sdk", fail_setup_allen_sdk)
     annotation = np.zeros((8, 8, 8), dtype=np.int32)
     annotation[0, 0, 0] = 5
     region_lookup = {
@@ -534,7 +534,7 @@ def test_batch_convert_annotate_regions_uses_truncation_lookup(tmp_path, monkeyp
         annotation[0, 0, 2] = 11
         return None, annotation, _BoundaryStructureTree()
 
-    monkeypatch.setattr("napari_swc_viewer.parquet.setup_allen_sdk", fake_setup_allen_sdk)
+    monkeypatch.setattr("napari_neuron_navigator.parquet.setup_allen_sdk", fake_setup_allen_sdk)
 
     input_dir = tmp_path / "input"
     input_dir.mkdir()
@@ -738,7 +738,7 @@ def test_swc_files_to_parquet_delegates_to_batch_converter(monkeypatch, tmp_path
         calls["n_workers"] = n_workers
         return type("Summary", (), {"processed_files": 7})()
 
-    monkeypatch.setattr("napari_swc_viewer.parquet.batch_convert_swc_to_parquet", fake_batch_convert)
+    monkeypatch.setattr("napari_neuron_navigator.parquet.batch_convert_swc_to_parquet", fake_batch_convert)
 
     processed = swc_files_to_parquet(
         tmp_path / "input",

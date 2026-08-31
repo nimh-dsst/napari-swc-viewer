@@ -170,7 +170,7 @@ def flip_all_to_right_hemisphere(swc_paths: list[Path]) -> list[Path]:
 
     from brainglobe_atlasapi import BrainGlobeAtlas
 
-    from napari_swc_viewer import (
+    from napari_neuron_navigator import (
         Hemisphere,
         detect_soma_hemisphere,
         flip_swc,
@@ -244,7 +244,7 @@ def convert_to_parquet(swc_dir: Path) -> Path:
         logger.info(f"[Parquet] Already exists: {PARQUET_PATH}")
         return PARQUET_PATH
 
-    from napari_swc_viewer.parquet import swc_files_to_parquet
+    from napari_neuron_navigator.parquet import swc_files_to_parquet
 
     logger.info(f"[Parquet] Converting SWC files in {swc_dir} to {PARQUET_PATH}...")
     t0 = time.perf_counter()
@@ -264,8 +264,8 @@ def convert_to_parquet(swc_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 def benchmark_projection(parquet_path: Path) -> None:
     """Load neuron data from parquet and benchmark slice projection."""
-    from napari_swc_viewer.db import NeuronDatabase
-    from napari_swc_viewer.widgets.slice_projection import NeuronSliceProjector
+    from napari_neuron_navigator.db import NeuronDatabase
+    from napari_neuron_navigator.widgets.slice_projection import NeuronSliceProjector
     from unittest.mock import MagicMock
 
     logger.info("[Benchmark] Loading neuron data from parquet...")

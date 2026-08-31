@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.db import NeuronDatabase
-from napari_swc_viewer.swc import NodeType
-from napari_swc_viewer.terminals import (
+from napari_neuron_navigator.db import NeuronDatabase
+from napari_neuron_navigator.swc import NodeType
+from napari_neuron_navigator.terminals import (
     TerminusCoverage,
     build_terminus_sql,
     childless_mask,

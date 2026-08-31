@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit
 
 
 BIL_DOI_URL = "https://doi.brainimagelibrary.org/doi/10.35077/g.73"
-USER_AGENT = "napari-swc-viewer-cpd2-downloader/1.0"
+USER_AGENT = "napari-neuron-navigator-cpd2-downloader/1.0"
 
 # Generated from the current cpd2.parquet file_id values by replacing the
 # locally aligned "_reg_right.swc" suffix with the BIL source "_reg.swc" suffix.

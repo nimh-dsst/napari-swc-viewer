@@ -1,7 +1,7 @@
 """Tests for pure neuron-table helper logic."""
 
-from napari_swc_viewer.neuron_palette import neuron_palette
-from napari_swc_viewer.neuron_table_ops import (
+from napari_neuron_navigator.neuron_palette import neuron_palette
+from napari_neuron_navigator.neuron_table_ops import (
     ClusterFilterSelection,
     GRAY_RGBA,
     NeuronTableSummary,

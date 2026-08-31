@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from napari_swc_viewer.flatmap_heatmap import (
+from napari_neuron_navigator.flatmap_heatmap import (
     DEFAULT_FLATMAP_Y_BINS,
     MAX_FLATMAP_Y_BINS,
     FlatmapBinCounts,

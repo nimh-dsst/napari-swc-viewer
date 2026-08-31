@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from napari_swc_viewer.flatmap_labels import build_flatmap_region_label_volume
+from napari_neuron_navigator.flatmap_labels import build_flatmap_region_label_volume
 
 
 def _grid_volumes(

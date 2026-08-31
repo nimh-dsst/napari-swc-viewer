@@ -7,7 +7,7 @@ The test_data/ directory contains Allen CCF-registered files.
 """
 
 from pathlib import Path
-from napari_swc_viewer import swc_files_to_parquet, get_parquet_summary
+from napari_neuron_navigator import swc_files_to_parquet, get_parquet_summary
 
 # Use test_data which contains Allen CCF-registered coordinates
 # SWC files in example_data_aligned may be in original image space

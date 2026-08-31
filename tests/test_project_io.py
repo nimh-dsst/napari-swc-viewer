@@ -12,11 +12,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import napari_swc_viewer.project_io as project_io_module
-from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
-from napari_swc_viewer.project_io import (
-    PROJECT_BUNDLE_FORMAT,
+import napari_neuron_navigator.project_io as project_io_module
+from napari_neuron_navigator.cluster_assignments import ClusterAssignmentStore
+from napari_neuron_navigator.project_io import (
     ENHANCED_NEURON_COLUMNS,
+    LEGACY_PROJECT_BUNDLE_FORMAT,
+    LEGACY_PROJECT_METADATA_PREFIX,
+    PROJECT_BUNDLE_FORMAT,
     export_enhanced_neuron_parquet,
     export_filtered_project_neuron_parquet,
     is_recognized_project_bundle,
@@ -70,7 +72,7 @@ def _add_flatmap_v3_schema_metadata(path: Path) -> dict[bytes, bytes]:
     """Attach representative v3 and custom Arrow metadata to a fixture."""
     table = pq.read_table(path)
     metadata = {
-        b"napari_swc_viewer.flatmap_projection_json": (
+        b"napari_neuron_navigator.flatmap_projection_json": (
             b'{"version":3,"lookup_set_id":"lookup-test"}'
         ),
         b"custom.dataset_metadata": b"must-survive",
@@ -373,9 +375,27 @@ def test_read_enhanced_parquet_metadata_imports_legacy_cluster_id(
     assert entries == {"n1": 4, "n2": 9}
 
 
+def test_read_enhanced_parquet_metadata_accepts_pre_rename_namespace(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-namespace.parquet"
+    _write_source_parquet(source)
+    table = pq.read_table(source)
+    metadata = dict(table.schema.metadata or {})
+    metadata[f"{LEGACY_PROJECT_METADATA_PREFIX}metadata_json".encode()] = (
+        json.dumps({"version": "2", "table_state": _table_state()}).encode()
+    )
+    pq.write_table(table.replace_schema_metadata(metadata), source)
+
+    payload = read_enhanced_parquet_metadata(source)
+
+    assert payload["has_project_metadata"] is True
+    assert payload["table_state"] == _table_state()
+
+
 def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_three_neuron_source_parquet(source)
 
     save_project_bundle(
@@ -396,14 +416,14 @@ def test_save_project_bundle_writes_only_current_table_neurons(tmp_path: Path) -
     assert saved.loc[
         saved["file_id"] == "n1", "cluster_assignment"
     ].unique().tolist() == [2]
-    assert not list(tmp_path.glob(".saved.swcv.*.staging"))
+    assert not list(tmp_path.glob(".saved.nnproj.*.staging"))
 
 
 def test_save_project_bundle_rejects_existing_destination_without_changes(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_source_parquet(source)
     save_project_bundle(
         bundle_path,
@@ -427,7 +447,7 @@ def test_save_project_bundle_rejects_existing_destination_without_changes(
 
 def test_save_project_bundle_overwrite_replaces_entire_bundle(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_source_parquet(source)
     stale_layer = _DummyLayer(
         name="Stale Heatmap",
@@ -454,14 +474,14 @@ def test_save_project_bundle_overwrite_replaces_entire_bundle(tmp_path: Path) ->
     assert loaded.layers == ()
     assert not (bundle_path / "stale.txt").exists()
     assert not any((bundle_path / "layers").iterdir())
-    assert not list(tmp_path.glob(".saved.swcv.*.rollback"))
+    assert not list(tmp_path.glob(".saved.nnproj.*.rollback"))
 
 
 def test_save_project_bundle_overwrites_project_using_its_bundled_source(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_source_parquet(source)
     save_project_bundle(
         bundle_path,
@@ -487,10 +507,10 @@ def test_project_overwrite_rejects_unrecognized_file_and_directory_targets(
 ) -> None:
     source = tmp_path / "source.parquet"
     _write_source_parquet(source)
-    missing = tmp_path / "missing.swcv"
-    file_target = tmp_path / "file.swcv"
+    missing = tmp_path / "missing.nnproj"
+    file_target = tmp_path / "file.nnproj"
     file_target.write_text("not a project")
-    directory_target = tmp_path / "directory.swcv"
+    directory_target = tmp_path / "directory.nnproj"
     directory_target.mkdir()
     (directory_target / "keep.txt").write_text("unrelated")
 
@@ -523,8 +543,8 @@ def test_project_overwrite_rejects_unrecognized_file_and_directory_targets(
 
 def test_project_overwrite_rejects_symlink_target(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
-    symlink_path = tmp_path / "linked.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
+    symlink_path = tmp_path / "linked.nnproj"
     _write_source_parquet(source)
     save_project_bundle(
         bundle_path,
@@ -553,7 +573,7 @@ def test_project_overwrite_staging_failure_keeps_original(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_source_parquet(source)
     save_project_bundle(
         bundle_path,
@@ -581,7 +601,7 @@ def test_project_overwrite_staging_failure_keeps_original(
 
     assert sentinel.read_text() == "original"
     assert is_recognized_project_bundle(bundle_path)
-    assert not list(tmp_path.glob(".saved.swcv.*.staging"))
+    assert not list(tmp_path.glob(".saved.nnproj.*.staging"))
 
 
 def test_project_overwrite_publication_failure_restores_original(
@@ -589,7 +609,7 @@ def test_project_overwrite_publication_failure_restores_original(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_source_parquet(source)
     save_project_bundle(
         bundle_path,
@@ -616,15 +636,15 @@ def test_project_overwrite_publication_failure_restores_original(
 
     assert sentinel.read_text() == "original"
     assert is_recognized_project_bundle(bundle_path)
-    assert not list(tmp_path.glob(".saved.swcv.*.staging"))
-    assert not list(tmp_path.glob(".saved.swcv.*.rollback"))
+    assert not list(tmp_path.glob(".saved.nnproj.*.staging"))
+    assert not list(tmp_path.glob(".saved.nnproj.*.rollback"))
 
 
 def test_load_project_bundle_accepts_version_one_manifest_and_table_state(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "legacy.swcv"
+    bundle_path = tmp_path / "legacy.nnproj"
     _write_source_parquet(source)
     save_project_bundle(
         bundle_path,
@@ -645,11 +665,41 @@ def test_load_project_bundle_accepts_version_one_manifest_and_table_state(
     assert bundle.comparison_board is None
 
 
+def test_load_and_overwrite_accept_pre_rename_project_bundle(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    bundle_path = tmp_path / "legacy.swcv"
+    _write_source_parquet(source)
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=source,
+        table_state=_table_state(),
+        layers=[],
+    )
+    manifest_path = bundle_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["format"] = LEGACY_PROJECT_BUNDLE_FORMAT
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert is_recognized_project_bundle(bundle_path)
+    assert load_project_bundle(bundle_path).manifest["format"] == (
+        LEGACY_PROJECT_BUNDLE_FORMAT
+    )
+
+    save_project_bundle(
+        bundle_path,
+        source_parquet_path=bundle_path / "data" / "source_neurons.parquet",
+        table_state=_table_state(),
+        layers=[],
+        overwrite=True,
+    )
+    assert load_project_bundle(bundle_path).manifest["format"] == PROJECT_BUNDLE_FORMAT
+
+
 def test_project_bundle_round_trips_comparison_board_and_heatmap_source_ids(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "comparison.swcv"
+    bundle_path = tmp_path / "comparison.nnproj"
     _write_source_parquet(source)
     heatmap = _DummyLayer(
         name="Cluster 3 Heatmap",
@@ -722,7 +772,7 @@ def test_project_bundle_filters_v2_assignments_to_current_membership(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_three_neuron_source_parquet(source)
     state = _multi_assignment_table_state()
     state["entries"] = state["entries"][:2]
@@ -750,7 +800,7 @@ def test_project_bundle_keeps_collision_resolved_assignment_column_stable(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     reexported = tmp_path / "reexported.parquet"
     _write_three_neuron_source_parquet(source)
     frame = pd.read_parquet(source)
@@ -781,7 +831,7 @@ def test_project_bundle_keeps_collision_resolved_assignment_column_stable(
 
 def test_save_project_bundle_replaces_existing_enhanced_columns(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_three_neuron_source_parquet(source)
     source_df = pd.read_parquet(source)
     source_df["neuron_label"] = "old"
@@ -812,7 +862,7 @@ def test_save_project_bundle_manifest_records_filtered_source_provenance(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_three_neuron_source_parquet(source)
 
     save_project_bundle(
@@ -840,7 +890,7 @@ def test_project_bundle_references_external_flatmap_cache_without_copying_it(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     cache_path = tmp_path / "shared-flatmap-cache"
     cache_path.mkdir()
     (cache_path / "flatmap-region-cache.json").write_text("{}\n")
@@ -866,10 +916,10 @@ def test_project_bundle_references_external_flatmap_cache_without_copying_it(
 
 def test_project_bundle_round_trips_region_appearance(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_three_neuron_source_parquet(source)
     appearance = {
-        "format": "napari_swc_viewer.region_palette",
+        "format": "napari_neuron_navigator.region_palette",
         "version": 1,
         "atlas": {"name": "allen_mouse_25um", "version": "1.2"},
         "overrides": {
@@ -896,7 +946,7 @@ def test_project_bundle_round_trips_region_appearance(tmp_path: Path) -> None:
 
 def test_save_project_bundle_rejects_empty_table(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "empty.swcv"
+    bundle_path = tmp_path / "empty.nnproj"
     _write_source_parquet(source)
 
     with pytest.raises(ValueError, match="at least one neuron"):
@@ -914,7 +964,7 @@ def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.parquet"
-    bundle_path = tmp_path / "saved.swcv"
+    bundle_path = tmp_path / "saved.nnproj"
     _write_source_parquet(source)
     progress_events: list[tuple[str, int, int]] = []
 
@@ -1000,7 +1050,7 @@ def test_save_and_load_project_bundle_preserves_mask_array_and_provenance(
 
 
 def test_project_colormap_payload_restores_image_colormap_kwargs() -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     kwargs: dict[str, object] = {}
     restored = NeuronViewerWidget._apply_project_colormap_kwargs(
@@ -1027,7 +1077,7 @@ def test_project_colormap_payload_restores_image_colormap_kwargs() -> None:
 
 
 def test_project_colormap_payload_restores_labels_colormap_kwargs() -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     kwargs: dict[str, object] = {}
     restored = NeuronViewerWidget._apply_project_colormap_kwargs(
@@ -1058,7 +1108,7 @@ def test_project_colormap_payload_restores_labels_colormap_kwargs() -> None:
 
 
 def test_project_image_restore_applies_saved_gamma() -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     viewer = SimpleNamespace(add_image=MagicMock())
     widget = SimpleNamespace(
@@ -1083,11 +1133,11 @@ def test_project_image_restore_applies_saved_gamma() -> None:
 
 
 def test_current_project_path_updates_save_control(tmp_path: Path) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     save_button = MagicMock()
     widget = SimpleNamespace(_save_project_btn=save_button)
-    project_path = tmp_path / "saved.swcv"
+    project_path = tmp_path / "saved.nnproj"
 
     NeuronViewerWidget._set_current_project_path(widget, project_path)
 
@@ -1105,7 +1155,7 @@ def test_loading_plain_parquet_clears_current_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     source = tmp_path / "source.parquet"
     new_db = MagicMock()
@@ -1151,9 +1201,9 @@ def test_save_current_project_cancel_does_not_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
-    project_path = tmp_path / "saved.swcv"
+    project_path = tmp_path / "saved.nnproj"
     widget = SimpleNamespace(
         _current_project_path=project_path,
         _confirm_project_overwrite=MagicMock(return_value=False),
@@ -1175,9 +1225,9 @@ def test_save_current_project_confirms_overwrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
-    project_path = tmp_path / "saved.swcv"
+    project_path = tmp_path / "saved.nnproj"
     widget = SimpleNamespace(
         _current_project_path=project_path,
         _confirm_project_overwrite=MagicMock(return_value=True),
@@ -1218,10 +1268,10 @@ def test_successful_save_as_sets_current_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     source = tmp_path / "source.parquet"
-    project_path = tmp_path / "saved.swcv"
+    project_path = tmp_path / "saved.nnproj"
     widget = _project_save_widget(source)
     method_globals = NeuronViewerWidget._save_project_to_path.__globals__
     save_calls: list[dict[str, object]] = []
@@ -1257,10 +1307,10 @@ def test_failed_overwrite_retains_recognized_current_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from napari_swc_viewer.widgets.neuron_viewer import NeuronViewerWidget
+    from napari_neuron_navigator.widgets.neuron_viewer import NeuronViewerWidget
 
     source = tmp_path / "source.parquet"
-    project_path = tmp_path / "saved.swcv"
+    project_path = tmp_path / "saved.nnproj"
     widget = _project_save_widget(source, current=project_path)
     method_globals = NeuronViewerWidget._save_project_to_path.__globals__
 

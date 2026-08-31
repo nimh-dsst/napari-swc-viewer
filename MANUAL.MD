@@ -1,8 +1,8 @@
-# napari_swc_viewer User Manual
+# napari-neuron-navigator User Manual
 
 ## What this plugin does
 
-`napari-swc-viewer` is a napari plugin for:
+`napari-neuron-navigator` is a napari plugin for:
 
 - Opening `.swc` neuron morphology files directly
 - Opening annotated `.parquet` neuron datasets
@@ -42,25 +42,28 @@ When napari is open, launch the widget from the Plugins menu and choose **Neuron
 To enable debug-level plugin logging for runtime diagnostics:
 
 ```bash
-NAPARI_SWC_VIEWER_DEBUG=1 pixi run napari
+NAPARI_NEURON_NAVIGATOR_DEBUG=1 pixi run napari
 ```
 
 Optional custom log file:
 
 ```bash
-NAPARI_SWC_VIEWER_DEBUG=1 NAPARI_SWC_VIEWER_LOG_FILE=/tmp/napari-swc-viewer.log pixi run napari
+NAPARI_NEURON_NAVIGATOR_DEBUG=1 NAPARI_NEURON_NAVIGATOR_LOG_FILE=/tmp/napari-neuron-navigator.log pixi run napari
 ```
 
 Without an override, logs are written to
-`~/.napari-swc-viewer/debug.log`. The file rotates at 10 MB and retains three
+`~/.napari-neuron-navigator/debug.log`. The file rotates at 10 MB and retains three
 backups. Plugin DEBUG output is written to both the file and console. Focused
 napari layer-slicer DEBUG output is captured in the file only.
 
+Project bundles created by Neuron Navigator use `.nnproj`. Existing `.swcv`
+project directories created before the rename can still be loaded and saved.
+
 ### Detached flatmap window diagnostics
 
-1. Launch napari with `NAPARI_SWC_VIEWER_DEBUG=1` and a dedicated
-   `NAPARI_SWC_VIEWER_LOG_FILE`.
-2. Open the plugin, project data into the detached **SWC Viewer Flatmap**
+1. Launch napari with `NAPARI_NEURON_NAVIGATOR_DEBUG=1` and a dedicated
+   `NAPARI_NEURON_NAVIGATOR_LOG_FILE`.
+2. Open the plugin, project data into the detached **Neuron Navigator Flatmap**
    window, use the operating-system control to close that window, and accept
    napari's close confirmation. Cancelling the confirmation must leave the
    existing viewer and layers usable.

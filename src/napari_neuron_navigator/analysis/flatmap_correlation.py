@@ -348,7 +348,7 @@ class FlatmapDepthNormalization:
     **The two flat map axes share one divisor**, so flat map space stays
     isotropic: equal distances in the metric mean equal distances on the flat
     map, whichever direction they run.  This is the same policy the voxel grid
-    uses -- :func:`napari_swc_viewer.flatmap_heatmap.resolve_flatmap_bin_counts`
+    uses -- :func:`napari_neuron_navigator.flatmap_heatmap.resolve_flatmap_bin_counts`
     derives the ``x`` bin count from the aspect ratio so a bin is as wide as it
     is tall, which is exactly one shared unit per axis.  Both take ``y`` as the
     reference axis, since ``y`` spans one hemisphere while ``x`` spans two.
@@ -585,13 +585,13 @@ def build_flatmap_count_matrix_from_bin_counts(
 
     ``counts`` must have ``file_id``, ``y_bin``, ``x_bin`` and ``node_count``
     columns, exactly as produced by
-    :func:`napari_swc_viewer.flatmap_heatmap._query_flatmap_bin_counts` with
+    :func:`napari_neuron_navigator.flatmap_heatmap._query_flatmap_bin_counts` with
     ``include_file_id=True``.
 
     A 2-length ``volume_shape`` selects a depth-collapsed matrix, whose counts
     carry no ``depth_bin`` column: every node at one flat map position lands in
     the same voxel regardless of its depth.  As in
-    :func:`napari_swc_viewer.flatmap_heatmap._rendered_binned_nodes`, the rank of
+    :func:`napari_neuron_navigator.flatmap_heatmap._rendered_binned_nodes`, the rank of
     the volume decides that -- never the presence of a column -- so a stray
     ``depth_bin`` cannot silently change the grouping.
     """

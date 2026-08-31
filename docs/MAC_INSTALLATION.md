@@ -1,9 +1,9 @@
-# macOS Installation Guide for napari-swc-viewer
+# macOS Installation Guide for napari-neuron-navigator
 
-This guide installs `napari-swc-viewer` into a standard folder:
+This guide installs `napari-neuron-navigator` into a standard folder:
 
 ```bash
-~/repos/napari-swc-viewer
+~/repos/napari-neuron-navigator
 ```
 
 `~` means your macOS home folder, usually `/Users/yourname`.
@@ -59,7 +59,7 @@ The repository is public. You do not need special GitHub permission to download 
 1. Open a web browser.
 2. Go to:
 
-   <https://github.com/nimh-dsst/napari-swc-viewer>
+   <https://github.com/nimh-dsst/napari-neuron-navigator>
 
 3. Click the green `Code` button.
 4. Choose either `HTTPS` or `SSH`.
@@ -71,13 +71,13 @@ Use `HTTPS` unless you already know that SSH keys are set up for your GitHub acc
 Make sure Terminal is still in `~/repos`, then run:
 
 ```bash
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
 ```
 
 Then enter the new folder:
 
 ```bash
-cd ~/repos/napari-swc-viewer
+cd ~/repos/napari-neuron-navigator
 ```
 
 ### Alternative: Clone with SSH
@@ -85,8 +85,8 @@ cd ~/repos/napari-swc-viewer
 Only use SSH if your GitHub SSH keys are already configured.
 
 ```bash
-git clone git@github.com:nimh-dsst/napari-swc-viewer.git
-cd ~/repos/napari-swc-viewer
+git clone git@github.com:nimh-dsst/napari-neuron-navigator.git
+cd ~/repos/napari-neuron-navigator
 ```
 
 ### Confirm the Clone Worked
@@ -162,7 +162,7 @@ pixi --version
 Go to the repository folder:
 
 ```bash
-cd ~/repos/napari-swc-viewer
+cd ~/repos/napari-neuron-navigator
 ```
 
 Start napari:
@@ -191,11 +191,11 @@ The Zsh script is recommended for modern macOS.
 Run these commands in Terminal:
 
 ```bash
-cp ~/repos/napari-swc-viewer/run_scripts/run_napari.zsh ~/Desktop/Run_napari_SWC_Viewer.command
-chmod +x ~/Desktop/Run_napari_SWC_Viewer.command
+cp ~/repos/napari-neuron-navigator/run_scripts/run_napari.zsh ~/Desktop/Run_napari_Neuron_Navigator.command
+chmod +x ~/Desktop/Run_napari_Neuron_Navigator.command
 ```
 
-You can now double-click `Run_napari_SWC_Viewer.command` on your Desktop.
+You can now double-click `Run_napari_Neuron_Navigator.command` on your Desktop.
 
 If macOS warns that the file cannot be opened because it is from an unidentified developer:
 
@@ -208,13 +208,13 @@ If macOS warns that the file cannot be opened because it is from an unidentified
 You can also run:
 
 ```bash
-~/repos/napari-swc-viewer/run_scripts/run_napari.zsh
+~/repos/napari-neuron-navigator/run_scripts/run_napari.zsh
 ```
 
 or:
 
 ```bash
-~/repos/napari-swc-viewer/run_scripts/run_napari.sh
+~/repos/napari-neuron-navigator/run_scripts/run_napari.sh
 ```
 
 ## 8. Updating Later
@@ -222,7 +222,7 @@ or:
 To get the newest public version from GitHub later:
 
 ```bash
-cd ~/repos/napari-swc-viewer
+cd ~/repos/napari-neuron-navigator
 git pull
 pixi run napari
 ```
@@ -234,13 +234,13 @@ pixi run napari
 If this command:
 
 ```bash
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
 ```
 
 says the folder already exists, the repository may already be downloaded. Try:
 
 ```bash
-cd ~/repos/napari-swc-viewer
+cd ~/repos/napari-neuron-navigator
 git pull
 ```
 
@@ -249,13 +249,13 @@ git pull
 If this command fails:
 
 ```bash
-git clone git@github.com:nimh-dsst/napari-swc-viewer.git
+git clone git@github.com:nimh-dsst/napari-neuron-navigator.git
 ```
 
 use HTTPS instead:
 
 ```bash
-git clone https://github.com/nimh-dsst/napari-swc-viewer.git
+git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
 ```
 
 ### Pixi Takes a Long Time the First Time
@@ -267,13 +267,13 @@ That is expected. The first `pixi run napari` has to create the environment and 
 The launcher assumes this exact folder:
 
 ```bash
-~/repos/napari-swc-viewer
+~/repos/napari-neuron-navigator
 ```
 
 If you cloned the repository somewhere else, either move it to that folder or edit the launcher script to use your actual path.
 
 ## Reference Links
 
-- Project repository: <https://github.com/nimh-dsst/napari-swc-viewer>
+- Project repository: <https://github.com/nimh-dsst/napari-neuron-navigator>
 - Pixi installation: <https://pixi.prefix.dev/latest/installation/>
 - GitHub cloning guide: <https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository>
