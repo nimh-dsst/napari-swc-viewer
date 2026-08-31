@@ -1,4 +1,4 @@
-# napari-swc-viewer
+# napari-neuron-navigator
 A Napari plugin that allows viewing of SWC files in napari
 
 ## Prerequisites
