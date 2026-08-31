@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from napari_swc_viewer.isocortex_layers import (
+from napari_neuron_navigator.isocortex_layers import (
     CustomRegionHierarchy,
     CustomRegionHierarchyNode,
 )
@@ -147,12 +147,12 @@ def _load_module():
         path = (
             Path(__file__).resolve().parents[1]
             / "src"
-            / "napari_swc_viewer"
+            / "napari_neuron_navigator"
             / "widgets"
             / "custom_region_selector.py"
         )
         spec = importlib.util.spec_from_file_location(
-            "napari_swc_viewer.widgets.custom_region_selector_test_module",
+            "napari_neuron_navigator.widgets.custom_region_selector_test_module",
             path,
         )
         assert spec is not None and spec.loader is not None

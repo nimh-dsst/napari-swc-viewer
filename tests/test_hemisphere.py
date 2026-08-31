@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from napari_swc_viewer.hemisphere import (
+from napari_neuron_navigator.hemisphere import (
     Hemisphere,
     detect_hemisphere,
     detect_soma_hemisphere,
@@ -14,7 +14,7 @@ from napari_swc_viewer.hemisphere import (
     flip_swc_batch,
     get_atlas_midline,
 )
-from napari_swc_viewer.swc import SWCData
+from napari_neuron_navigator.swc import SWCData
 
 
 @pytest.fixture
@@ -305,7 +305,7 @@ class TestFlipSWCBatch:
         np.testing.assert_almost_equal(results[0].coords[0, 2], 9000.0)
         np.testing.assert_almost_equal(results[1].coords[0, 2], 8000.0)
 
-    @patch("napari_swc_viewer.hemisphere.BrainGlobeAtlas")
+    @patch("napari_neuron_navigator.hemisphere.BrainGlobeAtlas")
     def test_batch_loads_atlas_once(self, mock_atlas_class):
         """Test that batch operation loads atlas only once."""
         mock_atlas_class.return_value.shape = (400, 400, 400)

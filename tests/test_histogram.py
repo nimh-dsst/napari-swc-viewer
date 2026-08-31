@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from napari_swc_viewer.analysis.histogram import (
+from napari_neuron_navigator.analysis.histogram import (
     _build_histogram_plot_series,
     _build_histogram_series,
     _build_histogram_step_curve,

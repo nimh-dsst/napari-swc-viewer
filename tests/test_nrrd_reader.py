@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from napari_swc_viewer._reader import (
+from napari_neuron_navigator._reader import (
     napari_get_reader,
     read_nrrd_file,
     read_nrrd_files,

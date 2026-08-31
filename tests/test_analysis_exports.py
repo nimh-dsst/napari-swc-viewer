@@ -7,21 +7,24 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 from openpyxl import load_workbook
 from PIL import Image
 
 matplotlib.use("Agg")
 
-from napari_swc_viewer.analysis.clustering import (
+from napari_neuron_navigator.analysis.clustering import (
     ClusterRegionSelection,
     ClusterResult,
     ClusterRunMetadata,
 )
-from napari_swc_viewer.analysis.export import (
+from napari_neuron_navigator.analysis.export import (
     CLUSTERMAP_HEIGHT_RATIOS,
     CLUSTERMAP_FIGURE_XLABEL_Y,
     DENDROGRAM_LINEWIDTH,
+    LEGACY_PARQUET_METADATA_PREFIX,
+    PARQUET_METADATA_PREFIX,
     export_cluster_workbook,
     export_distance_workbook,
     export_extended_parquet,
@@ -198,6 +201,32 @@ def test_export_extended_parquet_preserves_rows_and_round_trips_metadata(tmp_pat
     assert payload["cluster_labels_in_dendrogram_order"] == [2, 1]
     np.testing.assert_allclose(payload["distance_matrix"], result.distance_matrix)
     np.testing.assert_allclose(payload["linkage_matrix"], result.linkage_matrix)
+
+
+def test_read_extended_parquet_accepts_pre_rename_metadata(tmp_path: Path) -> None:
+    source_path = tmp_path / "neurons.parquet"
+    output_path = tmp_path / "legacy_metadata.parquet"
+    _write_source_parquet(source_path)
+    result, _cluster_color_map = _make_cluster_result(source_path)
+    export_extended_parquet(output_path, result)
+
+    table = pq.read_table(output_path)
+    metadata = {
+        (
+            key.replace(
+                PARQUET_METADATA_PREFIX.encode(),
+                LEGACY_PARQUET_METADATA_PREFIX.encode(),
+            )
+            if key.startswith(PARQUET_METADATA_PREFIX.encode())
+            else key
+        ): value
+        for key, value in (table.schema.metadata or {}).items()
+    }
+    pq.write_table(table.replace_schema_metadata(metadata), output_path)
+
+    payload = read_extended_parquet_analysis_metadata(output_path)
+
+    np.testing.assert_allclose(payload["distance_matrix"], result.distance_matrix)
 
 
 def test_build_clustermap_figure_applies_title_and_axis_labels(tmp_path: Path) -> None:

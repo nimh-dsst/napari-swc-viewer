@@ -1,4 +1,4 @@
-"""Runtime logging helpers for napari_swc_viewer."""
+"""Runtime logging helpers for napari_neuron_navigator."""
 
 from __future__ import annotations
 
@@ -10,11 +10,17 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterator
 
-_DEBUG_ENV_VAR = "NAPARI_SWC_VIEWER_DEBUG"
-_LOG_FILE_ENV_VAR = "NAPARI_SWC_VIEWER_LOG_FILE"
-_LOGGER_NAME = "napari_swc_viewer"
+_DEBUG_ENV_VARS = (
+    "NAPARI_NEURON_NAVIGATOR_DEBUG",
+    "NAPARI_SWC_VIEWER_DEBUG",
+)
+_LOG_FILE_ENV_VARS = (
+    "NAPARI_NEURON_NAVIGATOR_LOG_FILE",
+    "NAPARI_SWC_VIEWER_LOG_FILE",
+)
+_LOGGER_NAME = "napari_neuron_navigator"
 _NAPARI_DEBUG_LOGGER_NAMES = ("napari.components._layer_slicer",)
-_DEFAULT_LOG_FILE = Path.home() / ".napari-swc-viewer" / "debug.log"
+_DEFAULT_LOG_FILE = Path.home() / ".napari-neuron-navigator" / "debug.log"
 _LOG_FORMAT = (
     "%(asctime)s %(process)d %(threadName)s "
     "%(levelname)s %(name)s: %(message)s"
@@ -28,14 +34,22 @@ def _env_enabled(value: str | None) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _first_env_value(names: tuple[str, ...]) -> str | None:
+    """Return the first configured value from current and legacy names."""
+    for name in names:
+        if name in os.environ:
+            return os.environ[name]
+    return None
+
+
 def debug_logging_enabled() -> bool:
     """Return whether debug logging should be enabled for the plugin."""
-    return _env_enabled(os.environ.get(_DEBUG_ENV_VAR))
+    return _env_enabled(_first_env_value(_DEBUG_ENV_VARS))
 
 
 def resolve_log_path() -> Path:
     """Return the configured log file path."""
-    override = os.environ.get(_LOG_FILE_ENV_VAR)
+    override = _first_env_value(_LOG_FILE_ENV_VARS)
     if override:
         return Path(override).expanduser()
     return _DEFAULT_LOG_FILE
@@ -51,8 +65,8 @@ def configure_debug_logging() -> Path | None:
         return None
 
     logger = logging.getLogger(_LOGGER_NAME)
-    if getattr(logger, "_napari_swc_viewer_debug_configured", False):
-        existing_path = getattr(logger, "_napari_swc_viewer_log_path", None)
+    if getattr(logger, "_napari_neuron_navigator_debug_configured", False):
+        existing_path = getattr(logger, "_napari_neuron_navigator_log_path", None)
         return Path(existing_path) if existing_path is not None else resolve_log_path()
 
     log_path = resolve_log_path()
@@ -66,12 +80,12 @@ def configure_debug_logging() -> Path | None:
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
-    file_handler.set_name("napari_swc_viewer_debug_file")
+    file_handler.set_name("napari_neuron_navigator_debug_file")
 
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(logging.DEBUG)
     stream_handler.setFormatter(formatter)
-    stream_handler.set_name("napari_swc_viewer_debug_stream")
+    stream_handler.set_name("napari_neuron_navigator_debug_stream")
 
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
@@ -85,8 +99,8 @@ def configure_debug_logging() -> Path | None:
             # napari trace is written only to the file so routine slicing does
             # not overwhelm the console stream.
             napari_logger.addHandler(file_handler)
-    logger._napari_swc_viewer_debug_configured = True
-    logger._napari_swc_viewer_log_path = str(log_path)
+    logger._napari_neuron_navigator_debug_configured = True
+    logger._napari_neuron_navigator_log_path = str(log_path)
     logger.debug("Configured debug logging at %s", log_path)
     return log_path
 

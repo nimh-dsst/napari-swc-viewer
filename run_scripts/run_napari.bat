@@ -1,12 +1,12 @@
 @echo off
-set "REPO_DIR=%USERPROFILE%\repos\napari-swc-viewer"
+set "REPO_DIR=%USERPROFILE%\repos\napari-neuron-navigator"
 
 cd /d "%REPO_DIR%"
 if errorlevel 1 (
     echo Could not find the repository at:
     echo   %REPO_DIR%
     echo.
-    echo Clone the repository to %%USERPROFILE%%\repos\napari-swc-viewer, or edit this script to use your actual path.
+    echo Clone the repository to %%USERPROFILE%%\repos\napari-neuron-navigator, or edit this script to use your actual path.
     echo.
     pause
     exit /b 1

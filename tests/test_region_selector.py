@@ -152,12 +152,12 @@ def _import_region_selector_module():
         module_path = (
             Path(__file__).resolve().parent.parent
             / "src"
-            / "napari_swc_viewer"
+            / "napari_neuron_navigator"
             / "widgets"
             / "region_selector.py"
         )
         spec = importlib.util.spec_from_file_location(
-            "napari_swc_viewer.widgets.region_selector_test_module",
+            "napari_neuron_navigator.widgets.region_selector_test_module",
             module_path,
         )
         assert spec is not None

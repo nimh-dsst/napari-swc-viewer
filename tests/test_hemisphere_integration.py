@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from napari_swc_viewer.hemisphere import Hemisphere, detect_soma_hemisphere, flip_swc
-from napari_swc_viewer.swc import parse_swc
+from napari_neuron_navigator.hemisphere import Hemisphere, detect_soma_hemisphere, flip_swc
+from napari_neuron_navigator.swc import parse_swc
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "hemisphere"
 ALLEN_MOUSE_10UM_MIDLINE = 5695.0

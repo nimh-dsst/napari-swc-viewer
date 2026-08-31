@@ -6,7 +6,7 @@ import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from napari_swc_viewer.soma_summary import (
+from napari_neuron_navigator.soma_summary import (
     format_soma_hemisphere_summary,
     summarize_soma_hemispheres,
 )

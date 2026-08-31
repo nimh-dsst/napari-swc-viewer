@@ -54,17 +54,17 @@ def _region_fill_rgba(
 def _layer_base_visible(layer, *, default: bool = True) -> bool:
     """Preserve a napari visibility toggle as the global style gate."""
     current = bool(getattr(layer, "visible", default))
-    base = bool(getattr(layer, "_napari_swc_region_base_visible", default))
-    previous = getattr(layer, "_napari_swc_region_applied_visible", None)
+    base = bool(getattr(layer, "_napari_neuron_navigator_region_base_visible", default))
+    previous = getattr(layer, "_napari_neuron_navigator_region_applied_visible", None)
     if previous is not None and current != bool(previous):
         base = current
-        setattr(layer, "_napari_swc_region_base_visible", base)
+        setattr(layer, "_napari_neuron_navigator_region_base_visible", base)
     return base
 
 
 def _set_layer_applied_visible(layer, visible: bool) -> None:
     layer.visible = bool(visible)
-    setattr(layer, "_napari_swc_region_applied_visible", bool(visible))
+    setattr(layer, "_napari_neuron_navigator_region_applied_visible", bool(visible))
 
 
 def _array_startup_metadata(array) -> dict[str, object]:
@@ -460,13 +460,13 @@ def apply_region_appearance_to_layer(
             axis=0,
         )
         base_opacity = float(
-            getattr(layer, "_napari_swc_region_base_opacity", layer.opacity)
+            getattr(layer, "_napari_neuron_navigator_region_base_opacity", layer.opacity)
         )
         base_visible = _layer_base_visible(layer)
         layer.opacity = base_opacity * effective.fill_opacity
         _set_layer_applied_visible(layer, base_visible and effective.fill_visible)
     elif kind == "mesh_group":
-        region_ids = getattr(layer, "_napari_swc_region_vertex_ids", None)
+        region_ids = getattr(layer, "_napari_neuron_navigator_region_vertex_ids", None)
         if region_ids is None:
             return False
         normalized_ids = np.asarray(region_ids, dtype=np.int64)
@@ -478,7 +478,7 @@ def apply_region_appearance_to_layer(
             any_visible = any_visible or effective.fill_visible
         layer.vertex_colors = colors
         layer.opacity = float(
-            getattr(layer, "_napari_swc_region_base_opacity", layer.opacity)
+            getattr(layer, "_napari_neuron_navigator_region_base_opacity", layer.opacity)
         )
         _set_layer_applied_visible(layer, _layer_base_visible(layer) and any_visible)
     else:
@@ -612,9 +612,9 @@ def add_region_mesh(
             "region_acronym": str(acronym),
         },
     )
-    setattr(layer, "_napari_swc_region_base_opacity", float(opacity))
-    setattr(layer, "_napari_swc_region_base_visible", bool(visible))
-    setattr(layer, "_napari_swc_region_applied_visible", bool(layer.visible))
+    setattr(layer, "_napari_neuron_navigator_region_base_opacity", float(opacity))
+    setattr(layer, "_napari_neuron_navigator_region_base_visible", bool(visible))
+    setattr(layer, "_napari_neuron_navigator_region_applied_visible", bool(layer.visible))
 
     logger.info(f"Added region mesh layer: {layer}")
     return layer
@@ -705,12 +705,12 @@ def add_region_mesh_group(
     )
     setattr(
         layer,
-        "_napari_swc_region_vertex_ids",
+        "_napari_neuron_navigator_region_vertex_ids",
         np.concatenate(vertex_region_ids),
     )
-    setattr(layer, "_napari_swc_region_base_opacity", float(opacity))
-    setattr(layer, "_napari_swc_region_base_visible", bool(visible))
-    setattr(layer, "_napari_swc_region_applied_visible", bool(layer.visible))
+    setattr(layer, "_napari_neuron_navigator_region_base_opacity", float(opacity))
+    setattr(layer, "_napari_neuron_navigator_region_base_visible", bool(visible))
+    setattr(layer, "_napari_neuron_navigator_region_applied_visible", bool(layer.visible))
     return layer, tuple(missing_acronyms)
 
 

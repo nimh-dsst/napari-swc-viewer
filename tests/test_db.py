@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from napari_swc_viewer.db import NeuronDatabase
+from napari_neuron_navigator.db import NeuronDatabase
 
 
 def _write_source_parquet(path: Path) -> None:

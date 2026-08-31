@@ -1,6 +1,6 @@
-# SWC Viewer Use Cases
+# Neuron Navigator Use Cases
 
-This document describes what the SWC Viewer plugin can do through concrete,
+This document describes what the Neuron Navigator plugin can do through concrete,
 repeatable user workflows. Each use case also serves as a manual test case for
 confirming that the documented capability works in napari.
 
@@ -17,7 +17,7 @@ Unless a use case says otherwise:
    pixi run napari
    ```
 
-2. Open the **SWC Viewer** plugin from napari's **Plugins** menu.
+2. Open the **Neuron Navigator** plugin from napari's **Plugins** menu.
 3. Follow the selected use case from a clean napari session.
 4. Record the result in that use case's **Manual verification** section. A use
    case remains `Not run` until someone actually performs it in napari.
@@ -34,7 +34,7 @@ Unless a use case says otherwise:
 | [UC-006](#uc-006-inspect-and-query-custom-isocortex-layer-regions) | Inspect and query exact terminal regions grouped by Isocortex layer | Not run |
 | [UC-007](#uc-007-refine-and-save-multiple-cluster-assignments) | Preserve a soma clustering and refine selected neurons with a second method | Not run |
 | [UC-008](#uc-008-create-combined-individual-and-enhanced-neuron-heatmaps) | Create combined or individual heatmaps and enhance fine projections in selected layers | Not run |
-| [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current SWC Viewer project safely | Not run |
+| [UC-009](#uc-009-save-and-overwrite-the-current-project) | Save changes back to the current Neuron Navigator project safely | Not run |
 | [UC-010](#uc-010-identify-axon-termini-and-prune-neurons-lacking-them) | Locate termini as childless axon-typed nodes, then select and remove the neurons that have none (see the annotation caution) | Partially run |
 | [UC-011](#uc-011-view-a-depth-free-2d-flatmap-and-per-neuron-vector-traces) | View a plain flatmap with no depth axis as a 2D heatmap or per-neuron vector traces, and place somas in the current render's space | Not run |
 | [UC-012](#uc-012-balance-cortical-depth-against-flat-map-position-when-clustering-somas) | Cluster somas with an isotropic flatmap metric and an explicit cortical-depth weight | Partially run |
@@ -80,7 +80,7 @@ configuration; see BrainGlobe's
 - At least one of `allen_mouse_10um`, `allen_mouse_25um`,
   `allen_mouse_50um`, or `allen_mouse_100um` is not already present in the
   configured BrainGlobe cache.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -179,7 +179,7 @@ a partial output from being published.
       └── cell_c.SWC
   ```
 
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -264,7 +264,7 @@ and does not need to load or query the NRRDs.
   the same spatial grid and transform.
 - If the NRRD headers do not provide a usable spatial transform, know the
   lookup resolution in micrometers so it can be entered explicitly.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -349,7 +349,7 @@ projecting meshes, or converting region coordinates while viewing.
    BrainGlobe atlas with the same atlas/version structure catalog, choose
    **Precomputed Parquet + Cache**, set **Render** to **Heatmap** and its color
    mode to **Single color**, then click **Project to Flatmap**. After the
-   heatmap appears in **SWC Viewer Flatmap**, click **Choose Cache
+   heatmap appears in **Neuron Navigator Flatmap**, click **Choose Cache
    Directory...** and select the existing cache. Repeat the cache selection
    several times on both Windows and macOS when those systems are available.
    **Expected:** Cache validation runs without freezing either napari window.
@@ -409,7 +409,7 @@ projecting meshes, or converting region coordinates while viewing.
    empty window, while a failed re-render retains an already valid flatmap. The
    main viewer remains unchanged throughout.
 10. **Action (macOS only):** Put the main napari window in macOS Full Screen,
-    project, and dismiss/redisplay **SWC Viewer Flatmap** three times using its
+    project, and dismiss/redisplay **Neuron Navigator Flatmap** three times using its
     operating-system close control. Then put the flatmap window itself in Full
     Screen and use the same close control.
     **Expected:** The main window remains fullscreen and responsive. The
@@ -487,7 +487,7 @@ axes without asserting physical units or anatomical direction.
   overlay can be checked.
 - Include neurons with nodes in at least two Allen Isocortex layers. Include an
   agranular cortical area without layer 4 when test data is available.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -503,7 +503,7 @@ axes without asserting physical units or anatomical direction.
 2. **Action:** In **Regions**, choose **Atlas Regions**, select a cortical
    parent region, return to **Flatmap**, and click **Show Region Labels**
    before projecting neurons.
-   **Expected:** A separate **SWC Viewer Flatmap** window opens with a label-only
+   **Expected:** A separate **Neuron Navigator Flatmap** window opens with a label-only
    2D stack named **Flatmap Region Labels**. It has six planes ordered `L1`,
    `L2/3`, `L4`, `L5`, `L6a`, `L6b`, contains only the selected region's
    terminal Allen-layer descendants, uses atlas colors, and reads only the
@@ -853,7 +853,7 @@ fine projections easier to see without changing the underlying voxel data.
   a non-selected color control.
 - To exercise the memory warning, use an atlas resolution and selected-neuron
   count whose displayed estimate exceeds 1 GiB.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -941,7 +941,7 @@ fine projections easier to see without changing the underlying voxel data.
 
 **Capability**
 
-The user can create an SWC Viewer project and then save later table, analysis,
+The user can create a Neuron Navigator project and then save later table, analysis,
 and app-created layer changes back to that same project folder. Replacement is
 confirmed explicitly and publishes a complete new bundle without retaining
 stale files from the previous version.
@@ -952,7 +952,7 @@ stale files from the previous version.
   Parquet Data**.
 - Add both neurons to **Selected Neurons** and create one app-generated heatmap
   or mask layer that will be recognizable after a project reload.
-- Choose a writable directory where a new `.swcv` project folder can be
+- Choose a writable directory where a new `.nnproj` project folder can be
   created.
 
 **Steps and expected results**
@@ -962,13 +962,13 @@ stale files from the previous version.
    **Expected:** **Save Project** is disabled. **Save Project As...**, **Load
    Project...**, and **Export Enhanced Parquet...** remain available.
 2. **Action:** Click **Save Project As...**, choose a new path named
-   `overwrite_test.swcv`, and complete the save.
+   `overwrite_test.nnproj`, and complete the save.
    **Expected:** The project is created and the status reports **Saved project
-   bundle: overwrite_test.swcv**. **Save Project** becomes enabled and its
+   bundle: overwrite_test.nnproj**. **Save Project** becomes enabled and its
    tooltip identifies the new project's absolute path.
 3. **Action:** Change a table label or note, remove the saved heatmap or mask
    layer, create a different app-generated layer, and click **Save Project**.
-   In **Overwrite SWC Viewer Project?**, click **Cancel**.
+   In **Overwrite Neuron Navigator Project?**, click **Cancel**.
    **Expected:** The dialog shows the exact current project path, warns that all
    existing project-folder contents will be replaced, and defaults to
    **Cancel**. Cancelling starts no save and leaves the on-disk project
@@ -976,9 +976,9 @@ stale files from the previous version.
 4. **Action:** Click **Save Project** again and click **Overwrite**.
    **Expected:** Progress is shown while saving, both save actions are disabled
    during serialization, and completion reports **Saved project bundle:
-   overwrite_test.swcv**. No save-location picker is shown.
+   overwrite_test.nnproj**. No save-location picker is shown.
 5. **Action:** Close the session, click **Load Project...**, select
-   `overwrite_test.swcv`, and inspect its table state and app-generated layers.
+   `overwrite_test.nnproj`, and inspect its table state and app-generated layers.
    **Expected:** The changed table metadata and replacement layer are restored.
    The layer removed before overwrite does not return, and no stale project
    files affect the loaded session.
@@ -986,7 +986,7 @@ stale files from the previous version.
    **Expected:** **Save Project** becomes disabled because the session is no
    longer associated with a current project. **Save Project As...** can create
    another project, and doing so enables **Save Project** for that new folder.
-7. **Action:** Load `overwrite_test.swcv`, then rename or move that folder
+7. **Action:** Load `overwrite_test.nnproj`, then rename or move that folder
    outside napari and click **Save Project**.
    **Expected:** The plugin reports that the current project is unavailable or
    unrecognized, disables **Save Project**, and does not create or replace any
@@ -1206,14 +1206,14 @@ projections remain visible without changing their node-count data.
   visibly different from a single depth plane.
 - To check the over-limit behavior, have a table large enough that all selected
   neurons together exceed 250,000 rendered nodes.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
 1. **Action:** Select a few neuron rows, open **Flatmap**, choose **Precomputed
    Parquet + Cache** and **Both hemispheres, shaped**, set **Render** to **2D
    Heatmap**, and click **Project to Flatmap**.
-   **Expected:** **SWC Viewer Flatmap** shows one image named **Isocortex Flatmap
+   **Expected:** **Neuron Navigator Flatmap** shows one image named **Isocortex Flatmap
    2D Heatmap** in 2D. There is no plane slider and no plane caption in the
    upper-left corner. Labelled **Flatmap X** / **Flatmap Y** axis arrows are
    drawn at the image origin. The summary panel ends with `Depth: collapsed into
@@ -1280,7 +1280,7 @@ projections remain visible without changing their node-count data.
     **Expected:** Enhancement applies gamma `0.20` to the two selected flatmap
     heatmaps, brightening their faint projections without changing their data,
     contrast limits, or the unselected control. Reset restores gamma `1.00` on
-    both selected layers. Renaming or removing a heatmap in **SWC Viewer
+    both selected layers. Renaming or removing a heatmap in **Neuron Navigator
     Flatmap** refreshes the list. Using the flatmap window's operating-system
     close control clears the transient heatmaps and the list.
 
@@ -1398,7 +1398,7 @@ there, and it already exists.
   region will not show the difference.
 - A Parquet lacking canonical bounds is still usable but falls back to observed
   data bounds; results are then comparable only within that fixed dataset.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -1557,7 +1557,7 @@ descendant ID in each pixel.
   resolution may differ from the cache's.
 - Neurons whose arbors span several isocortical areas, so area boundaries are
   visible. `isocortex_total_right_brainglobe_flatmap.parquet` works.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -1702,7 +1702,7 @@ visible at a given 2D pixel; the 3D layer continues to preserve depth planes.
   areas or custom terminal regions. `MOp` and `SSp` make a useful pair.
 - To check both coordinate spaces, complete UC-003 and UC-004 and open the
   compatible flatmap region cache.
-- Start from a clean napari session with the **SWC Viewer** plugin open.
+- Start from a clean napari session with the **Neuron Navigator** plugin open.
 
 **Steps and expected results**
 
@@ -1826,13 +1826,13 @@ but no point picking or brush selection.
 - If those heatmaps filter `type = 2`, interpret the result as **axon-typed**,
   not confirmed axon: this dataset contains dendritic projections mislabeled
   as type 2, so a biological comparison still needs visual verification.
-- Start with the **SWC Viewer** plugin open. A 4×4 check needs enough screen
+- Start with the **Neuron Navigator** plugin open. A 4×4 check needs enough screen
   space to keep titles and hover readouts legible.
 
 **Steps and expected results**
 
 1. **Action:** Open **Compare** and click **Open Comparison Board**.
-   **Expected:** A separate **SWC Viewer Comparison Board** window opens with a
+   **Expected:** A separate **Neuron Navigator Comparison Board** window opens with a
    2×2 layout and a selected-cell inspector. Closing it hides the same board;
    clicking **Open Comparison Board** again restores its cells and camera state.
 2. **Action:** Set **Rows** and **Columns** through the boundary layouts 1×1,

@@ -3,7 +3,7 @@
 
 This script retrieves a random subset of SWC files from the BIL dataset
 DOI 10.35077/g.73 "Morphological diversity of single neurons in molecularly
-defined cell types" for testing the napari-swc-viewer plugin.
+defined cell types" for testing the napari-neuron-navigator plugin.
 """
 
 import json

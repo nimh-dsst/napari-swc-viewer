@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.analysis.flatmap_correlation import (
+from napari_neuron_navigator.analysis.flatmap_correlation import (
     FlatmapVoxelCorrelationSource,
     build_flatmap_count_matrix,
     compute_flatmap_voxel_correlation_result,

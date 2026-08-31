@@ -37,7 +37,7 @@ _ANNOTATION_METHODS = (
 
 @pytest.fixture
 def widget_class():
-    from napari_swc_viewer.widgets.flatmap import FlatmapProjectionWidget
+    from napari_neuron_navigator.widgets.flatmap import FlatmapProjectionWidget
 
     return FlatmapProjectionWidget
 
@@ -301,13 +301,13 @@ def test_flatmap_layers_use_a_separate_real_viewer_model(viewer) -> None:
     viewer.layers.selection.active = points
     viewer.scene.camera.center = (7.0, 8.0, 9.0)
     viewer.scene.camera.zoom = 3.0
-    flatmap_viewer = ViewerModel(title="SWC Viewer Flatmap", ndisplay=3)
+    flatmap_viewer = ViewerModel(title="Neuron Navigator Flatmap", ndisplay=3)
 
     flatmap = flatmap_viewer.add_image(
         np.zeros((2, 6, 8), dtype=np.float32),
         name="Flatmap",
         axis_labels=("Depth bin", "Flatmap Y", "Flatmap X"),
-        metadata={"napari_swc_viewer_space": "flatmap"},
+        metadata={"napari_neuron_navigator_space": "flatmap"},
     )
     flatmap_viewer.scene.camera.center = (1.0, 2.0, 3.0)
 

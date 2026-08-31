@@ -121,7 +121,7 @@ Create an internal renderer abstraction so the widget can switch implementation 
 Suggested structure:
 
 ```text
-src/napari_swc_viewer/rendering/
+src/napari_neuron_navigator/rendering/
   __init__.py
   geometry.py
   renderer_base.py

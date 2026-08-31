@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from napari_swc_viewer.neuron_palette import (
+from napari_neuron_navigator.neuron_palette import (
     MAX_DISTINCT_COLORS,
     MAX_PALETTE_LIGHTNESS,
     MIN_PALETTE_LIGHTNESS,

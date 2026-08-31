@@ -38,16 +38,16 @@ SRC_ROOT = REPO_ROOT / "src"
 if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from napari_swc_viewer.db import NeuronDatabase
-from napari_swc_viewer.flatmap_heatmap import (
+from napari_neuron_navigator.db import NeuronDatabase
+from napari_neuron_navigator.flatmap_heatmap import (
     DEFAULT_FLATMAP_DEPTH_BIN_UM,
     DEFAULT_FLATMAP_Y_BINS,
     FlatmapRenderResult,
     build_flatmap_render_data,
     compute_flatmap_lookup_stats,
 )
-from napari_swc_viewer.flatmap_loader import load_flatmap_volume_set
-from napari_swc_viewer.flatmap_projection import (
+from napari_neuron_navigator.flatmap_loader import load_flatmap_volume_set
+from napari_neuron_navigator.flatmap_projection import (
     COORDINATE_MODE_MICRONS,
     COORDINATE_MODE_VOXELS,
     DEFAULT_CCFV3_MIRROR_MIDLINE_UM,

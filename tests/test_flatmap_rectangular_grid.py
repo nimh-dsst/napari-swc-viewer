@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.flatmap_heatmap import (
+from napari_neuron_navigator.flatmap_heatmap import (
     _bin_flat_values,
     build_allen_layer_stack_from_projected_nodes,
     build_flatmap_render_data_from_projected_nodes,
@@ -22,9 +22,9 @@ from napari_swc_viewer.flatmap_heatmap import (
     flatmap_pixel_coordinates,
     resolve_flatmap_bin_counts,
 )
-from napari_swc_viewer.flatmap_labels import build_flatmap_region_label_volume
-from napari_swc_viewer.flatmap_projection import build_projected_segments
-from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
+from napari_neuron_navigator.flatmap_labels import build_flatmap_region_label_volume
+from napari_neuron_navigator.flatmap_projection import build_projected_segments
+from napari_neuron_navigator.isocortex_layers import AllenIsocortexLayerMap
 
 # Unequal on both axes and in both spans: 7 x bins over 14 units, 3 y bins over
 # 3 units.  A builder that reused one count, or swapped the axes, cannot agree
@@ -373,7 +373,7 @@ def test_an_unusable_resolution_is_rejected_before_the_lookup_scan(bad) -> None:
     cost a full scan.  A volume shape that would itself be rejected proves the
     check runs first.
     """
-    from napari_swc_viewer.flatmap_heatmap import build_flatmap_render_data
+    from napari_neuron_navigator.flatmap_heatmap import build_flatmap_render_data
 
     with pytest.raises(ValueError, match="must be positive"):
         build_flatmap_render_data(

@@ -6,7 +6,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from napari_swc_viewer.analysis.correlation import count_correlation_input_nodes
+from napari_neuron_navigator.analysis.correlation import count_correlation_input_nodes
 
 
 def test_count_correlation_input_nodes_supports_unfiltered_file_scope(tmp_path) -> None:

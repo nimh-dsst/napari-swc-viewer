@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from napari_swc_viewer.swc import NodeType, SWCData, parse_swc, write_swc
+from napari_neuron_navigator.swc import NodeType, SWCData, parse_swc, write_swc
 
 
 @pytest.fixture

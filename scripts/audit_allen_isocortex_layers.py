@@ -14,7 +14,7 @@ from typing import Any
 
 from brainglobe_atlasapi import BrainGlobeAtlas
 
-from napari_swc_viewer.isocortex_layers import (
+from napari_neuron_navigator.isocortex_layers import (
     AllenIsocortexLayerMap,
     layer_map_from_atlas,
 )

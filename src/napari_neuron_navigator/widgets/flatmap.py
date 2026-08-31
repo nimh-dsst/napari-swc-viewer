@@ -102,17 +102,17 @@ logger = logging.getLogger(__name__)
 def _region_layer_base_visible(layer) -> bool:
     """Return the current napari layer visibility before region styling."""
     current = bool(getattr(layer, "visible", True))
-    base = bool(getattr(layer, "_napari_swc_region_base_visible", True))
-    previous = getattr(layer, "_napari_swc_region_applied_visible", None)
+    base = bool(getattr(layer, "_napari_neuron_navigator_region_base_visible", True))
+    previous = getattr(layer, "_napari_neuron_navigator_region_applied_visible", None)
     if previous is not None and current != bool(previous):
         base = current
-        setattr(layer, "_napari_swc_region_base_visible", base)
+        setattr(layer, "_napari_neuron_navigator_region_base_visible", base)
     return base
 
 
 def _set_region_layer_visible(layer, visible: bool) -> None:
     layer.visible = bool(visible)
-    setattr(layer, "_napari_swc_region_applied_visible", bool(visible))
+    setattr(layer, "_napari_neuron_navigator_region_applied_visible", bool(visible))
 
 
 _SOURCE_SELECTED = "selected"
@@ -187,7 +187,7 @@ _ALLEN_LAYER_AXIS_LABEL = "Allen layer"
 _DEPTH_AXIS_LABEL = "Depth bin"
 _PLANE_TEXT_OVERLAY_FONT_SIZE = 12
 _PLANE_TEXT_OVERLAY_POSITION = "top_left"
-_FLATMAP_LAYER_SPACE_KEY = "napari_swc_viewer_space"
+_FLATMAP_LAYER_SPACE_KEY = "napari_neuron_navigator_space"
 _FLATMAP_LAYER_SPACE_VALUE = "flatmap"
 
 _LOOKUP_FILES_PURPOSE_TEXT = (
@@ -4628,8 +4628,8 @@ class FlatmapProjectionWidget(QWidget):
             if callable(refresh):
                 refresh()
 
-        setattr(layer, "_napari_swc_flatmap_region_labels_result", result)
-        setattr(layer, "_napari_swc_region_base_opacity", 0.35)
+        setattr(layer, "_napari_neuron_navigator_flatmap_region_labels_result", result)
+        setattr(layer, "_napari_neuron_navigator_region_base_opacity", 0.35)
         return layer
 
     @staticmethod
@@ -4900,11 +4900,11 @@ class FlatmapProjectionWidget(QWidget):
                     visible=effective.fill_visible,
                     metadata=metadata,
                 )
-                setattr(layer, "_napari_swc_region_base_opacity", 0.45)
-                setattr(layer, "_napari_swc_region_base_visible", True)
+                setattr(layer, "_napari_neuron_navigator_region_base_opacity", 0.45)
+                setattr(layer, "_napari_neuron_navigator_region_base_visible", True)
                 setattr(
                     layer,
-                    "_napari_swc_region_applied_visible",
+                    "_napari_neuron_navigator_region_applied_visible",
                     bool(layer.visible),
                 )
                 created.append(layer)
@@ -5025,11 +5025,11 @@ class FlatmapProjectionWidget(QWidget):
                     axis_labels=self._flat_axis_labels(),
                     metadata=metadata,
                 )
-                setattr(layer, "_napari_swc_region_base_opacity", 0.9)
-                setattr(layer, "_napari_swc_region_base_visible", True)
+                setattr(layer, "_napari_neuron_navigator_region_base_opacity", 0.9)
+                setattr(layer, "_napari_neuron_navigator_region_base_visible", True)
                 setattr(
                     layer,
-                    "_napari_swc_region_applied_visible",
+                    "_napari_neuron_navigator_region_applied_visible",
                     bool(layer.visible),
                 )
                 created.append(layer)
@@ -5127,11 +5127,11 @@ class FlatmapProjectionWidget(QWidget):
                     vector_style="line",
                     metadata=metadata,
                 )
-                setattr(layer, "_napari_swc_region_base_opacity", 0.9)
-                setattr(layer, "_napari_swc_region_base_visible", True)
+                setattr(layer, "_napari_neuron_navigator_region_base_opacity", 0.9)
+                setattr(layer, "_napari_neuron_navigator_region_base_visible", True)
                 setattr(
                     layer,
-                    "_napari_swc_region_applied_visible",
+                    "_napari_neuron_navigator_region_applied_visible",
                     bool(layer.visible),
                 )
                 created.append(layer)
@@ -5188,7 +5188,7 @@ class FlatmapProjectionWidget(QWidget):
             if kind == "flatmap_labels":
                 result = getattr(
                     layer,
-                    "_napari_swc_flatmap_region_labels_result",
+                    "_napari_neuron_navigator_flatmap_region_labels_result",
                     None,
                 )
                 colormap = self._region_label_colormap(
@@ -5208,7 +5208,7 @@ class FlatmapProjectionWidget(QWidget):
                 rgba = np.asarray(effective.color_rgba, dtype=np.float32)
                 layer.colormap = Colormap(np.vstack([rgba, rgba]))
                 base_opacity = float(
-                    getattr(layer, "_napari_swc_region_base_opacity", 0.45)
+                    getattr(layer, "_napari_neuron_navigator_region_base_opacity", 0.45)
                 )
                 layer.opacity = base_opacity * effective.fill_opacity
                 _set_region_layer_visible(
@@ -5228,7 +5228,7 @@ class FlatmapProjectionWidget(QWidget):
                     dtype=np.float32,
                 )
                 base_opacity = float(
-                    getattr(layer, "_napari_swc_region_base_opacity", 0.9)
+                    getattr(layer, "_napari_neuron_navigator_region_base_opacity", 0.9)
                 )
                 layer.opacity = base_opacity * effective.outline_opacity
                 _set_region_layer_visible(
@@ -5445,9 +5445,9 @@ class FlatmapProjectionWidget(QWidget):
         summary: ProjectionSummary,
         render_summary: FlatmapRenderSummary | AllenLayerStackSummary,
     ) -> None:
-        setattr(layer, "_napari_swc_flatmap_projected_nodes", projected_nodes)
-        setattr(layer, "_napari_swc_flatmap_summary", summary)
-        setattr(layer, "_napari_swc_flatmap_render_summary", render_summary)
+        setattr(layer, "_napari_neuron_navigator_flatmap_projected_nodes", projected_nodes)
+        setattr(layer, "_napari_neuron_navigator_flatmap_summary", summary)
+        setattr(layer, "_napari_neuron_navigator_flatmap_render_summary", render_summary)
 
     @staticmethod
     def _format_render_summary(
@@ -6122,7 +6122,7 @@ class FlatmapProjectionWidget(QWidget):
 
     def _install_heatmap_status_guard(self, layer) -> None:
         """Avoid napari status errors while a heatmap slice catches up to 3D."""
-        if getattr(layer, "_napari_swc_flatmap_status_guard_installed", False):
+        if getattr(layer, "_napari_neuron_navigator_flatmap_status_guard_installed", False):
             return
 
         original_get_status = getattr(layer, "get_status", None)
@@ -6150,13 +6150,13 @@ class FlatmapProjectionWidget(QWidget):
                     raise
                 return self._status_without_sampled_value(layer, position)
 
-        setattr(layer, "_napari_swc_flatmap_original_get_status", original_get_status)
+        setattr(layer, "_napari_neuron_navigator_flatmap_original_get_status", original_get_status)
         setattr(layer, "get_status", guarded_get_status)
-        setattr(layer, "_napari_swc_flatmap_status_guard_installed", True)
+        setattr(layer, "_napari_neuron_navigator_flatmap_status_guard_installed", True)
 
     def _install_heatmap_thumbnail_workarounds(self, layer) -> None:
         """Keep generated heatmap thumbnails stable across 2D/3D axis changes."""
-        if getattr(layer, "_napari_swc_flatmap_thumbnail_workarounds_installed", False):
+        if getattr(layer, "_napari_neuron_navigator_flatmap_thumbnail_workarounds_installed", False):
             return
 
         widget = self
@@ -6171,7 +6171,7 @@ class FlatmapProjectionWidget(QWidget):
                         raise
                     if not getattr(
                         bound_layer,
-                        "_napari_swc_flatmap_thumbnail_warning_logged",
+                        "_napari_neuron_navigator_flatmap_thumbnail_warning_logged",
                         False,
                     ):
                         logger.warning(
@@ -6180,7 +6180,7 @@ class FlatmapProjectionWidget(QWidget):
                             getattr(bound_layer, "name", "<unnamed>"),
                             error,
                         )
-                        bound_layer._napari_swc_flatmap_thumbnail_warning_logged = True
+                        bound_layer._napari_neuron_navigator_flatmap_thumbnail_warning_logged = True
 
             layer._update_thumbnail = MethodType(safe_update_thumbnail, layer)
 
@@ -6258,7 +6258,7 @@ class FlatmapProjectionWidget(QWidget):
                 layer,
             )
 
-        setattr(layer, "_napari_swc_flatmap_thumbnail_workarounds_installed", True)
+        setattr(layer, "_napari_neuron_navigator_flatmap_thumbnail_workarounds_installed", True)
 
     @staticmethod
     def _is_thumbnail_rank_mismatch_error(error: RuntimeError) -> bool:
@@ -6302,7 +6302,7 @@ class FlatmapProjectionWidget(QWidget):
     def _heatmap_stored_contrast_limits(cls, layer) -> tuple[float, float] | None:
         raw_limits = getattr(
             layer,
-            "_napari_swc_flatmap_heatmap_contrast_limits",
+            "_napari_neuron_navigator_flatmap_heatmap_contrast_limits",
             None,
         )
         if raw_limits is None:
@@ -6318,11 +6318,11 @@ class FlatmapProjectionWidget(QWidget):
         *,
         limits_range: tuple[float, float] | None = None,
     ) -> None:
-        setattr(layer, "_napari_swc_flatmap_heatmap_contrast_limits", limits)
+        setattr(layer, "_napari_neuron_navigator_flatmap_heatmap_contrast_limits", limits)
         resolved_range = limits_range or limits
         setattr(
             layer,
-            "_napari_swc_flatmap_heatmap_contrast_limits_range",
+            "_napari_neuron_navigator_flatmap_heatmap_contrast_limits_range",
             resolved_range,
         )
         metadata = getattr(layer, "metadata", None)
@@ -6344,7 +6344,7 @@ class FlatmapProjectionWidget(QWidget):
         stored = cls._coerce_contrast_limits(
             getattr(
                 layer,
-                "_napari_swc_flatmap_heatmap_contrast_limits_range",
+                "_napari_neuron_navigator_flatmap_heatmap_contrast_limits_range",
                 None,
             )
         )

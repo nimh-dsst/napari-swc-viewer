@@ -43,7 +43,9 @@ from .flatmap_loader import (
 from .isocortex_layers import AllenIsocortexLayerMap
 
 REGION_CACHE_MANIFEST_FILENAME = "flatmap-region-cache.json"
-REGION_CACHE_FORMAT = "napari_swc_viewer.flatmap_region_cache"
+REGION_CACHE_FORMAT = "napari_neuron_navigator.flatmap_region_cache"
+LEGACY_REGION_CACHE_FORMAT = "napari_swc_viewer.flatmap_region_cache"
+REGION_CACHE_FORMATS = frozenset({REGION_CACHE_FORMAT, LEGACY_REGION_CACHE_FORMAT})
 #: Version 2 replaced the single ``xy_bins`` grid key with per-axis ``x_bins`` /
 #: ``y_bins``, because the flat map ``x`` axis spans both hemispheres and ``y``
 #: only one, so equal counts made every bin twice as wide as it was tall.  A
@@ -489,9 +491,9 @@ def _empty_manifest() -> dict[str, Any]:
 
 
 def _validate_root_manifest(value: Mapping[str, Any]) -> None:
-    if value.get("format") != REGION_CACHE_FORMAT:
+    if value.get("format") not in REGION_CACHE_FORMATS:
         raise RegionCacheValidationError(
-            "Not a napari-swc-viewer flatmap region cache: unexpected format."
+            "Not a napari-neuron-navigator flatmap region cache: unexpected format."
         )
     found_version = value.get("format_version")
     if found_version != REGION_CACHE_FORMAT_VERSION:

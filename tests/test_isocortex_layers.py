@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from napari_swc_viewer.isocortex_layers import (
+from napari_neuron_navigator.isocortex_layers import (
     ALLEN_ISOCORTEX_LAYER_LABELS,
     CustomRegionSelectionGroup,
     build_isocortex_layer_hierarchy,

@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import napari_swc_viewer.flatmap_loader as flatmap_loader
-from napari_swc_viewer.flatmap_loader import (
+import napari_neuron_navigator.flatmap_loader as flatmap_loader
+from napari_neuron_navigator.flatmap_loader import (
     FlatmapLookupLoadCancelledError,
     load_flatmap_volume_set,
     normalize_flatmap_volume,
@@ -146,7 +146,7 @@ def test_load_flatmap_volume_set_creates_and_uses_npy_cache(
         raise AssertionError(f"cache miss for {path}")
 
     monkeypatch.setattr(
-        "napari_swc_viewer.flatmap_loader._read_nrrd",
+        "napari_neuron_navigator.flatmap_loader._read_nrrd",
         _fail_read_nrrd,
     )
 

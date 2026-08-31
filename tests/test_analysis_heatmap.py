@@ -8,7 +8,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from napari_swc_viewer.analysis.heatmap import build_node_counts_volume
+from napari_neuron_navigator.analysis.heatmap import build_node_counts_volume
 
 
 class _FakeAtlas:

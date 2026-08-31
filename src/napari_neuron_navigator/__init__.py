@@ -1,4 +1,4 @@
-"""napari-swc-viewer: A napari plugin for viewing SWC files."""
+"""napari-neuron-navigator: Navigate and analyze neuronal morphologies."""
 
 import logging
 

@@ -2,7 +2,7 @@
 
 A terminus is a node with no children. Restricting termini to a node type
 selects that compartment's tips, so axon termini are the childless nodes typed
-:data:`~napari_swc_viewer.swc.NodeType.AXON`.
+:data:`~napari_neuron_navigator.swc.NodeType.AXON`.
 
 Two rules keep the result correct, and both come from the same principle: the
 childless test must see the whole tree.

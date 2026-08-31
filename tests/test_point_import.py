@@ -15,8 +15,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import napari_swc_viewer.point_import as point_import
-from napari_swc_viewer.point_import import (
+import napari_neuron_navigator.point_import as point_import
+from napari_neuron_navigator.point_import import (
     append_point_file_to_parquet,
     append_point_parquet_to_parquet,
     append_point_csv_to_parquet,
@@ -234,14 +234,14 @@ def _import_neuron_viewer_widget():
             return None
 
     fake_analysis_module = types.ModuleType(
-        "napari_swc_viewer.widgets.analysis_tab"
+        "napari_neuron_navigator.widgets.analysis_tab"
     )
     fake_analysis_module.AnalysisTabWidget = _FakeAnalysisTabWidget
-    sys.modules["napari_swc_viewer.widgets.analysis_tab"] = fake_analysis_module
-    sys.modules.pop("napari_swc_viewer.widgets.neuron_viewer", None)
-    sys.modules.pop("napari_swc_viewer.widgets", None)
+    sys.modules["napari_neuron_navigator.widgets.analysis_tab"] = fake_analysis_module
+    sys.modules.pop("napari_neuron_navigator.widgets.neuron_viewer", None)
+    sys.modules.pop("napari_neuron_navigator.widgets", None)
 
-    module = importlib.import_module("napari_swc_viewer.widgets.neuron_viewer")
+    module = importlib.import_module("napari_neuron_navigator.widgets.neuron_viewer")
     return module.NeuronViewerWidget
 
 
@@ -1782,7 +1782,7 @@ def test_widget_import_point_parquet_populates_preview_and_imports_selected_laye
     monkeypatch.setattr(NeuronViewerWidget, "_toggle_template", lambda self, state: None)
     warnings: list[str] = []
     monkeypatch.setattr(
-        "napari_swc_viewer.widgets.neuron_viewer.show_warning",
+        "napari_neuron_navigator.widgets.neuron_viewer.show_warning",
         lambda message: warnings.append(message),
     )
 

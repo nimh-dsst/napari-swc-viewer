@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from napari_swc_viewer.auto_center import (
+from napari_neuron_navigator.auto_center import (
     center_to_depth_world,
     compute_center_of_rendered_neurons,
     depth_axis_from_not_displayed,

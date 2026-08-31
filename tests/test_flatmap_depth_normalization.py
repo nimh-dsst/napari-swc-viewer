@@ -25,14 +25,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from napari_swc_viewer.analysis.flatmap_correlation import (
+from napari_neuron_navigator.analysis.flatmap_correlation import (
     DEFAULT_FLATMAP_DEPTH_SCALE,
     FlatmapDepthNormalization,
     normalize_flatmap_soma_coordinates,
     query_flatmap_soma_coordinates,
     resolve_flatmap_depth_normalization,
 )
-from napari_swc_viewer.flatmap_parquet import FLATMAP_PARQUET_METADATA_KEY
+from napari_neuron_navigator.flatmap_parquet import FLATMAP_PARQUET_METADATA_KEY
 
 # Canonical bounds taken from the real
 # ``isocortex_total_right_brainglobe_flatmap.parquet``: ``x`` spans both
@@ -265,7 +265,7 @@ def test_both_styles_share_the_binning_reference_axis(canonical_parquet) -> None
     A change to either that broke this pairing would silently put soma
     clustering and the heatmap on differently-proportioned spaces.
     """
-    from napari_swc_viewer.flatmap_heatmap import resolve_flatmap_bin_counts
+    from napari_neuron_navigator.flatmap_heatmap import resolve_flatmap_bin_counts
 
     _frame, path = canonical_parquet
     for style, x_bounds, y_bounds in (
@@ -430,7 +430,7 @@ def _fake_atlas():
 
 
 def _run_worker(path, **kwargs):
-    from napari_swc_viewer import workers
+    from napari_neuron_navigator import workers
 
     finished: list = []
     errors: list = []

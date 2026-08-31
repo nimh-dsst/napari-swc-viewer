@@ -2,7 +2,7 @@
 """align_hemispheres.py - Flip all neurons to the right hemisphere."""
 
 from pathlib import Path
-from napari_swc_viewer import (
+from napari_neuron_navigator import (
     parse_swc,
     write_swc,
     detect_soma_hemisphere,

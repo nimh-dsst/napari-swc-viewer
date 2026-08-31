@@ -12,11 +12,11 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from napari_swc_viewer.analysis.clustering import (
+from napari_neuron_navigator.analysis.clustering import (
     ClusterRegionSelection,
     ClusterResult,
 )
-from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
+from napari_neuron_navigator.cluster_assignments import ClusterAssignmentStore
 
 
 class _BoundSignal:
@@ -655,22 +655,22 @@ def _import_analysis_tab_module():
         setattr(qtwidgets_module, name, value)
 
     repo_root = Path(__file__).resolve().parent.parent
-    package_root = repo_root / "src" / "napari_swc_viewer"
+    package_root = repo_root / "src" / "napari_neuron_navigator"
     widgets_root = package_root / "widgets"
 
-    napari_package = types.ModuleType("napari_swc_viewer")
+    napari_package = types.ModuleType("napari_neuron_navigator")
     napari_package.__path__ = [str(package_root)]
 
-    widgets_package = types.ModuleType("napari_swc_viewer.widgets")
+    widgets_package = types.ModuleType("napari_neuron_navigator.widgets")
     widgets_package.__path__ = [str(widgets_root)]
 
     collapsible_module = types.ModuleType(
-        "napari_swc_viewer.widgets.collapsible_section"
+        "napari_neuron_navigator.widgets.collapsible_section"
     )
     collapsible_module.CollapsibleSection = _DummyCollapsibleSection
 
     region_selector_module = types.ModuleType(
-        "napari_swc_viewer.widgets.region_selector"
+        "napari_neuron_navigator.widgets.region_selector"
     )
     region_selector_module.RegionSelectorWidget = _DummyRegionSelector
 
@@ -685,13 +685,13 @@ def _import_analysis_tab_module():
         "qtpy.QtCore": qtcore_module,
         "qtpy.QtGui": qtgui_module,
         "qtpy.QtWidgets": qtwidgets_module,
-        "napari_swc_viewer": napari_package,
-        "napari_swc_viewer.widgets": widgets_package,
-        "napari_swc_viewer.widgets.collapsible_section": collapsible_module,
-        "napari_swc_viewer.widgets.region_selector": region_selector_module,
+        "napari_neuron_navigator": napari_package,
+        "napari_neuron_navigator.widgets": widgets_package,
+        "napari_neuron_navigator.widgets.collapsible_section": collapsible_module,
+        "napari_neuron_navigator.widgets.region_selector": region_selector_module,
     }
     previous = {name: sys.modules.get(name) for name in replacements}
-    module_name = "napari_swc_viewer.widgets.analysis_tab"
+    module_name = "napari_neuron_navigator.widgets.analysis_tab"
     previous_module = sys.modules.get(module_name)
 
     try:
@@ -1583,12 +1583,12 @@ def test_collapse_depth_reaches_the_correlation_worker(monkeypatch) -> None:
             self.kwargs = kwargs
             created_workers.append(self)
 
-    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module = types.ModuleType("napari_neuron_navigator.workers")
     workers_module.FlatmapParquetCorrelationWorker = _FakeWorker
     workers_module.CorrelationWorker = object
     workers_module.FlatmapSomaClusterWorker = object
     workers_module.SomaClusterWorker = object
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", workers_module)
 
     widget._run_clustering_pipeline()
     request = widget._start_clustering_preflight.call_args.args[0]
@@ -1749,14 +1749,14 @@ def test_flatmap_voxel_dispatch_constructs_parquet_worker(monkeypatch) -> None:
             self.kwargs = kwargs
             created_workers.append(self)
 
-    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module = types.ModuleType("napari_neuron_navigator.workers")
     workers_module.FlatmapParquetCorrelationWorker = (
         _FakeFlatmapParquetCorrelationWorker
     )
     workers_module.CorrelationWorker = object
     workers_module.FlatmapSomaClusterWorker = object
     workers_module.SomaClusterWorker = object
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", workers_module)
 
     widget._run_clustering_pipeline()
     request = widget._start_clustering_preflight.call_args.args[0]
@@ -1806,12 +1806,12 @@ def test_flatmap_soma_dispatch_constructs_soma_worker(monkeypatch) -> None:
             self.kwargs = kwargs
             created_workers.append(self)
 
-    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module = types.ModuleType("napari_neuron_navigator.workers")
     workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
     workers_module.CorrelationWorker = object
     workers_module.FlatmapParquetCorrelationWorker = object
     workers_module.SomaClusterWorker = object
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", workers_module)
 
     widget._run_clustering_pipeline()
     request = widget._start_clustering_preflight.call_args.args[0]
@@ -1858,14 +1858,14 @@ def test_flatmap_selected_rows_scope_passes_file_ids_to_worker(monkeypatch) -> N
             self.kwargs = kwargs
             created_workers.append(self)
 
-    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module = types.ModuleType("napari_neuron_navigator.workers")
     workers_module.FlatmapParquetCorrelationWorker = (
         _FakeFlatmapParquetCorrelationWorker
     )
     workers_module.CorrelationWorker = object
     workers_module.FlatmapSomaClusterWorker = object
     workers_module.SomaClusterWorker = object
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", workers_module)
 
     widget._run_clustering_pipeline()
     request = widget._start_clustering_preflight.call_args.args[0]
@@ -1897,12 +1897,12 @@ def test_flatmap_soma_selected_rows_scope_passes_file_ids_to_worker(
             self.kwargs = kwargs
             created_workers.append(self)
 
-    workers_module = types.ModuleType("napari_swc_viewer.workers")
+    workers_module = types.ModuleType("napari_neuron_navigator.workers")
     workers_module.FlatmapSomaClusterWorker = _FakeFlatmapSomaClusterWorker
     workers_module.CorrelationWorker = object
     workers_module.FlatmapParquetCorrelationWorker = object
     workers_module.SomaClusterWorker = object
-    monkeypatch.setitem(sys.modules, "napari_swc_viewer.workers", workers_module)
+    monkeypatch.setitem(sys.modules, "napari_neuron_navigator.workers", workers_module)
 
     widget._run_clustering_pipeline()
     request = widget._start_clustering_preflight.call_args.args[0]
@@ -2583,7 +2583,7 @@ def test_draw_clustermap_emits_debug_logs(caplog):
     )
 
     with caplog.at_level(
-        logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"
+        logging.DEBUG, logger="napari_neuron_navigator.widgets.analysis_tab"
     ):
         widget._draw_clustermap(result)
 
@@ -2677,7 +2677,7 @@ def test_build_clustermap_on_demand_draws_cached_result_and_logs(caplog):
     widget._last_cluster_result = result
 
     with caplog.at_level(
-        logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"
+        logging.DEBUG, logger="napari_neuron_navigator.widgets.analysis_tab"
     ):
         widget._build_clustermap_on_demand()
 
@@ -2724,7 +2724,7 @@ def test_on_correlation_finished_emits_debug_logs(caplog):
     )
 
     with caplog.at_level(
-        logging.DEBUG, logger="napari_swc_viewer.widgets.analysis_tab"
+        logging.DEBUG, logger="napari_neuron_navigator.widgets.analysis_tab"
     ):
         widget._on_correlation_finished(result)
 

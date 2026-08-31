@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from napari_swc_viewer.cluster_assignments import ClusterAssignmentStore
+from napari_neuron_navigator.cluster_assignments import ClusterAssignmentStore
 
 
 def test_store_keeps_sparse_runs_and_switches_active_assignment() -> None:

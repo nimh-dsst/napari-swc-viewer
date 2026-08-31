@@ -1,4 +1,4 @@
-# CPD2 napari SWC Viewer Workflow
+# CPD2 napari Neuron Navigator Workflow
 
 This guide walks through cloning the repository, launching the napari plugin with
 Pixi, creating a left-hemisphere aligned `cpd2.parquet` file from `cpd2_data`,
@@ -21,15 +21,15 @@ SWC reconstructions. The CPD2 workflow uses the registered files ending in
 1. Clone the repository.
 
    ```bash
-   git clone https://github.com/nimh-dsst/napari-swc-viewer.git
-   cd napari-swc-viewer
+   git clone https://github.com/nimh-dsst/napari-neuron-navigator.git
+   cd napari-neuron-navigator
    ```
 
    If you use SSH for GitHub, clone with:
 
    ```bash
-   git clone git@github.com:nimh-dsst/napari-swc-viewer.git
-   cd napari-swc-viewer
+   git clone git@github.com:nimh-dsst/napari-neuron-navigator.git
+   cd napari-neuron-navigator
    ```
 
 2. Install Pixi if it is not already installed.
@@ -49,7 +49,7 @@ SWC reconstructions. The CPD2 workflow uses the registered files ending in
 
    The `napari` Pixi task depends on the `build` task in `pixi.toml`. That means
    `pixi run napari` first runs `pixi run build`, which installs
-   `napari_swc_viewer` in editable mode with `pip install -e .` inside the Pixi
+   `napari_neuron_navigator` in editable mode with `pip install -e .` inside the Pixi
    environment. After the editable install finishes, Pixi runs the `napari`
    executable from the locked environment. The current `pixi.lock` resolves
    napari to `0.9.0`, so this command builds the plugin and then starts napari
@@ -57,7 +57,7 @@ SWC reconstructions. The CPD2 workflow uses the registered files ending in
 
 4. In napari, open the plugin from the menu:
 
-   `Plugins` -> `napari-swc-viewer` -> `Neuron Viewer`
+   `Plugins` -> `napari-neuron-navigator` -> `Neuron Viewer`
 
 ## Download CPD2 source SWCs
 

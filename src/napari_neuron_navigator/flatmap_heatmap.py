@@ -673,7 +673,7 @@ def build_flatmap_segment_vectors(
     """Convert projected parent-child segments into napari vector data.
 
     ``segment_endpoints`` is the ``(M, 2, 2)`` array
-    :func:`napari_swc_viewer.flatmap_projection.build_projected_segments`
+    :func:`napari_neuron_navigator.flatmap_projection.build_projected_segments`
     returns: ``[:, 0]`` is the parent endpoint, ``[:, 1]`` the child endpoint,
     and the last axis is ``(x_flat, y_flat)`` in raw flatmap units.  Output
     coordinates are image pixels in ``(row, col)`` order so the vectors land on

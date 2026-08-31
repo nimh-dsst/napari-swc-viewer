@@ -11,7 +11,11 @@ from typing import Any, Iterable, Literal
 import numpy as np
 
 
-REGION_PALETTE_FORMAT = "napari_swc_viewer.region_palette"
+REGION_PALETTE_FORMAT = "napari_neuron_navigator.region_palette"
+LEGACY_REGION_PALETTE_FORMAT = "napari_swc_viewer.region_palette"
+REGION_PALETTE_FORMATS = frozenset(
+    {REGION_PALETTE_FORMAT, LEGACY_REGION_PALETTE_FORMAT}
+)
 REGION_PALETTE_VERSION = 1
 
 ColorMode = Literal["custom", "atlas"]
@@ -383,7 +387,7 @@ class RegionAppearanceStore:
 
     @classmethod
     def from_palette_dict(cls, payload: Mapping[str, object]) -> RegionAppearanceStore:
-        if payload.get("format") != REGION_PALETTE_FORMAT:
+        if payload.get("format") not in REGION_PALETTE_FORMATS:
             raise ValueError("Unsupported region palette format.")
         try:
             version = int(payload.get("version", -1))

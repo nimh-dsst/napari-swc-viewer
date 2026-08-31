@@ -1,12 +1,12 @@
 #!/usr/bin/env zsh
 
-repo_dir="$HOME/repos/napari-swc-viewer"
+repo_dir="$HOME/repos/napari-neuron-navigator"
 
 if [[ ! -d "$repo_dir" ]]; then
     echo "Could not find the repository at:"
     echo "  $repo_dir"
     echo
-    echo "Clone the repository to ~/repos/napari-swc-viewer, or edit this script to use your actual path."
+    echo "Clone the repository to ~/repos/napari-neuron-navigator, or edit this script to use your actual path."
     echo
     printf "Press Return to close this window..."
     read -r reply

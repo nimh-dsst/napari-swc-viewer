@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_swc_viewer.flatmap_heatmap import (
+from napari_neuron_navigator.flatmap_heatmap import (
     FLATMAP_HEATMAP_COLOR_CLUSTER,
     FLATMAP_HEATMAP_COLOR_INDIVIDUAL,
     FLATMAP_HEATMAP_COLOR_SINGLE,
@@ -29,7 +29,7 @@ from napari_swc_viewer.flatmap_heatmap import (
     flatmap_pixel_coordinates,
     rendered_plane_points,
 )
-from napari_swc_viewer.isocortex_layers import AllenIsocortexLayerMap
+from napari_neuron_navigator.isocortex_layers import AllenIsocortexLayerMap
 
 
 def _lookup_volumes() -> tuple[np.ndarray, np.ndarray]:
