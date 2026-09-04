@@ -307,3 +307,7 @@ This operation is vectorized using NumPy for efficient processing of large SWC f
 ## Third Party Attribution
 
 This repository contains modified code derived from [napari swc editor](https://github.com/LaboratoryOpticsBiosciences/napari-swc-editor) by Clément Caporal.
+
+## AI Usage Statement
+
+U.S. Department of Health and Human Services (HHS) ChatGPT models 5.5 and 5.6 Sol, as well as Claude Opus 4.8, were used for software-development assistance. All AI-assisted content was reviewed and validated by the authors.
