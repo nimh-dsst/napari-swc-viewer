@@ -214,6 +214,18 @@ class _DummyCombo:
         self.enabled = bool(enabled)
 
 
+class _DummyDataCombo:
+    def __init__(self, data) -> None:
+        self.data = data
+        self.enabled = True
+
+    def currentData(self):
+        return self.data
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+
 class _DummyLayer:
     def __init__(self, data, **kwargs) -> None:
         # Kept verbatim so a test can assert what was and was not passed at
@@ -2840,6 +2852,264 @@ def test_allen_layer_stack_uses_one_2d_categorical_image(monkeypatch) -> None:
     assert layer.metadata["flatmap_projection_source"] == "legacy_auto"
 
 
+def test_allen_layer_selection_helpers_preserve_canonical_order(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    widget._allen_layer_checkboxes = [
+        _DummyValueControl(checked=value)
+        for value in (False, True, False, False, True, False)
+    ]
+    widget._allen_layer_output_combo = _DummyDataCombo(
+        module.ALLEN_LAYER_OUTPUT_PROJECTION
+    )
+
+    assert widget._current_allen_layer_indices() == (1, 4)
+    assert widget._is_allen_layer_projection() is True
+    assert widget._current_plane_mode() == "allen_layer_projection"
+    assert widget._axis_labels_for_render_mode(module._RENDER_ALLEN_LAYERS) == (
+        "Flatmap Y",
+        "Flatmap X",
+    )
+
+
+def test_allen_layer_options_default_to_all_layers_and_stack(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+
+    assert widget._current_allen_layer_indices() == (0, 1, 2, 3, 4, 5)
+    assert widget._current_allen_layer_output_mode() == "stack"
+
+
+def test_allen_layer_options_are_visible_only_in_allen_mode(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    options_group = _DummyProgressBar()
+    widget._allen_layer_options_group = options_group
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+
+    widget._update_render_mode_controls()
+    assert options_group.visible is True
+
+    widget._render_mode_combo.data = module._RENDER_HEATMAP
+    widget._update_render_mode_controls()
+    assert options_group.visible is False
+
+
+def test_allen_layer_option_change_invalidates_existing_render(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    widget._allen_layer_checkboxes = [
+        _DummyValueControl(checked=index == 3) for index in range(6)
+    ]
+    invalidated = []
+    widget._invalidate_flatmap_grid_layers = lambda: invalidated.append(True)
+    widget._update_render_mode_controls = lambda: None
+    widget._update_cached_region_controls = lambda: None
+
+    widget._on_allen_layer_options_changed()
+
+    assert invalidated == [True]
+    assert widget._status_label.text == (
+        "Allen layers L5 will render as a compact 2D stack."
+    )
+
+
+def test_empty_allen_layer_selection_disables_projection_and_labels(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    widget._projection_source_combo = _DummyDataCombo(
+        module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._allen_layer_checkboxes = [
+        _DummyValueControl(checked=False)
+        for _label in module.ALLEN_ISOCORTEX_LAYER_LABELS
+    ]
+    widget._active_cache_profile = object()
+    widget._add_soma_btn = _DummyButton()
+
+    widget._set_projection_controls_enabled(True)
+
+    assert widget._project_btn.enabled is False
+    assert widget._add_soma_btn.enabled is False
+    assert widget._cached_region_control_states()["_region_labels_btn"] is False
+
+
+def test_allen_layer_projection_uses_rank_two_layer_and_metadata(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    widget._heatmap_color_mode_combo = _DummyDataCombo(
+        module._HEATMAP_COLOR_SINGLE
+    )
+    summary = module.AllenLayerStackSummary(
+        total_nodes=3,
+        flatmap_valid_nodes=3,
+        layer_classified_nodes=3,
+        rendered_nodes=2,
+        excluded_non_layer_nodes=0,
+        excluded_unselected_layer_nodes=1,
+        nonzero_voxels=1,
+        traces_represented=2,
+        y_bins=4,
+        x_bins=4,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        layer_labels=("L2/3", "L6a"),
+        layer_node_counts=(1, 1),
+        selected_layer_indices=(1, 4),
+        output_mode=module.ALLEN_LAYER_OUTPUT_PROJECTION,
+        output_shape=(4, 4),
+        atlas_name="allen_mouse_25um",
+    )
+    projected = pd.DataFrame(
+        {
+            "file_id": ["a.swc", "b.swc"],
+            "render_valid": [True, True],
+            "allen_layer_index": [1, 4],
+            "allen_layer_render_index": [0, 1],
+            "y_flat_bin": [1, 1],
+            "x_flat_bin": [2, 2],
+        }
+    )
+    result = module.AllenLayerStackResult(
+        projected_nodes=projected,
+        volume=np.asarray(
+            [[0, 0, 0, 0], [0, 0, 2, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+            dtype=np.float32,
+        ),
+        summary=summary,
+    )
+
+    layer = widget._create_or_update_allen_layer_stack(
+        result,
+        _simple_projection_summary(module, total_nodes=3),
+        flatmap_style="both_shaped",
+        coordinate_mode="parquet_columns",
+    )
+
+    assert layer.name == module._ALLEN_LAYER_PROJECTION_LAYER_NAME
+    assert layer.data.shape == (4, 4)
+    assert layer.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_plane_mode"] == "allen_layer_projection"
+    assert layer.metadata["allen_layer_output_mode"] == "projection"
+    assert layer.metadata["allen_layer_indices"] == [1, 4]
+    assert layer.metadata["allen_layer_labels"] == ["L2/3", "L6a"]
+    assert widget._viewer.canvas.overlays.text.visible is False
+
+
+def test_selected_allen_stack_caption_uses_compact_plane_number(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    summary = module.AllenLayerStackSummary(
+        total_nodes=2,
+        flatmap_valid_nodes=2,
+        layer_classified_nodes=2,
+        rendered_nodes=2,
+        excluded_non_layer_nodes=0,
+        nonzero_voxels=2,
+        traces_represented=1,
+        y_bins=4,
+        x_bins=4,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        layer_labels=("L2/3", "L5"),
+        layer_node_counts=(1, 1),
+        selected_layer_indices=(1, 3),
+        output_mode=module.ALLEN_LAYER_OUTPUT_STACK,
+        output_shape=(2, 4, 4),
+        atlas_name="allen_mouse_25um",
+    )
+    result = module.AllenLayerStackResult(
+        projected_nodes=pd.DataFrame(
+            {
+                "file_id": ["a.swc", "a.swc"],
+                "render_valid": [True, True],
+                "allen_layer_render_index": [0, 1],
+                "y_flat_bin": [1, 2],
+                "x_flat_bin": [1, 2],
+            }
+        ),
+        volume=np.ones((2, 4, 4), dtype=np.float32),
+        summary=summary,
+    )
+
+    widget._create_or_update_allen_layer_stack(
+        result,
+        _simple_projection_summary(module, total_nodes=2),
+        flatmap_style="both_shaped",
+        coordinate_mode="parquet_columns",
+    )
+    widget._viewer.dims.set_current_step(1)
+
+    assert widget._viewer.text_overlay.text == "Allen layer: L5  (plane 2 of 2)"
+
+
+def test_allen_layer_projection_places_selected_somas_in_xy_only(monkeypatch) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    widget._allen_layer_output_combo = _DummyDataCombo(
+        module.ALLEN_LAYER_OUTPUT_PROJECTION
+    )
+    widget._soma_layer = None
+    summary = module.AllenLayerStackSummary(
+        total_nodes=2,
+        flatmap_valid_nodes=2,
+        layer_classified_nodes=2,
+        rendered_nodes=1,
+        excluded_non_layer_nodes=0,
+        excluded_unselected_layer_nodes=1,
+        nonzero_voxels=1,
+        traces_represented=1,
+        y_bins=4,
+        x_bins=4,
+        x_flat_min=0.0,
+        x_flat_max=1.0,
+        y_flat_min=0.0,
+        y_flat_max=1.0,
+        layer_labels=("L5",),
+        layer_node_counts=(1,),
+        selected_layer_indices=(3,),
+        output_mode=module.ALLEN_LAYER_OUTPUT_PROJECTION,
+        output_shape=(4, 4),
+        atlas_name="allen_mouse_25um",
+    )
+    render = module.AllenLayerStackResult(
+        projected_nodes=pd.DataFrame(
+            {
+                "file_id": ["a.swc", "b.swc"],
+                "render_valid": [True, False],
+                "y_flat_bin": [2, -1],
+                "x_flat_bin": [3, -1],
+                "allen_layer_index": [3, 4],
+                "allen_layer_render_index": [0, -1],
+            }
+        ),
+        volume=np.zeros((4, 4), dtype=np.float32),
+        summary=summary,
+    )
+
+    layer = widget._create_or_update_soma_layer(
+        render,
+        _simple_projection_summary(module, total_nodes=2),
+    )
+
+    np.testing.assert_array_equal(layer.data, np.asarray([[2.0, 3.0]]))
+    assert layer.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_plane_mode"] == "allen_layer_projection"
+    assert layer.metadata["allen_layer_indices"] == [3]
+
+
 def _render_allen_layer_stack(module, widget, *, color_mode=None):
     """Render a six-plane Allen stack through the widget's normal entry point."""
     color_mode = color_mode or module._HEATMAP_COLOR_SINGLE
@@ -4252,6 +4522,80 @@ def test_cached_allen_layer_labels_create_synchronized_planar_stack(
     assert "6 Allen layer planes" in widget._region_labels_status_label.text
 
 
+def test_cached_allen_layer_projection_labels_share_selected_xy_space(
+    monkeypatch,
+) -> None:
+    module = _load_flatmap_widget_module(monkeypatch)
+    widget = _widget(module)
+    widget._active_cache_profile = types.SimpleNamespace(profile_id="profile-1")
+    widget._region_cache_dir = Path("cache")
+    widget._style_combo = _DummyDataCombo("both_shaped")
+    widget._projection_source_combo = _DummyDataCombo(
+        module._PROJECTION_SOURCE_PRECOMPUTED
+    )
+    widget._render_mode_combo = _DummyDataCombo(module._RENDER_ALLEN_LAYERS)
+    widget._allen_layer_output_combo = _DummyDataCombo(
+        module.ALLEN_LAYER_OUTPUT_PROJECTION
+    )
+    widget._allen_layer_checkboxes = [
+        _DummyValueControl(checked=index in {1, 4}) for index in range(6)
+    ]
+    widget._selected_region_ids_provider = lambda: [10, 11]
+    widget._selected_region_acronyms_provider = lambda: ["R10", "R11"]
+    widget._selected_region_source_provider = lambda: "custom_regions"
+    widget._selected_region_scope_provider = lambda: "whole_parquet"
+    widget._atlas_provider = lambda: types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        structures={},
+    )
+    layer_map = types.SimpleNamespace(
+        atlas_name="allen_mouse_25um",
+        atlas_version="1.2.3",
+        layer_labels=("L1", "L2/3", "L4", "L5", "L6a", "L6b"),
+    )
+    widget._current_allen_layer_map = lambda: layer_map
+    result = types.SimpleNamespace(
+        labels=np.asarray([[10, 0], [0, 11]], dtype=np.int32),
+        profile_id="profile-1",
+        selected_region_ids=(10, 11),
+        layer_mapped_region_ids=(10, 11),
+        represented_region_ids=(10, 11),
+        layer_labels=("L2/3", "L6a"),
+        summary=types.SimpleNamespace(
+            labeled_bins=2,
+            to_dict=lambda: {
+                "labeled_bins": 2,
+                "output_shape": [2, 2],
+            },
+        ),
+    )
+    import napari_neuron_navigator.flatmap_region_cache as cache_module
+
+    captured = {}
+    monkeypatch.setattr(
+        cache_module,
+        "materialize_allen_layer_region_selection",
+        lambda _profile, _region_ids, **kwargs: (
+            captured.update(kwargs) or result
+        ),
+    )
+
+    actual = widget._create_cached_region_labels()
+
+    assert actual is result
+    assert captured["selected_layer_indices"] == (1, 4)
+    assert captured["output_mode"] == "projection"
+    layer = widget._region_labels_layer
+    assert layer.name == module._ALLEN_LAYER_PROJECTION_REGION_LABELS_LAYER_NAME
+    assert layer.data.shape == (2, 2)
+    assert layer.axis_labels == ("Flatmap Y", "Flatmap X")
+    assert layer.metadata["flatmap_plane_mode"] == "allen_layer_projection"
+    assert layer.metadata["allen_layer_indices"] == [1, 4]
+    assert "projected from 2 selected Allen layer" in (
+        widget._region_labels_status_label.text
+    )
+
+
 def test_cached_allen_layer_labels_reject_unmapped_and_clear_empty_results(
     monkeypatch,
 ) -> None:
@@ -5201,6 +5545,8 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
             "depth_bin_label": ["0-25 um"],
             "allen_layer_index": [0],
             "allen_layer_label": ["L1"],
+            "allen_layer_selected": [True],
+            "allen_layer_render_index": [0],
         }
     )
 
@@ -5216,6 +5562,8 @@ def test_export_current_projection_to_path_writes_csv(monkeypatch, tmp_path) -> 
     assert exported["x_flat_bin"].tolist() == [10]
     assert exported["allen_layer_index"].tolist() == [0]
     assert exported["allen_layer_label"].tolist() == ["L1"]
+    assert bool(exported["allen_layer_selected"].iloc[0]) is True
+    assert exported["allen_layer_render_index"].tolist() == [0]
     assert "Exported flatmap projection" in widget._status_label.text
 
 

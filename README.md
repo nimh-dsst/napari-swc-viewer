@@ -171,7 +171,8 @@ Vector**, **Show Region Labels** builds one depth-collapsed label image and
 from the same occupancy arrays — these two overlays need no cache rebuild of
 their own. Collapsing sums source-voxel counts across depth **per selected
 region**, so a 2D overlay is a map of the areas you selected rather than of
-cortical layers; use **Allen Layer Heatmap (2D stack)** for per-layer questions.
+cortical layers; use **Allen Layer Heatmap** to select Allen layers and view
+them as either a compact stack or a summed 2D projection.
 Cached surfaces stay 3D-only, since a voxel shell has no 2D form.
 
 Missing or incompatible cache data reports the specific mismatch and never
